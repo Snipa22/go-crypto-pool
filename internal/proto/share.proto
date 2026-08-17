@@ -1,0 +1,148 @@
+// Copyright and license: see repository LICENSE (MIT).
+//
+// Share/Block wire schema for go-crypto-pool, exchanged between leaf
+// binaries (leaf-direct, leaf-solo, leaf-proxy) and the backend over the
+// HTTP+Protobuf edge transport (see internal/leaflib/transport).
+//
+// Design notes / deltas from the legacy SXMR proto2 schema
+// (nodejs-pool-sxmr's Share/Block), which this schema generalizes for a
+// multi-algo, multi-network omni-pool:
+//
+//   - Algo is now a required, explicit field on every Share/Block. The
+//     legacy schema had no coin/algo tag at all because it assumed one
+//     deployment per coin. go-crypto-pool serves RXT/C29/SHA3X/RXM out of
+//     one backend, so every message must self-identify its algo.
+//   - Network (MAINNET/TESTNET) is likewise now a required, explicit
+//     field on every Share/Block, per the project requirement to support
+//     testnet operation for all algos during development.
+//   - The legacy `bitcoin bool` payout-currency flag is dropped entirely —
+//     it was a Monero-fork-specific hack that doesn't generalize to Tari's
+//     multi-algo model and isn't used here.
+//   - The legacy `trustedShare bool` field is carried forward as
+//     `trusted_share` — it is still actively used in production
+//     (accounting/payout trust-boundary flag), do not drop it.
+//   - `blockHeight` is int64, not int32 (legacy proto2 used int32, which
+//     is a real overflow bug waiting to happen well before height 2^31).
+//   - The legacy RandomX-specific trio (`blobData`, `minerHex`,
+//     `seedHash`) is replaced by a `oneof raw_proof` with one message per
+//     algo family, since C29 (Cuckaroo29 cycle-proof) and SHA3X (plain
+//     hash) are structurally different from RandomX's blob/seed/hash
+//     model and don't fit the same three fields. This raw proof is
+//     optional supporting data for a future secondary/audit validator;
+//     the backend itself does NOT re-validate PoW (see AGENTS.md — it's a
+//     trust boundary, leaves own all algo-specific validation).
+//
+// NOTE on C29Proof: exact Cuckaroo29/Cuckatoo29 cycle-proof field shapes
+// are NOT verified against the real Tari C29 miner implementation as of
+// this schema pass — `edge_bits` + repeated `cycle` (the 42-edge cycle,
+// typically represented as u32/u64 nonces) is a reasonable placeholder
+// based on general Cuckoo-cycle proof shape, but should be checked
+// against actual go-tari-* C29 code before this is relied on for
+// anything beyond optional audit data.
+syntax = "proto3";
+
+package pool.v1;
+
+option go_package = "github.com/Snipa22/go-crypto-pool/internal/proto;poolpb";
+
+// Algo identifies the mining algorithm / share stream a message belongs
+// to. go-crypto-pool is an omni-pool serving all four from one backend,
+// so this tag is mandatory on every Share and Block.
+enum Algo {
+  ALGO_UNSPECIFIED = 0;
+  ALGO_RXT = 1;   // RandomX-Tari
+  ALGO_C29 = 2;   // Cuckaroo/Cuckatoo29
+  ALGO_SHA3X = 3; // SHA3-256 (Tari merge-mining / SHA3X)
+  ALGO_RXM = 4;   // RandomX-Monero-family
+}
+
+// Network distinguishes mainnet from testnet deployments. Required on
+// every Share/Block so a single backend can safely serve both without
+// cross-contaminating payout/accounting state.
+enum Network {
+  NETWORK_UNSPECIFIED = 0;
+  NETWORK_MAINNET = 1;
+  NETWORK_TESTNET = 2;
+}
+
+// PoolType mirrors the legacy SXMR POOLTYPE enum — this part of the
+// legacy design generalizes fine as-is.
+enum PoolType {
+  POOL_TYPE_UNSPECIFIED = 0;
+  POOL_TYPE_PPLNS = 1;
+  POOL_TYPE_PPS = 2;
+  POOL_TYPE_PROP = 3;
+  POOL_TYPE_SOLO = 4;
+}
+
+// RandomXProof carries the legacy blob/seed/result trio for RXT and RXM,
+// which are both RandomX-family algos and share the same proof shape.
+message RandomXProof {
+  bytes blob = 1;       // block template blob that was hashed
+  bytes seed_hash = 2;  // RandomX seed hash in effect for this height
+  string result_hex = 3; // claimed PoW hash result, hex-encoded
+}
+
+// C29Proof carries a Cuckaroo/Cuckatoo29 cycle-proof. See the top-of-file
+// note: this field shape is an unverified placeholder, not confirmed
+// against a real Tari C29 miner implementation.
+message C29Proof {
+  uint32 edge_bits = 1;   // graph size parameter (unverified placeholder)
+  repeated uint64 cycle = 2; // the proof cycle's edge nonces (unverified placeholder)
+}
+
+// SHA3XProof carries a straight header+nonce pair for the SHA3X algo,
+// which has no intermediate blob/seed concept the way RandomX does.
+message SHA3XProof {
+  bytes header = 1;
+  uint64 nonce = 2;
+}
+
+// Share represents one accepted share submission from a leaf to the
+// backend. Every field the backend needs for accounting/payout is
+// present without decoding raw_proof; raw_proof is optional supporting
+// data for a future secondary/audit validator only.
+message Share {
+  Algo algo = 1;
+  Network network = 2;
+
+  int64 shares = 3;
+  string payment_address = 4;
+  bool found_block = 5;
+  optional string payment_id = 6;
+  PoolType pool_type = 7;
+  int32 pool_id = 8;
+  int64 block_diff = 9;
+  int64 block_height = 10; // int64: legacy int32 overflows well before real chain heights
+  int64 timestamp = 11;
+  string identifier = 12; // worker/rig identifier
+
+  // raw_proof is optional, algo-tagged proof material kept around for a
+  // future audit/secondary-validation path. The backend does not decode
+  // or validate this today.
+  oneof raw_proof {
+    RandomXProof randomx_proof = 13;
+    C29Proof c29_proof = 14;
+    SHA3XProof sha3x_proof = 15;
+  }
+
+  // trusted_share carried over from the legacy schema — actively used in
+  // production (accounting/payout trust-boundary flag), do not drop.
+  bool trusted_share = 16;
+}
+
+// Block represents a block found and reported by a leaf.
+message Block {
+  Algo algo = 1;
+  Network network = 2;
+
+  string hash = 3;
+  int64 difficulty = 4;
+  int64 shares = 5;
+  int64 timestamp = 6;
+  PoolType pool_type = 7;
+  bool unlocked = 8;
+  bool valid = 9;
+  optional int64 value = 10;
+  int64 height = 11; // block_height wasn't in the legacy Block message; added since the backend needs it for the same overflow reasons as Share
+}
