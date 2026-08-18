@@ -19,6 +19,17 @@
 //	                         story).
 //	GCPOOL_AUTH_HEADER_VALUE (optional) expected value for the header
 //	                         above.
+//	GCPOOL_NETWORK           (required) the network this backend is
+//	                         configured for. Accepts "mainnet" or
+//	                         "testnet" (case-insensitive). There is no
+//	                         default — startup fails fast if this is
+//	                         missing or does not parse to a valid
+//	                         network, since silently defaulting to
+//	                         either network here is exactly the kind of
+//	                         cross-network contamination this backend
+//	                         must prevent. Every submitted Share/Block
+//	                         must carry this exact network or it is
+//	                         rejected with 400.
 package main
 
 import (
@@ -29,14 +40,31 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/api"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
+	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
 const defaultListenAddr = ":8080"
+
+// parseNetwork parses the GCPOOL_NETWORK environment variable value
+// into a poolpb.Network. Only "mainnet" and "testnet" (case-insensitive)
+// are accepted; anything else (including empty string) is an error —
+// there is deliberately no default value here.
+func parseNetwork(raw string) (poolpb.Network, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "mainnet":
+		return poolpb.Network_NETWORK_MAINNET, nil
+	case "testnet":
+		return poolpb.Network_NETWORK_TESTNET, nil
+	default:
+		return poolpb.Network_NETWORK_UNSPECIFIED, fmt.Errorf("GCPOOL_NETWORK: unrecognized value %q, want \"mainnet\" or \"testnet\"", raw)
+	}
+}
 
 // repositoryAdapter adapts *db.Repository (whose InsertShare/InsertBlock
 // operate on db.Share/db.Block) to api.ShareBlockRepository (which
@@ -101,6 +129,11 @@ func run() error {
 	authHeaderName := os.Getenv("GCPOOL_AUTH_HEADER_NAME")
 	authHeaderValue := os.Getenv("GCPOOL_AUTH_HEADER_VALUE")
 
+	network, err := parseNetwork(os.Getenv("GCPOOL_NETWORK"))
+	if err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -114,6 +147,7 @@ func run() error {
 	handler := api.NewHandler(repositoryAdapter{repo: repo}, api.Config{
 		AuthHeaderName:  authHeaderName,
 		AuthHeaderValue: authHeaderValue,
+		Network:         network,
 	})
 
 	srv := &http.Server{

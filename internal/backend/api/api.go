@@ -22,6 +22,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -97,6 +98,21 @@ type Config struct {
 	// AuthHeaderValue. Both empty means no auth check is performed.
 	AuthHeaderName  string
 	AuthHeaderValue string
+
+	// Network is this backend's own configured network
+	// (NETWORK_MAINNET or NETWORK_TESTNET). Every submitted Share/Block
+	// must carry this exact Network value or it is rejected — this is
+	// the guard against a testnet leaf submitting to a mainnet backend
+	// (or vice versa) undetected.
+	//
+	// NETWORK_UNSPECIFIED (the zero value) disables this check, mainly
+	// so existing/unit tests that don't care about network enforcement
+	// don't need to set it. cmd/backend's production wiring must always
+	// set this explicitly (it fails fast at startup if it can't parse a
+	// valid network from its environment) — silently defaulting here
+	// would reintroduce exactly the cross-network contamination risk
+	// this field exists to close.
+	Network poolpb.Network
 }
 
 // Handler implements the backend's share/block ingestion HTTP endpoints.
@@ -163,6 +179,11 @@ func (h *Handler) handleShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := h.checkNetwork(share.GetNetwork()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	record := shareToRecord(share)
 	if err := h.repo.InsertShare(r.Context(), record, HeightPartitionBucketSize); err != nil {
 		writeErr(w, http.StatusInternalServerError, "insert failed")
@@ -195,6 +216,11 @@ func (h *Handler) handleBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := h.checkNetwork(block.GetNetwork()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	record := blockToRecord(block)
 	if err := h.repo.InsertBlock(r.Context(), record); err != nil {
 		writeErr(w, http.StatusInternalServerError, "insert failed")
@@ -202,6 +228,30 @@ func (h *Handler) handleBlock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusCreated)
+}
+
+// checkNetwork enforces that a submitted Share/Block's Network exactly
+// matches this backend's own configured network (h.cfg.Network). This
+// is deliberately a hard rejection, not a warning: silently accepting a
+// mismatched network is exactly how a testnet leaf ends up contaminating
+// a mainnet backend's data (or vice versa).
+//
+// If the backend itself has no configured network (h.cfg.Network ==
+// NETWORK_UNSPECIFIED), this check is skipped — mirrors the auth
+// header's "not configured means not enforced" pattern, and lets
+// callers/tests that don't care about network enforcement omit it.
+// Production wiring (cmd/backend) always sets this field and fails
+// fast at startup if it cannot, so this escape hatch does not apply
+// there.
+func (h *Handler) checkNetwork(got poolpb.Network) error {
+	if h.cfg.Network == poolpb.Network_NETWORK_UNSPECIFIED {
+		return nil
+	}
+	if got != h.cfg.Network {
+		return fmt.Errorf("network mismatch: backend configured for %s, share/block submitted for %s",
+			h.cfg.Network, got)
+	}
+	return nil
 }
 
 func readBody(r *http.Request) ([]byte, error) {
