@@ -298,3 +298,77 @@ func TestNewHandler(t *testing.T) {
 		t.Fatal("NewHandler returned nil")
 	}
 }
+
+func TestHandleShare_NetworkMatchesConfigured_Accepted(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{Network: poolpb.Network_NETWORK_TESTNET})
+	rr := postProto(t, h.Mux(), "/api/v1/share", validShare(), nil)
+
+	if rr.Code < 200 || rr.Code >= 300 {
+		t.Fatalf("status = %d, want 2xx; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(repo.shares) != 1 {
+		t.Fatalf("expected 1 share inserted, got %d", len(repo.shares))
+	}
+}
+
+func TestHandleShare_NetworkMismatch_Rejected(t *testing.T) {
+	// Backend configured for mainnet; share submitted is testnet
+	// (validShare's default). This must be a hard rejection — a
+	// testnet leaf must not be able to write into a mainnet backend.
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{Network: poolpb.Network_NETWORK_MAINNET})
+	rr := postProto(t, h.Mux(), "/api/v1/share", validShare(), nil)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(repo.shares) != 0 {
+		t.Errorf("expected no insert on network mismatch, got %d", len(repo.shares))
+	}
+}
+
+func TestHandleBlock_NetworkMatchesConfigured_Accepted(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{Network: poolpb.Network_NETWORK_MAINNET})
+	rr := postProto(t, h.Mux(), "/api/v1/block", validBlock(), nil)
+
+	if rr.Code < 200 || rr.Code >= 300 {
+		t.Fatalf("status = %d, want 2xx; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(repo.blocks) != 1 {
+		t.Fatalf("expected 1 block inserted, got %d", len(repo.blocks))
+	}
+}
+
+func TestHandleBlock_NetworkMismatch_Rejected(t *testing.T) {
+	// Backend configured for testnet; block submitted is mainnet
+	// (validBlock's default). Must be rejected, not silently accepted.
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{Network: poolpb.Network_NETWORK_TESTNET})
+	rr := postProto(t, h.Mux(), "/api/v1/block", validBlock(), nil)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(repo.blocks) != 0 {
+		t.Errorf("expected no insert on network mismatch, got %d", len(repo.blocks))
+	}
+}
+
+func TestHandleShare_NetworkNotConfiguredMeansNoCheck(t *testing.T) {
+	// Config{} (Network unspecified) must keep behaving exactly like
+	// before this change — no network enforcement — so existing/other
+	// callers/tests that don't set Network aren't broken by this
+	// additive check.
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{})
+	rr := postProto(t, h.Mux(), "/api/v1/share", validShare(), nil)
+
+	if rr.Code < 200 || rr.Code >= 300 {
+		t.Fatalf("status = %d, want 2xx; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(repo.shares) != 1 {
+		t.Errorf("expected 1 insert, got %d", len(repo.shares))
+	}
+}
