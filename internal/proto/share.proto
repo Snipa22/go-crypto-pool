@@ -32,13 +32,19 @@
 //     the backend itself does NOT re-validate PoW (see AGENTS.md — it's a
 //     trust boundary, leaves own all algo-specific validation).
 //
-// NOTE on C29Proof: exact Cuckaroo29/Cuckatoo29 cycle-proof field shapes
-// are NOT verified against the real Tari C29 miner implementation as of
-// this schema pass — `edge_bits` + repeated `cycle` (the 42-edge cycle,
-// typically represented as u32/u64 nonces) is a reasonable placeholder
-// based on general Cuckoo-cycle proof shape, but should be checked
-// against actual go-tari-* C29 code before this is relied on for
-// anything beyond optional audit data.
+// NOTE on C29Proof: field shapes were checked against the real Tari C29
+// miner implementation (go-tari-c29-solo-stratum's SubmitJob, via
+// snipa22/powkit's cuckoo.Client.Verify) as part of building the
+// internal/leaflib/validator package. `edge_bits` + repeated `cycle` (the
+// 42-edge Cuckaroo29 cycle, u64 edge nonces) matches the real proof shape.
+// `header` was ADDED here (it did not exist in the original placeholder)
+// because the real cycle-verify primitive needs header/merge-mining-hash
+// material to derive its siphash keys (see legacy SubmitJob:
+// `nonceBytes = nonce || job.BlockResult.MergeMiningHash`, hashed to
+// derive `hasher.Verify(nonceBytes, submittedWork.POW)`'s keys) — the
+// original placeholder had no field carrying that, which would have made
+// real verification impossible. See internal/leaflib/validator for the
+// port.
 syntax = "proto3";
 
 package pool.v1;
@@ -84,11 +90,19 @@ message RandomXProof {
 }
 
 // C29Proof carries a Cuckaroo/Cuckatoo29 cycle-proof. See the top-of-file
-// note: this field shape is an unverified placeholder, not confirmed
-// against a real Tari C29 miner implementation.
+// note: field shapes are checked against the real go-tari-c29-solo-stratum
+// SubmitJob verification path.
 message C29Proof {
-  uint32 edge_bits = 1;   // graph size parameter (unverified placeholder)
-  repeated uint64 cycle = 2; // the proof cycle's edge nonces (unverified placeholder)
+  uint32 edge_bits = 1;   // graph size parameter (29 for Tari's Cuckaroo29)
+  repeated uint64 cycle = 2; // the proof cycle's 42 edge nonces
+
+  // header is the nonce-independent header/merge-mining-hash material the
+  // real verifier hashes (blake2b-256) to derive its siphash keys — ported
+  // from go-tari-c29-solo-stratum's `nonceBytes = nonce || MergeMiningHash`
+  // construction. Added in this pass: the original placeholder omitted it,
+  // which would have made real cycle verification impossible.
+  bytes header = 3;
+  uint64 nonce = 4; // the submitted nonce, combined with header per above
 }
 
 // SHA3XProof carries a straight header+nonce pair for the SHA3X algo,
