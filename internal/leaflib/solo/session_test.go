@@ -38,6 +38,14 @@ type testHarness struct {
 
 func newTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *testHarness {
 	t.Helper()
+	return newTestHarnessWithJobMaxAge(t, staticDiff, networkTargetDiff, 0)
+}
+
+// newTestHarnessWithJobMaxAge is newTestHarness plus an explicit
+// JobManagerConfig.JobMaxAge override (0 keeps NewJobManager's own
+// default of 6 minutes), used by the real per-job expiry tests below.
+func newTestHarnessWithJobMaxAge(t *testing.T, staticDiff, networkTargetDiff uint64, jobMaxAge time.Duration) *testHarness {
+	t.Helper()
 	node := &fakeNodeClient{
 		height:           42,
 		targetDifficulty: networkTargetDiff,
@@ -48,6 +56,7 @@ func newTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *testHar
 		Node:             node,
 		PayoutAddress:    "solo-test-address",
 		StaticDifficulty: staticDiff,
+		JobMaxAge:        jobMaxAge,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -130,6 +139,18 @@ func (h *testHarness) recvErrorResponse() ErrorResponse {
 		h.t.Fatalf("unmarshal error response: %v", err)
 	}
 	return resp
+}
+
+// recvJobPush reads and decodes one unsolicited "job" push
+// (protocol.go's JobPush) — the shape handleGetJob/vardiff retargets/
+// invalidateAndRepushJobs use to hand a session a fresh job.
+func (h *testHarness) recvJobPush() JobPush {
+	h.t.Helper()
+	var push JobPush
+	if err := json.Unmarshal(h.recvRaw(), &push); err != nil {
+		h.t.Fatalf("unmarshal job push: %v", err)
+	}
+	return push
 }
 
 func TestSessionLoginPushesInitialJob(t *testing.T) {
@@ -466,6 +487,233 @@ func TestTwoSessionsGetDifferentXNsAndDifferentJobs(t *testing.T) {
 	jobIDB := currentJobIDForXN(t, hB, xnB)
 	if jobIDA == jobIDB {
 		t.Fatalf("expected two different xns to be served two different job_ids at the same height, both got %q", jobIDA)
+	}
+}
+
+// TestSessionSubmitAgainstAnotherSessionsJobIsRejected is THE core
+// regression guard for the security fix this PR exists for.
+//
+// staticDiff=1 and networkTargetDiff=1 are both satisfied by
+// virtually any hash-derived difficulty (see
+// TestSessionSubmitMeetingBlockDifficulty's identical setup), so this
+// submission would be BOTH cryptographically valid AND block-finding
+// were it not rejected — a false accept here can only be explained by
+// the session-ownership check being skipped, not by the nonce
+// coincidentally failing PoW.
+//
+// Deliberately structured to be algo-agnostic proof, not an
+// xn-prefix-catches-it accident: the nonce submitted by session B is
+// prefixed with session A's own xn (xnA), i.e. the xn check would
+// have INCORRECTLY ALLOWED this submission through if it were still
+// the security boundary. Only the session-ownership check (session
+// B's own jobLog never having an entry for session A's job_id) can
+// explain the rejection here.
+func TestSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
+	h := newTestHarness(t, 1, 1)
+
+	serverConnA, clientA := net.Pipe()
+	serverConnB, clientB := net.Pipe()
+	ctx := context.Background()
+	go h.server.handleConn(ctx, serverConnA, 1)
+	go h.server.handleConn(ctx, serverConnB, 1)
+	t.Cleanup(func() {
+		_ = clientA.Close()
+		_ = clientB.Close()
+	})
+
+	hA := &testHarness{t: t, server: h.server, jm: h.jm, node: h.node, client: clientA, reader: bufio.NewReader(clientA), writer: bufio.NewWriter(clientA)}
+	hB := &testHarness{t: t, server: h.server, jm: h.jm, node: h.node, client: clientB, reader: bufio.NewReader(clientB), writer: bufio.NewWriter(clientB)}
+
+	sessionIDA, xnA := login(t, hA, "addr-owner-a")
+	_, xnB := login(t, hB, "addr-attacker-b")
+	if xnA == xnB {
+		t.Fatalf("expected sessions A and B to get different xn values, both got %q", xnA)
+	}
+
+	// Session A's real, currently-issued job_id.
+	jobIDA := currentJobIDForXN(t, hA, xnA)
+
+	// Session B submits against session A's job_id, using session A's
+	// sessionID and a nonce prefixed with session A's OWN xn (xnA) —
+	// so the xn-prefix check, if it were still the security boundary,
+	// would have let this straight through to PoW validation (which
+	// would then have accepted it, given staticDiff=1/networkTargetDiff=1).
+	hB.send(Request{ID: 20, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:    sessionIDA,
+		JobID: jobIDA,
+		Nonce: xnPrefixedNonceHex(xnA, 999),
+	})})
+	resp := hB.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("SECURITY REGRESSION: session B's submit against session A's real job was ACCEPTED — cross-session job submission must be structurally impossible")
+	}
+	if resp.Error == "" {
+		t.Fatal("expected a clear rejection error for a cross-session job submission")
+	}
+	if !strings.Contains(resp.Error, "unknown or stale job_id") {
+		t.Errorf("expected rejection to be classed as \"unknown or stale job_id\" (the session-ownership boundary), got %q", resp.Error)
+	}
+	if h.node.submitCalls.Load() != 0 {
+		t.Errorf("SubmitBlock must NOT be called for a cross-session job submission, got %d calls", h.node.submitCalls.Load())
+	}
+	stats := h.server.Stats()
+	if stats.TotalShares != 0 {
+		t.Errorf("TotalShares = %d, want 0: no share must be credited for a cross-session job submission", stats.TotalShares)
+	}
+	if stats.TotalBlocks != 0 {
+		t.Errorf("TotalBlocks = %d, want 0", stats.TotalBlocks)
+	}
+
+	// Sanity check: session A submitting against its OWN job_id with
+	// this exact same shape must still work — proving the rejection
+	// above is really about ownership, not some broken plumbing.
+	hA.send(Request{ID: 21, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:    sessionIDA,
+		JobID: jobIDA,
+		Nonce: xnPrefixedNonceHex(xnA, 999),
+	})})
+	okResp := hA.recvShareResponse()
+	if !okResp.Result {
+		t.Fatalf("expected session A's own submit against its own job to be accepted, got %#v", okResp)
+	}
+}
+
+// TestSessionSubmitAgainstExpiredJobIsRejected confirms the real,
+// independent per-job expiry (JobManagerConfig.JobMaxAge, backed by
+// Job.CreatedAt): a job still technically present in the submitting
+// session's own job history must be rejected once it is older than
+// the configured max age, WITHOUT InvalidateAll ever having run (i.e.
+// this is not gated on tip movement or the periodic refresh timer).
+func TestSessionSubmitAgainstExpiredJobIsRejected(t *testing.T) {
+	h := newTestHarnessWithJobMaxAge(t, 1, math.MaxUint64, time.Minute)
+	sessionID, xn := login(t, h, "addr-expiry")
+
+	jobID := currentJobIDForXN(t, h, xn)
+
+	// Directly age the real *Job past the configured max age. This is
+	// the SAME *Job pointer both JobManager's cache and the session's
+	// own jobLog hold (RestampDifficulty/recordJob never copy the
+	// struct), so mutating CreatedAt here is equivalent to real wall
+	// clock time having passed with no InvalidateAll in between.
+	job, ok := h.jm.GetJob(jobID)
+	if !ok {
+		t.Fatalf("expected job %q to be resolvable via JobManager for test setup", jobID)
+	}
+	job.CreatedAt = time.Now().Add(-2 * time.Minute)
+
+	h.send(Request{ID: 30, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:    sessionID,
+		JobID: jobID,
+		Nonce: xnPrefixedNonceHex(xn, 1),
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a submit against an expired job to be rejected")
+	}
+	if resp.Error == "" {
+		t.Fatal("expected a clear rejection error for an expired job")
+	}
+	if !strings.Contains(resp.Error, "expired") {
+		t.Errorf("expected the rejection error to mention expiry, got %q", resp.Error)
+	}
+	if strings.Contains(resp.Error, "unknown or stale job_id") {
+		t.Errorf("expired-job rejection must be a DISTINCT reason from unknown-job_id, got %q", resp.Error)
+	}
+	if h.node.submitCalls.Load() != 0 {
+		t.Errorf("SubmitBlock must not be called for an expired-job submit, got %d calls", h.node.submitCalls.Load())
+	}
+	stats := h.server.Stats()
+	if stats.TotalShares != 0 {
+		t.Errorf("TotalShares = %d, want 0 for an expired-job submit", stats.TotalShares)
+	}
+}
+
+// TestSessionJobHistoryIsBounded confirms the per-session
+// jobList/jobLog trimming behavior ported from
+// go-tari-sha3x-solo-stratum's CleanMinerJobs: once more than
+// defaultSessionJobHistorySize distinct jobs have been issued to a
+// session, the oldest entries drop off and become unsubmittable,
+// while the most recent defaultSessionJobHistorySize remain
+// submittable. Exercised via repeated tip-triggered regenerations
+// (InvalidateAll + getjob), mirroring how a real session accumulates
+// job history over several vardiff retargets/tip movements.
+func TestSessionJobHistoryIsBounded(t *testing.T) {
+	h := newTestHarness(t, 1, math.MaxUint64)
+	sessionID, xn := login(t, h, "addr-bounded")
+
+	// The login itself already issued one job; capture it as index 0.
+	jobIDs := []string{currentJobIDForXN(t, h, xn)}
+
+	// Force enough distinct new jobs (via real tip-triggered cache
+	// invalidation, matching production's actual invalidation path:
+	// InvalidateAll fires JobManager's subscribers, which is exactly
+	// how server.go's invalidateAndRepushJobs pushes a freshly
+	// regenerated job to every logged-in session — no explicit getjob
+	// needed) to overflow the bound by 3.
+	const extra = defaultSessionJobHistorySize + 3
+	for i := 0; i < extra; i++ {
+		// InvalidateAll's subscriber notification (invalidateAndRepushJobs)
+		// runs synchronously on the CALLER's goroutine and writes
+		// directly to this session's connection — exactly like the
+		// real block-found path (handleSubmit's `go
+		// s.server.jobManager.InvalidateAll()`), InvalidateAll must be
+		// invoked from its own goroutine here too, since net.Pipe's
+		// writes block until the peer (this same test) reads them;
+		// calling it inline would self-deadlock against the
+		// recvJobPush call below.
+		go h.jm.InvalidateAll()
+		push := h.recvJobPush()
+		if push.Params.JobID == "" {
+			t.Fatalf("push %d: expected a non-empty job_id", i)
+		}
+		jobIDs = append(jobIDs, push.Params.JobID)
+
+		// A real miner sends periodic keepalives; do the same here so
+		// this session's rolling idle deadline (ManagerConfig.
+		// IdleTimeout, 2s in this harness) doesn't expire purely
+		// because this test loop itself never needs to submit
+		// anything between pushes.
+		h.send(Request{ID: 900 + i, Method: "keepalived"})
+		_ = h.recvErrorResponse()
+	}
+
+	total := len(jobIDs)
+	dropped := total - defaultSessionJobHistorySize
+	if dropped <= 0 {
+		t.Fatalf("test setup issued %d distinct jobs, expected more than %d to actually exercise the bound", total, defaultSessionJobHistorySize)
+	}
+
+	// The oldest `dropped` job_ids must now be rejected as unknown —
+	// they've fallen out of this session's own bounded history.
+	for i := 0; i < dropped; i++ {
+		h.send(Request{ID: 100 + i, Method: "submit", Params: mustJSON(t, SubmitRequest{
+			ID:    sessionID,
+			JobID: jobIDs[i],
+			Nonce: xnPrefixedNonceHex(xn, uint64(2000+i)),
+		})})
+		resp := h.recvShareResponse()
+		if resp.Result {
+			t.Fatalf("job index %d (job_id %q) should have been trimmed from the bounded history, but was accepted", i, jobIDs[i])
+		}
+		if !strings.Contains(resp.Error, "unknown or stale job_id") {
+			t.Errorf("job index %d: expected an unknown-job_id rejection for a trimmed job, got %q", i, resp.Error)
+		}
+	}
+
+	// The most recent defaultSessionJobHistorySize job_ids must still
+	// be submittable (accepted, since staticDiff=1 here).
+	for i := dropped; i < total; i++ {
+		h.send(Request{ID: 200 + i, Method: "submit", Params: mustJSON(t, SubmitRequest{
+			ID:    sessionID,
+			JobID: jobIDs[i],
+			Nonce: xnPrefixedNonceHex(xn, uint64(3000+i)),
+		})})
+		resp := h.recvShareResponse()
+		if !resp.Result {
+			t.Fatalf("job index %d (job_id %q) should still be within the bounded history and accepted, got error %q", i, jobIDs[i], resp.Error)
+		}
 	}
 }
 
