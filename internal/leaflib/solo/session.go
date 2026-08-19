@@ -88,7 +88,7 @@ type Session struct {
 	hashesAccumulated atomic.Uint64
 }
 
-func newSession(mc *leaflib.ManagedConnection, server *Server) *Session {
+func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64) *Session {
 	id, _ := newRandomHexID() // collisions are cosmetic only (diagnostic/session id, not consensus data)
 	// Assigned once, here, at connect time — see the xn field's doc
 	// comment. A crypto/rand read failure here is exceptionally rare
@@ -104,7 +104,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server) *Session {
 	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now()}
 	s.address.Store("")
 	s.worker.Store("")
-	s.currentDifficulty.Store(server.startingDifficulty)
+	s.currentDifficulty.Store(startingDifficulty)
 	return s
 }
 

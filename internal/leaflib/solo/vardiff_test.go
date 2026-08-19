@@ -161,11 +161,12 @@ func TestComputeRetargetZeroConnSecondsIsNoop(t *testing.T) {
 // deterministic scenarios, and to assert on the exact job pushed to
 // ONLY that session).
 type vardiffHarness struct {
-	t      *testing.T
-	server *Server
-	jm     *JobManager
-	node   *fakeNodeClient
-	cancel context.CancelFunc
+	t            *testing.T
+	server       *Server
+	jm           *JobManager
+	node         *fakeNodeClient
+	cancel       context.CancelFunc
+	startingDiff uint64
 }
 
 func newVardiffHarness(t *testing.T, startingDiff, networkTargetDiff uint64, vardiff VardiffConfig) *vardiffHarness {
@@ -184,9 +185,9 @@ func newVardiffHarness(t *testing.T, startingDiff, networkTargetDiff uint64, var
 	ctx, cancel := context.WithCancel(context.Background())
 	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 30 * time.Second})
 	v := validator.NewSHA3XValidator()
-	server := NewServer(cm, jm, node, v, poolpb.Network_NETWORK_TESTNET, nil, startingDiff, vardiff)
+	server := NewServer(cm, jm, node, v, poolpb.Network_NETWORK_TESTNET, nil, vardiff)
 
-	h := &vardiffHarness{t: t, server: server, jm: jm, node: node, cancel: cancel}
+	h := &vardiffHarness{t: t, server: server, jm: jm, node: node, cancel: cancel, startingDiff: startingDiff}
 	t.Cleanup(cancel)
 	return h
 }
@@ -212,7 +213,7 @@ func (h *vardiffHarness) connectAndLogin(address string) (*vardiffClient, *Sessi
 	h.t.Helper()
 	serverConn, clientConn := net.Pipe()
 	ctx := context.Background()
-	go h.server.handleConn(ctx, serverConn)
+	go h.server.handleConn(ctx, serverConn, h.startingDiff)
 
 	c := &vardiffClient{
 		t:      h.t,

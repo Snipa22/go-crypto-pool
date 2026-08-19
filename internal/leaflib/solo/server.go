@@ -25,14 +25,6 @@ type Server struct {
 	network    poolpb.Network
 	logger     *log.Logger
 
-	// startingDifficulty is the difficulty every newly-connected
-	// session begins at (LEAF_SOLO_STARTING_DIFFICULTY). From that
-	// point on, each session's own vardiff retarget loop (vardiff.go)
-	// independently adjusts ITS difficulty based on its own accept
-	// history — this field is never mutated after construction and is
-	// only ever read once per new session (newSession, session.go).
-	startingDifficulty uint64
-
 	// vardiff configures the per-session adaptive retargeting
 	// algorithm (see vardiff.go's VardiffConfig/computeRetarget) that
 	// every session's own runVardiffLoop goroutine uses. Normalized
@@ -49,25 +41,27 @@ type Server struct {
 // desired MaxConnections/IdleTimeout (ManagerConfig) by the caller —
 // solo's Server does not own ConnectionManager construction so callers
 // keep full control of that already-merged, already-correct lifecycle
-// policy. startingDifficulty is the difficulty every newly-connected
-// session begins at; vardiff configures each session's own independent
+// policy. There is no single "starting difficulty" on Server anymore —
+// a Server now serves any number of simultaneous port tiers (see
+// portconfig.go's PortConfig and Serve below), each of which supplies
+// its OWN starting difficulty for sessions accepted on it. vardiff
+// configures each session's own independent
 // per-connection adaptive retargeting from that starting point (a
 // zero-value VardiffConfig is normalized to sane defaults — see
 // vardiff.go's defaultVardiffConfig).
-func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeClient, v validator.AlgoValidator, network poolpb.Network, logger *log.Logger, startingDifficulty uint64, vardiff VardiffConfig) *Server {
+func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeClient, v validator.AlgoValidator, network poolpb.Network, logger *log.Logger, vardiff VardiffConfig) *Server {
 	if logger == nil {
 		logger = log.Default()
 	}
 	s := &Server{
-		cm:                 cm,
-		jobManager:         jobManager,
-		node:               node,
-		validator:          v,
-		network:            network,
-		logger:             logger,
-		startingDifficulty: startingDifficulty,
-		vardiff:            vardiff.normalized(),
-		sessions:           make(map[uint64]*Session),
+		cm:         cm,
+		jobManager: jobManager,
+		node:       node,
+		validator:  v,
+		network:    network,
+		logger:     logger,
+		vardiff:    vardiff.normalized(),
+		sessions:   make(map[uint64]*Session),
 	}
 	s.unsubscribe = jobManager.Subscribe(s.invalidateAndRepushJobs)
 	return s
@@ -104,8 +98,16 @@ func (s *Server) invalidateAndRepushJobs() {
 }
 
 // Serve accepts miner connections on ln until ctx is cancelled or ln is
-// closed. It blocks; callers typically run it in its own goroutine.
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+// closed, stamping every session accepted on ln with port.Difficulty as
+// its STARTING difficulty (see portconfig.go's PortConfig doc comment
+// — from that point on, vardiff takes over exactly as before, per
+// session, regardless of which port it came in on). It blocks; callers
+// typically run it in its own goroutine, one call per configured port
+// tier, all sharing this same Server (and therefore the same
+// JobManager/ConnectionManager/NodeClient/validator) — see
+// cmd/leaf-solo/main.go's startup sequence for the multi-listener
+// fan-out.
+func (s *Server) Serve(ctx context.Context, ln net.Listener, port PortConfig) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -118,11 +120,17 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
-		go s.handleConn(ctx, conn)
+		go s.handleConn(ctx, conn, port.Difficulty)
 	}
 }
 
-func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
+// handleConn accepts and runs one already-dialed connection through a
+// new Session, seeded at startingDifficulty (the difficulty of the
+// port tier this conn was accepted on — see Serve above). Test-only
+// direct callers (session_test.go's testHarness) that don't go through
+// a real net.Listener/Serve call this directly with whichever
+// difficulty that test wants the session to start at.
+func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficulty uint64) {
 	mc, err := s.cm.Accept(ctx, conn)
 	if err != nil {
 		// Accept already closed conn on rejection (see
@@ -130,7 +138,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	session := newSession(mc, s)
+	session := newSession(mc, s, startingDifficulty)
 	s.mu.Lock()
 	s.sessions[mc.ID()] = session
 	s.mu.Unlock()

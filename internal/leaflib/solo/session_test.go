@@ -53,10 +53,10 @@ func newTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *testHar
 	ctx, cancel := context.WithCancel(context.Background())
 	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 2 * time.Second})
 	v := validator.NewSHA3XValidator()
-	server := NewServer(cm, jm, node, v, poolpb.Network_NETWORK_TESTNET, nil, staticDiff, VardiffConfig{})
+	server := NewServer(cm, jm, node, v, poolpb.Network_NETWORK_TESTNET, nil, VardiffConfig{})
 
 	serverConn, clientConn := net.Pipe()
-	go server.handleConn(ctx, serverConn)
+	go server.handleConn(ctx, serverConn, staticDiff)
 
 	h := &testHarness{
 		t:      t,
@@ -445,8 +445,8 @@ func TestTwoSessionsGetDifferentXNsAndDifferentJobs(t *testing.T) {
 	serverConnA, clientA := net.Pipe()
 	serverConnB, clientB := net.Pipe()
 	ctx := context.Background()
-	go h.server.handleConn(ctx, serverConnA)
-	go h.server.handleConn(ctx, serverConnB)
+	go h.server.handleConn(ctx, serverConnA, 1000)
+	go h.server.handleConn(ctx, serverConnB, 1000)
 	t.Cleanup(func() {
 		_ = clientA.Close()
 		_ = clientB.Close()
