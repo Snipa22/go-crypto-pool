@@ -165,6 +165,30 @@ type JobManagerConfig struct {
 	// stale templates.
 	TipPollInterval time.Duration
 
+	// JobMaxAge is the REAL per-job expiry threshold, checked against
+	// Job.CreatedAt independently of tip-invalidation (see
+	// SECURITY FIX doc comment on Session's jobList/jobLog below,
+	// session.go's handleSubmit).
+	//
+	// Before this field existed, the ONLY thing that ever invalidated
+	// a Job was InvalidateAll (tip movement or the periodic
+	// RefreshInterval timer) — a whole-cache wipe, not a per-job
+	// check. A job that happened to still be present (e.g. a session's
+	// own recent-job history, or, previously, the global jobsByID map)
+	// could be submitted against arbitrarily long after it was issued
+	// as long as the cache hadn't been globally invalidated yet. This
+	// field adds a REAL, independent age ceiling: handleSubmit rejects
+	// a submit against a job older than JobMaxAge with a distinct
+	// "job expired" reason, regardless of whether InvalidateAll has
+	// run.
+	//
+	// Defaults to 6 minutes (NewJobManager), mirroring
+	// go-tari-sha3x-solo-stratum's CleanMinerJobs default
+	// (`time.Now().Add(-1*6*time.Minute)`, subsystems/poolStratum/
+	// miner.go). Configurable via LEAF_SOLO_JOB_MAX_AGE in
+	// cmd/leaf-solo/main.go.
+	JobMaxAge time.Duration
+
 	Logger *log.Logger
 }
 
@@ -359,14 +383,36 @@ func (jm *JobManager) lookupXN(xn string) (*Job, bool) {
 }
 
 // GetJob returns the job matching id, searching across every xn's
-// currently-cached entry (a submission is checked against whichever
-// per-xn job produced that job_id, not a single global job — see Job's
-// doc comment).
+// currently-cached entry.
+//
+// SECURITY NOTE: this is NOT, and must never be treated as, a
+// session-ownership/security boundary. It is a diagnostic/test
+// convenience only (used by job_test.go to assert cache-invalidation
+// behavior directly against JobManager). The real security boundary —
+// "can the submitting session actually reference this job_id" — lives
+// entirely on Session's own bounded jobList/jobLog (session.go), which
+// is populated at every point a job is actually handed to that
+// specific session (login, getjob, vardiff-driven push,
+// invalidation-driven repush) and checked by handleSubmit BEFORE any
+// other validation. Do not add a caller that uses GetJob to gate a
+// submit — a shared, all-xn-spanning map has no notion of "whose job
+// this actually is", which used to be the real, exploitable gap this
+// fix closes (see this method's git history / the PR that introduced
+// Session-level ownership).
 func (jm *JobManager) GetJob(id string) (*Job, bool) {
 	jm.mu.RLock()
 	defer jm.mu.RUnlock()
 	job, ok := jm.jobsByID[id]
 	return job, ok
+}
+
+// JobMaxAge returns the configured real per-job expiry threshold (see
+// JobManagerConfig.JobMaxAge's doc comment) — used by Session's
+// handleSubmit to reject a submit against a job that is still present
+// in the submitting session's own job history but has aged out,
+// independently of whether InvalidateAll has ever run.
+func (jm *JobManager) JobMaxAge() time.Duration {
+	return jm.cfg.JobMaxAge
 }
 
 // InvalidateAll drops every cached per-xn Job, forcing the next

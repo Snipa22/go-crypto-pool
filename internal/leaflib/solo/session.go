@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,11 +48,41 @@ type Session struct {
 	// responses) carries this same value in JobPayload.XN, and every
 	// submit from this session must have its nonce hex-prefixed with
 	// it (handleSubmit below) or be rejected before any PoW validation
-	// runs.
+	// runs. NOTE: xn is a SHA3X-specific nonce-composition convention,
+	// not the real security boundary — see jobList/jobLog below.
 	xn       string
 	loggedIn atomic.Bool
 	address  atomic.Value // string
 	worker   atomic.Value // string
+
+	// --- SECURITY FIX: per-session job ownership (jobList/jobLog) ---
+	//
+	// Ported from go-tari-sha3x-solo-stratum's minerStruct
+	// (subsystems/poolStratum/miner.go, ~line 50-97): each MINER
+	// (session), not the pool/JobManager as a whole, owns its own
+	// bounded history of jobs it has actually been issued. jobList is
+	// an ordered (oldest-first) list of this session's own recent
+	// job_ids; jobLog maps those same job_ids to the *Job they refer
+	// to. This mirrors the legacy jobList/jobLog pair exactly (see
+	// getJob/CleanMinerJobs, miner.go ~line 344-428).
+	//
+	// Before this existed, handleSubmit looked up
+	// s.server.jobManager.GetJob(submit.JobID) against ONE GLOBAL map
+	// shared by every session (job.go's jobsByID) — any session could
+	// submit against any OTHER session's job_id, and the only thing
+	// standing in the way was the SHA3X-specific xn-prefix check
+	// below, which does not generalize to future non-xn algos
+	// (RandomX/RXT/RXM). Session-scoped jobList/jobLog makes
+	// cross-session submission STRUCTURALLY IMPOSSIBLE: session B's
+	// code path can never even see an entry for a job_id that was only
+	// ever recorded into session A's own jobLog — there is no shared
+	// data structure to read from at all. See ownJob/recordJob below
+	// and handleSubmit's ownership check, which now runs BEFORE the
+	// xn-prefix check and applies uniformly to every algo.
+	jobsMu         sync.Mutex
+	jobList        []string        // oldest-first job_ids this session has actually been issued
+	jobLog         map[string]*Job // job_id -> *Job, mirrors jobList
+	jobHistorySize int             // bound on len(jobList); see newSession/defaultSessionJobHistorySize
 
 	// shareCount/blockCount are local diagnostic counters only - solo
 	// mode has no share table and no backend to forward to (see
@@ -91,6 +122,24 @@ type Session struct {
 	hashesAccumulated atomic.Uint64
 }
 
+// defaultSessionJobHistorySize is the default bound on how many of a
+// session's own most-recently-issued jobs remain submittable.
+//
+// Reasoning: a miner can legitimately still be hashing against a
+// slightly stale job for a brief window around a job push (e.g. a
+// vardiff retarget or a tip-triggered invalidateAndRepushJobs firing
+// while a share for the previous job is already in flight on the
+// wire) — the bound must tolerate that race without being so large
+// that ancient jobs stay submittable indefinitely (that's what
+// JobMaxAge's real time-based expiry is for; the count-based bound
+// here is about memory/history size, not staleness per se). 8 keeps
+// a comfortable multi-push cushion (a session's own vardiff retarget
+// interval defaults to 60s and a tip-triggered repush is comparatively
+// rare) while bounding each session's own memory footprint to a small,
+// constant number of held *Job pointers regardless of connection
+// lifetime.
+const defaultSessionJobHistorySize = 8
+
 func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64) *Session {
 	id, _ := newRandomHexID() // collisions are cosmetic only (diagnostic/session id, not consensus data)
 	// Assigned once, here, at connect time — see the xn field's doc
@@ -104,7 +153,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		xn = "0000"
 		server.logger.Printf("solo: failed to generate session xn, falling back to %q: %v", xn, err)
 	}
-	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now()}
+	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now(), jobLog: make(map[string]*Job), jobHistorySize: defaultSessionJobHistorySize}
 	s.address.Store("")
 	s.worker.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
@@ -266,21 +315,39 @@ func (s *Session) handleGetJob(req Request) {
 // (SHA3XValidator.Validate, block-target comparison, SubmitBlock,
 // shareCount/blockCount bookkeeping) is unchanged from the previous
 // wire format — only request parsing and response encoding are new
-// relative to that pass. NOW ALSO enforces the real per-session xn
-// prefix check (ported from go-tari-sha3x-solo-stratum's miner.go
-// SubmitJob: `strings.HasPrefix(strings.ToLower(submittedWork.Nonce),
-// m.xn)`), BEFORE any PoW validation work happens — a nonce that
-// doesn't start with this session's own assigned xn is rejected
-// outright, mirroring the legacy rejection message shape ("Invalid
-// XNonce %v"). This is purely wire-level/session bookkeeping: verified
-// against the real hash math in validator/sha3x.go
-// (sha3xHeaderDiff/GetHeaderDiff) that the full 8-byte nonce is used
-// directly as hash pre-image material with no separate xn encoding —
-// xn is a leading-byte convention miners are expected to respect on
-// their nonce composition, not something baked into the hash function
-// itself, so no change to SHA3XValidator was needed or made. DOES
-// enforce per-job used-nonce tracking via Job.MarkNonceUsed, which the
-// previous wire format's implementation never had.
+// relative to that pass.
+//
+// SECURITY FIX: the job lookup now queries THIS SESSION'S OWN job
+// history (s.ownJob, jobsMu/jobList/jobLog above) instead of
+// s.server.jobManager.GetJob's shared, all-sessions-spanning map. A
+// submit referencing a job_id this session was never actually issued
+// is rejected as "unknown or stale job_id" — this is the REAL,
+// structural security boundary (session B's code path cannot even see
+// an entry for a job_id only ever recorded into session A's jobLog),
+// checked BEFORE the xn-prefix check and BEFORE any PoW validation, so
+// it applies uniformly to every algo including future non-xn ones
+// (RandomX/RXT/RXM). Also enforces a REAL per-job expiry
+// (JobManager.JobMaxAge, backed by JobManagerConfig.JobMaxAge/
+// Job.CreatedAt) independently of tip-invalidation: a job still
+// present in this session's own history but older than the
+// configured max age is rejected with a distinct "job expired"
+// reason.
+//
+// The per-session xn prefix check (ported from
+// go-tari-sha3x-solo-stratum's miner.go SubmitJob:
+// `strings.HasPrefix(strings.ToLower(submittedWork.Nonce), m.xn)`)
+// STAYS — it is still a real, useful SHA3X-specific nonce-composition
+// validity check — but it is no longer the security boundary; it now
+// runs AFTER session-ownership has already been confirmed. This is
+// purely wire-level/session bookkeeping: verified against the real
+// hash math in validator/sha3x.go (sha3xHeaderDiff/GetHeaderDiff) that
+// the full 8-byte nonce is used directly as hash pre-image material
+// with no separate xn encoding — xn is a leading-byte convention
+// miners are expected to respect on their nonce composition, not
+// something baked into the hash function itself, so no change to
+// SHA3XValidator was needed or made. DOES enforce per-job used-nonce
+// tracking via Job.MarkNonceUsed, which the previous wire format's
+// implementation never had.
 func (s *Session) handleSubmit(req Request) {
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before submit", "")
@@ -296,14 +363,30 @@ func (s *Session) handleSubmit(req Request) {
 		return
 	}
 
-	job, ok := s.server.jobManager.GetJob(submit.JobID)
+	// SECURITY: session-ownership check FIRST, independently of xn —
+	// see this method's doc comment. job.ID must have actually been
+	// issued to THIS session (s.ownJob), never any other session's.
+	job, ok := s.ownJob(submit.JobID)
 	if !ok {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("unknown or stale job_id: %s", submit.JobID))
 		return
 	}
 
+	// Real per-job expiry, independent of tip-invalidation (see
+	// JobManagerConfig.JobMaxAge's doc comment): a job can still be
+	// present in this session's own bounded history yet be too old to
+	// accept, e.g. a race right at InvalidateAll's boundary.
+	if maxAge := s.server.jobManager.JobMaxAge(); maxAge > 0 {
+		if age := time.Since(job.CreatedAt); age > maxAge {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("job expired: job_id %s was issued %s ago (max age %s)", submit.JobID, age.Round(time.Second), maxAge))
+			return
+		}
+	}
+
 	// xn-prefix check happens BEFORE nonce decoding/PoW validation —
 	// ported exactly from the legacy ordering and rejection shape.
+	// This is a real SHA3X-specific validity check, NOT the security
+	// boundary (see doc comment above).
 	if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 		return
@@ -412,6 +495,59 @@ func (s *Session) handleSubmit(req Request) {
 	go s.server.jobManager.InvalidateAll()
 }
 
+// recordJob records job into this session's own bounded job history
+// (jobList/jobLog — see the Session type's SECURITY FIX doc comment),
+// making it the ONLY data structure handleSubmit's ownership check
+// consults. Called from jobPayload below, which every job-issuing code
+// path (handleLogin, pushJob — itself called from handleGetJob,
+// vardiff's maybeRetarget, and server.go's invalidateAndRepushJobs) is
+// already guaranteed to go through before putting a job on the wire,
+// so bookkeeping happens exactly once per real job issuance with no
+// separate call needed at each of those call sites.
+//
+// If job.ID is already present (RestampDifficulty produces a new *Job
+// with the SAME ID, just a fresh StaticDifficulty/usedNonces set — see
+// job.go's doc comment), the stored pointer is refreshed in place
+// without growing jobList, so a restamp doesn't consume a slot in the
+// bounded history and submits always see the most recently issued
+// version of that job_id.
+func (s *Session) recordJob(job *Job) {
+	if job == nil {
+		return
+	}
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	if s.jobLog == nil {
+		s.jobLog = make(map[string]*Job)
+	}
+	if _, exists := s.jobLog[job.ID]; !exists {
+		s.jobList = append(s.jobList, job.ID)
+	}
+	s.jobLog[job.ID] = job
+
+	size := s.jobHistorySize
+	if size <= 0 {
+		size = defaultSessionJobHistorySize
+	}
+	for len(s.jobList) > size {
+		oldest := s.jobList[0]
+		s.jobList = s.jobList[1:]
+		delete(s.jobLog, oldest)
+	}
+}
+
+// ownJob returns the Job matching id ONLY IF it was actually issued to
+// THIS session (recorded via recordJob above) — see the Session type's
+// SECURITY FIX doc comment. This is the real, structural security
+// boundary handleSubmit gates on: there is no code path by which
+// another session's job_id can appear in this map.
+func (s *Session) ownJob(id string) (*Job, bool) {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	job, ok := s.jobLog[id]
+	return job, ok
+}
+
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
 }
@@ -460,7 +596,16 @@ func (s *Session) pushJob(job *Job) {
 // XN is this session's own assigned extranonce (the same value on
 // every job pushed to this session, since xn is assigned once at
 // connect time — see the xn field's doc comment).
+//
+// SECURITY FIX: this is also the single choke point where job is
+// recorded into THIS session's own job history (s.recordJob) — every
+// caller (handleLogin's LoginResponse, pushJob's JobPush) already goes
+// through jobPayload before putting a job on the wire, so this
+// guarantees bookkeeping happens at every point a Session is handed a
+// job (login, getjob, vardiff-driven pushes, invalidation-driven
+// repushes) without needing a separate recordJob call at each site.
 func (s *Session) jobPayload(job *Job) JobPayload {
+	s.recordJob(job)
 	return JobPayload{
 		Algo:   "sha3x",
 		Blob:   hex.EncodeToString(job.Header),

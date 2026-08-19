@@ -78,6 +78,7 @@ type config struct {
 
 	refreshInterval time.Duration
 	tipPollInterval time.Duration
+	jobMaxAge       time.Duration
 
 	maxConnections int
 	idleTimeout    time.Duration
@@ -108,6 +109,14 @@ func loadConfig() config {
 
 	flag.DurationVar(&cfg.refreshInterval, "refresh-interval", envOrDuration("LEAF_SOLO_REFRESH_INTERVAL", 30*time.Second), "unconditional block-template refresh interval. Env: LEAF_SOLO_REFRESH_INTERVAL")
 	flag.DurationVar(&cfg.tipPollInterval, "tip-poll-interval", envOrDuration("LEAF_SOLO_TIP_POLL_INTERVAL", 5*time.Second), "chain-tip poll interval (forces an immediate refresh on tip movement). Env: LEAF_SOLO_TIP_POLL_INTERVAL")
+
+	// LEAF_SOLO_JOB_MAX_AGE is the SECURITY-FIX real per-job expiry
+	// threshold (see solo.JobManagerConfig.JobMaxAge's doc comment):
+	// a submit against a job older than this, independent of whether
+	// InvalidateAll has run, is rejected outright. Mirrors
+	// go-tari-sha3x-solo-stratum's CleanMinerJobs default of 6
+	// minutes.
+	flag.DurationVar(&cfg.jobMaxAge, "job-max-age", envOrDuration("LEAF_SOLO_JOB_MAX_AGE", 6*time.Minute), "real per-job expiry threshold, independent of tip-invalidation; a submit against an older job is rejected as expired. Env: LEAF_SOLO_JOB_MAX_AGE")
 
 	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_SOLO_MAX_CONNECTIONS", 0), "max concurrent miner connections, 0 = unlimited. Env: LEAF_SOLO_MAX_CONNECTIONS")
 	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", envOrDuration("LEAF_SOLO_IDLE_TIMEOUT", 2*time.Minute), "rolling per-connection idle timeout. Env: LEAF_SOLO_IDLE_TIMEOUT")
@@ -288,6 +297,7 @@ func main() {
 		logger.Printf("port tier: address=%s starting-difficulty=%d desc=%s", p.Address, p.Difficulty, desc)
 	}
 	logger.Printf("vardiff bounds [%d, %d], target time %ds, retarget interval %s", cfg.minDifficulty, cfg.maxDifficulty, cfg.vardiffTargetTime, cfg.vardiffInterval)
+	logger.Printf("job max age (security: per-job expiry independent of tip invalidation): %s", cfg.jobMaxAge)
 	logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
 
 	node := solo.NewGRPCNodeClient(cfg.nodeGRPCAddress)
@@ -310,6 +320,7 @@ func main() {
 		StaticDifficulty: ports[0].Difficulty,
 		RefreshInterval:  cfg.refreshInterval,
 		TipPollInterval:  cfg.tipPollInterval,
+		JobMaxAge:        cfg.jobMaxAge,
 		Logger:           logger,
 	})
 
