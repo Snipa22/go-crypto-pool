@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -55,6 +56,12 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
+
+// version is a build-time-overridable identifier surfaced on the
+// leaf_solo_build_info metric and the stats page — override via
+// -ldflags "-X main.version=...", e.g. from a CI tag; "dev" is the
+// honest fallback for a local/untagged build.
+var version = "dev"
 
 type config struct {
 	nodeGRPCAddress string
@@ -74,6 +81,9 @@ type config struct {
 
 	maxConnections int
 	idleTimeout    time.Duration
+
+	metricsListenAddress string
+	maxAddressLabels     int
 }
 
 func loadConfig() config {
@@ -101,6 +111,9 @@ func loadConfig() config {
 
 	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_SOLO_MAX_CONNECTIONS", 0), "max concurrent miner connections, 0 = unlimited. Env: LEAF_SOLO_MAX_CONNECTIONS")
 	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", envOrDuration("LEAF_SOLO_IDLE_TIMEOUT", 2*time.Minute), "rolling per-connection idle timeout. Env: LEAF_SOLO_IDLE_TIMEOUT")
+
+	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_SOLO_METRICS_LISTEN_ADDRESS", ":9600"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the miner-facing stratum port). Set to empty string to disable. Env: LEAF_SOLO_METRICS_LISTEN_ADDRESS")
+	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_SOLO_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_SOLO_MAX_ADDRESS_LABELS")
 
 	flag.Parse()
 	return cfg
@@ -325,6 +338,28 @@ func main() {
 	// difficulty.
 	server := solo.NewServer(cm, jobManager, node, sha3xValidator, networkFromString(cfg.network), logger, vardiffCfg)
 	defer server.Shutdown()
+
+	if cfg.metricsListenAddress != "" {
+		server.EnableMetrics(version, cfg.maxAddressLabels)
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", server.MetricsHandler())
+		metricsMux.Handle("/", server.StatsHTMLHandler())
+		metricsSrv := &http.Server{Addr: cfg.metricsListenAddress, Handler: metricsMux}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Printf("metrics/stats HTTP server error: %v", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutdownCtx)
+		}()
+		logger.Printf("serving /metrics and stats page on %s", cfg.metricsListenAddress)
+	} else {
+		logger.Printf("metrics/stats HTTP server disabled (-metrics-listen-address is empty)")
+	}
 
 	listeners := make([]net.Listener, 0, len(ports))
 	for _, p := range ports {
