@@ -53,7 +53,7 @@ func newTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *testHar
 	ctx, cancel := context.WithCancel(context.Background())
 	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 2 * time.Second})
 	v := validator.NewSHA3XValidator()
-	server := NewServer(cm, jm, node, v, poolpb.Network_NETWORK_TESTNET, nil)
+	server := NewServer(cm, jm, node, v, poolpb.Network_NETWORK_TESTNET, nil, staticDiff, VardiffConfig{})
 
 	serverConn, clientConn := net.Pipe()
 	go server.handleConn(ctx, serverConn)
