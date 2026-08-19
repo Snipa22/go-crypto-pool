@@ -80,6 +80,15 @@ func (v *SHA3XValidator) Validate(_ context.Context, share *poolpb.Share) (bool,
 	return true, nil
 }
 
+// SHA3XHeaderDiff exposes the same triple-SHA3-256 difficulty derivation
+// Validate uses internally, for callers (e.g. cmd/leaf-solo's session
+// handling) that need to report/log the derived difficulty of an
+// already-validated share without re-implementing or duplicating the
+// hashing logic.
+func SHA3XHeaderDiff(nonce uint64, header []byte) uint64 {
+	return sha3xHeaderDiff(nonce, header)
+}
+
 // sha3xHeaderDiff is a direct, unmodified port of
 // go-tari-sha3x-solo-stratum's GetHeaderDiff (see type doc comment for
 // the algorithm and provenance).
