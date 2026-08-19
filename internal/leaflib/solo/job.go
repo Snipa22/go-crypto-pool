@@ -23,6 +23,12 @@ import (
 // per-miner coinbase/payout splitting, everything found pays the single
 // configured solo address.
 type Job struct {
+	// ID is the real miner-facing job_id: the first 16 hex characters
+	// of hex(BlockHash) — ported exactly from
+	// go-tari-sha3x-solo-stratum's minerTracking.GetJobJSON
+	// (fmt.Sprintf("%x", job.BlockResult.BlockHash)[0:16]). This is
+	// what goes on the wire in JobPayload.JobID and what miners echo
+	// back in SubmitRequest.JobID.
 	ID     string
 	Height uint64
 
@@ -31,12 +37,22 @@ type Job struct {
 	// — see validator.SHA3XValidator's doc comment and
 	// go-tari-sha3x-solo-stratum's SubmitJob call site
 	// (GetHeaderDiff(header, MergeMiningHash)). This is
-	// Result.MergeMiningHash, not the serialized block header.
+	// Result.MergeMiningHash, not the serialized block header. It is
+	// also, hex-encoded, the wire "blob" field (see protocol.go's
+	// JobPayload doc comment).
 	Header []byte
+
+	// BlockHash is the real header hash of the completed block
+	// (Result.BlockHash) that ID is derived from. Kept alongside ID
+	// (rather than discarded after deriving ID) purely for
+	// debuggability/logging.
+	BlockHash []byte
 
 	// StaticDifficulty is the leaf-configured share difficulty (vardiff
 	// is explicitly out of scope for this pass — see LEAF_SOLO_DIFFICULTY
-	// in cmd/leaf-solo/main.go).
+	// in cmd/leaf-solo/main.go). This is also the difficulty the wire
+	// "target" field (protocol.go's JobPayload) is derived from — see
+	// diffToTarget in session.go's jobPayload helper.
 	StaticDifficulty uint64
 
 	// NetworkTargetDifficulty is the real difficulty a share's hash must
@@ -50,6 +66,34 @@ type Job struct {
 	Result *tari_generated.GetNewBlockResult
 
 	CreatedAt time.Time
+
+	// nonceMu/usedNonces implement per-job (not per-session) used-nonce
+	// tracking, ported from go-tari-sha3x-solo-stratum's
+	// MinerJob.UsedNonces/NonceMutex (minerTracking/structs.go) — a
+	// miner replaying the same nonce twice must not be credited twice.
+	// This lives on Job rather than Session because, unlike the legacy
+	// reference, every job here is global/shared across all connected
+	// miners (see this type's doc comment), so the dedup set must be
+	// shared too.
+	nonceMu    sync.Mutex
+	usedNonces map[uint64]struct{}
+}
+
+// MarkNonceUsed records nonce as spent against this job and reports
+// whether it was newly recorded (true) or already used (false, i.e.
+// this is a replay that must be rejected without being credited
+// again).
+func (j *Job) MarkNonceUsed(nonce uint64) (firstUse bool) {
+	j.nonceMu.Lock()
+	defer j.nonceMu.Unlock()
+	if j.usedNonces == nil {
+		j.usedNonces = make(map[uint64]struct{})
+	}
+	if _, seen := j.usedNonces[nonce]; seen {
+		return false
+	}
+	j.usedNonces[nonce] = struct{}{}
+	return true
 }
 
 // JobManagerConfig configures a JobManager.
@@ -231,15 +275,16 @@ func (jm *JobManager) Refresh(ctx context.Context) (*Job, error) {
 		return nil, fmt.Errorf("solo: GetBlockTemplate returned an incomplete result")
 	}
 
-	id, err := newJobID()
+	id, err := jobIDFromBlockHash(result.GetBlockHash())
 	if err != nil {
-		return nil, fmt.Errorf("solo: generating job id: %w", err)
+		return nil, fmt.Errorf("solo: deriving job id from block hash: %w", err)
 	}
 
 	job := &Job{
 		ID:                      id,
 		Height:                  result.GetBlock().GetHeader().GetHeight(),
 		Header:                  result.GetMergeMiningHash(),
+		BlockHash:               result.GetBlockHash(),
 		StaticDifficulty:        jm.cfg.StaticDifficulty,
 		NetworkTargetDifficulty: result.GetMinerData().GetTargetDifficulty(),
 		Result:                  result,
@@ -257,7 +302,24 @@ func (jm *JobManager) Refresh(ctx context.Context) (*Job, error) {
 	return job, nil
 }
 
-func newJobID() (string, error) {
+// jobIDFromBlockHash derives the real miner-facing job_id from a raw
+// block hash — ported exactly from go-tari-sha3x-solo-stratum's
+// minerTracking.GetJobJSON: fmt.Sprintf("%x", blockHash)[0:16], i.e.
+// the first 16 HEX CHARACTERS (8 bytes' worth) of the hex-encoded raw
+// hash, not the first 16 raw bytes.
+func jobIDFromBlockHash(blockHash []byte) (string, error) {
+	full := hex.EncodeToString(blockHash)
+	if len(full) < 16 {
+		return "", fmt.Errorf("block hash too short to derive a job id: got %d hex chars, need at least 16 (raw hash %d bytes)", len(full), len(blockHash))
+	}
+	return full[:16], nil
+}
+
+// newRandomHexID returns 8 cryptographically-random bytes, hex-encoded.
+// Used for the per-connection session/login "id" the wire protocol
+// hands a miner (LoginResult.ID in protocol.go) — unrelated to a job's
+// real, block-hash-derived job_id (jobIDFromBlockHash above).
+func newRandomHexID() (string, error) {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err

@@ -3,6 +3,8 @@ package solo
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -22,6 +24,18 @@ type fakeNodeClient struct {
 	targetDifficulty uint64
 	mergeMiningHash  []byte
 
+	// blockHashSeed is the fixed prefix of the synthetic block hash
+	// GetBlockTemplate returns; the real leading bytes matter for
+	// nothing here except uniqueness/determinism, since the reference
+	// GetJobJSON's job_id is derived from this real BlockHash field
+	// (see job.go's jobIDFromBlockHash). A per-call counter is appended
+	// so consecutive refreshes in the same test (e.g. two calls at the
+	// same height) still get distinct job ids, mirroring how a real
+	// base node hands back a genuinely different block hash on every
+	// GetNewBlockResult even without a height change (nonce/timestamp
+	// jitter, etc.).
+	blockHashSeed []byte
+
 	templateCalls atomic.Int64
 	tipCalls      atomic.Int64
 	submitCalls   atomic.Int64
@@ -34,13 +48,15 @@ type fakeNodeClient struct {
 }
 
 func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress string) (*tari_generated.GetNewBlockResult, error) {
-	f.templateCalls.Add(1)
+	call := f.templateCalls.Add(1)
 	if f.getBlockTemplateErr != nil {
 		return nil, f.getBlockTemplateErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	blockHash := f.syntheticBlockHash(call)
 	return &tari_generated.GetNewBlockResult{
+		BlockHash:       blockHash,
 		MergeMiningHash: f.mergeMiningHash,
 		Block: &tari_generated.Block{
 			Header: &tari_generated.BlockHeader{Height: f.height},
@@ -49,6 +65,28 @@ func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress strin
 			TargetDifficulty: f.targetDifficulty,
 		},
 	}, nil
+}
+
+// syntheticBlockHash builds a deterministic, real-shaped (32-byte)
+// block hash for test fixtures: blockHashSeed (or a default 32-byte
+// filler if unset) with the last 8 bytes overwritten by the refresh
+// call counter, so every call to GetBlockTemplate in a test yields a
+// distinct hash/job_id even at a fixed height, matching real base node
+// behavior.
+func (f *fakeNodeClient) syntheticBlockHash(call int64) []byte {
+	seed := f.blockHashSeed
+	if len(seed) == 0 {
+		seed = []byte("default-test-block-hash-32byte!")
+	}
+	hash := make([]byte, len(seed))
+	copy(hash, seed)
+	if len(hash) < 8 {
+		padded := make([]byte, 8)
+		copy(padded, hash)
+		hash = padded
+	}
+	binary.BigEndian.PutUint64(hash[len(hash)-8:], uint64(call))
+	return hash
 }
 
 func (f *fakeNodeClient) GetTipInfo(_ context.Context) (*tari_generated.TipInfoResponse, error) {
@@ -103,6 +141,16 @@ func TestJobManagerRefreshBuildsJobFromTemplate(t *testing.T) {
 	}
 	if string(job.Header) != "\x01\x02\x03" {
 		t.Errorf("Header = %v, want [1 2 3]", job.Header)
+	}
+	// Real wire job_id derivation check: must be exactly the first 16
+	// hex characters of hex(BlockHash) — ported exactly from
+	// go-tari-sha3x-solo-stratum's minerTracking.GetJobJSON.
+	wantID := hex.EncodeToString(job.BlockHash)[:16]
+	if job.ID != wantID {
+		t.Errorf("job.ID = %q, want %q (first 16 hex chars of BlockHash)", job.ID, wantID)
+	}
+	if len(job.ID) != 16 {
+		t.Errorf("job.ID length = %d, want 16", len(job.ID))
 	}
 	if jm.Current() != job {
 		t.Error("Current() should return the just-refreshed job")
@@ -194,5 +242,49 @@ func TestJobManagerStartRefreshesOnTimerAndTipMovement(t *testing.T) {
 	}
 	if jm.Current().Height != 2 {
 		t.Errorf("Current().Height = %d, want 2 after tip-triggered refresh", jm.Current().Height)
+	}
+}
+
+// TestJobMarkNonceUsedRejectsReplay exercises the per-job used-nonce
+// tracking ported from go-tari-sha3x-solo-stratum's
+// MinerJob.UsedNonces/NonceMutex (minerTracking/structs.go) — required
+// to prevent a miner from being credited twice for resubmitting the
+// same nonce against the same job. See this task's "what NOT to skip"
+// note: unlike XNonce splitting and address-suffix parsing, this
+// mechanism DOES carry over, just relocated onto Job (global/shared
+// jobs) instead of per-session.
+func TestJobMarkNonceUsedRejectsReplay(t *testing.T) {
+	job := &Job{ID: "deadbeefdeadbeef"}
+
+	if !job.MarkNonceUsed(42) {
+		t.Fatal("first use of a nonce must be reported as newly recorded")
+	}
+	if job.MarkNonceUsed(42) {
+		t.Fatal("replaying the same nonce must be reported as already used")
+	}
+	if !job.MarkNonceUsed(43) {
+		t.Fatal("a different nonce must be independently trackable")
+	}
+}
+
+func TestJobMarkNonceUsedIsConcurrencySafe(t *testing.T) {
+	job := &Job{ID: "deadbeefdeadbeef"}
+	var wg sync.WaitGroup
+	var accepted atomic.Int64
+	const n = 200
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(nonce uint64) {
+			defer wg.Done()
+			// Every goroutine races to submit the SAME nonce; exactly
+			// one must win.
+			if job.MarkNonceUsed(7) {
+				accepted.Add(1)
+			}
+		}(7)
+	}
+	wg.Wait()
+	if accepted.Load() != 1 {
+		t.Errorf("expected exactly 1 winner racing to mark the same nonce used, got %d", accepted.Load())
 	}
 }
