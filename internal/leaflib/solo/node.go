@@ -70,6 +70,19 @@ var poolCoinbaseExtraTag = []byte("GCPOOL-SOLO")
 // weighting field, not an absolute currency amount — the base node
 // computes the actual reward split from this), instead of the legacy
 // per-miner multi-coinbase pool scheme.
+//
+// IMPORTANT for per-xn extranonce support (job.go's JobManager.JobForXN):
+// this already appends a FRESH, cryptographically-independent random
+// 8-byte nonce buffer to the coinbase-extra field on EVERY call — see
+// nonceBuf below — mirroring the legacy GetBlockSha3's own
+// `binary.LittleEndian.PutUint64(buf, rand.Uint64())` coinbase-extra
+// randomization exactly. That random data flows into the coinbase
+// transaction, which changes the resulting block's MergeMiningHash, so
+// two calls to this method (e.g. for two different sessions' xn values)
+// already produce genuinely distinct, non-overlapping hash pre-images
+// even at the same chain height — this method did NOT need any new
+// randomization logic added for per-xn support; JobManager only needed
+// to call it once per newly-seen xn and cache the result (see job.go).
 func (c *GRPCNodeClient) GetBlockTemplate(_ context.Context, payoutAddress string) (*tari_generated.GetNewBlockResult, error) {
 	nonceBuf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(nonceBuf, rand.Uint64())

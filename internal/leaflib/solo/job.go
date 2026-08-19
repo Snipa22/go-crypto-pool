@@ -18,10 +18,38 @@ import (
 // payout address) plus the static difficulty miners must meet for a
 // "share" to count, and the real network target difficulty a share must
 // meet to actually BE a full block (at which point SubmitBlock is
-// called for real). There is one global Job shared by every connected
-// miner in this pass — see cmd/leaf-solo's doc comment: solo mode has no
-// per-miner coinbase/payout splitting, everything found pays the single
-// configured solo address.
+// called for real).
+//
+// IMPORTANT (see this package's per-xn extranonce support, added after
+// a real production crash — the graxil GPU miner panicked on a missing
+// "xn" field, and the maintainer clarified that "solo" means "single
+// payout address", NOT "single miner": any number of miners can point
+// at a solo leaf). There is NOT one global Job shared by every
+// connected miner. Each connecting session is assigned its own random
+// 2-byte extranonce (xn) once, at connect time (see session.go's
+// newSession), and JobManager maintains one independently-generated Job
+// per xn (see JobManager.perXN below) so that miners with different xn
+// values search genuinely different, non-overlapping hash spaces —
+// ported from go-tari-sha3x-solo-stratum's
+// subsystems/blockTemplateCache/blockTemplate.go (GetBlockSha3 +
+// GetBlockWithXN) and subsystems/poolStratum/miner.go (needsXN/xn
+// assignment at connection-init, getJob/SendNewJob, the submit-time xn
+// prefix check).
+//
+// This is NOT Bitcoin-style nonce-range slicing. It's a genuinely
+// distinct-block-template split: NodeClient.GetBlockTemplate (node.go)
+// already appends a fresh, randomly-generated 8-byte nonce buffer to
+// the coinbase-extra field on every call (mirroring the legacy
+// GetBlockSha3's `binary.LittleEndian.PutUint64(buf, rand.Uint64())`
+// coinbase-extra randomization), so calling it once per newly-seen xn
+// already yields a block whose MergeMiningHash pre-image genuinely
+// differs from every other xn's template, even at the same height —
+// see node.go's GetBlockTemplate doc comment. What JobManager adds here
+// is the per-xn CACHING/reuse behavior on top of that: a given xn keeps
+// getting served the SAME Job on repeat requests (consistent job_id
+// across getjob calls, matching the legacy GetBlockWithXN's "this xn
+// already claimed a cached template" behavior) until the whole cache is
+// invalidated by tip movement.
 type Job struct {
 	// ID is the real miner-facing job_id: the first 16 hex characters
 	// of hex(BlockHash) — ported exactly from
@@ -67,14 +95,14 @@ type Job struct {
 
 	CreatedAt time.Time
 
-	// nonceMu/usedNonces implement per-job (not per-session) used-nonce
-	// tracking, ported from go-tari-sha3x-solo-stratum's
-	// MinerJob.UsedNonces/NonceMutex (minerTracking/structs.go) — a
-	// miner replaying the same nonce twice must not be credited twice.
-	// This lives on Job rather than Session because, unlike the legacy
-	// reference, every job here is global/shared across all connected
-	// miners (see this type's doc comment), so the dedup set must be
-	// shared too.
+	// nonceMu/usedNonces implement per-job used-nonce tracking, ported
+	// from go-tari-sha3x-solo-stratum's MinerJob.UsedNonces/NonceMutex
+	// (minerTracking/structs.go) — a miner replaying the same nonce
+	// twice must not be credited twice. Since every xn now gets its own
+	// distinct Job (see type doc comment), this is naturally per-xn
+	// too: two different miners with two different xns can legitimately
+	// use the "same" raw nonce value against their own independent
+	// templates without colliding.
 	nonceMu    sync.Mutex
 	usedNonces map[uint64]struct{}
 }
@@ -109,41 +137,56 @@ type JobManagerConfig struct {
 	// comment.
 	StaticDifficulty uint64
 
-	// RefreshInterval is how often a brand new block template is fetched
-	// unconditionally, regardless of tip movement.
+	// RefreshInterval is how often the ENTIRE per-xn job cache is
+	// unconditionally invalidated, regardless of tip movement, forcing
+	// a fresh template (with fresh randomized coinbase data) to be
+	// generated for every xn on its next request. Mirrors the legacy
+	// UpdateBlockTemplateCache's periodic refresh.
 	RefreshInterval time.Duration
 
-	// TipPollInterval is how often the chain tip is polled so a new
-	// template can be fetched immediately when someone else finds a
-	// block, instead of waiting out the full RefreshInterval on a stale
-	// template.
+	// TipPollInterval is how often the chain tip is polled so the
+	// per-xn cache can be invalidated immediately when someone else
+	// finds a block, instead of waiting out the full RefreshInterval on
+	// stale templates.
 	TipPollInterval time.Duration
 
 	Logger *log.Logger
 }
 
-// JobManager owns the current Job, refreshing it on a timer and
-// immediately on tip movement, and fans out newly-refreshed jobs to
-// subscribers (miner sessions) via OnNewJob.
+// JobManager maintains a per-xn cache of independently-generated block
+// template Jobs (see Job's doc comment for why this replaced a single
+// global Job), refreshing/invalidating that cache on a timer and
+// immediately on tip movement, and notifies subscribers (Server) when
+// an invalidation happens so already-connected sessions can be handed
+// fresh, regenerated per-xn jobs instead of continuing to work a job
+// for a tip that has already moved.
 type JobManager struct {
 	cfg JobManagerConfig
 
-	mu         sync.RWMutex
-	current    *Job
-	lastHeight uint64
+	mu       sync.RWMutex
+	perXN    map[string]*Job // xn (hex string) -> that xn's current Job
+	jobsByID map[string]*Job // job.ID -> Job, spanning every xn's current entry, for submit-time lookup
 
-	refreshMu sync.Mutex // serializes concurrent refresh attempts
+	// lastTipHeight is the most recently observed real chain-tip
+	// height (from NodeClient.GetTipInfo), used purely to detect tip
+	// movement in tipPollLoop. It is NOT the same thing as any
+	// individual Job.Height (each xn's Job is fetched independently and
+	// may observe a template at a very slightly different moment).
+	lastTipHeight uint64
+	tipObserved   bool // false until tipPollLoop's first successful GetTipInfo, so that first poll seeds a baseline instead of being misread as tip movement from a zero-value default
+
+	genMu sync.Mutex // serializes concurrent new-template generation
 
 	subMu sync.RWMutex
-	subs  map[uint64]func(*Job)
+	subs  map[uint64]func()
 	subID uint64
 
 	logger *log.Logger
 }
 
 // NewJobManager constructs a JobManager. Call Start to begin the
-// refresh/tip-poll loops; call Refresh directly (e.g. from tests) for a
-// single synchronous fetch.
+// refresh/tip-poll loops; call JobForXN directly (e.g. from tests) for
+// a single synchronous per-xn fetch.
 func NewJobManager(cfg JobManagerConfig) *JobManager {
 	logger := cfg.Logger
 	if logger == nil {
@@ -156,38 +199,129 @@ func NewJobManager(cfg JobManagerConfig) *JobManager {
 		cfg.TipPollInterval = 5 * time.Second
 	}
 	return &JobManager{
-		cfg:    cfg,
-		subs:   make(map[uint64]func(*Job)),
-		logger: logger,
+		cfg:      cfg,
+		perXN:    make(map[string]*Job),
+		jobsByID: make(map[string]*Job),
+		subs:     make(map[uint64]func()),
+		logger:   logger,
 	}
 }
 
-// Current returns the most recently refreshed Job, or nil if none has
-// been fetched yet.
-func (jm *JobManager) Current() *Job {
-	jm.mu.RLock()
-	defer jm.mu.RUnlock()
-	return jm.current
+// JobForXN returns the current Job for the given per-session xn,
+// generating and caching a brand new, independently-randomized block
+// template the first time this xn is seen (or after the cache has been
+// invalidated by tip movement/periodic refresh) — ported from
+// go-tari-sha3x-solo-stratum's GetBlockWithXN. Repeat calls with the
+// same xn against the same cache generation return the SAME Job
+// (consistent job_id across getjob calls), matching the legacy
+// behavior exactly.
+func (jm *JobManager) JobForXN(ctx context.Context, xn string) (*Job, error) {
+	if job, ok := jm.lookupXN(xn); ok {
+		return job, nil
+	}
+
+	// Serialize generation so concurrent first-requests for the same
+	// (or different) xn don't race to fetch redundant templates; a
+	// double-check after acquiring genMu keeps this cheap in the common
+	// case where the xn is already cached.
+	jm.genMu.Lock()
+	defer jm.genMu.Unlock()
+
+	if job, ok := jm.lookupXN(xn); ok {
+		return job, nil
+	}
+
+	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress)
+	if err != nil {
+		return nil, fmt.Errorf("solo: GetBlockTemplate for xn %s: %w", xn, err)
+	}
+	if result == nil || result.GetBlock() == nil || result.GetBlock().GetHeader() == nil {
+		return nil, fmt.Errorf("solo: GetBlockTemplate returned an incomplete result for xn %s", xn)
+	}
+
+	id, err := jobIDFromBlockHash(result.GetBlockHash())
+	if err != nil {
+		return nil, fmt.Errorf("solo: deriving job id from block hash for xn %s: %w", xn, err)
+	}
+
+	job := &Job{
+		ID:                      id,
+		Height:                  result.GetBlock().GetHeader().GetHeight(),
+		Header:                  result.GetMergeMiningHash(),
+		BlockHash:               result.GetBlockHash(),
+		StaticDifficulty:        jm.cfg.StaticDifficulty,
+		NetworkTargetDifficulty: result.GetMinerData().GetTargetDifficulty(),
+		Result:                  result,
+		CreatedAt:               time.Now(),
+	}
+
+	jm.mu.Lock()
+	jm.perXN[xn] = job
+	jm.jobsByID[job.ID] = job
+	jm.mu.Unlock()
+
+	return job, nil
 }
 
-// GetJob returns the job matching id, if it is still the current job or
-// was recently current. This implementation only tracks the single most
-// recent job (solo mode's simplified single-global-job model — see
-// Job's doc comment), so a submission against a job that has already
-// been superseded is reported as not-found, prompting the caller to
-// request a fresh job.
+func (jm *JobManager) lookupXN(xn string) (*Job, bool) {
+	jm.mu.RLock()
+	defer jm.mu.RUnlock()
+	job, ok := jm.perXN[xn]
+	return job, ok
+}
+
+// GetJob returns the job matching id, searching across every xn's
+// currently-cached entry (a submission is checked against whichever
+// per-xn job produced that job_id, not a single global job — see Job's
+// doc comment).
 func (jm *JobManager) GetJob(id string) (*Job, bool) {
 	jm.mu.RLock()
 	defer jm.mu.RUnlock()
-	if jm.current != nil && jm.current.ID == id {
-		return jm.current, true
-	}
-	return nil, false
+	job, ok := jm.jobsByID[id]
+	return job, ok
 }
 
-// Subscribe registers fn to be called with every newly-refreshed Job.
-// Returns an unsubscribe function.
-func (jm *JobManager) Subscribe(fn func(*Job)) (unsubscribe func()) {
+// InvalidateAll drops every cached per-xn Job, forcing the next
+// JobForXN call for any xn to generate a brand new, independently
+// randomized template. Called on tip movement (a block was found,
+// possibly by an entirely different miner/xn — every previously-cached
+// template height is now stale) and on the unconditional periodic
+// refresh timer. Mirrors go-tari-sha3x-solo-stratum's GetBlockWithXN
+// discard-stale-entries-at-read-time behavior, but eagerly: rather than
+// filtering stale entries out one lookup at a time, the whole
+// generation is invalidated up front so no session can be served a job
+// for a tip that has already moved.
+func (jm *JobManager) InvalidateAll() {
+	jm.mu.Lock()
+	jm.perXN = make(map[string]*Job)
+	jm.jobsByID = make(map[string]*Job)
+	jm.mu.Unlock()
+	jm.notify()
+}
+
+// Probe performs a single, uncached GetBlockTemplate call purely to
+// fail fast at startup if the base node is unreachable/misconfigured,
+// mirroring main.go's previous "fetch initial block template" sanity
+// check. The result is discarded — it is deliberately NOT cached under
+// any xn, since with per-xn jobs there is no "the" initial job to seed;
+// each session's first JobForXN call generates its own.
+func (jm *JobManager) Probe(ctx context.Context) error {
+	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress)
+	if err != nil {
+		return fmt.Errorf("solo: GetBlockTemplate probe: %w", err)
+	}
+	if result == nil || result.GetBlock() == nil || result.GetBlock().GetHeader() == nil {
+		return fmt.Errorf("solo: GetBlockTemplate probe returned an incomplete result")
+	}
+	return nil
+}
+
+// Subscribe registers fn to be called every time the per-xn job cache
+// is invalidated (tip movement or periodic refresh). Callers (Server)
+// use this to push freshly (re-)generated per-xn jobs out to every
+// currently-connected, logged-in session. Returns an unsubscribe
+// function.
+func (jm *JobManager) Subscribe(fn func()) (unsubscribe func()) {
 	jm.subMu.Lock()
 	id := jm.subID
 	jm.subID++
@@ -200,11 +334,11 @@ func (jm *JobManager) Subscribe(fn func(*Job)) (unsubscribe func()) {
 	}
 }
 
-func (jm *JobManager) notify(job *Job) {
+func (jm *JobManager) notify() {
 	jm.subMu.RLock()
 	defer jm.subMu.RUnlock()
 	for _, fn := range jm.subs {
-		fn(job)
+		fn()
 	}
 }
 
@@ -223,9 +357,8 @@ func (jm *JobManager) refreshLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := jm.Refresh(ctx); err != nil {
-				jm.logger.Printf("solo: periodic job refresh failed: %v", err)
-			}
+			jm.logger.Printf("solo: periodic per-xn job cache invalidation")
+			jm.InvalidateAll()
 		}
 	}
 }
@@ -248,58 +381,28 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 			}
 			height := tip.GetMetadata().GetBestBlockHeight()
 			jm.mu.RLock()
-			last := jm.lastHeight
+			last := jm.lastTipHeight
+			observed := jm.tipObserved
 			jm.mu.RUnlock()
+			if !observed {
+				// First successful tip observation: just seed the
+				// baseline, don't treat it as "movement" (there is
+				// nothing to have moved FROM yet).
+				jm.mu.Lock()
+				jm.lastTipHeight = height
+				jm.tipObserved = true
+				jm.mu.Unlock()
+				continue
+			}
 			if height > last {
-				jm.logger.Printf("solo: new tip detected (height %d -> %d), refreshing job", last, height)
-				if _, err := jm.Refresh(ctx); err != nil {
-					jm.logger.Printf("solo: tip-triggered job refresh failed: %v", err)
-				}
+				jm.logger.Printf("solo: new tip detected (height %d -> %d), invalidating per-xn job cache", last, height)
+				jm.mu.Lock()
+				jm.lastTipHeight = height
+				jm.mu.Unlock()
+				jm.InvalidateAll()
 			}
 		}
 	}
-}
-
-// Refresh synchronously fetches a fresh block template, builds a new
-// Job, stores it as current, and notifies subscribers. Safe to call
-// directly (e.g. once at startup before Start, or from tests).
-func (jm *JobManager) Refresh(ctx context.Context) (*Job, error) {
-	jm.refreshMu.Lock()
-	defer jm.refreshMu.Unlock()
-
-	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress)
-	if err != nil {
-		return nil, fmt.Errorf("solo: GetBlockTemplate: %w", err)
-	}
-	if result == nil || result.GetBlock() == nil || result.GetBlock().GetHeader() == nil {
-		return nil, fmt.Errorf("solo: GetBlockTemplate returned an incomplete result")
-	}
-
-	id, err := jobIDFromBlockHash(result.GetBlockHash())
-	if err != nil {
-		return nil, fmt.Errorf("solo: deriving job id from block hash: %w", err)
-	}
-
-	job := &Job{
-		ID:                      id,
-		Height:                  result.GetBlock().GetHeader().GetHeight(),
-		Header:                  result.GetMergeMiningHash(),
-		BlockHash:               result.GetBlockHash(),
-		StaticDifficulty:        jm.cfg.StaticDifficulty,
-		NetworkTargetDifficulty: result.GetMinerData().GetTargetDifficulty(),
-		Result:                  result,
-		CreatedAt:               time.Now(),
-	}
-
-	jm.mu.Lock()
-	jm.current = job
-	if job.Height > jm.lastHeight {
-		jm.lastHeight = job.Height
-	}
-	jm.mu.Unlock()
-
-	jm.notify(job)
-	return job, nil
 }
 
 // jobIDFromBlockHash derives the real miner-facing job_id from a raw
@@ -321,6 +424,24 @@ func jobIDFromBlockHash(blockHash []byte) (string, error) {
 // real, block-hash-derived job_id (jobIDFromBlockHash above).
 func newRandomHexID() (string, error) {
 	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// newSessionXN returns a fresh per-session extranonce (xn): 2
+// cryptographically-random bytes, hex-encoded to a 4-character string
+// — ported exactly from go-tari-sha3x-solo-stratum's miner.go
+// connection-init (`buf := make([]byte, 8); binary.LittleEndian.
+// PutUint64(buf, rand.Uint64()); m.xn = fmt.Sprintf("%x", buf[0:2])`):
+// same size (2 bytes / 4 hex chars) and same "generated once per
+// connection at accept time, not per-job" timing, just sourced from
+// crypto/rand instead of math/rand since this package already uses
+// crypto/rand for newRandomHexID above and there's no reason to pull in
+// a second, weaker RNG for an adjacent purpose.
+func newSessionXN() (string, error) {
+	buf := make([]byte, 2)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}

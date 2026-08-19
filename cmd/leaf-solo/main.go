@@ -139,9 +139,9 @@ func main() {
 		Logger:           logger,
 	})
 
-	logger.Println("fetching initial block template...")
-	if _, err := jobManager.Refresh(ctx); err != nil {
-		logger.Fatalf("initial block template fetch failed: %v", err)
+	logger.Println("probing base node connectivity...")
+	if err := jobManager.Probe(ctx); err != nil {
+		logger.Fatalf("base node connectivity probe failed: %v", err)
 	}
 	jobManager.Start(ctx)
 
