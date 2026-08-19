@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"math"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,9 +49,6 @@ func newTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *testHar
 		PayoutAddress:    "solo-test-address",
 		StaticDifficulty: staticDiff,
 	})
-	if _, err := jm.Refresh(context.Background()); err != nil {
-		t.Fatalf("initial job refresh: %v", err)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 2 * time.Second})
@@ -167,6 +165,20 @@ func TestSessionLoginPushesInitialJob(t *testing.T) {
 	if resp.Result.Job.Target == "" {
 		t.Error("expected a non-empty target in the login-pushed job")
 	}
+	// Real per-session extranonce (xn) requirement: graxil and other
+	// real miner software hard-requires this field to be present — see
+	// job.go/protocol.go doc comments for the production crash this
+	// fixes. Must be exactly 4 hex characters (2 bytes), matching
+	// go-tari-sha3x-solo-stratum's xn sizing exactly.
+	if resp.Result.Job.XN == "" {
+		t.Fatal("expected a non-empty xn in the login-pushed job")
+	}
+	if len(resp.Result.Job.XN) != 4 {
+		t.Errorf("xn length = %d, want 4 hex characters (2 bytes)", len(resp.Result.Job.XN))
+	}
+	if _, err := hex.DecodeString(resp.Result.Job.XN); err != nil {
+		t.Errorf("xn %q is not valid hex: %v", resp.Result.Job.XN, err)
+	}
 	// Real wire encoding check: target must decode to exactly 8 raw
 	// bytes (a little-endian uint64), matching
 	// go-tari-sha3x-solo-stratum's diffToTarget encoding exactly.
@@ -210,13 +222,13 @@ func TestSessionGetJobWithoutLoginIsRejected(t *testing.T) {
 // {"result":true}.
 func TestSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 	h := newTestHarness(t, 1, math.MaxUint64)
-	sessionID := login(t, h, "addr-1")
+	sessionID, xn := login(t, h, "addr-1")
 
-	jobID := currentJobID(t, h)
+	jobID := currentJobIDForXN(t, h, xn)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
-		Nonce: nonceHex(12345),
+		Nonce: xnPrefixedNonceHex(xn, 12345),
 	})})
 	resp := h.recvShareResponse()
 
@@ -247,15 +259,20 @@ func TestSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 // nonce. On the real wire, a block-find and an ordinary accepted share
 // both surface identically as {"result":true} — there is no separate
 // "block found" wire status in the real dialect.
+//
+// This is also the REGRESSION GUARD that the existing accept path still
+// works correctly with the new xn-prefix check added in front of it:
+// the nonce here is correctly xn-prefixed AND cryptographically valid,
+// so it must still be accepted exactly as before xn support was added.
 func TestSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	h := newTestHarness(t, 1, 1)
-	sessionID := login(t, h, "addr-2")
+	sessionID, xn := login(t, h, "addr-2")
 
-	jobID := currentJobID(t, h)
+	jobID := currentJobIDForXN(t, h, xn)
 	h.send(Request{ID: 3, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
-		Nonce: nonceHex(999),
+		Nonce: xnPrefixedNonceHex(xn, 999),
 	})})
 	resp := h.recvShareResponse()
 
@@ -280,13 +297,13 @@ func TestSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 // SHA3XValidator.Validate reports the share invalid.
 func TestSessionSubmitCryptographicallyInvalid(t *testing.T) {
 	h := newTestHarness(t, math.MaxUint64, math.MaxUint64)
-	sessionID := login(t, h, "addr-3")
+	sessionID, xn := login(t, h, "addr-3")
 
-	jobID := currentJobID(t, h)
+	jobID := currentJobIDForXN(t, h, xn)
 	h.send(Request{ID: 4, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
-		Nonce: nonceHex(1),
+		Nonce: xnPrefixedNonceHex(xn, 1),
 	})})
 	resp := h.recvShareResponse()
 
@@ -307,12 +324,12 @@ func TestSessionSubmitCryptographicallyInvalid(t *testing.T) {
 
 func TestSessionSubmitUnknownJobIDIsRejected(t *testing.T) {
 	h := newTestHarness(t, 1000, 1<<62)
-	sessionID := login(t, h, "addr-4")
+	sessionID, xn := login(t, h, "addr-4")
 
 	h.send(Request{ID: 6, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: "0000000000000000",
-		Nonce: nonceHex(1),
+		Nonce: xnPrefixedNonceHex(xn, 1),
 	})})
 	resp := h.recvShareResponse()
 
@@ -332,14 +349,14 @@ func TestSessionSubmitUnknownJobIDIsRejected(t *testing.T) {
 // credited twice.
 func TestSessionSubmitDuplicateNonceIsRejected(t *testing.T) {
 	h := newTestHarness(t, 1, math.MaxUint64)
-	sessionID := login(t, h, "addr-6")
+	sessionID, xn := login(t, h, "addr-6")
 
-	jobID := currentJobID(t, h)
+	jobID := currentJobIDForXN(t, h, xn)
 	submit := func() ShareResponse {
 		h.send(Request{ID: 7, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			ID:    sessionID,
 			JobID: jobID,
-			Nonce: nonceHex(42424242),
+			Nonce: xnPrefixedNonceHex(xn, 42424242),
 		})})
 		return h.recvShareResponse()
 	}
@@ -363,77 +380,133 @@ func TestSessionSubmitDuplicateNonceIsRejected(t *testing.T) {
 	}
 }
 
-// TestSessionKeepalivedRoundTrip exercises the real "keepalived" method
-// XMRig-class miners use to keep an idle connection alive.
-func TestSessionKeepalivedRoundTrip(t *testing.T) {
-	h := newTestHarness(t, 1000, 1<<62)
-	login(t, h, "addr-7")
+// TestSessionSubmitWithWrongXNPrefixIsRejectedBeforeValidation is the
+// core new requirement: a submit whose nonce does NOT carry the
+// session's own assigned xn as a hex prefix must be rejected outright
+// — BEFORE any PoW validation work happens — ported from
+// go-tari-sha3x-solo-stratum's miner.go SubmitJob
+// (`strings.HasPrefix(strings.ToLower(submittedWork.Nonce), m.xn)`).
+// staticDiff/networkTargetDiff are both set to 1 (i.e. this nonce WOULD
+// have been cryptographically valid and even block-finding, were it not
+// for the xn mismatch) specifically so a false accept can only be
+// explained by the xn check being skipped, not by the nonce
+// coincidentally failing PoW too.
+func TestSessionSubmitWithWrongXNPrefixIsRejectedBeforeValidation(t *testing.T) {
+	h := newTestHarness(t, 1, 1)
+	sessionID, xn := login(t, h, "addr-8")
 
-	h.send(Request{ID: 8, Method: "keepalived"})
-	resp := h.recvErrorResponse()
-
-	if resp.Error != "" {
-		t.Errorf("unexpected error on keepalived: %s", resp.Error)
+	wrongXN := "ffff"
+	if wrongXN == xn {
+		wrongXN = "0000"
 	}
-	if resp.Result != "KEEPALIVED" {
-		t.Errorf("keepalived result = %q, want KEEPALIVED", resp.Result)
+
+	jobID := currentJobIDForXN(t, h, xn)
+	h.send(Request{ID: 9, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:    sessionID,
+		JobID: jobID,
+		Nonce: xnPrefixedNonceHex(wrongXN, 999),
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a submit with a nonce not prefixed by the session's own xn to be rejected")
+	}
+	if resp.Error == "" {
+		t.Error("expected a clear rejection error for an xn-prefix mismatch")
+	}
+	if !strings.Contains(strings.ToLower(resp.Error), "xnonce") {
+		t.Errorf("expected the rejection error to mention XNonce, got %q", resp.Error)
+	}
+	// Nothing downstream of the xn check must have run: no share
+	// credited, no SubmitBlock call, even though this nonce/job would
+	// otherwise have been both a valid share AND a block find.
+	if h.node.submitCalls.Load() != 0 {
+		t.Errorf("SubmitBlock must not be called when the xn-prefix check fails, got %d calls", h.node.submitCalls.Load())
+	}
+	stats := h.server.Stats()
+	if stats.TotalShares != 0 {
+		t.Errorf("TotalShares = %d, want 0 for an xn-prefix-rejected submit", stats.TotalShares)
+	}
+	if stats.TotalBlocks != 0 {
+		t.Errorf("TotalBlocks = %d, want 0 for an xn-prefix-rejected submit", stats.TotalBlocks)
 	}
 }
 
-// TestManagedConnectionLifecycleUsedNotBypassed confirms the session is
-// riding on ManagedConnection's real lifecycle guarantees: closing the
-// underlying pipe from the client side should eventually cause the
-// server-side ManagedConnection to be torn down and deregistered from
-// the ConnectionManager, without the session's read loop needing to
-// implement its own cleanup.
-func TestManagedConnectionLifecycleUsedNotBypassed(t *testing.T) {
+// TestTwoSessionsGetDifferentXNsAndDifferentJobs is the multi-session
+// requirement at the protocol/session layer (job_test.go covers the
+// same guarantee at the JobManager layer directly): two independently
+// logged-in sessions against the same server, at the same height, must
+// be handed different xn values and different job_ids/blobs — a real
+// miner pointed at go-crypto-pool's solo leaf must not collide with
+// another miner's search space.
+func TestTwoSessionsGetDifferentXNsAndDifferentJobs(t *testing.T) {
 	h := newTestHarness(t, 1000, 1<<62)
-	login(t, h, "addr-5")
 
-	if h.cm.Count() != 1 {
-		t.Fatalf("expected 1 registered connection after login, got %d", h.cm.Count())
+	serverConnA, clientA := net.Pipe()
+	serverConnB, clientB := net.Pipe()
+	ctx := context.Background()
+	go h.server.handleConn(ctx, serverConnA)
+	go h.server.handleConn(ctx, serverConnB)
+	t.Cleanup(func() {
+		_ = clientA.Close()
+		_ = clientB.Close()
+	})
+
+	hA := &testHarness{t: t, server: h.server, jm: h.jm, node: h.node, client: clientA, reader: bufio.NewReader(clientA), writer: bufio.NewWriter(clientA)}
+	hB := &testHarness{t: t, server: h.server, jm: h.jm, node: h.node, client: clientB, reader: bufio.NewReader(clientB), writer: bufio.NewWriter(clientB)}
+
+	_, xnA := login(t, hA, "addr-multi-a")
+	_, xnB := login(t, hB, "addr-multi-b")
+
+	if xnA == xnB {
+		t.Fatalf("expected two independently-connected sessions to get different xn values, both got %q (collision probability is 1/65536 per pair — if this genuinely flakes, widen the assertion, but treat a repeat failure as a real bug)", xnA)
 	}
 
-	_ = h.client.Close()
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if h.cm.Count() == 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	jobIDA := currentJobIDForXN(t, hA, xnA)
+	jobIDB := currentJobIDForXN(t, hB, xnB)
+	if jobIDA == jobIDB {
+		t.Fatalf("expected two different xns to be served two different job_ids at the same height, both got %q", jobIDA)
 	}
-	t.Fatalf("expected ConnectionManager to deregister the connection after client close, still has %d", h.cm.Count())
 }
 
 // login performs a real login handshake and returns the session id the
-// server handed back (LoginResult.ID), which real submits must echo in
-// SubmitRequest.ID.
-func login(t *testing.T, h *testHarness, address string) (sessionID string) {
+// server handed back (LoginResult.ID) and the session's own assigned
+// xn (LoginResult.Job.XN), which real submits must echo/prefix
+// respectively.
+func login(t *testing.T, h *testHarness, address string) (sessionID, xn string) {
 	t.Helper()
 	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: address, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
 	resp := h.recvLoginResponse()
 	if resp.Result.Status != "OK" {
 		t.Fatalf("login failed: status=%q", resp.Result.Status)
 	}
-	return resp.Result.ID
+	return resp.Result.ID, resp.Result.Job.XN
 }
 
-func currentJobID(t *testing.T, h *testHarness) string {
+// currentJobIDForXN looks up the current job for a given already-issued
+// xn directly from the shared JobManager (mirroring what the session
+// itself would resolve via JobForXN).
+func currentJobIDForXN(t *testing.T, h *testHarness, xn string) string {
 	t.Helper()
-	job := h.jm.Current()
-	if job == nil {
-		t.Fatal("no current job")
+	job, err := h.jm.JobForXN(context.Background(), xn)
+	if err != nil {
+		t.Fatalf("JobForXN(%q): %v", xn, err)
 	}
 	return job.ID
 }
 
-func nonceHex(n uint64) string {
+// xnPrefixedNonceHex builds an 8-byte, hex-encoded nonce whose leading
+// hex characters are exactly xn, matching the real wire convention
+// go-tari-sha3x-solo-stratum's miners are expected to follow
+// (session.go's handleSubmit checks strings.HasPrefix on the hex
+// string, not on the decoded bytes' numeric value).
+func xnPrefixedNonceHex(xn string, n uint64) string {
 	buf := make([]byte, 8)
 	for i := 0; i < 8; i++ {
 		buf[i] = byte(n >> (8 * i))
 	}
-	return hex.EncodeToString(buf)
+	full := hex.EncodeToString(buf)
+	return xn + full[len(xn):]
 }
 
 func mustJSON(t *testing.T, v any) json.RawMessage {

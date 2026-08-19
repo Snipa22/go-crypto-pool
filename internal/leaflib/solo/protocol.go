@@ -41,17 +41,29 @@ import "encoding/json"
 //	always a string, never a bool):
 //	  {"id":1,"jsonrpc":"2.0","error":"invalid address provided","result":""}
 //
-// Deliberately NOT ported from the legacy reference (see task/PR
-// description for rationale — go-crypto-pool's solo leaf gives every
-// miner the same single global job, so extranonce-prefix splitting and
-// per-miner custom-difficulty address suffixes do not apply here):
-//   - XNonce ("xn") extranonce splitting/prefix-checking.
-//   - "." / "+" login-address suffix parsing for payment-ID/custom-diff.
+// Ported and REQUIRED (see task description, and this package's job.go
+// doc comment for the full rationale — a real production crash: the
+// graxil GPU miner panicked on a missing "xn" field, and "solo" means
+// "single payout address", NOT "single miner"):
+//   - XNonce ("xn") extranonce assignment (one random 2-byte value per
+//     connecting session, see job.go's newSessionXN) and wire exposure
+//     (JobPayload.XN below) so multiple miners hitting the same solo
+//     leaf search genuinely different, non-overlapping template spaces
+//     instead of colliding on one global job.
+//   - Submit-time xn-prefix rejection (session.go's handleSubmit),
+//     ported from go-tari-sha3x-solo-stratum's miner.go SubmitJob
+//     (`strings.HasPrefix(strings.ToLower(submittedWork.Nonce), m.xn)`).
+//
+// Deliberately still NOT ported: "." / "+" login-address suffix parsing
+// for payment-ID/custom-difficulty (go-crypto-pool's solo leaf uses one
+// static, leaf-configured difficulty for everyone — see
+// JobManagerConfig.StaticDifficulty in job.go) — the address is taken
+// as-is.
 //
 // Ported and REQUIRED (see task description): per-job used-nonce
 // tracking, so a miner can't replay the same nonce twice for credit —
-// implemented on Job itself (job.go), since jobs are shared globally
-// across all connected miners in this leaf, not per-session.
+// implemented on Job itself (job.go). Since jobs are now per-xn (see
+// job.go's doc comment), this dedup set is naturally per-xn too.
 
 // Request is one client->server envelope. Every method — login,
 // getjob, submit — arrives wrapped in this shape; see this file's doc
@@ -79,9 +91,12 @@ type LoginRequest struct {
 // session/connection id the miner was handed at login (echoed back,
 // not separately validated — the reference doesn't authenticate on it
 // either, see miner.go's SubmitJob), JobID matches a previously-sent
-// job_id, Nonce is hex-encoded little-endian 8 bytes, and Result is the
-// miner's claimed hex-encoded hash (accepted on the wire, but not
-// required for validation since the server recomputes it for real via
+// job_id, Nonce is hex-encoded little-endian 8 bytes and MUST be
+// prefixed (case-insensitively) with the session's own assigned xn —
+// see session.go's handleSubmit, ported from go-tari-sha3x-solo-stratum's
+// miner.go SubmitJob xn-prefix check — and Result is the miner's
+// claimed hex-encoded hash (accepted on the wire, but not required for
+// validation since the server recomputes it for real via
 // SHA3XValidator).
 type SubmitRequest struct {
 	ID     string `json:"id"`
@@ -91,10 +106,11 @@ type SubmitRequest struct {
 }
 
 // JobPayload is the real job object shape (messages.MinerJobJSON in the
-// reference, minus the "xn" extranonce field, which does not apply to
-// go-crypto-pool's solo leaf — see this file's doc comment). It is used
-// both nested inside a login response's "job" field and as a
-// standalone unsolicited "job" push's "params".
+// reference, INCLUDING the "xn" extranonce field — see this file's doc
+// comment for why this is required, not optional: graxil and other
+// real miner software hard-requires it and panics on a missing/absent
+// field). It is used both nested inside a login response's "job" field
+// and as a standalone unsolicited "job" push's "params".
 //
 // Target/blob/job_id encodings (see minerTracking/structs.go's
 // diffToTarget/GetJobJSON, ported exactly in jobPayload below):
@@ -104,12 +120,18 @@ type SubmitRequest struct {
 //     LITTLE-ENDIAN order, then hex-encoded as a string.
 //   - JobID is hex(BlockHash)[0:16] — the first 16 HEX CHARACTERS of
 //     the hex-encoded raw block hash.
+//   - XN is the session's own assigned extranonce (job.go's
+//     newSessionXN), 4 hex characters (2 bytes) — the SAME value on
+//     every job sent to a given session, since xn is assigned once at
+//     connect time, not per-job. Field name/tag matches the legacy
+//     messages.MinerJobJSON.XNonce field exactly.
 type JobPayload struct {
 	Algo   string `json:"algo"`
 	Blob   string `json:"blob"`
 	Height uint64 `json:"height"`
 	JobID  string `json:"job_id"`
 	Target string `json:"target"`
+	XN     string `json:"xn,omitempty"`
 }
 
 // LoginResult is the real login response's nested "result" object.

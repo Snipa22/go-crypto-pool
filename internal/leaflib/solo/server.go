@@ -49,14 +49,18 @@ func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeC
 		logger:     logger,
 		sessions:   make(map[uint64]*Session),
 	}
-	s.unsubscribe = jobManager.Subscribe(s.broadcastJob)
+	s.unsubscribe = jobManager.Subscribe(s.invalidateAndRepushJobs)
 	return s
 }
 
-// broadcastJob pushes a newly-refreshed Job to every currently-connected,
-// logged-in session. Called from JobManager's notify (job.go), itself
-// invoked from the refresh/tip-poll loops or a post-block-find refresh.
-func (s *Server) broadcastJob(job *Job) {
+// invalidateAndRepushJobs is called whenever JobManager invalidates its
+// per-xn job cache (tip movement or periodic refresh — see
+// JobManager.Subscribe's doc comment). Since jobs are now per-xn (see
+// job.go's doc comment), there is no single new Job to broadcast:
+// instead, for every currently-connected, logged-in session, a fresh
+// (or freshly-regenerated) job is fetched for THAT session's own xn
+// and pushed to it individually.
+func (s *Server) invalidateAndRepushJobs() {
 	s.mu.RLock()
 	sessions := make([]*Session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
@@ -64,6 +68,14 @@ func (s *Server) broadcastJob(job *Job) {
 	}
 	s.mu.RUnlock()
 	for _, sess := range sessions {
+		if !sess.loggedIn.Load() {
+			continue
+		}
+		job, err := s.jobManager.JobForXN(context.Background(), sess.xn)
+		if err != nil {
+			s.logger.Printf("solo: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.xn, err)
+			continue
+		}
 		sess.pushJob(job)
 	}
 }

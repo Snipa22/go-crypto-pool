@@ -34,9 +34,20 @@ type Session struct {
 	server *Server
 
 	sessionID string
-	loggedIn  atomic.Bool
-	address   atomic.Value // string
-	worker    atomic.Value // string
+	// xn is this session's own randomly-assigned 2-byte extranonce
+	// (job.go's newSessionXN), assigned exactly once, at connect time
+	// (here, in newSession below) — mirroring go-tari-sha3x-solo-stratum's
+	// miner.go connection-init timing exactly, NOT re-rolled per job or
+	// per login. Every job payload sent to this session (login
+	// response's nested job, unsolicited pushes, explicit getjob
+	// responses) carries this same value in JobPayload.XN, and every
+	// submit from this session must have its nonce hex-prefixed with
+	// it (handleSubmit below) or be rejected before any PoW validation
+	// runs.
+	xn       string
+	loggedIn atomic.Bool
+	address  atomic.Value // string
+	worker   atomic.Value // string
 
 	// shareCount/blockCount are local diagnostic counters only — solo
 	// mode has no share table and no backend to forward to (see
@@ -48,7 +59,18 @@ type Session struct {
 
 func newSession(mc *leaflib.ManagedConnection, server *Server) *Session {
 	id, _ := newRandomHexID() // collisions are cosmetic only (diagnostic/session id, not consensus data)
-	s := &Session{mc: mc, server: server, sessionID: id}
+	// Assigned once, here, at connect time — see the xn field's doc
+	// comment. A crypto/rand read failure here is exceptionally rare
+	// (would indicate a broken system RNG); falling back to the
+	// all-zeros xn "0000" rather than panicking or dropping the
+	// connection keeps this session merely un-partitioned from any
+	// other all-zeros-fallback session instead of unusable.
+	xn, err := newSessionXN()
+	if err != nil {
+		xn = "0000"
+		server.logger.Printf("solo: failed to generate session xn, falling back to %q: %v", xn, err)
+	}
+	s := &Session{mc: mc, server: server, sessionID: id, xn: xn}
 	s.address.Store("")
 	s.worker.Store("")
 	return s
@@ -125,8 +147,9 @@ func (s *Session) handleLogin(req Request) {
 	s.worker.Store(worker)
 	s.loggedIn.Store(true)
 
-	job := s.server.jobManager.Current()
-	if job == nil {
+	job, err := s.server.jobManager.JobForXN(context.Background(), s.xn)
+	if err != nil {
+		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
 	}
@@ -135,7 +158,7 @@ func (s *Session) handleLogin(req Request) {
 		JsonRPC: "2.0",
 		Result: LoginResult{
 			ID:     s.sessionID,
-			Job:    jobPayload(job),
+			Job:    s.jobPayload(job),
 			Status: "OK",
 		},
 		Status: "OK",
@@ -148,8 +171,9 @@ func (s *Session) handleGetJob(req Request) {
 		s.writeGeneralResponse(req.ID, "login required before getjob", "")
 		return
 	}
-	job := s.server.jobManager.Current()
-	if job == nil {
+	job, err := s.server.jobManager.JobForXN(context.Background(), s.xn)
+	if err != nil {
+		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
 	}
@@ -165,12 +189,22 @@ func (s *Session) handleGetJob(req Request) {
 // handleSubmit implements the real "submit" method. Underlying logic
 // (SHA3XValidator.Validate, block-target comparison, SubmitBlock,
 // shareCount/blockCount bookkeeping) is unchanged from the previous
-// wire format — only request parsing and response encoding are new.
-// Deliberately does NOT check any XNonce prefix (no xn/extranonce
-// concept in go-crypto-pool's solo leaf — every miner gets the same
-// global job, see job.go's doc comment); DOES enforce per-job
-// used-nonce tracking via Job.MarkNonceUsed, which the previous wire
-// format's implementation never had.
+// wire format — only request parsing and response encoding are new
+// relative to that pass. NOW ALSO enforces the real per-session xn
+// prefix check (ported from go-tari-sha3x-solo-stratum's miner.go
+// SubmitJob: `strings.HasPrefix(strings.ToLower(submittedWork.Nonce),
+// m.xn)`), BEFORE any PoW validation work happens — a nonce that
+// doesn't start with this session's own assigned xn is rejected
+// outright, mirroring the legacy rejection message shape ("Invalid
+// XNonce %v"). This is purely wire-level/session bookkeeping: verified
+// against the real hash math in validator/sha3x.go
+// (sha3xHeaderDiff/GetHeaderDiff) that the full 8-byte nonce is used
+// directly as hash pre-image material with no separate xn encoding —
+// xn is a leading-byte convention miners are expected to respect on
+// their nonce composition, not something baked into the hash function
+// itself, so no change to SHA3XValidator was needed or made. DOES
+// enforce per-job used-nonce tracking via Job.MarkNonceUsed, which the
+// previous wire format's implementation never had.
 func (s *Session) handleSubmit(req Request) {
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before submit", "")
@@ -189,6 +223,13 @@ func (s *Session) handleSubmit(req Request) {
 	job, ok := s.server.jobManager.GetJob(submit.JobID)
 	if !ok {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("unknown or stale job_id: %s", submit.JobID))
+		return
+	}
+
+	// xn-prefix check happens BEFORE nonce decoding/PoW validation —
+	// ported exactly from the legacy ordering and rejection shape.
+	if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 		return
 	}
 
@@ -262,13 +303,13 @@ func (s *Session) handleSubmit(req Request) {
 	s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
 	s.writeShareResponse(req.ID, true, "")
 
-	// A block was found; the current template is now stale for everyone.
-	// Force an immediate refresh rather than waiting on the poll timers.
-	go func() {
-		if _, err := s.server.jobManager.Refresh(context.Background()); err != nil {
-			s.server.logger.Printf("solo: post-block-find job refresh failed: %v", err)
-		}
-	}()
+	// A block was found; every cached per-xn template is now stale
+	// (built against a tip that no longer exists). Invalidate the
+	// whole cache (this also fires JobManager's subscribers, which
+	// triggers Server.invalidateAndRepushJobs to regenerate+push fresh
+	// jobs to every connected session) rather than waiting out the
+	// tip-poll interval.
+	go s.server.jobManager.InvalidateAll()
 }
 
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
@@ -295,27 +336,31 @@ func (s *Session) writeJSON(v any) {
 }
 
 // pushJob sends an unsolicited real "job" push (protocol.go's JobPush)
-// for a newly-refreshed Job.
+// for a newly-(re)generated Job specific to this session's own xn.
 func (s *Session) pushJob(job *Job) {
 	if !s.loggedIn.Load() {
 		return
 	}
-	s.writeJSON(JobPush{JsonRPC: "2.0", Method: "job", Params: jobPayload(job)})
+	s.writeJSON(JobPush{JsonRPC: "2.0", Method: "job", Params: s.jobPayload(job)})
 }
 
 // jobPayload builds the real wire job object (protocol.go's JobPayload)
 // for job, ported exactly from go-tari-sha3x-solo-stratum's
 // minerTracking.MinerJob.GetJobJSON: Blob is hex(Header) (the merge
 // mining hash), JobID is the job's already block-hash-derived real
-// job_id (see job.go's jobIDFromBlockHash), and Target is
-// diffToTarget(difficulty) little-endian-8-byte-then-hex encoded.
-func jobPayload(job *Job) JobPayload {
+// job_id (see job.go's jobIDFromBlockHash), Target is
+// diffToTarget(difficulty) little-endian-8-byte-then-hex encoded, and
+// XN is this session's own assigned extranonce (the same value on
+// every job pushed to this session, since xn is assigned once at
+// connect time — see the xn field's doc comment).
+func (s *Session) jobPayload(job *Job) JobPayload {
 	return JobPayload{
 		Algo:   "sha3x",
 		Blob:   hex.EncodeToString(job.Header),
 		Height: job.Height,
 		JobID:  job.ID,
 		Target: diffToTargetHex(job.StaticDifficulty),
+		XN:     s.xn,
 	}
 }
 
