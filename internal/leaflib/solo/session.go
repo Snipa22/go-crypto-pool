@@ -11,6 +11,7 @@ import (
 	"math"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 	"google.golang.org/protobuf/proto"
@@ -49,12 +50,42 @@ type Session struct {
 	address  atomic.Value // string
 	worker   atomic.Value // string
 
-	// shareCount/blockCount are local diagnostic counters only — solo
+	// shareCount/blockCount are local diagnostic counters only - solo
 	// mode has no share table and no backend to forward to (see
 	// cmd/leaf-solo's doc comment); a share only matters here as
 	// hashrate-estimation signal.
 	shareCount atomic.Uint64
 	blockCount atomic.Uint64
+
+	// --- per-session vardiff state (ported from
+	// go-tari-sha3x-solo-stratum's minerStruct.Difficulty/hashes/
+	// connectTime, see vardiff.go) ---
+
+	// connectedAt is this session's connection time, used by
+	// vardiff.go's maybeRetarget to compute connSeconds
+	// (go-tari-sha3x-solo-stratum's getConnSeconds). Set once, here,
+	// at connect time; never mutated afterward, so no synchronization
+	// is needed for reads from the vardiff goroutine (see the
+	// happens-before guarantee documented on runVardiffLoop).
+	connectedAt time.Time
+
+	// currentDifficulty is THIS session's own current share
+	// difficulty (go-tari-sha3x-solo-stratum's minerStruct.Difficulty).
+	// It starts at the server's configured starting difficulty and is
+	// only ever mutated by this session's own vardiff retarget
+	// goroutine (vardiff.go's maybeRetarget) — no other session's
+	// retarget can touch it, and no shared/global state is involved.
+	currentDifficulty atomic.Uint64
+
+	// hashesAccumulated is the difficulty-weighted accept-history
+	// accumulator (go-tari-sha3x-solo-stratum's minerStruct.hashes):
+	// incremented by the job's current StaticDifficulty on every
+	// accepted share (see handleSubmit below), never reset for the
+	// lifetime of the connection. This is NOT a raw hash count; it is
+	// "sum of difficulty values of every share accepted so far",
+	// which vardiff.go's computeRetarget divides by connection-time to
+	// estimate this session's accepted-share rate.
+	hashesAccumulated atomic.Uint64
 }
 
 func newSession(mc *leaflib.ManagedConnection, server *Server) *Session {
@@ -70,9 +101,10 @@ func newSession(mc *leaflib.ManagedConnection, server *Server) *Session {
 		xn = "0000"
 		server.logger.Printf("solo: failed to generate session xn, falling back to %q: %v", xn, err)
 	}
-	s := &Session{mc: mc, server: server, sessionID: id, xn: xn}
+	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now()}
 	s.address.Store("")
 	s.worker.Store("")
+	s.currentDifficulty.Store(server.startingDifficulty)
 	return s
 }
 
@@ -119,9 +151,11 @@ func (s *Session) handleLine(line string) {
 // every other method — {"id","jsonrpc","method":"login","params":{...}}
 // — confirmed against go-tari-sha3x-solo-stratum's actual dispatch
 // loop). Deliberately does NOT parse "." / "+" address-suffix syntax
-// for payment-ID/custom-difficulty (go-crypto-pool's solo leaf uses one
-// static, leaf-configured difficulty for everyone — see JobManagerConfig
-// .StaticDifficulty) — the address is taken as-is.
+// for payment-ID/custom-difficulty (go-crypto-pool's solo leaf assigns
+// every session the same STARTING difficulty — see
+// LEAF_SOLO_STARTING_DIFFICULTY — after which each session's own
+// vardiff retarget loop (vardiff.go) independently adjusts it based on
+// that session's own accept history) — the address is taken as-is.
 func (s *Session) handleLogin(req Request) {
 	var login LoginRequest
 	if len(req.Params) > 0 {
@@ -147,7 +181,7 @@ func (s *Session) handleLogin(req Request) {
 	s.worker.Store(worker)
 	s.loggedIn.Store(true)
 
-	job, err := s.server.jobManager.JobForXN(context.Background(), s.xn)
+	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
@@ -171,7 +205,7 @@ func (s *Session) handleGetJob(req Request) {
 		s.writeGeneralResponse(req.ID, "login required before getjob", "")
 		return
 	}
-	job, err := s.server.jobManager.JobForXN(context.Background(), s.xn)
+	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
@@ -277,6 +311,14 @@ func (s *Session) handleSubmit(req Request) {
 	diff := validator.SHA3XHeaderDiff(nonce, job.Header)
 
 	if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
+		// Accepted share, below block difficulty: this is the
+		// vardiff accept-history signal (ported exactly from
+		// go-tari-sha3x-solo-stratum's SubmitJob, `m.hashes +=
+		// job.Target` at the "valid, non-block" accept point — see
+		// vardiff.go's doc comment). job.StaticDifficulty is THIS
+		// job's stamped difficulty, i.e. this session's current
+		// vardiff value at the moment this share was accepted.
+		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.writeShareResponse(req.ID, true, "")
 		return
 	}
@@ -288,6 +330,15 @@ func (s *Session) handleSubmit(req Request) {
 	block := cloneBlockWithNonce(job.Result.GetBlock(), nonce)
 	_, err = s.server.node.SubmitBlock(context.Background(), block)
 	if err != nil {
+		// Ported exactly from the reference (miner.go's SubmitJob,
+		// SubmitBlock-error branch): the reference still increments
+		// m.hashes here even though the wire response to the miner
+		// is a rejection (their proof was cryptographically valid,
+		// but the pool/node-level submission failed — that's not the
+		// miner's fault to see as an accept, so mirror the
+		// reference's choice byte-for-byte on both the wire response
+		// AND the vardiff accounting, rather than "fixing" either).
+		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.server.logger.Printf("solo: SubmitBlock failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
 		// Ported exactly from the reference (miner.go's SubmitJob,
 		// SubmitBlock-error branch): the wire response to the miner is
@@ -301,6 +352,7 @@ func (s *Session) handleSubmit(req Request) {
 
 	s.blockCount.Add(1)
 	s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
+	s.hashesAccumulated.Add(job.StaticDifficulty)
 	s.writeShareResponse(req.ID, true, "")
 
 	// A block was found; every cached per-xn template is now stale

@@ -76,11 +76,18 @@ type Job struct {
 	// debuggability/logging.
 	BlockHash []byte
 
-	// StaticDifficulty is the leaf-configured share difficulty (vardiff
-	// is explicitly out of scope for this pass — see LEAF_SOLO_DIFFICULTY
-	// in cmd/leaf-solo/main.go). This is also the difficulty the wire
-	// "target" field (protocol.go's JobPayload) is derived from — see
-	// diffToTarget in session.go's jobPayload helper.
+	// StaticDifficulty is the share difficulty this Job was stamped
+	// with at generation time. Despite the name (kept for backward
+	// compatibility with the field's original static-difficulty-only
+	// meaning), this now holds whatever difficulty value was current
+	// for the owning session at the moment the job was (re)generated
+	// or restamped — see vardiff.go: each session's own per-connection
+	// retarget loop can change its difficulty independently, and
+	// JobManager.RestampDifficulty produces a fresh *Job (same ID/
+	// Header/template, new StaticDifficulty) reflecting that change.
+	// This is also the difficulty the wire "target" field
+	// (protocol.go's JobPayload) is derived from — see diffToTarget in
+	// session.go's jobPayload helper.
 	StaticDifficulty uint64
 
 	// NetworkTargetDifficulty is the real difficulty a share's hash must
@@ -132,9 +139,17 @@ type JobManagerConfig struct {
 	// mode's only payout destination — see cmd/leaf-solo's doc comment).
 	PayoutAddress string
 
-	// StaticDifficulty is the fixed per-share difficulty every job is
-	// stamped with. Vardiff is explicitly deferred; see Job's doc
-	// comment.
+	// StaticDifficulty is the DEFAULT/fallback difficulty JobForXN
+	// stamps onto a newly-generated Job when no per-session difficulty
+	// override is supplied. In production, every real caller now goes
+	// through JobForXNAtDifficulty with the requesting session's own
+	// current vardiff difficulty (see session.go's handleLogin/
+	// handleGetJob and server.go's invalidateAndRepushJobs), so this
+	// field is effectively only exercised by JobForXN callers that
+	// don't care about a specific difficulty (tests, Probe-adjacent
+	// code paths). Vardiff (per-session adaptive retargeting) is
+	// implemented in vardiff.go; this field is NOT the "one true"
+	// difficulty for every session anymore.
 	StaticDifficulty uint64
 
 	// RefreshInterval is how often the ENTIRE per-xn job cache is
@@ -214,8 +229,30 @@ func NewJobManager(cfg JobManagerConfig) *JobManager {
 // go-tari-sha3x-solo-stratum's GetBlockWithXN. Repeat calls with the
 // same xn against the same cache generation return the SAME Job
 // (consistent job_id across getjob calls), matching the legacy
-// behavior exactly.
+// behavior exactly. A newly-generated Job (first-time-seen xn, or the
+// first request after invalidation) is stamped with
+// JobManagerConfig.StaticDifficulty; callers that want a specific
+// session's own current vardiff difficulty stamped instead should use
+// JobForXNAtDifficulty.
 func (jm *JobManager) JobForXN(ctx context.Context, xn string) (*Job, error) {
+	return jm.jobForXN(ctx, xn, jm.cfg.StaticDifficulty)
+}
+
+// JobForXNAtDifficulty is JobForXN's per-session-vardiff-aware
+// counterpart: if xn is not yet cached (first request, or the first
+// request after an invalidation), the freshly-generated Job is stamped
+// with difficulty instead of JobManagerConfig.StaticDifficulty. If xn
+// is already cached, the EXISTING cached Job is returned as-is
+// (matching JobForXN's "repeat requests get the same Job" contract) —
+// this does NOT retroactively change an already-cached job's stamped
+// difficulty; that is RestampDifficulty's job, called explicitly by a
+// session's vardiff retarget (vardiff.go's maybeRetarget), not by every
+// ordinary getjob/login call.
+func (jm *JobManager) JobForXNAtDifficulty(ctx context.Context, xn string, difficulty uint64) (*Job, error) {
+	return jm.jobForXN(ctx, xn, difficulty)
+}
+
+func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64) (*Job, error) {
 	if job, ok := jm.lookupXN(xn); ok {
 		return job, nil
 	}
@@ -249,7 +286,7 @@ func (jm *JobManager) JobForXN(ctx context.Context, xn string) (*Job, error) {
 		Height:                  result.GetBlock().GetHeader().GetHeight(),
 		Header:                  result.GetMergeMiningHash(),
 		BlockHash:               result.GetBlockHash(),
-		StaticDifficulty:        jm.cfg.StaticDifficulty,
+		StaticDifficulty:        difficulty,
 		NetworkTargetDifficulty: result.GetMinerData().GetTargetDifficulty(),
 		Result:                  result,
 		CreatedAt:               time.Now(),
@@ -261,6 +298,57 @@ func (jm *JobManager) JobForXN(ctx context.Context, xn string) (*Job, error) {
 	jm.mu.Unlock()
 
 	return job, nil
+}
+
+// RestampDifficulty is vardiff.go's job-push mechanism: given that xn's
+// CURRENTLY cached Job (block template, height, header — all unchanged,
+// no new GRPC call needed), produce and cache a new *Job with the SAME
+// ID/Height/Header/BlockHash/NetworkTargetDifficulty/Result but a NEW
+// StaticDifficulty, replacing the old entry under both perXN[xn] and
+// jobsByID[id] — mirroring go-tari-sha3x-solo-stratum's getJob(), which
+// on every SendNewJob call constructs a brand new minerTracking.MinerJob
+// (with a fresh, empty UsedNonces set) under the SAME jobLog[blockHash]
+// key whenever the block hash/xn is unchanged, just with an updated
+// Target field. If xn has no cached Job yet (a retarget firing before
+// this session's first getjob/login, which in practice can't happen
+// since a session always logs in before its vardiff loop can start —
+// see vardiff.go's runVardiffLoop is only started after Run begins, and
+// login is the first message any session sends), this falls back to
+// generating a brand new one at the requested difficulty, exactly like
+// JobForXNAtDifficulty would. If the cached Job's StaticDifficulty
+// already equals difficulty, the existing Job is returned unchanged
+// (no-op, no new cache entry) — callers (vardiff.go's maybeRetarget)
+// are expected not to call this unless the retarget algorithm actually
+// decided the difficulty changed, but this guard makes RestampDifficulty
+// itself idempotent regardless.
+func (jm *JobManager) RestampDifficulty(ctx context.Context, xn string, difficulty uint64) (*Job, error) {
+	jm.mu.RLock()
+	existing, ok := jm.perXN[xn]
+	jm.mu.RUnlock()
+	if !ok {
+		return jm.jobForXN(ctx, xn, difficulty)
+	}
+	if existing.StaticDifficulty == difficulty {
+		return existing, nil
+	}
+
+	restamped := &Job{
+		ID:                      existing.ID,
+		Height:                  existing.Height,
+		Header:                  existing.Header,
+		BlockHash:               existing.BlockHash,
+		StaticDifficulty:        difficulty,
+		NetworkTargetDifficulty: existing.NetworkTargetDifficulty,
+		Result:                  existing.Result,
+		CreatedAt:               existing.CreatedAt,
+	}
+
+	jm.mu.Lock()
+	jm.perXN[xn] = restamped
+	jm.jobsByID[restamped.ID] = restamped
+	jm.mu.Unlock()
+
+	return restamped, nil
 }
 
 func (jm *JobManager) lookupXN(xn string) (*Job, bool) {
