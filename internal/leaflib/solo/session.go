@@ -4,6 +4,7 @@ package solo
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -20,12 +21,14 @@ import (
 )
 
 // Session drives one miner connection's request/response loop on top of
-// an already-accepted *leaflib.ManagedConnection. It never bypasses
-// ManagedConnection's lifecycle guarantees: all reads go through mc.Read
-// (which re-arms the rolling idle deadline — see connection.go), all
-// writes go through mc.Write (which is already synchronized onto the
-// connection's single writer goroutine), and teardown always ends in
-// mc.Close so the ConnectionManager registry stays consistent.
+// an already-accepted *leaflib.ManagedConnection, speaking the real
+// Monero-style JSON-RPC 2.0 stratum dialect (protocol.go) that actual
+// SHA3X miner software requires. It never bypasses ManagedConnection's
+// lifecycle guarantees: all reads go through mc.Read (which re-arms the
+// rolling idle deadline — see connection.go), all writes go through
+// mc.Write (which is already synchronized onto the connection's single
+// writer goroutine), and teardown always ends in mc.Close so the
+// ConnectionManager registry stays consistent.
 type Session struct {
 	mc     *leaflib.ManagedConnection
 	server *Server
@@ -44,7 +47,7 @@ type Session struct {
 }
 
 func newSession(mc *leaflib.ManagedConnection, server *Server) *Session {
-	id, _ := newJobID() // reuse the same random-hex helper; collisions are cosmetic only
+	id, _ := newRandomHexID() // collisions are cosmetic only (diagnostic/session id, not consensus data)
 	s := &Session{mc: mc, server: server, sessionID: id}
 	s.address.Store("")
 	s.worker.Store("")
@@ -72,7 +75,7 @@ func (s *Session) Run(ctx context.Context) {
 func (s *Session) handleLine(line string) {
 	var req Request
 	if err := json.Unmarshal([]byte(line), &req); err != nil {
-		s.writeResponse(0, nil, fmt.Sprintf("invalid request: %v", err))
+		s.server.logger.Printf("solo: session %s sent unparseable message, dropping: %v", s.sessionID, err)
 		return
 	}
 	switch req.Method {
@@ -82,79 +85,124 @@ func (s *Session) handleLine(line string) {
 		s.handleGetJob(req)
 	case "submit":
 		s.handleSubmit(req)
+	case "keepalived":
+		s.writeGeneralResponse(req.ID, "", "KEEPALIVED")
 	default:
-		s.writeResponse(req.ID, nil, fmt.Sprintf("unknown method: %s", req.Method))
+		s.writeGeneralResponse(req.ID, fmt.Sprintf("unknown method: %s", req.Method), "")
 	}
 }
 
+// handleLogin implements the real "login" method (see protocol.go's
+// doc comment: the wire message is wrapped in the same envelope as
+// every other method — {"id","jsonrpc","method":"login","params":{...}}
+// — confirmed against go-tari-sha3x-solo-stratum's actual dispatch
+// loop). Deliberately does NOT parse "." / "+" address-suffix syntax
+// for payment-ID/custom-difficulty (go-crypto-pool's solo leaf uses one
+// static, leaf-configured difficulty for everyone — see JobManagerConfig
+// .StaticDifficulty) — the address is taken as-is.
 func (s *Session) handleLogin(req Request) {
-	var params LoginParams
+	var login LoginRequest
 	if len(req.Params) > 0 {
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			s.writeResponse(req.ID, nil, fmt.Sprintf("invalid login params: %v", err))
+		if err := json.Unmarshal(req.Params, &login); err != nil {
+			s.writeGeneralResponse(req.ID, fmt.Sprintf("invalid login params: %v", err), "")
 			return
 		}
 	}
-	if params.Address == "" {
-		s.writeResponse(req.ID, nil, "login requires a non-empty address")
+	if login.Login == "" {
+		s.writeGeneralResponse(req.ID, "invalid address provided, please use a valid address", "")
 		return
 	}
-	s.address.Store(params.Address)
-	s.worker.Store(params.Worker)
+
+	worker := login.Pass
+	if login.RigID != "" {
+		worker = login.RigID
+	}
+	if worker == "" {
+		worker = "x"
+	}
+
+	s.address.Store(login.Login)
+	s.worker.Store(worker)
 	s.loggedIn.Store(true)
 
 	job := s.server.jobManager.Current()
 	if job == nil {
-		s.writeResponse(req.ID, nil, "no job template available yet, retry shortly")
+		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
 	}
-	s.writeResponse(req.ID, LoginResult{
-		Status:    "ok",
-		SessionID: s.sessionID,
-		Job:       jobPayload(job),
-	}, "")
+	resp := LoginResponse{
+		ID:      req.ID,
+		JsonRPC: "2.0",
+		Result: LoginResult{
+			ID:     s.sessionID,
+			Job:    jobPayload(job),
+			Status: "OK",
+		},
+		Status: "OK",
+	}
+	s.writeJSON(resp)
 }
 
 func (s *Session) handleGetJob(req Request) {
 	if !s.loggedIn.Load() {
-		s.writeResponse(req.ID, nil, "login required before getjob")
+		s.writeGeneralResponse(req.ID, "login required before getjob", "")
 		return
 	}
 	job := s.server.jobManager.Current()
 	if job == nil {
-		s.writeResponse(req.ID, nil, "no job template available yet, retry shortly")
+		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
 	}
-	s.writeResponse(req.ID, jobPayload(job), "")
+	// Real miners issuing an explicit getjob get the same unsolicited
+	// "job" push shape as an unprompted refresh, per
+	// go-tari-sha3x-solo-stratum's dispatch (server.go's `case
+	// "getjob"` calls SendNewJob(false), the same push path a
+	// background refresh uses — it does not echo the request id back
+	// in a Response).
+	s.pushJob(job)
 }
 
+// handleSubmit implements the real "submit" method. Underlying logic
+// (SHA3XValidator.Validate, block-target comparison, SubmitBlock,
+// shareCount/blockCount bookkeeping) is unchanged from the previous
+// wire format — only request parsing and response encoding are new.
+// Deliberately does NOT check any XNonce prefix (no xn/extranonce
+// concept in go-crypto-pool's solo leaf — every miner gets the same
+// global job, see job.go's doc comment); DOES enforce per-job
+// used-nonce tracking via Job.MarkNonceUsed, which the previous wire
+// format's implementation never had.
 func (s *Session) handleSubmit(req Request) {
 	if !s.loggedIn.Load() {
-		s.writeResponse(req.ID, nil, "login required before submit")
+		s.writeGeneralResponse(req.ID, "login required before submit", "")
 		return
 	}
-	var params SubmitParams
+	var submit SubmitRequest
 	if len(req.Params) == 0 {
-		s.writeResponse(req.ID, nil, "submit requires params")
+		s.writeShareResponse(req.ID, false, "submit requires params")
 		return
 	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		s.writeResponse(req.ID, nil, fmt.Sprintf("invalid submit params: %v", err))
+	if err := json.Unmarshal(req.Params, &submit); err != nil {
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid submit params: %v", err))
 		return
 	}
 
-	job, ok := s.server.jobManager.GetJob(params.JobID)
+	job, ok := s.server.jobManager.GetJob(submit.JobID)
 	if !ok {
-		s.writeResponse(req.ID, SubmitResult{Status: StatusRejected}, "unknown or stale job_id, request a new job")
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("unknown or stale job_id: %s", submit.JobID))
 		return
 	}
 
-	nonceBytes, err := hex.DecodeString(params.Nonce)
+	nonceBytes, err := hex.DecodeString(submit.Nonce)
 	if err != nil || len(nonceBytes) != 8 {
-		s.writeResponse(req.ID, SubmitResult{Status: StatusRejected}, "nonce must be 8 bytes, hex-encoded little-endian uint64")
+		s.writeShareResponse(req.ID, false, "nonce must be 8 bytes, hex-encoded little-endian uint64")
 		return
 	}
-	nonce := leBytesToUint64(nonceBytes)
+	nonce := binary.LittleEndian.Uint64(nonceBytes)
+
+	if !job.MarkNonceUsed(nonce) {
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("duplicate nonce: %s", submit.Nonce))
+		return
+	}
 
 	share := &poolpb.Share{
 		Algo:           poolpb.Algo_ALGO_SHA3X,
@@ -173,11 +221,11 @@ func (s *Session) handleSubmit(req Request) {
 
 	valid, err := s.server.validator.Validate(context.Background(), share)
 	if err != nil && err != validator.ErrWrongProofType {
-		s.writeResponse(req.ID, SubmitResult{Status: StatusRejected}, fmt.Sprintf("validation error: %v", err))
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
 		return
 	}
 	if !valid {
-		s.writeResponse(req.ID, SubmitResult{Status: StatusRejected}, "share does not meet configured difficulty or is cryptographically invalid")
+		s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
 		return
 	}
 
@@ -188,7 +236,7 @@ func (s *Session) handleSubmit(req Request) {
 	diff := validator.SHA3XHeaderDiff(nonce, job.Header)
 
 	if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
-		s.writeResponse(req.ID, SubmitResult{Status: StatusOK, Difficulty: diff}, "")
+		s.writeShareResponse(req.ID, true, "")
 		return
 	}
 
@@ -200,13 +248,19 @@ func (s *Session) handleSubmit(req Request) {
 	_, err = s.server.node.SubmitBlock(context.Background(), block)
 	if err != nil {
 		s.server.logger.Printf("solo: SubmitBlock failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
-		s.writeResponse(req.ID, SubmitResult{Status: StatusBlockRejected, Difficulty: diff}, err.Error())
+		// Ported exactly from the reference (miner.go's SubmitJob,
+		// SubmitBlock-error branch): the wire response to the miner is
+		// still a rejection (their proof was cryptographically valid,
+		// but the pool/node-level submission failed — that is not the
+		// miner's fault to see as an accept, so mirror the reference's
+		// choice here byte-for-byte rather than "fixing" it).
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: %v", err))
 		return
 	}
 
 	s.blockCount.Add(1)
 	s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
-	s.writeResponse(req.ID, SubmitResult{Status: StatusBlockFound, Difficulty: diff}, "")
+	s.writeShareResponse(req.ID, true, "")
 
 	// A block was found; the current template is now stale for everyone.
 	// Force an immediate refresh rather than waiting on the poll timers.
@@ -217,9 +271,16 @@ func (s *Session) handleSubmit(req Request) {
 	}()
 }
 
-func (s *Session) writeResponse(id int, result any, errMsg string) {
-	resp := Response{ID: id, Result: result, Error: errMsg}
-	buf, err := json.Marshal(resp)
+func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
+	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
+}
+
+func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
+	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
+}
+
+func (s *Session) writeJSON(v any) {
+	buf, err := json.Marshal(v)
 	if err != nil {
 		s.server.logger.Printf("solo: failed to marshal response for session %s: %v", s.sessionID, err)
 		return
@@ -233,36 +294,49 @@ func (s *Session) writeResponse(id int, result any, errMsg string) {
 	}
 }
 
-// pushJob sends an unsolicited "job" push for a newly-refreshed Job.
+// pushJob sends an unsolicited real "job" push (protocol.go's JobPush)
+// for a newly-refreshed Job.
 func (s *Session) pushJob(job *Job) {
 	if !s.loggedIn.Load() {
 		return
 	}
-	push := Push{Method: "job", Params: jobPayload(job)}
-	buf, err := json.Marshal(push)
-	if err != nil {
-		return
-	}
-	buf = append(buf, '\n')
-	_ = s.mc.Write(buf)
+	s.writeJSON(JobPush{JsonRPC: "2.0", Method: "job", Params: jobPayload(job)})
 }
 
+// jobPayload builds the real wire job object (protocol.go's JobPayload)
+// for job, ported exactly from go-tari-sha3x-solo-stratum's
+// minerTracking.MinerJob.GetJobJSON: Blob is hex(Header) (the merge
+// mining hash), JobID is the job's already block-hash-derived real
+// job_id (see job.go's jobIDFromBlockHash), and Target is
+// diffToTarget(difficulty) little-endian-8-byte-then-hex encoded.
 func jobPayload(job *Job) JobPayload {
 	return JobPayload{
-		JobID:      job.ID,
-		Height:     job.Height,
-		Header:     hex.EncodeToString(job.Header),
-		Difficulty: job.StaticDifficulty,
-		Algo:       "sha3x",
+		Algo:   "sha3x",
+		Blob:   hex.EncodeToString(job.Header),
+		Height: job.Height,
+		JobID:  job.ID,
+		Target: diffToTargetHex(job.StaticDifficulty),
 	}
 }
 
-func leBytesToUint64(b []byte) uint64 {
-	var v uint64
-	for i := 0; i < 8 && i < len(b); i++ {
-		v |= uint64(b[i]) << (8 * i)
+// diffToTargetHex ports go-tari-sha3x-solo-stratum's
+// minerTracking.MinerJob.diffToTarget + GetJobJSON's subsequent
+// encoding exactly: target = uint64(2^64-1) / difficulty, then that
+// resulting uint64 is written out as 8 raw bytes in LITTLE-ENDIAN
+// order, then hex-encoded as a string. A difficulty of 0 would be a
+// division by zero in the reference's own formula too (it has no
+// guard); since go-crypto-pool always stamps jobs with a non-zero
+// leaf-configured StaticDifficulty (LEAF_SOLO_DIFFICULTY) in normal
+// operation, treat an explicit 0 as 1 here purely to avoid a runtime
+// panic on a misconfiguration rather than changing the real formula.
+func diffToTargetHex(difficulty uint64) string {
+	if difficulty == 0 {
+		difficulty = 1
 	}
-	return v
+	target := uint64(math.MaxUint64) / difficulty
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, target)
+	return hex.EncodeToString(buf)
 }
 
 // safeInt64 converts a uint64 to int64 by clamping to math.MaxInt64

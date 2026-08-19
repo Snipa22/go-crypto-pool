@@ -3,88 +3,160 @@ package solo
 
 import "encoding/json"
 
-// Wire protocol: newline-delimited JSON objects in both directions.
-// This is a new, intentionally minimal protocol for go-crypto-pool (not
-// required to match the legacy go-tari-sha3x-solo-stratum JSON-RPC wire
-// format byte-for-byte), loosely inspired by it:
+// Wire protocol: newline-delimited JSON objects in both directions,
+// speaking the real Monero-style JSON-RPC 2.0 stratum dialect used by
+// actual SHA3X miner software (XMRig-class tools, the tari-project/
+// graxil GPU miner, etc.) — ported byte-shape-for-byte-shape from the
+// legacy go-tari-sha3x-solo-stratum reference implementation
+// (subsystems/messages/minerStructs.go, subsystems/poolStratum/
+// miner.go, subsystems/minerTracking/structs.go), NOT the custom
+// JSON-line protocol this file previously defined (see PR #7). This
+// replaces that custom protocol outright: no real miner speaks it, so
+// nothing about it survives except the underlying validator/JobManager
+// wiring, which is untouched.
 //
-//   Client -> Server (request):
-//     {"id":1,"method":"login","params":{"address":"...","worker":"rig1"}}
-//     {"id":2,"method":"getjob"}
-//     {"id":3,"method":"submit","params":{"job_id":"...","nonce":"..hex.."}}
+// Confirmed against the reference's actual dispatch loop
+// (subsystems/poolStratum/server.go, ~line 139-152): EVERY client->server
+// message — including login — arrives wrapped in the same envelope
+// below; login is not a bare/unwrapped object on the wire. Only the
+// reference's internal Go convenience unmarshal (MinerRPCLogin) is
+// unwrapped from Request.Params, not the wire message itself.
 //
-//   Server -> Client (response to a request, echoes id):
-//     {"id":1,"result":{...},"error":null}
+//	Miner -> Server (envelope, all methods):
+//	  {"id":1,"jsonrpc":"2.0","method":"login","params":{"login":"<address>","pass":"x","agent":"XMRig/6.21.0","algo":["sha3x"]}}
+//	  {"id":2,"jsonrpc":"2.0","method":"submit","params":{"id":"<session id>","job_id":"<job_id>","nonce":"<hex le8>","result":"<hex>"}}
+//	  {"id":3,"jsonrpc":"2.0","method":"getjob"}
 //
-//   Server -> Client (unsolicited push, id omitted/zero):
-//     {"method":"job","params":{...}}
+//	Server -> Miner, login response:
+//	  {"id":1,"jsonrpc":"2.0","result":{"id":"<session id>","job":{...},"status":"OK"},"status":"OK"}
+//
+//	Server -> Miner, unsolicited new job push (e.g. on tip movement):
+//	  {"jsonrpc":"2.0","method":"job","params":{...}}
+//
+//	Server -> Miner, submit (share) response — bare boolean result:
+//	  {"id":2,"jsonrpc":"2.0","result":true}
+//
+//	Server -> Miner, general/login error response — STRING result
+//	(distinct shape from the share response above; result here is
+//	always a string, never a bool):
+//	  {"id":1,"jsonrpc":"2.0","error":"invalid address provided","result":""}
+//
+// Deliberately NOT ported from the legacy reference (see task/PR
+// description for rationale — go-crypto-pool's solo leaf gives every
+// miner the same single global job, so extranonce-prefix splitting and
+// per-miner custom-difficulty address suffixes do not apply here):
+//   - XNonce ("xn") extranonce splitting/prefix-checking.
+//   - "." / "+" login-address suffix parsing for payment-ID/custom-diff.
+//
+// Ported and REQUIRED (see task description): per-job used-nonce
+// tracking, so a miner can't replay the same nonce twice for credit —
+// implemented on Job itself (job.go), since jobs are shared globally
+// across all connected miners in this leaf, not per-session.
 
-// Request is one client->server line.
+// Request is one client->server envelope. Every method — login,
+// getjob, submit — arrives wrapped in this shape; see this file's doc
+// comment for how that was confirmed against the reference dispatch
+// loop.
 type Request struct {
-	ID     int             `json:"id,omitempty"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params,omitempty"`
+	ID      int             `json:"id"`
+	JsonRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
 }
 
-// Response is one server->client reply to a Request (Method omitted; ID
-// echoes the request it answers).
-type Response struct {
-	ID     int    `json:"id"`
-	Result any    `json:"result,omitempty"`
-	Error  string `json:"error,omitempty"`
+// LoginRequest is the real "login" method's params shape
+// (messages.MinerRPCLogin in the reference).
+type LoginRequest struct {
+	Login string   `json:"login"`
+	Pass  string   `json:"pass"`
+	Agent string   `json:"agent"`
+	Algo  []string `json:"algo"`
+	RigID string   `json:"rigid"`
 }
 
-// Push is one server->client unsolicited message (new job broadcast).
-type Push struct {
-	Method string `json:"method"`
-	Params any    `json:"params"`
+// SubmitRequest is the real "submit" method's params shape
+// (messages.MinerRPCSubmit in the reference). ID here is the
+// session/connection id the miner was handed at login (echoed back,
+// not separately validated — the reference doesn't authenticate on it
+// either, see miner.go's SubmitJob), JobID matches a previously-sent
+// job_id, Nonce is hex-encoded little-endian 8 bytes, and Result is the
+// miner's claimed hex-encoded hash (accepted on the wire, but not
+// required for validation since the server recomputes it for real via
+// SHA3XValidator).
+type SubmitRequest struct {
+	ID     string `json:"id"`
+	JobID  string `json:"job_id"`
+	Nonce  string `json:"nonce"`
+	Result string `json:"result"`
 }
 
-// LoginParams is the "login" request body: the address rewards/shares
-// are attributed to locally (diagnostic only in solo mode — there is no
-// backend payout scheme, see cmd/leaf-solo's doc comment) and an
-// optional worker/rig name.
-type LoginParams struct {
-	Address string `json:"address"`
-	Worker  string `json:"worker,omitempty"`
-}
-
-// JobPayload is the wire shape of a Job (job.go) pushed to a miner,
-// either as part of a login response or an unsolicited "job" push.
+// JobPayload is the real job object shape (messages.MinerJobJSON in the
+// reference, minus the "xn" extranonce field, which does not apply to
+// go-crypto-pool's solo leaf — see this file's doc comment). It is used
+// both nested inside a login response's "job" field and as a
+// standalone unsolicited "job" push's "params".
+//
+// Target/blob/job_id encodings (see minerTracking/structs.go's
+// diffToTarget/GetJobJSON, ported exactly in jobPayload below):
+//   - Blob is hex(job.Header), where Header is the real
+//     MergeMiningHash pre-image material.
+//   - Target is uint64(2^64-1)/difficulty, encoded as 8 raw bytes in
+//     LITTLE-ENDIAN order, then hex-encoded as a string.
+//   - JobID is hex(BlockHash)[0:16] — the first 16 HEX CHARACTERS of
+//     the hex-encoded raw block hash.
 type JobPayload struct {
-	JobID      string `json:"job_id"`
-	Height     uint64 `json:"height"`
-	Header     string `json:"header"` // hex-encoded merge-mining-hash pre-image material
-	Difficulty uint64 `json:"difficulty"`
-	Algo       string `json:"algo"`
+	Algo   string `json:"algo"`
+	Blob   string `json:"blob"`
+	Height uint64 `json:"height"`
+	JobID  string `json:"job_id"`
+	Target string `json:"target"`
 }
 
-// LoginResult is the "login" response body.
+// LoginResult is the real login response's nested "result" object.
 type LoginResult struct {
-	Status    string     `json:"status"`
-	SessionID string     `json:"session_id"`
-	Job       JobPayload `json:"job"`
+	ID     string     `json:"id"`
+	Job    JobPayload `json:"job"`
+	Status string     `json:"status"`
 }
 
-// SubmitParams is the "submit" request body: the job this proof is
-// against, and the nonce the miner found, hex-encoded (little-endian
-// uint64, matching internal/leaflib/validator.SHA3XValidator's expected
-// nonce encoding via SHA3XProof.Nonce — see sha3x.go).
-type SubmitParams struct {
-	JobID string `json:"job_id"`
-	Nonce string `json:"nonce"`
+// LoginResponse is the real "login" response envelope
+// (messages.MinerRPCLoginResponse in the reference) — note the
+// top-level "status" field duplicated alongside the nested one, ported
+// exactly as the reference has it.
+type LoginResponse struct {
+	ID      int         `json:"id"`
+	JsonRPC string      `json:"jsonrpc"`
+	Result  LoginResult `json:"result"`
+	Status  string      `json:"status"`
 }
 
-// Share-outcome status strings returned in a "submit" Response.Result.
-const (
-	StatusOK            = "ok"             // valid share, below block difficulty
-	StatusBlockFound    = "block_found"    // valid share, met block difficulty, submitted
-	StatusRejected      = "rejected"       // invalid share (bad nonce encoding, wrong job, or failed PoW check)
-	StatusBlockRejected = "block_rejected" // met block difficulty locally but the node rejected SubmitBlock
-)
+// JobPush is the real unsolicited new-job push envelope
+// (messages.MinerRPCPush in the reference).
+type JobPush struct {
+	JsonRPC string     `json:"jsonrpc"`
+	Method  string     `json:"method"`
+	Params  JobPayload `json:"params"`
+}
 
-// SubmitResult is the "submit" response body.
-type SubmitResult struct {
-	Status     string `json:"status"`
-	Difficulty uint64 `json:"difficulty"`
+// ShareResponse is the real submit/share response shape
+// (messages.MinerRPCShareResponse in the reference) — Result is a bare
+// BOOLEAN. This is a genuinely different shape from ErrorResponse
+// below (whose Result is a string); real miners parse these
+// differently, so they must not be conflated.
+type ShareResponse struct {
+	ID      int    `json:"id"`
+	JsonRPC string `json:"jsonrpc"`
+	Error   string `json:"error,omitempty"`
+	Result  bool   `json:"result"`
+}
+
+// ErrorResponse is the real general-purpose response shape
+// (messages.MinerRPCResponse in the reference), used for login errors,
+// unknown methods, keepalive acks, and anything else that is not a
+// share/submit outcome. Result here is a STRING, not a boolean.
+type ErrorResponse struct {
+	ID      int    `json:"id"`
+	JsonRPC string `json:"jsonrpc"`
+	Error   string `json:"error,omitempty"`
+	Result  string `json:"result"`
 }
