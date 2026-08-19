@@ -20,16 +20,33 @@
 // LEAF_SOLO_STARTING_DIFFICULTY and its own per-connection retarget
 // loop independently adjusts it from there based on that session's own
 // accept history.
+//
+// Also REMOVED: the single-listener/single-starting-difficulty model.
+// leaf-solo now supports any number of simultaneous stratum "port
+// tiers" (internal/leaflib/solo/portconfig.go's PortConfig) — each a
+// (listen address, starting difficulty, operator label) triple, all
+// sharing the SAME JobManager/ConnectionManager/NodeClient/validator
+// (one backend node connection, one set of per-xn job templates,
+// exposed on multiple ports). See LEAF_SOLO_PORTS / -ports below;
+// LEAF_SOLO_LISTEN_ADDRESS + LEAF_SOLO_STARTING_DIFFICULTY remain
+// fully supported as the implicit single-tier configuration when
+// LEAF_SOLO_PORTS is unset, so the already-deployed CT132
+// leaf-solo.service (which only knows the old single-value env vars)
+// keeps working unmodified.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -46,6 +63,7 @@ type config struct {
 	network         string
 
 	startingDifficulty uint64
+	portsRaw           string
 	minDifficulty      uint64
 	maxDifficulty      uint64
 	vardiffTargetTime  int
@@ -72,6 +90,7 @@ func loadConfig() config {
 	// smooth migration, but LEAF_SOLO_STARTING_DIFFICULTY takes
 	// precedence when both are set.
 	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64Fallback("LEAF_SOLO_STARTING_DIFFICULTY", "LEAF_SOLO_DIFFICULTY", 10000), "starting share difficulty for a newly-connected session; vardiff adjusts it from here based on that session's own accept history. Env: LEAF_SOLO_STARTING_DIFFICULTY (falls back to legacy LEAF_SOLO_DIFFICULTY if unset)")
+	flag.StringVar(&cfg.portsRaw, "ports", envOr("LEAF_SOLO_PORTS", ""), "comma-separated list of address:difficulty[:desc] port tiers, e.g. ':4444:10000:low-diff,:4445:1000000:high-diff'. When set, this REPLACES -listen-address/-starting-difficulty entirely (they are ignored). When unset (the default), -listen-address/-starting-difficulty are used as a single implicit port tier, preserving the pre-multi-port behavior exactly. Env: LEAF_SOLO_PORTS")
 	flag.Uint64Var(&cfg.minDifficulty, "min-difficulty", envOrUint64("LEAF_SOLO_MIN_DIFFICULTY", 100), "absolute floor vardiff will never retarget below. Env: LEAF_SOLO_MIN_DIFFICULTY")
 	flag.Uint64Var(&cfg.maxDifficulty, "max-difficulty", envOrUint64("LEAF_SOLO_MAX_DIFFICULTY", 1_000_000_000), "absolute ceiling vardiff will never retarget above. Env: LEAF_SOLO_MAX_DIFFICULTY")
 	flag.IntVar(&cfg.vardiffTargetTime, "vardiff-target-time", envOrInt("LEAF_SOLO_VARDIFF_TARGET_TIME", 30), "seconds between shares vardiff aims for. Env: LEAF_SOLO_VARDIFF_TARGET_TIME")
@@ -85,6 +104,91 @@ func loadConfig() config {
 
 	flag.Parse()
 	return cfg
+}
+
+// resolvePorts turns cfg's port configuration into a concrete list of
+// solo.PortConfig port tiers. If cfg.portsRaw is set (LEAF_SOLO_PORTS /
+// -ports), it is parsed as a comma-separated list of
+// "address:difficulty[:desc]" entries — each entry's address is
+// everything up to the LAST TWO colon-separated fields (so IPv6
+// addresses and bare ":PORT" forms both work: "difficulty" and
+// "desc"/(no desc) are peeled off the tail, and whatever remains is
+// the listen address verbatim). If cfg.portsRaw is unset, this returns
+// a single implicit port tier built from cfg.listenAddress /
+// cfg.startingDifficulty — this is the exact backward-compatible path
+// the already-deployed CT132 leaf-solo.service (old single-value env
+// vars only) relies on.
+func resolvePorts(cfg config) ([]solo.PortConfig, error) {
+	if strings.TrimSpace(cfg.portsRaw) == "" {
+		return []solo.PortConfig{{
+			Address:    cfg.listenAddress,
+			Difficulty: cfg.startingDifficulty,
+			PortDesc:   "default",
+		}}, nil
+	}
+
+	entries := strings.Split(cfg.portsRaw, ",")
+	ports := make([]solo.PortConfig, 0, len(entries))
+	for i, raw := range entries {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		port, err := parsePortEntry(raw)
+		if err != nil {
+			return nil, fmt.Errorf("LEAF_SOLO_PORTS entry %d (%q): %w", i+1, raw, err)
+		}
+		ports = append(ports, port)
+	}
+	if len(ports) == 0 {
+		return nil, errors.New("LEAF_SOLO_PORTS was set but contained no usable entries")
+	}
+	return ports, nil
+}
+
+// parsePortEntry parses one "address:difficulty" or
+// "address:difficulty:desc" entry. address itself is free to contain
+// colons (bare ":4444", "0.0.0.0:4444", "[::1]:4444") — difficulty
+// (and an optional trailing desc) are peeled off the END of the
+// colon-separated fields rather than assuming address has no colons of
+// its own.
+func parsePortEntry(raw string) (solo.PortConfig, error) {
+	fields := strings.Split(raw, ":")
+	if len(fields) < 2 {
+		return solo.PortConfig{}, errors.New(`expected "address:difficulty" or "address:difficulty:desc"`)
+	}
+
+	// Try treating the LAST field as difficulty first (the
+	// "address:difficulty:desc" shape); if that doesn't parse as a
+	// number, fall back to the second-to-last field being difficulty
+	// and the last being desc.
+	var (
+		addressFields []string
+		difficulty    uint64
+		desc          string
+		err           error
+	)
+	if difficulty, err = strconv.ParseUint(fields[len(fields)-1], 10, 64); err == nil {
+		addressFields = fields[:len(fields)-1]
+	} else if len(fields) >= 3 {
+		difficulty, err = strconv.ParseUint(fields[len(fields)-2], 10, 64)
+		if err != nil {
+			return solo.PortConfig{}, fmt.Errorf("invalid difficulty: %w", err)
+		}
+		addressFields = fields[:len(fields)-2]
+		desc = fields[len(fields)-1]
+	} else {
+		return solo.PortConfig{}, fmt.Errorf("invalid difficulty: %w", err)
+	}
+
+	address := strings.Join(addressFields, ":")
+	if address == "" {
+		return solo.PortConfig{}, errors.New("address portion is empty")
+	}
+	if difficulty == 0 {
+		return solo.PortConfig{}, errors.New("difficulty must be > 0")
+	}
+	return solo.PortConfig{Address: address, Difficulty: difficulty, PortDesc: desc}, nil
 }
 
 func envOr(key, def string) string {
@@ -159,7 +263,18 @@ func main() {
 		logger.Fatal("LEAF_SOLO_PAYOUT_ADDRESS (or -payout-address) is required")
 	}
 
-	logger.Printf("starting difficulty: %d, vardiff bounds [%d, %d], target time %ds, retarget interval %s", cfg.startingDifficulty, cfg.minDifficulty, cfg.maxDifficulty, cfg.vardiffTargetTime, cfg.vardiffInterval)
+	ports, err := resolvePorts(cfg)
+	if err != nil {
+		logger.Fatalf("invalid port configuration: %v", err)
+	}
+	for _, p := range ports {
+		desc := p.PortDesc
+		if desc == "" {
+			desc = "-"
+		}
+		logger.Printf("port tier: address=%s starting-difficulty=%d desc=%s", p.Address, p.Difficulty, desc)
+	}
+	logger.Printf("vardiff bounds [%d, %d], target time %ds, retarget interval %s", cfg.minDifficulty, cfg.maxDifficulty, cfg.vardiffTargetTime, cfg.vardiffInterval)
 	logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
 
 	node := solo.NewGRPCNodeClient(cfg.nodeGRPCAddress)
@@ -168,9 +283,18 @@ func main() {
 	defer cancel()
 
 	jobManager := solo.NewJobManager(solo.JobManagerConfig{
-		Node:             node,
-		PayoutAddress:    cfg.payoutAddress,
-		StaticDifficulty: cfg.startingDifficulty,
+		Node:          node,
+		PayoutAddress: cfg.payoutAddress,
+		// StaticDifficulty is only the JobForXN fallback default (see
+		// JobManagerConfig.StaticDifficulty's doc comment) — every
+		// real session created by Server.handleConn goes through
+		// JobForXNAtDifficulty with its OWN port tier's starting
+		// difficulty (or its current vardiff value thereafter), so
+		// this is not "the" difficulty for any port; the first
+		// configured port's difficulty is used here purely as a
+		// reasonable default for any hypothetical direct JobForXN
+		// caller.
+		StaticDifficulty: ports[0].Difficulty,
 		RefreshInterval:  cfg.refreshInterval,
 		TipPollInterval:  cfg.tipPollInterval,
 		Logger:           logger,
@@ -194,23 +318,43 @@ func main() {
 		TargetTime:       cfg.vardiffTargetTime,
 		RetargetInterval: cfg.vardiffInterval,
 	}
-	server := solo.NewServer(cm, jobManager, node, sha3xValidator, networkFromString(cfg.network), logger, cfg.startingDifficulty, vardiffCfg)
+	// One Server shared by every port tier: same
+	// JobManager/ConnectionManager/NodeClient/validator, multiple
+	// concurrent listeners (see the Serve fan-out below) each
+	// stamping newly-accepted sessions with ITS OWN starting
+	// difficulty.
+	server := solo.NewServer(cm, jobManager, node, sha3xValidator, networkFromString(cfg.network), logger, vardiffCfg)
 	defer server.Shutdown()
 
-	ln, err := net.Listen("tcp", cfg.listenAddress)
-	if err != nil {
-		logger.Fatalf("failed to listen on %s: %v", cfg.listenAddress, err)
+	listeners := make([]net.Listener, 0, len(ports))
+	for _, p := range ports {
+		ln, err := net.Listen("tcp", p.Address)
+		if err != nil {
+			for _, opened := range listeners {
+				_ = opened.Close()
+			}
+			logger.Fatalf("failed to listen on %s: %v", p.Address, err)
+		}
+		listeners = append(listeners, ln)
+		logger.Printf("listening for miners on %s (starting difficulty %d)", p.Address, p.Difficulty)
 	}
-	logger.Printf("listening for miners on %s", cfg.listenAddress)
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.Serve(ctx, ln)
-	}()
+	errCh := make(chan error, len(listeners))
+	var wg sync.WaitGroup
+	for i, ln := range listeners {
+		wg.Add(1)
+		go func(ln net.Listener, port solo.PortConfig) {
+			defer wg.Done()
+			errCh <- server.Serve(ctx, ln, port)
+		}(ln, ports[i])
+	}
 
 	select {
 	case <-ctx.Done():
 		logger.Println("shutdown signal received, draining connections...")
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
 		cm.Shutdown()
 	case err := <-errCh:
 		if err != nil {
