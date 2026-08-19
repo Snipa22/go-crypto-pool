@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -370,5 +371,183 @@ func TestHandleShare_NetworkNotConfiguredMeansNoCheck(t *testing.T) {
 	}
 	if len(repo.shares) != 1 {
 		t.Errorf("expected 1 insert, got %d", len(repo.shares))
+	}
+}
+
+// scrapeMetrics starts a real httptest.Server around h.Mux(), GETs
+// /metrics through it, and returns the real rendered Prometheus text
+// body. This exercises the genuine promhttp handler end to end, not a
+// mock of the Prometheus client library.
+func scrapeMetrics(t *testing.T, h *Handler) string {
+	t.Helper()
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type = %q, want text/plain prefix", ct)
+	}
+
+	buf := make([]byte, 16384)
+	n, _ := resp.Body.Read(buf)
+	if n == 0 {
+		t.Fatal("expected non-empty /metrics body")
+	}
+	return string(buf[:n])
+}
+
+// TestMetrics_SmokeTest is the basic "does /metrics respond and look
+// like valid Prometheus exposition format" check via a real
+// httptest.Server sitting in front of the actual Handler.Mux(),
+// scraping the real promhttp-rendered output.
+func TestMetrics_SmokeTest(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	body := scrapeMetrics(t, h)
+	if !strings.Contains(body, "backend_build_info") {
+		t.Errorf("expected backend_build_info in /metrics output, got:\n%s", body)
+	}
+}
+
+// TestMetrics_ShareOutcomes_RecordedWithRealLabels drives real
+// requests through the real handler across every branch point
+// (accepted, rejected-bad-network, rejected-bad-auth, DB-error), then
+// scrapes /metrics and asserts on the actual rendered counter lines —
+// not a mocked metrics interface.
+func TestMetrics_ShareOutcomes_RecordedWithRealLabels(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{
+		AuthHeaderName:  "X-Pool-Auth",
+		AuthHeaderValue: "secret",
+		Network:         poolpb.Network_NETWORK_TESTNET,
+	})
+	mux := h.Mux()
+
+	// accepted
+	rr := postProto(t, mux, "/api/v1/share", validShare(), map[string]string{"X-Pool-Auth": "secret"})
+	if rr.Code < 200 || rr.Code >= 300 {
+		t.Fatalf("accepted share: status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	// rejected: bad auth (wrong header value)
+	rr = postProto(t, mux, "/api/v1/share", validShare(), map[string]string{"X-Pool-Auth": "wrong"})
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("bad-auth share: status = %d, want 401", rr.Code)
+	}
+
+	// rejected: network mismatch (validShare() is TESTNET; submit as-is
+	// but with the header, then check against a MAINNET-configured
+	// handler for this one call by building a second handler)
+	mismatchRepo := &fakeRepo{}
+	hMismatch := NewHandler(mismatchRepo, Config{Network: poolpb.Network_NETWORK_MAINNET})
+	rrMismatch := postProto(t, hMismatch.Mux(), "/api/v1/share", validShare(), nil)
+	if rrMismatch.Code != http.StatusBadRequest {
+		t.Fatalf("network-mismatch share: status = %d, want 400", rrMismatch.Code)
+	}
+
+	// error: DB insert fails
+	errRepo := &fakeRepo{shareErr: errors.New("db exploded")}
+	hErr := NewHandler(errRepo, Config{})
+	rrErr := postProto(t, hErr.Mux(), "/api/v1/share", validShare(), nil)
+	if rrErr.Code != http.StatusInternalServerError {
+		t.Fatalf("db-error share: status = %d, want 500", rrErr.Code)
+	}
+
+	body := scrapeMetrics(t, h)
+	wantAccepted := `shares_total{algo="RXT",network="TESTNET",pool_type="PPLNS",result="accepted"} 1`
+	if !strings.Contains(body, wantAccepted) {
+		t.Errorf("expected %q in %s's /metrics output, got:\n%s", wantAccepted, "h", body)
+	}
+	wantRejected := `shares_total{algo="unknown",network="unknown",pool_type="unknown",result="rejected"} 1`
+	if !strings.Contains(body, wantRejected) {
+		t.Errorf("expected %q (bad-auth rejection) in /metrics output, got:\n%s", wantRejected, body)
+	}
+
+	mismatchBody := scrapeMetrics(t, hMismatch)
+	wantMismatch := `shares_total{algo="RXT",network="TESTNET",pool_type="PPLNS",result="rejected"} 1`
+	if !strings.Contains(mismatchBody, wantMismatch) {
+		t.Errorf("expected %q (network-mismatch rejection) in /metrics output, got:\n%s", wantMismatch, mismatchBody)
+	}
+
+	errBody := scrapeMetrics(t, hErr)
+	wantError := `shares_total{algo="RXT",network="TESTNET",pool_type="PPLNS",result="error"} 1`
+	if !strings.Contains(errBody, wantError) {
+		t.Errorf("expected %q (DB error) in /metrics output, got:\n%s", wantError, errBody)
+	}
+}
+
+// TestMetrics_BlockOutcomes_RecordedWithRealLabels mirrors the share
+// test above for /api/v1/block.
+func TestMetrics_BlockOutcomes_RecordedWithRealLabels(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{Network: poolpb.Network_NETWORK_MAINNET})
+
+	rr := postProto(t, h.Mux(), "/api/v1/block", validBlock(), nil)
+	if rr.Code < 200 || rr.Code >= 300 {
+		t.Fatalf("accepted block: status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	errRepo := &fakeRepo{blockErr: errors.New("db exploded")}
+	hErr := NewHandler(errRepo, Config{})
+	rrErr := postProto(t, hErr.Mux(), "/api/v1/block", validBlock(), nil)
+	if rrErr.Code != http.StatusInternalServerError {
+		t.Fatalf("db-error block: status = %d, want 500", rrErr.Code)
+	}
+
+	body := scrapeMetrics(t, h)
+	wantAccepted := `blocks_total{algo="C29",network="MAINNET",result="accepted"} 1`
+	if !strings.Contains(body, wantAccepted) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", wantAccepted, body)
+	}
+
+	errBody := scrapeMetrics(t, hErr)
+	wantError := `blocks_total{algo="C29",network="MAINNET",result="error"} 1`
+	if !strings.Contains(errBody, wantError) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", wantError, errBody)
+	}
+}
+
+// TestMetrics_UnknownLabelsOnPreDecodeRejections confirms that
+// rejections which happen before a share/block is decoded (malformed
+// protobuf body) are recorded with the fixed "unknown" label values,
+// not left unrecorded or guessed at.
+func TestMetrics_UnknownLabelsOnPreDecodeRejections(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/share", bytes.NewReader([]byte{0xff, 0x01, 0x02, 0xff, 0xff}))
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	rr := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+
+	body := scrapeMetrics(t, h)
+	want := `shares_total{algo="unknown",network="unknown",pool_type="unknown",result="rejected"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", want, body)
+	}
+}
+
+// TestMetrics_InsertDurationHistograms_ObserveRealTiming confirms the
+// share/block insert histograms actually receive an observation for
+// every attempted (post-validation) insert.
+func TestMetrics_InsertDurationHistograms_ObserveRealTiming(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	postProto(t, h.Mux(), "/api/v1/share", validShare(), nil)
+	postProto(t, h.Mux(), "/api/v1/block", validBlock(), nil)
+
+	body := scrapeMetrics(t, h)
+	for _, want := range []string{"share_insert_duration_seconds_count 1", "block_insert_duration_seconds_count 1"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in /metrics output, got:\n%s", want, body)
+		}
 	}
 }

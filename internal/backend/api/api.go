@@ -9,6 +9,10 @@
 //
 //   - POST /api/v1/share  — body is a protobuf-marshaled poolpb.Share
 //   - POST /api/v1/block  — body is a protobuf-marshaled poolpb.Block
+//   - GET  /metrics       — standard Prometheus text-exposition
+//     format (promhttp.HandlerFor over this Handler's private
+//     registry; see internal/backend/metrics). Not part of the leaf
+//     wire contract, ops-only.
 //   - Content-Type: application/x-protobuf on both.
 //   - Optional shared-secret auth header: if the server is configured
 //     with an auth header name+value, requests missing that header (or
@@ -25,7 +29,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
+	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 	"google.golang.org/protobuf/proto"
 )
@@ -113,28 +119,74 @@ type Config struct {
 	// would reintroduce exactly the cross-network contamination risk
 	// this field exists to close.
 	Network poolpb.Network
+
+	// Metrics, if non-nil, is the metrics.Metrics instance this
+	// Handler's handlers increment/observe and serves on GET
+	// /metrics. If nil, NewHandler creates a fresh, private one (see
+	// metrics.New's doc comment) — most callers, including
+	// cmd/backend, can leave this unset.
+	Metrics *metrics.Metrics
+
+	// Version is recorded on the metrics build_info gauge when this
+	// Handler creates its own default Metrics (i.e. when Metrics
+	// above is left nil). Ignored if Metrics is set explicitly.
+	Version string
 }
 
 // Handler implements the backend's share/block ingestion HTTP endpoints.
 type Handler struct {
 	repo ShareBlockRepository
 	cfg  Config
+	m    *metrics.Metrics
 }
 
 // NewHandler constructs a Handler backed by repo, using cfg for optional
 // auth-header configuration.
+//
+// If cfg.Metrics is nil, a fresh, private metrics.Metrics is created
+// for this Handler (see metrics.New's doc comment on why a private
+// registry per Handler, rather than the global default one, is the
+// right default here — it is what keeps repeated NewHandler calls in
+// tests safe).
 func NewHandler(repo ShareBlockRepository, cfg Config) *Handler {
-	return &Handler{repo: repo, cfg: cfg}
+	m := cfg.Metrics
+	if m == nil {
+		m = metrics.New(cfg.Version)
+	}
+	return &Handler{repo: repo, cfg: cfg, m: m}
+}
+
+// Metrics returns this Handler's metrics.Metrics instance (the same
+// one whose collectors are incremented/observed by handleShare/
+// handleBlock), primarily so cmd/backend and tests can reach its
+// Handler() for the /metrics route or assert on collected values.
+func (h *Handler) Metrics() *metrics.Metrics {
+	return h.m
 }
 
 // Mux builds an *http.ServeMux with this Handler's routes registered.
 // Kept simple deliberately — this repo has exactly two endpoints and
-// does not need a web framework for that.
+// does not need a web framework for that. /metrics is intentionally
+// NOT wrapped by the in-flight-request middleware below — it is not
+// part of the share/block ingestion surface that gauge exists to
+// describe.
 func (h *Handler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/v1/share", h.handleShare)
-	mux.HandleFunc("POST /api/v1/block", h.handleBlock)
+	mux.Handle("POST /api/v1/share", h.instrumentInFlight(http.HandlerFunc(h.handleShare)))
+	mux.Handle("POST /api/v1/block", h.instrumentInFlight(http.HandlerFunc(h.handleBlock)))
+	mux.Handle("GET /metrics", h.m.Handler())
 	return mux
+}
+
+// instrumentInFlight wraps next so http_requests_in_flight tracks
+// exactly the requests currently inside /api/v1/share or
+// /api/v1/block handling.
+func (h *Handler) instrumentInFlight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.m.HTTPRequestsInFlight.Inc()
+		defer h.m.HTTPRequestsInFlight.Dec()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // authConfigured reports whether an auth header check should be
@@ -158,75 +210,104 @@ func (h *Handler) checkAuth(r *http.Request) bool {
 
 func (h *Handler) handleShare(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAuth(r) {
+		h.m.SharesTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
 	body, err := readBody(r)
 	if err != nil {
+		h.m.SharesTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusBadRequest, "request body too large or unreadable")
 		return
 	}
 
 	share := &poolpb.Share{}
 	if err := proto.Unmarshal(body, share); err != nil {
+		h.m.SharesTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusBadRequest, "malformed protobuf Share")
 		return
 	}
 
+	// From here on the share decoded far enough to know its real
+	// algo/network/pool_type (even if one of those fields is itself
+	// the reason validation below fails, e.g. algo unspecified —
+	// algoString etc. map that to "", which is still a single fixed
+	// label value, not per-request data).
+	algo, network, poolType := algoString(share.GetAlgo()), networkString(share.GetNetwork()), poolTypeString(share.GetPoolType())
+
 	if err := validateShare(share); err != nil {
+		h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	if err := h.checkNetwork(share.GetNetwork()); err != nil {
+		h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	record := shareToRecord(share)
-	if err := h.repo.InsertShare(r.Context(), record, HeightPartitionBucketSize); err != nil {
+	start := time.Now()
+	err = h.repo.InsertShare(r.Context(), record, HeightPartitionBucketSize)
+	h.m.ShareInsertDuration.Observe(time.Since(start).Seconds())
+	if err != nil {
+		h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultError).Inc()
 		writeErr(w, http.StatusInternalServerError, "insert failed")
 		return
 	}
 
+	h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultAccepted).Inc()
 	w.WriteHeader(http.StatusCreated)
 }
 
 func (h *Handler) handleBlock(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAuth(r) {
+		h.m.BlocksTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
 	body, err := readBody(r)
 	if err != nil {
+		h.m.BlocksTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusBadRequest, "request body too large or unreadable")
 		return
 	}
 
 	block := &poolpb.Block{}
 	if err := proto.Unmarshal(body, block); err != nil {
+		h.m.BlocksTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusBadRequest, "malformed protobuf Block")
 		return
 	}
 
+	algo, network := algoString(block.GetAlgo()), networkString(block.GetNetwork())
+
 	if err := validateBlock(block); err != nil {
+		h.m.BlocksTotal.WithLabelValues(algo, network, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	if err := h.checkNetwork(block.GetNetwork()); err != nil {
+		h.m.BlocksTotal.WithLabelValues(algo, network, metrics.ResultRejected).Inc()
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	record := blockToRecord(block)
-	if err := h.repo.InsertBlock(r.Context(), record); err != nil {
+	start := time.Now()
+	err = h.repo.InsertBlock(r.Context(), record)
+	h.m.BlockInsertDuration.Observe(time.Since(start).Seconds())
+	if err != nil {
+		h.m.BlocksTotal.WithLabelValues(algo, network, metrics.ResultError).Inc()
 		writeErr(w, http.StatusInternalServerError, "insert failed")
 		return
 	}
 
+	h.m.BlocksTotal.WithLabelValues(algo, network, metrics.ResultAccepted).Inc()
 	w.WriteHeader(http.StatusCreated)
 }
 
