@@ -7,8 +7,10 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"net"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -110,7 +113,11 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 
 // Run is the session's read loop. It returns when the connection closes
 // for any reason (remote EOF, idle timeout, manager shutdown). The
-// caller (Server.handleConn) owns calling mc.Close afterward.
+// caller (Server.handleConn) owns calling mc.Close afterward. Before
+// returning, it classifies the real reason the read loop ended (see
+// classifyCloseError) and records it against
+// leaf_connection_errors_total — purely observability, it never
+// changes when/why the loop actually stops.
 func (s *Session) Run(ctx context.Context) {
 	scanner := bufio.NewScanner(s.mc)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
@@ -124,6 +131,41 @@ func (s *Session) Run(ctx context.Context) {
 		}
 		s.handleLine(line)
 	}
+	s.server.recordConnectionError(classifyCloseError(scanner.Err()))
+}
+
+// classifyCloseError maps a real bufio.Scanner terminal error from
+// Session.Run's read loop onto the small, fixed set of connection-error
+// categories metrics.Metrics.ConnectionErrorsTotal exposes. Every
+// branch corresponds to a real, observed code path (see
+// metrics.ConnErrorIdleTimeout/ConnErrorRemoteEOF/
+// ConnErrorProtocolError's doc comments for exactly which):
+//   - nil: bufio.Scanner reports a plain io.EOF (the common case, the
+//     miner cleanly closed its side) as a nil Err() — remote-eof.
+//   - a net.Error with Timeout() == true: the rolling idle deadline
+//     (internal/leaflib.ManagedConnection.armDeadline) fired.
+//   - bufio.ErrTooLong: the miner sent a line longer than the
+//     scanner's configured buffer — a real protocol violation.
+//   - leaflib.ErrConnectionClosed: the connection was already being
+//     torn down by another path (e.g. manager shutdown) when this
+//     read observed it. There is no dedicated "shutdown" category in
+//     the fixed set, and this is not the miner's fault, so it is
+//     folded into ConnErrorOther rather than inventing a new fixed
+//     category with no other producer.
+//   - anything else (e.g. a raw TCP reset): ConnErrorOther, the
+//     bounded catch-all bucket.
+func classifyCloseError(err error) string {
+	if err == nil {
+		return metrics.ConnErrorRemoteEOF
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return metrics.ConnErrorIdleTimeout
+	}
+	if errors.Is(err, bufio.ErrTooLong) {
+		return metrics.ConnErrorProtocolError
+	}
+	return metrics.ConnErrorOther
 }
 
 func (s *Session) handleLine(line string) {
@@ -340,6 +382,11 @@ func (s *Session) handleSubmit(req Request) {
 		// AND the vardiff accounting, rather than "fixing" either).
 		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.server.logger.Printf("solo: SubmitBlock failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
+		// Real block ATTEMPT that failed at the node-submission
+		// level — a genuinely different event from an ordinary
+		// rejected share (the PoW was valid; distinguish it on
+		// leaf_blocks_total, not leaf_shares_total).
+		s.server.recordBlock(false)
 		// Ported exactly from the reference (miner.go's SubmitJob,
 		// SubmitBlock-error branch): the wire response to the miner is
 		// still a rejection (their proof was cryptographically valid,
@@ -352,6 +399,7 @@ func (s *Session) handleSubmit(req Request) {
 
 	s.blockCount.Add(1)
 	s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
+	s.server.recordBlock(true)
 	s.hashesAccumulated.Add(job.StaticDifficulty)
 	s.writeShareResponse(req.ID, true, "")
 
@@ -369,6 +417,13 @@ func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 }
 
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
+	// Every submit outcome (share or block, accepted or rejected)
+	// flows through this single response-writing helper, so hooking
+	// leaf_shares_total here — rather than at each individual
+	// rejection call site in handleSubmit — captures every real
+	// branch point exactly once, uniformly labeled by result, without
+	// touching any of the actual accept/reject decision logic above.
+	s.server.recordShare(accepted)
 	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
 }
 
