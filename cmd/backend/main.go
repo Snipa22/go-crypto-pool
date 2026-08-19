@@ -51,6 +51,12 @@ import (
 
 const defaultListenAddr = ":8080"
 
+// Version is the backend's build version, recorded on the
+// backend_build_info Prometheus gauge. Overridable at build time via
+// -ldflags "-X main.Version=...", e.g. from a CI-set git tag/commit;
+// defaults to "dev" for local/unreleased builds.
+var Version = "dev"
+
 // parseNetwork parses the GCPOOL_NETWORK environment variable value
 // into a poolpb.Network. Only "mainnet" and "testnet" (case-insensitive)
 // are accepted; anything else (including empty string) is an error —
@@ -148,6 +154,7 @@ func run() error {
 		AuthHeaderName:  authHeaderName,
 		AuthHeaderValue: authHeaderValue,
 		Network:         network,
+		Version:         Version,
 	})
 
 	srv := &http.Server{
