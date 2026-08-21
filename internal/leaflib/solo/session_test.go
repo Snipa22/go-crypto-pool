@@ -93,6 +93,56 @@ func newTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *testHar
 	return newTestHarnessWithJobMaxAge(t, staticDiff, networkTargetDiff, 0)
 }
 
+// newRXTTestHarness is newC29TestHarness's RXT counterpart: the
+// JobManager is configured for Algo_ALGO_RXT, the fakeNodeClient is
+// seeded with a real-shaped vmKey (RandomX seed material,
+// GetNewBlockResult.VmKey), and the validator.Registry's RXT entry is
+// backed by a REAL RandomXValidator pointed at randomXServiceURL (not
+// a mock) -- so tests using this harness exercise the actual live
+// randomx-service daemon end-to-end, not a stand-in.
+func newRXTTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64, randomXServiceURL string) *testHarness {
+	t.Helper()
+	node := &fakeNodeClient{
+		height:           42,
+		targetDifficulty: networkTargetDiff,
+		mergeMiningHash:  []byte("test-merge-mining-hash-32bytes!"),
+		blockHashSeed:    []byte("test-block-hash-seed-32-bytes!!"),
+		vmKey:            []byte("test key 000"), // real reference-vector seed, see randomx_real_daemon_test.go
+	}
+	jm := NewJobManager(JobManagerConfig{
+		Node:             node,
+		PayoutAddress:    "solo-test-address",
+		StaticDifficulty: staticDiff,
+		Algo:             poolpb.Algo_ALGO_RXT,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 260 * time.Second})
+	rx := validator.NewRandomXValidator(randomXServiceURL)
+	registry := validator.Registry{poolpb.Algo_ALGO_RXT: rx}
+	server := NewServer(cm, jm, node, registry, poolpb.Network_NETWORK_TESTNET, nil, VardiffConfig{})
+
+	serverConn, clientConn := net.Pipe()
+	go server.handleConn(ctx, serverConn, staticDiff)
+
+	h := &testHarness{
+		t:      t,
+		server: server,
+		cm:     cm,
+		jm:     jm,
+		node:   node,
+		client: clientConn,
+		reader: bufio.NewReader(clientConn),
+		writer: bufio.NewWriter(clientConn),
+		cancel: cancel,
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = clientConn.Close()
+	})
+	return h
+}
+
 // newTestHarnessWithJobMaxAge is newTestHarness plus an explicit
 // JobManagerConfig.JobMaxAge override (0 keeps NewJobManager's own
 // default of 6 minutes), used by the real per-job expiry tests below.

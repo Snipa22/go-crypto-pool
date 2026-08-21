@@ -83,16 +83,29 @@ var poolCoinbaseExtraTag = []byte("GCPOOL-SOLO")
 // maps to SHA3X for defensive backward compatibility (JobManagerConfig.Algo
 // already normalizes this before it ever reaches here — see job.go — but
 // this method doesn't assume that normalization has definitely happened).
-// ALGO_RXT/ALGO_RXM are not supported by this leaf's block-template fetch
-// (leaf-solo has never served RandomX templates; only SHA3X and now C29).
+// ALGO_RXT (Tari's own native RandomX PoW — NOT merge-mining RXM, which
+// remains explicitly out of scope for this leaf) maps to the real
+// tari_generated.PowAlgo_POW_ALGOS_RANDOMXT value — confirmed = 2 in this
+// session's research (go-tari-grpc-lib/v3's block.pb.go), matching the
+// real Tari Rust source's own PowAlgorithm::RandomXT discriminant (also
+// 2, base_layer/transaction_components/src/tari_proof_of_work/
+// proof_of_work_algorithm.rs). Do NOT confuse this with
+// PowAlgo_POW_ALGOS_RANDOMXM (value 0) — that is RXM/merge-mining,
+// explicitly out of scope.
+// ALGO_RXM is not supported by this leaf's block-template fetch — RXM
+// (Monero merge-mining) requires an entirely different
+// minotari_merge_mining_proxy-style pipeline this leaf does not
+// implement.
 func tariPowAlgo(algo poolpb.Algo) (tari_generated.PowAlgo_PowAlgos, error) {
 	switch algo {
 	case poolpb.Algo_ALGO_UNSPECIFIED, poolpb.Algo_ALGO_SHA3X:
 		return tari_generated.PowAlgo_POW_ALGOS_SHA3X, nil
 	case poolpb.Algo_ALGO_C29:
 		return tari_generated.PowAlgo_POW_ALGOS_CUCKAROO, nil
+	case poolpb.Algo_ALGO_RXT:
+		return tari_generated.PowAlgo_POW_ALGOS_RANDOMXT, nil
 	default:
-		return 0, fmt.Errorf("solo: leaf-solo does not support fetching block templates for algo %v (only SHA3X and C29 are supported)", algo)
+		return 0, fmt.Errorf("solo: leaf-solo does not support fetching block templates for algo %v (only SHA3X, C29, and RXT are supported — RXM merge-mining is explicitly out of scope)", algo)
 	}
 }
 

@@ -111,6 +111,16 @@ type Job struct {
 	// NodeClient.SubmitBlock when a share meets NetworkTargetDifficulty.
 	Result *tari_generated.GetNewBlockResult
 
+	// VmKey is the real RandomX seed/key for an ALGO_RXT job, taken
+	// directly from GetNewBlockResult.VmKey (confirmed real field,
+	// go-tari-grpc-lib/v3's base_node.pb.go — the base node's GRPC
+	// response already provides this; leaf-solo does not derive it
+	// itself). Empty/unused for SHA3X and C29 jobs. Surfaced on the wire
+	// as JobPayload.SeedHash (protocol.go) and fed to
+	// validator.RandomXValidator as poolpb.RandomXProof.SeedHash at
+	// submit time (session.go's handleSubmit).
+	VmKey []byte
+
 	CreatedAt time.Time
 
 	// nonceMu/usedNonces implement per-job used-nonce tracking, ported
@@ -349,6 +359,7 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 		StaticDifficulty:        difficulty,
 		NetworkTargetDifficulty: result.GetMinerData().GetTargetDifficulty(),
 		Result:                  result,
+		VmKey:                   result.GetVmKey(),
 		CreatedAt:               time.Now(),
 	}
 
@@ -401,6 +412,7 @@ func (jm *JobManager) RestampDifficulty(ctx context.Context, xn string, difficul
 		StaticDifficulty:        difficulty,
 		NetworkTargetDifficulty: existing.NetworkTargetDifficulty,
 		Result:                  existing.Result,
+		VmKey:                   existing.VmKey,
 		CreatedAt:               existing.CreatedAt,
 	}
 
