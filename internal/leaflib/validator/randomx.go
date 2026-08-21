@@ -63,15 +63,21 @@ import (
 //   - If no randomx-service is deployed/reachable, Validate() returns a
 //     real (non-nil) error from the underlying HTTP client — it does NOT
 //     silently accept or reject shares in that case.
-//   - This HAS been tested here against an httptest-mocked HTTP server
-//     standing in for randomx-service, matching the FIXED client protocol
-//     (POST /hash + POST /seed, per go-xmr-lib v0.2.5's
-//     hashValidation/randomx.go) — NOT against real RandomX output or a
-//     live randomx-service daemon (no such daemon is available in this
-//     sandbox). Before this validator is trusted in production, it still
-//     needs an end-to-end pass against a real randomx-service instance
-//     (the same gap SXMR's own integration test flags via its 90s
-//     real-daemon skip-if-unreachable guard).
+//   - This HAS been tested against an httptest-mocked HTTP server standing
+//     in for randomx-service (matching the FIXED client protocol, POST
+//     /hash + POST /seed, per go-xmr-lib v0.2.5's hashValidation/randomx.go)
+//     AND, as of 2026-08-21, against a REAL, LIVE randomx-service daemon
+//     (tevador's own reference implementation, v1.0.2, running locally):
+//     the real daemon returned the exact expected hash for the well-known
+//     "test key 000"/"This is a test" reference vector
+//     (639183aae1bf4c9a35884cb46b09cad9175f04efd7684e7262a0ac1c2f0b4e3f —
+//     the same vector go-randomx's own pure-Go test suite and
+//     randomx-service's own doc/API.md both independently confirm), and
+//     correctly rejected a wrong claimed hash for the same input. See
+//     randomx_real_daemon_test.go — this closes the exact gap this
+//     doc comment used to describe as still open. This validator is now
+//     genuinely confirmed correct end-to-end against real RandomX output,
+//     not just a mocked transport.
 type RandomXValidator struct {
 	verifier *hashValidation.RXVerifier
 }
