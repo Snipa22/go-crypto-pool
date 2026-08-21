@@ -91,18 +91,31 @@ type LoginRequest struct {
 // session/connection id the miner was handed at login (echoed back,
 // not separately validated — the reference doesn't authenticate on it
 // either, see miner.go's SubmitJob), JobID matches a previously-sent
-// job_id, Nonce is hex-encoded little-endian 8 bytes and MUST be
-// prefixed (case-insensitively) with the session's own assigned xn —
-// see session.go's handleSubmit, ported from go-tari-sha3x-solo-stratum's
+// job_id, Nonce is hex-encoded 8 bytes and MUST be prefixed
+// (case-insensitively) with the session's own assigned xn — see
+// session.go's handleSubmit, ported from go-tari-sha3x-solo-stratum's
 // miner.go SubmitJob xn-prefix check — and Result is the miner's
 // claimed hex-encoded hash (accepted on the wire, but not required for
-// validation since the server recomputes it for real via
-// SHA3XValidator).
+// validation since the server recomputes it for real via the
+// algo-appropriate validator).
+//
+// The Nonce field's BYTE ORDER when decoded is algo-dependent — see
+// session.go's handleSubmit: SHA3X decodes it little-endian
+// (go-tari-sha3x-solo-stratum's miner.go), C29 decodes it BIG-ENDIAN
+// (go-tari-c29-solo-stratum's miner.go SubmitJob:
+// `nonce := binary.BigEndian.Uint64(b)`) — confirmed from source, not
+// assumed to be the same just because the envelope shape is shared.
+//
+// POW carries the real C29-only submit field (messages.MinerRPCSubmit's
+// `POW []uint64` in go-tari-c29-solo-stratum): the 42-edge Cuckaroo29
+// cycle being submitted. Absent (omitempty) on every SHA3X submit,
+// which never carries this field on the real wire either.
 type SubmitRequest struct {
-	ID     string `json:"id"`
-	JobID  string `json:"job_id"`
-	Nonce  string `json:"nonce"`
-	Result string `json:"result"`
+	ID     string   `json:"id"`
+	JobID  string   `json:"job_id"`
+	Nonce  string   `json:"nonce"`
+	POW    []uint64 `json:"pow,omitempty"`
+	Result string   `json:"result"`
 }
 
 // JobPayload is the real job object shape (messages.MinerJobJSON in the
