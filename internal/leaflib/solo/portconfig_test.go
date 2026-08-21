@@ -41,7 +41,9 @@ func newMultiPortTestServer(t *testing.T) (*Server, *JobManager, *fakeNodeClient
 	})
 	cm := leaflib.NewConnectionManager(context.Background(), leaflib.ManagerConfig{IdleTimeout: 2 * time.Second})
 	v := validator.NewSHA3XValidator()
-	server := NewServer(cm, jm, node, v, poolpb.Network_NETWORK_TESTNET, nil, VardiffConfig{})
+	c29 := validator.NewC29Validator()
+	registry := validator.Registry{poolpb.Algo_ALGO_SHA3X: v, poolpb.Algo_ALGO_C29: c29}
+	server := NewServer(cm, jm, node, registry, poolpb.Network_NETWORK_TESTNET, nil, VardiffConfig{})
 	return server, jm, node
 }
 

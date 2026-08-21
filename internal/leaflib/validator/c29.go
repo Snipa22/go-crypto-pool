@@ -130,6 +130,27 @@ func (v *C29Validator) Validate(_ context.Context, share *poolpb.Share) (bool, e
 	return true, nil
 }
 
+// C29Difficulty exposes the same blake2b256-of-packed-cycle difficulty
+// derivation Validate uses internally, for callers (e.g.
+// internal/leaflib/solo's Session.handleSubmit) that need to determine
+// whether an already-validated C29 share also meets a job's real
+// network target difficulty (i.e. is a block find), without
+// re-implementing or duplicating the hashing logic. This is a pure
+// wiring convenience — the math is unchanged from c29Difficulty below.
+func C29Difficulty(cycle []uint64, edgeBits int) (uint64, error) {
+	return c29Difficulty(cycle, edgeBits)
+}
+
+// C29EdgePacking exposes the same real edgePacking bit-packing
+// c29Difficulty uses internally, for callers that need to build the
+// real on-wire ProofOfWork.PowData a submitted C29 cycle maps to (see
+// go-tari-c29-solo-stratum's SubmitJob: `job.BlockResult.Block.Header.
+// Pow.PowData = packedData`, the SAME packedData used for the
+// difficulty hash) — a pure wiring convenience, not a reimplementation.
+func C29EdgePacking(cycle []uint64, edgeBits int) []byte {
+	return c29EdgePacking(cycle, edgeBits)
+}
+
 // c29Difficulty ports go-tari-c29-solo-stratum SubmitJob's difficulty
 // calculation: blake2b256(edgePacking(cycle, edgeBits)) interpreted as a
 // big-endian uint256, difficulty = maxUint256 / that value.

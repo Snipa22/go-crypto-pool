@@ -185,7 +185,9 @@ func newVardiffHarness(t *testing.T, startingDiff, networkTargetDiff uint64, var
 	ctx, cancel := context.WithCancel(context.Background())
 	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 30 * time.Second})
 	v := validator.NewSHA3XValidator()
-	server := NewServer(cm, jm, node, v, poolpb.Network_NETWORK_TESTNET, nil, vardiff)
+	c29 := validator.NewC29Validator()
+	registry := validator.Registry{poolpb.Algo_ALGO_SHA3X: v, poolpb.Algo_ALGO_C29: c29}
+	server := NewServer(cm, jm, node, registry, poolpb.Network_NETWORK_TESTNET, nil, vardiff)
 
 	h := &vardiffHarness{t: t, server: server, jm: jm, node: node, cancel: cancel, startingDiff: startingDiff}
 	t.Cleanup(cancel)

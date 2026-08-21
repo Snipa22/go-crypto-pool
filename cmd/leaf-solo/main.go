@@ -69,6 +69,14 @@ type config struct {
 	payoutAddress   string
 	network         string
 
+	// algo selects which SINGLE mining algorithm this leaf-solo
+	// process serves: "sha3x" (default) or "c29". See loadConfig's
+	// LEAF_SOLO_ALGO doc comment for why a simple single-algo-per-
+	// process flag was chosen over per-port algo selection for this
+	// pass, and why leaving it unset preserves the already-deployed
+	// CT132 leaf-solo.service's SHA3X-only behavior exactly.
+	algo string
+
 	startingDifficulty uint64
 	portsRaw           string
 	minDifficulty      uint64
@@ -94,6 +102,7 @@ func loadConfig() config {
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_SOLO_LISTEN_ADDRESS", ":4444"), "miner-facing TCP listen address. Env: LEAF_SOLO_LISTEN_ADDRESS")
 	flag.StringVar(&cfg.payoutAddress, "payout-address", envOr("LEAF_SOLO_PAYOUT_ADDRESS", ""), "solo payout address; found-block coinbase rewards go here. Env: LEAF_SOLO_PAYOUT_ADDRESS")
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_SOLO_NETWORK", "testnet"), "network tag for share/diagnostic records: mainnet|testnet. Env: LEAF_SOLO_NETWORK")
+	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default) or c29. Env: LEAF_SOLO_ALGO")
 
 	// LEAF_SOLO_STARTING_DIFFICULTY replaces the old, now-removed
 	// LEAF_SOLO_DIFFICULTY (which used to be THE only difficulty any
@@ -274,6 +283,19 @@ func networkFromString(s string) poolpb.Network {
 	}
 }
 
+// algoFromString parses -algo/LEAF_SOLO_ALGO. Defaults to
+// poolpb.Algo_ALGO_SHA3X for any unrecognized value (including the
+// empty string), matching this leaf's pre-multi-algo behavior exactly
+// when the flag/env var is left unset.
+func algoFromString(s string) poolpb.Algo {
+	switch s {
+	case "c29":
+		return poolpb.Algo_ALGO_C29
+	default:
+		return poolpb.Algo_ALGO_SHA3X
+	}
+}
+
 func main() {
 	cfg := loadConfig()
 	logger := log.New(os.Stdout, "leaf-solo: ", log.LstdFlags|log.Lmicroseconds)
@@ -308,6 +330,7 @@ func main() {
 	jobManager := solo.NewJobManager(solo.JobManagerConfig{
 		Node:          node,
 		PayoutAddress: cfg.payoutAddress,
+		Algo:          algoFromString(cfg.algo),
 		// StaticDifficulty is only the JobForXN fallback default (see
 		// JobManagerConfig.StaticDifficulty's doc comment) — every
 		// real session created by Server.handleConn goes through
@@ -335,7 +358,15 @@ func main() {
 		IdleTimeout:    cfg.idleTimeout,
 	})
 
-	sha3xValidator := validator.NewSHA3XValidator()
+	// Registry covers all four algos so this Server can dispatch a
+	// submit to the right validator by the job's own Algo field. This
+	// leaf currently only fetches/serves SHA3X and C29 job templates
+	// (see -algo below); RXT/RXM entries in the registry are present
+	// for completeness/future-proofing but never actually invoked by
+	// this leaf today, so an empty randomXServiceURL is fine — it
+	// would only matter if this leaf ever requested an RXT/RXM
+	// template, which it does not.
+	validators := validator.NewRegistry("")
 	vardiffCfg := solo.VardiffConfig{
 		MinDifficulty:    cfg.minDifficulty,
 		MaxDifficulty:    cfg.maxDifficulty,
@@ -347,7 +378,7 @@ func main() {
 	// concurrent listeners (see the Serve fan-out below) each
 	// stamping newly-accepted sessions with ITS OWN starting
 	// difficulty.
-	server := solo.NewServer(cm, jobManager, node, sha3xValidator, networkFromString(cfg.network), logger, vardiffCfg)
+	server := solo.NewServer(cm, jobManager, node, validators, networkFromString(cfg.network), logger, vardiffCfg)
 	defer server.Shutdown()
 
 	if cfg.metricsListenAddress != "" {

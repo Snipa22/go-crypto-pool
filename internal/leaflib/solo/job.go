@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+
+	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
 // Job is one refreshed unit of mineable work: a real Tari SHA3X block
@@ -59,6 +61,15 @@ type Job struct {
 	// back in SubmitRequest.JobID.
 	ID     string
 	Height uint64
+
+	// Algo identifies which mining algorithm this Job's template was
+	// fetched for (poolpb.Algo_ALGO_SHA3X or poolpb.Algo_ALGO_C29 as of
+	// this pass — see JobManagerConfig.Algo). Every downstream
+	// algo-aware decision (session.go's jobPayload wire "algo" label,
+	// handleSubmit's nonce-byte-order/proof-shape/validator dispatch)
+	// keys off THIS field, not any global/process-wide assumption, so
+	// that a Job always self-describes which algo it actually is.
+	Algo poolpb.Algo
 
 	// Header is the merge-mining-hash pre-image material the real
 	// GetHeaderDiff/SHA3XValidator hashes alongside the submitted nonce
@@ -134,6 +145,21 @@ func (j *Job) MarkNonceUsed(nonce uint64) (firstUse bool) {
 // JobManagerConfig configures a JobManager.
 type JobManagerConfig struct {
 	Node NodeClient
+
+	// Algo is which mining algorithm this JobManager fetches block
+	// templates for (poolpb.Algo_ALGO_SHA3X or poolpb.Algo_ALGO_C29 as
+	// of this pass). Defaults (an unset/zero ALGO_UNSPECIFIED value) to
+	// poolpb.Algo_ALGO_SHA3X in NewJobManager below — this is the
+	// backward-compatibility guarantee the already-deployed CT132
+	// leaf-solo.service depends on: a JobManager built without
+	// explicitly setting Algo behaves exactly as it did before C29
+	// support existed. One JobManager instance serves exactly ONE
+	// algo (this leaf's chosen single-algo-per-process model — see
+	// cmd/leaf-solo/main.go's LEAF_SOLO_ALGO doc comment for why a
+	// simpler single-algo flag was chosen over per-port algo selection
+	// for this pass); every Job it produces is stamped with this same
+	// Algo (see jobForXN below).
+	Algo poolpb.Algo
 
 	// PayoutAddress is where found-block coinbase rewards go (solo
 	// mode's only payout destination — see cmd/leaf-solo's doc comment).
@@ -237,6 +263,15 @@ func NewJobManager(cfg JobManagerConfig) *JobManager {
 	if cfg.TipPollInterval <= 0 {
 		cfg.TipPollInterval = 5 * time.Second
 	}
+	// Backward-compatibility default: an unconfigured/zero-value Algo
+	// (poolpb.Algo_ALGO_UNSPECIFIED) means "the already-deployed CT132
+	// behavior", i.e. SHA3X-only — see JobManagerConfig.Algo's doc
+	// comment. This is the single normalization point that keeps
+	// every pre-existing caller (tests, main.go before LEAF_SOLO_ALGO
+	// was introduced) working unchanged.
+	if cfg.Algo == poolpb.Algo_ALGO_UNSPECIFIED {
+		cfg.Algo = poolpb.Algo_ALGO_SHA3X
+	}
 	return &JobManager{
 		cfg:      cfg,
 		perXN:    make(map[string]*Job),
@@ -292,7 +327,7 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 		return job, nil
 	}
 
-	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress)
+	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress, jm.cfg.Algo)
 	if err != nil {
 		return nil, fmt.Errorf("solo: GetBlockTemplate for xn %s: %w", xn, err)
 	}
@@ -307,6 +342,7 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 
 	job := &Job{
 		ID:                      id,
+		Algo:                    jm.cfg.Algo,
 		Height:                  result.GetBlock().GetHeader().GetHeight(),
 		Header:                  result.GetMergeMiningHash(),
 		BlockHash:               result.GetBlockHash(),
@@ -358,6 +394,7 @@ func (jm *JobManager) RestampDifficulty(ctx context.Context, xn string, difficul
 
 	restamped := &Job{
 		ID:                      existing.ID,
+		Algo:                    existing.Algo,
 		Height:                  existing.Height,
 		Header:                  existing.Header,
 		BlockHash:               existing.BlockHash,
@@ -440,7 +477,7 @@ func (jm *JobManager) InvalidateAll() {
 // any xn, since with per-xn jobs there is no "the" initial job to seed;
 // each session's first JobForXN call generates its own.
 func (jm *JobManager) Probe(ctx context.Context) error {
-	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress)
+	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress, jm.cfg.Algo)
 	if err != nil {
 		return fmt.Errorf("solo: GetBlockTemplate probe: %w", err)
 	}

@@ -311,11 +311,45 @@ func (s *Session) handleGetJob(req Request) {
 	s.pushJob(job)
 }
 
+// c29SubmitCycleSize/c29SubmitEdgeBits mirror validator/c29.go's
+// c29ProofSize/c29EdgeBits exactly (Tari's real Cuckaroo29: 42-edge
+// cycles at edge_bits=29) — duplicated here as session-package-local
+// constants purely because the validator package's own constants are
+// unexported (this package only wires the already-correct validator
+// in, it doesn't reach into its internals).
+const (
+	c29SubmitEdgeBits  = 29
+	c29SubmitCycleSize = 42
+)
+
 // handleSubmit implements the real "submit" method. Underlying logic
 // (SHA3XValidator.Validate, block-target comparison, SubmitBlock,
 // shareCount/blockCount bookkeeping) is unchanged from the previous
 // wire format — only request parsing and response encoding are new
 // relative to that pass.
+//
+// ALGO-AWARE DISPATCH (this pass): everything below the xn-prefix
+// check branches on job.Algo (job.go's Job.Algo, stamped at template
+// fetch time from JobManagerConfig.Algo) rather than assuming SHA3X:
+//   - nonce byte order: SHA3X decodes little-endian (unchanged from
+//     before), C29 decodes BIG-ENDIAN — confirmed from
+//     go-tari-c29-solo-stratum's real miner.go SubmitJob
+//     (`nonce := binary.BigEndian.Uint64(b)`), genuinely different
+//     from SHA3X, not assumed to be the same.
+//   - raw_proof shape: SHA3X builds a Share_Sha3XProof (header+nonce),
+//     C29 builds a Share_C29Proof (header+nonce+the submitted "pow"
+//     42-edge cycle — see protocol.go's SubmitRequest.POW, ported
+//     exactly from go-tari-c29-solo-stratum's MinerRPCSubmit.POW).
+//   - validator dispatch: looked up from s.server.validators (a
+//     validator.Registry) BY job.Algo, not a single server-wide
+//     validator field.
+//   - post-accept block-find difficulty/SubmitBlock: SHA3X reuses
+//     validator.SHA3XHeaderDiff and clones the block with just a
+//     stamped Nonce; C29 uses validator.C29Difficulty and clones the
+//     block with BOTH a stamped Nonce AND a real
+//     Header.Pow.PowData = the submitted cycle, edge-packed exactly as
+//     go-tari-c29-solo-stratum's SubmitJob does
+//     (`job.BlockResult.Block.Header.Pow.PowData = packedData`).
 //
 // SECURITY FIX: the job lookup now queries THIS SESSION'S OWN job
 // history (s.ownJob, jobsMu/jobList/jobLog above) instead of
@@ -336,18 +370,21 @@ func (s *Session) handleGetJob(req Request) {
 // The per-session xn prefix check (ported from
 // go-tari-sha3x-solo-stratum's miner.go SubmitJob:
 // `strings.HasPrefix(strings.ToLower(submittedWork.Nonce), m.xn)`)
-// STAYS — it is still a real, useful SHA3X-specific nonce-composition
-// validity check — but it is no longer the security boundary; it now
-// runs AFTER session-ownership has already been confirmed. This is
-// purely wire-level/session bookkeeping: verified against the real
-// hash math in validator/sha3x.go (sha3xHeaderDiff/GetHeaderDiff) that
-// the full 8-byte nonce is used directly as hash pre-image material
-// with no separate xn encoding — xn is a leading-byte convention
-// miners are expected to respect on their nonce composition, not
-// something baked into the hash function itself, so no change to
-// SHA3XValidator was needed or made. DOES enforce per-job used-nonce
-// tracking via Job.MarkNonceUsed, which the previous wire format's
-// implementation never had.
+// STAYS — it is still a real, useful nonce-composition validity check
+// for BOTH algos (go-tari-c29-solo-stratum's SubmitJob has the exact
+// same xn-prefix check on the exact same hex-STRING representation of
+// the nonce, before decoding it) — but it is no longer the security
+// boundary; it now runs AFTER session-ownership has already been
+// confirmed. This is purely wire-level/session bookkeeping: verified
+// against the real hash math in validator/sha3x.go
+// (sha3xHeaderDiff/GetHeaderDiff) that the full 8-byte nonce is used
+// directly as hash pre-image material with no separate xn encoding —
+// xn is a leading-byte convention miners are expected to respect on
+// their nonce composition, not something baked into the hash function
+// itself, so no change to SHA3XValidator (or C29Validator) was needed
+// or made. DOES enforce per-job used-nonce tracking via
+// Job.MarkNonceUsed, which the previous wire format's implementation
+// never had.
 func (s *Session) handleSubmit(req Request) {
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before submit", "")
@@ -384,9 +421,10 @@ func (s *Session) handleSubmit(req Request) {
 	}
 
 	// xn-prefix check happens BEFORE nonce decoding/PoW validation —
-	// ported exactly from the legacy ordering and rejection shape.
-	// This is a real SHA3X-specific validity check, NOT the security
-	// boundary (see doc comment above).
+	// ported exactly from the legacy ordering and rejection shape, and
+	// identical across both algos (see doc comment above). This is a
+	// real validity check, NOT the security boundary (see doc comment
+	// above).
 	if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 		return
@@ -394,32 +432,78 @@ func (s *Session) handleSubmit(req Request) {
 
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
 	if err != nil || len(nonceBytes) != 8 {
-		s.writeShareResponse(req.ID, false, "nonce must be 8 bytes, hex-encoded little-endian uint64")
+		s.writeShareResponse(req.ID, false, "nonce must be 8 bytes, hex-encoded uint64")
 		return
 	}
-	nonce := binary.LittleEndian.Uint64(nonceBytes)
+
+	var (
+		nonce uint64
+		share *poolpb.Share
+	)
+	switch job.Algo {
+	case poolpb.Algo_ALGO_C29:
+		// Real C29 submit wire shape, ported exactly from
+		// go-tari-c29-solo-stratum's messages.MinerRPCSubmit: the
+		// 42-edge cycle rides in "pow", absent from SHA3X's submit
+		// shape entirely.
+		if len(submit.POW) != c29SubmitCycleSize {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("pow must carry exactly %d edges for a C29 cycle, got %d", c29SubmitCycleSize, len(submit.POW)))
+			return
+		}
+		// CONFIRMED DIFFERENT FROM SHA3X: C29 decodes its nonce
+		// BIG-ENDIAN (go-tari-c29-solo-stratum's miner.go SubmitJob:
+		// `nonce := binary.BigEndian.Uint64(b)`), not little-endian.
+		nonce = binary.BigEndian.Uint64(nonceBytes)
+		share = &poolpb.Share{
+			Algo:           poolpb.Algo_ALGO_C29,
+			Network:        s.server.network,
+			BlockDiff:      safeInt64(job.StaticDifficulty),
+			BlockHeight:    int64(job.Height),
+			PaymentAddress: s.address.Load().(string),
+			Identifier:     s.worker.Load().(string),
+			RawProof: &poolpb.Share_C29Proof{
+				C29Proof: &poolpb.C29Proof{
+					EdgeBits: c29SubmitEdgeBits,
+					Cycle:    submit.POW,
+					Header:   job.Header,
+					Nonce:    nonce,
+				},
+			},
+		}
+	default:
+		// SHA3X (and, defensively, any legacy/unstamped
+		// ALGO_UNSPECIFIED job — matches JobManagerConfig.Algo's own
+		// SHA3X-default normalization): unchanged from before C29
+		// support existed.
+		nonce = binary.LittleEndian.Uint64(nonceBytes)
+		share = &poolpb.Share{
+			Algo:           poolpb.Algo_ALGO_SHA3X,
+			Network:        s.server.network,
+			BlockDiff:      safeInt64(job.StaticDifficulty),
+			BlockHeight:    int64(job.Height),
+			PaymentAddress: s.address.Load().(string),
+			Identifier:     s.worker.Load().(string),
+			RawProof: &poolpb.Share_Sha3XProof{
+				Sha3XProof: &poolpb.SHA3XProof{
+					Header: job.Header,
+					Nonce:  nonce,
+				},
+			},
+		}
+	}
 
 	if !job.MarkNonceUsed(nonce) {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("duplicate nonce: %s", submit.Nonce))
 		return
 	}
 
-	share := &poolpb.Share{
-		Algo:           poolpb.Algo_ALGO_SHA3X,
-		Network:        s.server.network,
-		BlockDiff:      safeInt64(job.StaticDifficulty),
-		BlockHeight:    int64(job.Height),
-		PaymentAddress: s.address.Load().(string),
-		Identifier:     s.worker.Load().(string),
-		RawProof: &poolpb.Share_Sha3XProof{
-			Sha3XProof: &poolpb.SHA3XProof{
-				Header: job.Header,
-				Nonce:  nonce,
-			},
-		},
+	v, err := s.server.validators.Get(job.Algo)
+	if err != nil {
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("no validator configured for this leaf's algo %v: %v", job.Algo, err))
+		return
 	}
 
-	valid, err := s.server.validator.Validate(context.Background(), share)
+	valid, err := v.Validate(context.Background(), share)
 	if err != nil && err != validator.ErrWrongProofType {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
 		return
@@ -433,7 +517,18 @@ func (s *Session) handleSubmit(req Request) {
 	// local diagnostic/hashrate-estimation signal only — solo mode has
 	// no share table and no backend to forward it to.
 	s.shareCount.Add(1)
-	diff := validator.SHA3XHeaderDiff(nonce, job.Header)
+
+	diff, block, err := s.blockCandidate(job, nonce, submit.POW)
+	if err != nil {
+		// Infrastructure-only failure deriving the real difficulty of
+		// an already-validated share (e.g. a zero C29 hash — see
+		// validator.C29Difficulty's doc comment); this is not the
+		// miner's fault, but there is nothing sound to compare
+		// against job.NetworkTargetDifficulty, so reject rather than
+		// silently mis-accept/mis-reject a block find.
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
+		return
+	}
 
 	if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
 		// Accepted share, below block difficulty: this is the
@@ -448,11 +543,10 @@ func (s *Session) handleSubmit(req Request) {
 		return
 	}
 
-	// Meets full block difficulty: construct the real submission from
-	// the already-fetched real GRPC template/coinbase data and submit
-	// it for real. Mirrors go-tari-sha3x-solo-stratum's SubmitJob
-	// (subsystems/poolStratum/miner.go, ~line 493).
-	block := cloneBlockWithNonce(job.Result.GetBlock(), nonce)
+	// Meets full block difficulty: submit the real, already-constructed
+	// candidate block (see blockCandidate above) for real. Mirrors
+	// go-tari-sha3x-solo-stratum's SubmitJob (subsystems/poolStratum/
+	// miner.go, ~line 493) and go-tari-c29-solo-stratum's equivalent.
 	_, err = s.server.node.SubmitBlock(context.Background(), block)
 	if err != nil {
 		// Ported exactly from the reference (miner.go's SubmitJob,
@@ -493,6 +587,29 @@ func (s *Session) handleSubmit(req Request) {
 	// jobs to every connected session) rather than waiting out the
 	// tip-poll interval.
 	go s.server.jobManager.InvalidateAll()
+}
+
+// blockCandidate computes the real, algo-appropriate difficulty of an
+// already-validated share and the real candidate block that would be
+// submitted if that difficulty turns out to meet job.NetworkTargetDifficulty
+// (handleSubmit decides whether to actually call SubmitBlock with it).
+// Building the block unconditionally (not just on the block-find path)
+// keeps this the single place nonce/cycle-to-block wiring happens per
+// algo, mirroring both reference implementations, which likewise stamp
+// job.BlockResult.Block.Header before checking whether the result meets
+// full block difficulty.
+func (s *Session) blockCandidate(job *Job, nonce uint64, cycle []uint64) (diff uint64, block *tari_generated.Block, err error) {
+	switch job.Algo {
+	case poolpb.Algo_ALGO_C29:
+		diff, err = validator.C29Difficulty(cycle, c29SubmitEdgeBits)
+		if err != nil {
+			return 0, nil, err
+		}
+		return diff, cloneBlockWithC29Proof(job.Result.GetBlock(), nonce, cycle), nil
+	default:
+		diff = validator.SHA3XHeaderDiff(nonce, job.Header)
+		return diff, cloneBlockWithNonce(job.Result.GetBlock(), nonce), nil
+	}
 }
 
 // recordJob records job into this session's own bounded job history
@@ -607,12 +724,31 @@ func (s *Session) pushJob(job *Job) {
 func (s *Session) jobPayload(job *Job) JobPayload {
 	s.recordJob(job)
 	return JobPayload{
-		Algo:   "sha3x",
+		Algo:   algoWireName(job.Algo),
 		Blob:   hex.EncodeToString(job.Header),
 		Height: job.Height,
 		JobID:  job.ID,
 		Target: diffToTargetHex(job.StaticDifficulty),
 		XN:     s.xn,
+	}
+}
+
+// algoWireName maps a Job's stamped poolpb.Algo onto the real wire
+// "algo" label real miner software expects — confirmed against both
+// reference implementations' MinerJobJSON.Algo: go-tari-sha3x-solo-stratum
+// literally hardcodes "sha3x", go-tari-c29-solo-stratum's GetJobJSON sets
+// "C29" (mixed case in that repo, but this is a case-insensitive label
+// miners key off, not consensus data — lowercased here for consistency
+// with the SHA3X label and this package's own login/getjob "algo": []
+// string convention, which is already lowercase). ALGO_UNSPECIFIED (a
+// legacy/never-should-happen Job) falls back to "sha3x" for defensive
+// backward compatibility, matching JobManagerConfig.Algo's own default.
+func algoWireName(algo poolpb.Algo) string {
+	switch algo {
+	case poolpb.Algo_ALGO_C29:
+		return "c29"
+	default:
+		return "sha3x"
 	}
 }
 
@@ -671,5 +807,32 @@ func cloneBlockWithNonce(block *tari_generated.Block, nonce uint64) *tari_genera
 		blockCopy.Header = &tari_generated.BlockHeader{}
 	}
 	blockCopy.Header.Nonce = nonce
+	return blockCopy
+}
+
+// cloneBlockWithC29Proof is cloneBlockWithNonce's C29 counterpart: in
+// addition to stamping Header.Nonce, it also stamps
+// Header.Pow.PowData with the real, edge-packed submitted cycle —
+// ported exactly from go-tari-c29-solo-stratum's SubmitJob
+// (`job.BlockResult.Block.Header.Pow.PowData = packedData`, where
+// packedData is the SAME edgePacking(cycle, 29) output also used for
+// the difficulty hash — see validator.C29EdgePacking/C29Difficulty).
+// SHA3X has no equivalent supplemental pow_data (see
+// tari_generated.ProofOfWork's doc comment: "for Sha3x, this would be
+// empty"), which is why cloneBlockWithNonce above doesn't touch
+// Header.Pow at all.
+func cloneBlockWithC29Proof(block *tari_generated.Block, nonce uint64, cycle []uint64) *tari_generated.Block {
+	if block == nil {
+		return nil
+	}
+	blockCopy := proto.Clone(block).(*tari_generated.Block)
+	if blockCopy.Header == nil {
+		blockCopy.Header = &tari_generated.BlockHeader{}
+	}
+	blockCopy.Header.Nonce = nonce
+	if blockCopy.Header.Pow == nil {
+		blockCopy.Header.Pow = &tari_generated.ProofOfWork{}
+	}
+	blockCopy.Header.Pow.PowData = validator.C29EdgePacking(cycle, c29SubmitEdgeBits)
 	return blockCopy
 }

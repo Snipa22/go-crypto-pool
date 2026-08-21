@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+
+	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
 // fakeNodeClient is a NodeClient test double: no real GRPC, no real
@@ -46,9 +48,11 @@ type fakeNodeClient struct {
 	submitBlockErr      error
 
 	lastSubmittedBlock *tari_generated.Block
+	lastRequestedAlgo  poolpb.Algo
 }
 
-func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress string) (*tari_generated.GetNewBlockResult, error) {
+func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress string, algo poolpb.Algo) (*tari_generated.GetNewBlockResult, error) {
+	f.lastRequestedAlgo = algo
 	call := f.templateCalls.Add(1)
 	if f.getBlockTemplateErr != nil {
 		return nil, f.getBlockTemplateErr

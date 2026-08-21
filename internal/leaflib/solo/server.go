@@ -18,14 +18,26 @@ import (
 
 // Server ties together internal/leaflib.ConnectionManager (miner
 // connection lifecycle), a JobManager (real Tari base-node GRPC job
-// pipeline), and a validator.AlgoValidator (real SHA3X PoW checking) —
-// this is the entire leaf-solo vertical slice. There is deliberately no
-// backend connection anywhere in this type.
+// pipeline), and a validator.Registry (real per-algo PoW checking —
+// SHA3XValidator and, as of this pass, C29Validator) — this is the
+// entire leaf-solo vertical slice. There is deliberately no backend
+// connection anywhere in this type.
 type Server struct {
 	cm         *leaflib.ConnectionManager
 	jobManager *JobManager
 	node       NodeClient
-	validator  validator.AlgoValidator
+
+	// validators is looked up by a JOB's own stamped poolpb.Algo (see
+	// job.go's Job.Algo) at submit time (session.go's handleSubmit),
+	// not by any single server-wide algo assumption — this is what
+	// makes validator dispatch algo-aware rather than SHA3X-hardcoded.
+	// Callers that only ever serve SHA3X (the default/unconfigured
+	// path — see cmd/leaf-solo/main.go) construct a Registry with only
+	// poolpb.Algo_ALGO_SHA3X registered, which is exactly the
+	// already-deployed CT132 behavior: any job somehow stamped with a
+	// different algo would fail this lookup rather than being silently
+	// mis-validated.
+	validators validator.Registry
 	network    poolpb.Network
 	logger     *log.Logger
 
@@ -71,7 +83,7 @@ type Server struct {
 // per-connection adaptive retargeting from that starting point (a
 // zero-value VardiffConfig is normalized to sane defaults — see
 // vardiff.go's defaultVardiffConfig).
-func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeClient, v validator.AlgoValidator, network poolpb.Network, logger *log.Logger, vardiff VardiffConfig) *Server {
+func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeClient, validators validator.Registry, network poolpb.Network, logger *log.Logger, vardiff VardiffConfig) *Server {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -79,7 +91,7 @@ func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeC
 		cm:               cm,
 		jobManager:       jobManager,
 		node:             node,
-		validator:        v,
+		validators:       validators,
 		network:          network,
 		logger:           logger,
 		vardiff:          vardiff.normalized(),
