@@ -136,15 +136,23 @@ type SubmitRequest struct {
 //   - XN is the session's own assigned extranonce (job.go's
 //     newSessionXN), 4 hex characters (2 bytes) — the SAME value on
 //     every job sent to a given session, since xn is assigned once at
-//     connect time, not per-job. Field name/tag matches the legacy
-//     messages.MinerJobJSON.XNonce field exactly.
+//     connect time — see the xn field's doc comment. Field name/tag
+//     matches the legacy messages.MinerJobJSON.XNonce field exactly.
+//   - SeedHash is RXT-only: the real Tari RandomX seed/key for this
+//     job (job.go's Job.VmKey, taken directly from
+//     GetNewBlockResult.VmKey), hex-encoded. Mirrors XMRig's own
+//     stratum job-JSON convention for RandomX-family coins (a
+//     "seed_hash" field the miner needs to (re)prime its own RandomX
+//     VM against). Absent (omitempty) for SHA3X/C29 jobs, which have
+//     no seed concept.
 type JobPayload struct {
-	Algo   string `json:"algo"`
-	Blob   string `json:"blob"`
-	Height uint64 `json:"height"`
-	JobID  string `json:"job_id"`
-	Target string `json:"target"`
-	XN     string `json:"xn,omitempty"`
+	Algo     string `json:"algo"`
+	Blob     string `json:"blob"`
+	Height   uint64 `json:"height"`
+	JobID    string `json:"job_id"`
+	Target   string `json:"target"`
+	XN       string `json:"xn,omitempty"`
+	SeedHash string `json:"seed_hash,omitempty"`
 }
 
 // LoginResult is the real login response's nested "result" object.

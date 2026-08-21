@@ -77,6 +77,16 @@ type config struct {
 	// CT132 leaf-solo.service's SHA3X-only behavior exactly.
 	algo string
 
+	// randomXServiceURL is the RandomX-verification HTTP daemon address
+	// (github.com/Snipa22/go-xmr-lib's hashValidation.RXVerifier — see
+	// internal/leaflib/validator/randomx.go) this leaf's RandomXValidator
+	// talks to for RXT (and, if ever configured for it, RXM) shares.
+	// Only actually consulted when -algo/LEAF_SOLO_ALGO is "rxt" — for
+	// sha3x/c29 leaves the registry's RXT/RXM entries are built but
+	// never invoked. Defaults to the real, locally-running daemon this
+	// pass was tested against (http://127.0.0.1:39093).
+	randomXServiceURL string
+
 	startingDifficulty uint64
 	portsRaw           string
 	minDifficulty      uint64
@@ -102,7 +112,8 @@ func loadConfig() config {
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_SOLO_LISTEN_ADDRESS", ":4444"), "miner-facing TCP listen address. Env: LEAF_SOLO_LISTEN_ADDRESS")
 	flag.StringVar(&cfg.payoutAddress, "payout-address", envOr("LEAF_SOLO_PAYOUT_ADDRESS", ""), "solo payout address; found-block coinbase rewards go here. Env: LEAF_SOLO_PAYOUT_ADDRESS")
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_SOLO_NETWORK", "testnet"), "network tag for share/diagnostic records: mainnet|testnet. Env: LEAF_SOLO_NETWORK")
-	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default) or c29. Env: LEAF_SOLO_ALGO")
+	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default), c29, or rxt. Env: LEAF_SOLO_ALGO")
+	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_SOLO_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (only consulted when -algo=rxt). Env: LEAF_SOLO_RANDOMX_SERVICE_URL")
 
 	// LEAF_SOLO_STARTING_DIFFICULTY replaces the old, now-removed
 	// LEAF_SOLO_DIFFICULTY (which used to be THE only difficulty any
@@ -291,6 +302,8 @@ func algoFromString(s string) poolpb.Algo {
 	switch s {
 	case "c29":
 		return poolpb.Algo_ALGO_C29
+	case "rxt":
+		return poolpb.Algo_ALGO_RXT
 	default:
 		return poolpb.Algo_ALGO_SHA3X
 	}
@@ -360,13 +373,14 @@ func main() {
 
 	// Registry covers all four algos so this Server can dispatch a
 	// submit to the right validator by the job's own Algo field. This
-	// leaf currently only fetches/serves SHA3X and C29 job templates
-	// (see -algo below); RXT/RXM entries in the registry are present
-	// for completeness/future-proofing but never actually invoked by
-	// this leaf today, so an empty randomXServiceURL is fine — it
-	// would only matter if this leaf ever requested an RXT/RXM
-	// template, which it does not.
-	validators := validator.NewRegistry("")
+	// leaf currently fetches/serves SHA3X, C29, and now RXT job
+	// templates (see -algo above); RXM remains out of scope. The
+	// RandomX validator (shared by RXT/RXM) is wired to the real,
+	// configured randomx-service daemon (cfg.randomXServiceURL,
+	// defaulting to the locally-tested http://127.0.0.1:39093) rather
+	// than an empty placeholder — this is what RXT submits actually
+	// verify against.
+	validators := validator.NewRegistry(cfg.randomXServiceURL)
 	vardiffCfg := solo.VardiffConfig{
 		MinDifficulty:    cfg.minDifficulty,
 		MaxDifficulty:    cfg.maxDifficulty,

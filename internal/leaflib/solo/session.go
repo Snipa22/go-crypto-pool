@@ -470,6 +470,46 @@ func (s *Session) handleSubmit(req Request) {
 				},
 			},
 		}
+	case poolpb.Algo_ALGO_RXT:
+		// Real RXT (Tari's OWN native RandomX PoW — NOT merge-mining
+		// RXM) submit wire shape: no "pow" field (that's C29-only); the
+		// miner's claimed RandomX result hash rides in the existing
+		// generic "result" field (submit.Result), and the nonce is
+		// encoded BIG-ENDIAN — CONFIRMED from the real Tari Rust source
+		// (create_tari_mining_blob's `header.nonce.to_be_bytes()`),
+		// matching C29's convention, NOT SHA3X's little-endian one.
+		nonce = binary.BigEndian.Uint64(nonceBytes)
+
+		if submit.Result == "" {
+			s.writeShareResponse(req.ID, false, "rxt submit requires a claimed result hash in \"result\"")
+			return
+		}
+
+		// Build the real 76-byte Tari mining blob (rxt.go's
+		// createTariMiningBlob, ported byte-for-byte from the real
+		// Tari Rust create_tari_mining_blob) from THIS job's own
+		// mining-hash material and pow_data, and the submitted nonce.
+		var powData []byte
+		if job.Result != nil && job.Result.GetBlock() != nil && job.Result.GetBlock().GetHeader() != nil {
+			powData = job.Result.GetBlock().GetHeader().GetPow().GetPowData()
+		}
+		blob := createTariMiningBlob(job.Header, nonce, rxtPowAlgoByte, powData)
+
+		share = &poolpb.Share{
+			Algo:           poolpb.Algo_ALGO_RXT,
+			Network:        s.server.network,
+			BlockDiff:      safeInt64(job.StaticDifficulty),
+			BlockHeight:    int64(job.Height),
+			PaymentAddress: s.address.Load().(string),
+			Identifier:     s.worker.Load().(string),
+			RawProof: &poolpb.Share_RandomxProof{
+				RandomxProof: &poolpb.RandomXProof{
+					Blob:      blob,
+					SeedHash:  job.VmKey,
+					ResultHex: submit.Result,
+				},
+			},
+		}
 	default:
 		// SHA3X (and, defensively, any legacy/unstamped
 		// ALGO_UNSPECIFIED job — matches JobManagerConfig.Algo's own
@@ -518,7 +558,7 @@ func (s *Session) handleSubmit(req Request) {
 	// no share table and no backend to forward it to.
 	s.shareCount.Add(1)
 
-	diff, block, err := s.blockCandidate(job, nonce, submit.POW)
+	diff, block, err := s.blockCandidate(job, nonce, submit.POW, submit.Result)
 	if err != nil {
 		// Infrastructure-only failure deriving the real difficulty of
 		// an already-validated share (e.g. a zero C29 hash — see
@@ -598,7 +638,17 @@ func (s *Session) handleSubmit(req Request) {
 // algo, mirroring both reference implementations, which likewise stamp
 // job.BlockResult.Block.Header before checking whether the result meets
 // full block difficulty.
-func (s *Session) blockCandidate(job *Job, nonce uint64, cycle []uint64) (diff uint64, block *tari_generated.Block, err error) {
+//
+// resultHex is only consulted for ALGO_RXT: it is the miner's claimed
+// RandomX result hash (submit.Result), which by the time this is called
+// has ALREADY been confirmed by validator.RandomXValidator to be the
+// real, randomx-service-computed hash for this share's blob+seed (see
+// handleSubmit's call ordering: Validate runs before blockCandidate) —
+// this function does not itself re-verify anything cryptographic, it
+// only derives the little-endian-U256 difficulty (rxt.go's
+// rxtLittleEndianDifficulty) of that already-confirmed-real hash, per
+// the real Tari Difficulty::little_endian_difficulty formula.
+func (s *Session) blockCandidate(job *Job, nonce uint64, cycle []uint64, resultHex string) (diff uint64, block *tari_generated.Block, err error) {
 	switch job.Algo {
 	case poolpb.Algo_ALGO_C29:
 		diff, err = validator.C29Difficulty(cycle, c29SubmitEdgeBits)
@@ -606,6 +656,21 @@ func (s *Session) blockCandidate(job *Job, nonce uint64, cycle []uint64) (diff u
 			return 0, nil, err
 		}
 		return diff, cloneBlockWithC29Proof(job.Result.GetBlock(), nonce, cycle), nil
+	case poolpb.Algo_ALGO_RXT:
+		hashBytes, hexErr := hex.DecodeString(resultHex)
+		if hexErr != nil {
+			return 0, nil, fmt.Errorf("solo: rxt claimed result hash is not valid hex: %w", hexErr)
+		}
+		diff, err = rxtLittleEndianDifficulty(hashBytes)
+		if err != nil {
+			return 0, nil, err
+		}
+		// RXT has no supplemental on-chain pow_data to stamp (unlike
+		// C29's edge-packed cycle) — the template's own Header.Pow
+		// (pow_algo=RandomXT, whatever pow_data the base node already
+		// populated it with) is left exactly as fetched; only
+		// Header.Nonce is mutated, same as SHA3X/cloneBlockWithNonce.
+		return diff, cloneBlockWithNonce(job.Result.GetBlock(), nonce), nil
 	default:
 		diff = validator.SHA3XHeaderDiff(nonce, job.Header)
 		return diff, cloneBlockWithNonce(job.Result.GetBlock(), nonce), nil
@@ -723,7 +788,7 @@ func (s *Session) pushJob(job *Job) {
 // repushes) without needing a separate recordJob call at each site.
 func (s *Session) jobPayload(job *Job) JobPayload {
 	s.recordJob(job)
-	return JobPayload{
+	payload := JobPayload{
 		Algo:   algoWireName(job.Algo),
 		Blob:   hex.EncodeToString(job.Header),
 		Height: job.Height,
@@ -731,6 +796,15 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 		Target: diffToTargetHex(job.StaticDifficulty),
 		XN:     s.xn,
 	}
+	// RXT-only: surface the real RandomX seed/key (job.go's Job.VmKey,
+	// taken directly from GetNewBlockResult.VmKey) as the wire
+	// "seed_hash" field — mirrors XMRig's own stratum job-JSON
+	// convention for RandomX-family coins. SHA3X/C29 jobs have no
+	// VmKey, so this is simply omitted (omitempty) for them.
+	if job.Algo == poolpb.Algo_ALGO_RXT && len(job.VmKey) > 0 {
+		payload.SeedHash = hex.EncodeToString(job.VmKey)
+	}
+	return payload
 }
 
 // algoWireName maps a Job's stamped poolpb.Algo onto the real wire
@@ -747,6 +821,8 @@ func algoWireName(algo poolpb.Algo) string {
 	switch algo {
 	case poolpb.Algo_ALGO_C29:
 		return "c29"
+	case poolpb.Algo_ALGO_RXT:
+		return "rxt"
 	default:
 		return "sha3x"
 	}

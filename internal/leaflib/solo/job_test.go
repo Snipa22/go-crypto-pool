@@ -39,6 +39,20 @@ type fakeNodeClient struct {
 	// doc comment).
 	blockHashSeed []byte
 
+	// vmKey is the synthetic RandomX seed/key GetBlockTemplate returns
+	// as GetNewBlockResult.VmKey — only meaningful for RXT tests
+	// (job.go's Job.VmKey is populated straight from this field).
+	// Empty/unused for SHA3X/C29 test harnesses.
+	vmKey []byte
+
+	// powData is the synthetic ProofOfWork.PowData GetBlockTemplate's
+	// returned Block.Header.Pow carries — used by RXT tests to exercise
+	// createTariMiningBlob's pow.to_bytes()-equivalent segment with
+	// non-empty pow_data (a fresh real RXT template's pow_data is
+	// typically empty, but the blob construction must handle a
+	// nonempty one correctly too).
+	powData []byte
+
 	templateCalls atomic.Int64
 	tipCalls      atomic.Int64
 	submitCalls   atomic.Int64
@@ -63,8 +77,12 @@ func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress strin
 	return &tari_generated.GetNewBlockResult{
 		BlockHash:       blockHash,
 		MergeMiningHash: f.mergeMiningHash,
+		VmKey:           f.vmKey,
 		Block: &tari_generated.Block{
-			Header: &tari_generated.BlockHeader{Height: f.height},
+			Header: &tari_generated.BlockHeader{
+				Height: f.height,
+				Pow:    &tari_generated.ProofOfWork{PowData: f.powData},
+			},
 		},
 		MinerData: &tari_generated.MinerData{
 			TargetDifficulty: f.targetDifficulty,
