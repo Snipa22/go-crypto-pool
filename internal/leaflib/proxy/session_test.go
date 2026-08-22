@@ -301,8 +301,8 @@ func TestSession_LoginGetJobSubmit_FullFlow(t *testing.T) {
 	if loginResp.Result.Job.Blob == "" {
 		t.Fatal("expected a non-empty job blob in the login response")
 	}
-	if loginResp.Result.Job.Algo != "rxm" {
-		t.Errorf("expected algo=rxm, got %q", loginResp.Result.Job.Algo)
+	if loginResp.Result.Job.Algo != "rx/0" {
+		t.Errorf("expected algo=rx/0, got %q", loginResp.Result.Job.Algo)
 	}
 
 	// getjob
