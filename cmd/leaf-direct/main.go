@@ -402,6 +402,7 @@ func main() {
 		server.EnableMetrics(version, cfg.maxAddressLabels)
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", server.MetricsHandler())
+		metricsMux.Handle("/", server.StatsHTMLHandler())
 		metricsSrv := &http.Server{Addr: cfg.metricsListenAddress, Handler: metricsMux}
 		go func() {
 			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -414,7 +415,7 @@ func main() {
 			defer cancel()
 			_ = metricsSrv.Shutdown(shutdownCtx)
 		}()
-		logger.Printf("serving /metrics on %s", cfg.metricsListenAddress)
+		logger.Printf("serving /metrics and / (basic stats page) on %s", cfg.metricsListenAddress)
 	} else {
 		logger.Printf("metrics HTTP server disabled (-metrics-listen-address is empty)")
 	}
