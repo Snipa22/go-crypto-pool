@@ -409,7 +409,17 @@ func (s *Session) pushJob(job *Job) {
 func (s *Session) jobPayload(job *Job) JobPayload {
 	s.recordJob(job)
 	payload := JobPayload{
-		Algo:   "rxm",
+		// "rx/0" is the real wire algo string a real Monero-family
+		// pool/miner actually uses (confirmed from the real pool-server
+		// source, nodejs-pool-sxmr's lib/pool.js: `newJob.algo =
+		// "rx/0"`) -- NOT "rxm" (that string is this repo's own
+		// internal poolpb.Algo protobuf enum name, ALGO_RXM, meaning
+		// "RandomX-Monero-family" at the schema level; it was never
+		// meant to leak onto the real miner-facing wire protocol as a
+		// literal algo string, and SXMR mines plain Monero RandomX,
+		// not a Tari-specific merge-mined target -- caught live,
+		// 2026-08-22).
+		Algo:   "rx/0",
 		Blob:   hex.EncodeToString(job.Blob),
 		Height: job.Height,
 		JobID:  job.ID,
