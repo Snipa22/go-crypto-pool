@@ -70,8 +70,6 @@ type config struct {
 	vardiffInterval    time.Duration
 	jobMaxAge          time.Duration
 
-	randomXServiceURL string
-
 	maxConnections int
 	idleTimeout    time.Duration
 
@@ -114,8 +112,6 @@ func loadConfig() config {
 	flag.IntVar(&cfg.vardiffTargetTime, "vardiff-target-time", envOrInt("LEAF_PROXY_VARDIFF_TARGET_TIME", 30), "seconds between shares vardiff aims for. Env: LEAF_PROXY_VARDIFF_TARGET_TIME")
 	flag.DurationVar(&cfg.vardiffInterval, "vardiff-retarget-interval", envOrDuration("LEAF_PROXY_VARDIFF_RETARGET_INTERVAL", 60*time.Second), "how often each downstream session's own vardiff retarget timer fires. Env: LEAF_PROXY_VARDIFF_RETARGET_INTERVAL")
 	flag.DurationVar(&cfg.jobMaxAge, "job-max-age", envOrDuration("LEAF_PROXY_JOB_MAX_AGE", 6*time.Minute), "real per-job expiry threshold; a submit against an older job is rejected. Env: LEAF_PROXY_JOB_MAX_AGE")
-
-	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_PROXY_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address used for real local re-validation. Env: LEAF_PROXY_RANDOMX_SERVICE_URL")
 
 	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_PROXY_MAX_CONNECTIONS", 0), "max concurrent downstream miner connections, 0 = unlimited. Env: LEAF_PROXY_MAX_CONNECTIONS")
 	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", envOrDuration("LEAF_PROXY_IDLE_TIMEOUT", 2*time.Minute), "rolling per-downstream-connection idle timeout. Env: LEAF_PROXY_IDLE_TIMEOUT")
@@ -211,7 +207,21 @@ func main() {
 		IdleTimeout:    cfg.idleTimeout,
 	})
 
-	rxValidator := validator.NewRandomXValidator(cfg.randomXServiceURL)
+	// Real, in-process, pure-Go RandomX validator -- NO external
+	// randomx-service HTTP daemon dependency. leaf-proxy's local
+	// re-validation gate (internal/leaflib/proxy/session.go's
+	// handleSubmit) only calls ValidateBlobSeedResult on a genuine
+	// block-level find (a submit that already meets the real upstream
+	// pool's block target), not on every ordinary sub-block share -- at
+	// that call frequency, pure-Go RandomX's real ~258ms/hash cost
+	// (benchmarked separately, git.gammaspectra.live/P2Pool/go-randomx
+	// @v1.0.0) is genuinely acceptable, and removing the external
+	// daemon dependency simplifies leaf-proxy's deployment. See
+	// internal/leaflib/validator/randomx_puregolang.go's doc comment
+	// for the full honest writeup, including why leaf-solo's RXT
+	// support (a real per-share hot path) still uses the external-
+	// daemon-backed RandomXValidator instead.
+	rxValidator := validator.NewPureGoRandomXValidator()
 
 	vardiffCfg := leaflib.VardiffConfig{
 		MinDifficulty:    cfg.minDifficulty,

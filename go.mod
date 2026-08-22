@@ -15,6 +15,7 @@ require (
 )
 
 require (
+	git.gammaspectra.live/P2Pool/go-randomx v1.0.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dchest/blake2b v1.0.0 // indirect

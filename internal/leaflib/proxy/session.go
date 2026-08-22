@@ -20,12 +20,15 @@ import (
 // ShareValidator is the real local-RandomX-re-validation dependency
 // leaf-proxy's Session uses to check a downstream miner's claimed
 // result BEFORE ever forwarding anything upstream — implemented by
-// the already-merged, already-live-verified
-// internal/leaflib/validator.RandomXValidator (its
+// the real, in-process, pure-Go
+// internal/leaflib/validator.PureGoRandomXValidator (its
 // ValidateBlobSeedResult method matches this shape exactly — see that
-// method's doc comment). Defined as an interface here purely so
-// session_test.go can inject a deterministic fake instead of standing
-// up a real randomx-service daemon for every unit test run.
+// type's doc comment for why leaf-proxy uses the pure-Go
+// implementation while leaf-solo's RXT support still uses the
+// external-daemon-backed RandomXValidator, which implements this same
+// method shape too). Defined as an interface here purely so
+// session_test.go can inject a deterministic fake instead of paying
+// pure-Go RandomX's real per-call cost for every unit test run.
 type ShareValidator interface {
 	ValidateBlobSeedResult(ctx context.Context, blob, seed []byte, resultHex string) (bool, error)
 }
