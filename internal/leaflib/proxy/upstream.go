@@ -48,8 +48,14 @@ type UpstreamClient struct {
 	// it here, for an OUTBOUND connection, rather than hand-rolling a
 	// second ad hoc net.Conn wrapper, is exactly the "reuse shared
 	// infra" requirement applied to the upstream side too.
-	cm *leaflib.ConnectionManager
-	mc *leaflib.ManagedConnection
+	// cmMu guards cm/mc against concurrent access between a
+	// (re)connect (dialAndLogin, which replaces both after a fresh
+	// dial+login) and Close (which reads both to tear them down) —
+	// both can run concurrently in practice via reconnectLoop racing
+	// an operator-triggered Close.
+	cmMu sync.Mutex
+	cm   *leaflib.ConnectionManager
+	mc   *leaflib.ManagedConnection
 
 	sessionID string // the pool's own assigned session id, from the login response
 
@@ -66,6 +72,14 @@ type UpstreamClient struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	// connected/reconnects back UpstreamHealth (see server.go's
+	// UpstreamHealth interface doc comment): connected reflects
+	// whether the upstream socket is currently up, reconnects counts
+	// real, successful re-establishments after a real connection
+	// loss (the initial Connect is NOT counted).
+	connected  atomic.Bool
+	reconnects atomic.Uint64
 }
 
 // UpstreamConfig configures a real upstream pool connection.
@@ -146,8 +160,44 @@ func NewUpstreamClient(cfg UpstreamConfig, logger *log.Logger) *UpstreamClient {
 // Connect dials the real upstream pool, performs the real login, and
 // starts the background read loop. On success, an initial
 // WorkerTemplate (from the login response's nested "job") is already
-// available via CurrentTemplate.
+// available via CurrentTemplate. If the connection is later lost
+// (readLoop's scanner terminating for any reason other than an
+// explicit Close), a background reconnectLoop automatically redials
+// and re-logs-in with exponential backoff — see reconnectLoop's doc
+// comment. Connected()/ReconnectCount() expose this real health state
+// for metrics (see server.go's UpstreamHealth interface).
 func (uc *UpstreamClient) Connect(ctx context.Context) error {
+	if err := uc.dialAndLogin(ctx); err != nil {
+		return err
+	}
+	uc.connected.Store(true)
+	return nil
+}
+
+// dialAndLogin performs the real dial + ManagedConnection registration
+// + login round-trip shared by both the initial Connect and every
+// reconnectLoop attempt. It does NOT start readLoop or flip
+// uc.connected — callers own that (Connect does it once for the
+// initial connection; reconnectLoop does it after a successful
+// redial).
+//
+// FIXED (this pass): readLoop MUST already be reading the socket
+// before login()'s request goes out, because login() blocks on
+// uc.pending waiting for a response that only readLoop's scanner
+// loop can ever deliver — readLoop is therefore started here, right
+// after uc.mc is assigned (under cmMu) and BEFORE login() is called,
+// rather than by callers after dialAndLogin returns. To avoid a
+// duplicate/uncoordinated readLoop goroutine when THIS login attempt
+// itself fails (dialAndLogin closes mc/cm below, which makes this
+// same readLoop's scanner terminate too), readLoop is told via
+// loggedIn whether login for this exact connection ever actually
+// succeeded: if not, it exits quietly instead of invoking
+// reconnectLoop itself — that failure is already being surfaced as
+// this function's own return value, to whichever caller (Connect, or
+// reconnectLoop's own retry-with-backoff loop) is driving this
+// attempt, so a second, independent reconnectLoop invocation from
+// inside readLoop would be a real duplicate.
+func (uc *UpstreamClient) dialAndLogin(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", uc.cfg.Host, uc.cfg.Port)
 	dialer := &net.Dialer{Timeout: uc.cfg.DialTimeout}
 
@@ -163,35 +213,97 @@ func (uc *UpstreamClient) Connect(ctx context.Context) error {
 		return fmt.Errorf("proxy: dialing upstream pool %s: %w", addr, err)
 	}
 
-	uc.cm = leaflib.NewConnectionManager(context.Background(), leaflib.ManagerConfig{
+	cm := leaflib.NewConnectionManager(context.Background(), leaflib.ManagerConfig{
 		MaxConnections: 1,
 		IdleTimeout:    uc.cfg.IdleTimeout,
 	})
-	mc, err := uc.cm.Accept(ctx, conn)
+	mc, err := cm.Accept(ctx, conn)
 	if err != nil {
+		cm.Shutdown()
 		return fmt.Errorf("proxy: registering upstream connection: %w", err)
 	}
+	uc.cmMu.Lock()
+	uc.cm = cm
 	uc.mc = mc
+	uc.cmMu.Unlock()
 
-	go uc.readLoop()
+	loggedIn := &atomic.Bool{}
+	go uc.readLoop(mc, loggedIn)
 
 	if _, err := uc.login(ctx); err != nil {
-		_ = uc.Close()
+		_ = mc.Close("upstream login failed")
+		cm.Shutdown()
 		return err
 	}
+	loggedIn.Store(true)
 	return nil
 }
+
+// reconnectLoop is started by readLoop when the upstream connection
+// is lost for any reason other than an explicit Close (see readLoop's
+// doc comment). It redials and re-logs-in with a real exponential
+// backoff (1s, doubling, capped at 30s), incrementing
+// UpstreamReconnectsTotal (via ReconnectCount, observed by
+// server.go's sessionSnapshots) on every SUCCESSFUL reconnect. Exits
+// without further action if uc.closed fires while backing off or
+// mid-attempt (an explicit Close during a reconnect attempt is not
+// itself a failure worth logging/retrying).
+func (uc *UpstreamClient) reconnectLoop() {
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+	for {
+		select {
+		case <-uc.closed:
+			return
+		default:
+		}
+
+		attemptCtx, cancel := context.WithTimeout(context.Background(), uc.cfg.DialTimeout+uc.cfg.RequestTimeout)
+		err := uc.dialAndLogin(attemptCtx)
+		cancel()
+		if err == nil {
+			uc.reconnects.Add(1)
+			uc.connected.Store(true)
+			uc.logger.Printf("proxy: upstream connection re-established (reconnect #%d)", uc.reconnects.Load())
+			return
+		}
+
+		uc.logger.Printf("proxy: upstream reconnect attempt failed, retrying in %s: %v", backoff, err)
+		select {
+		case <-time.After(backoff):
+		case <-uc.closed:
+			return
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+// Connected reports whether the upstream pool connection is currently
+// established — implements server.go's UpstreamHealth.
+func (uc *UpstreamClient) Connected() bool { return uc.connected.Load() }
+
+// ReconnectCount reports the real, monotonically-increasing count of
+// successful reconnects since process start (the initial startup
+// Connect is NOT counted) — implements server.go's UpstreamHealth.
+func (uc *UpstreamClient) ReconnectCount() uint64 { return uc.reconnects.Load() }
 
 // Close tears down the upstream connection.
 func (uc *UpstreamClient) Close() error {
 	var err error
 	uc.closeOnce.Do(func() {
 		close(uc.closed)
-		if uc.mc != nil {
-			err = uc.mc.Close("upstream client closed")
+		uc.connected.Store(false)
+		uc.cmMu.Lock()
+		mc, cm := uc.mc, uc.cm
+		uc.cmMu.Unlock()
+		if mc != nil {
+			err = mc.Close("upstream client closed")
 		}
-		if uc.cm != nil {
-			uc.cm.Shutdown()
+		if cm != nil {
+			cm.Shutdown()
 		}
 	})
 	return err
@@ -431,12 +543,45 @@ func targetHexToDifficulty(targetHex string) (uint64, error) {
 	return maxVal / target, nil
 }
 
-// readLoop is the single goroutine reading from the upstream socket,
-// dispatching every inbound line either to an unsolicited job push
-// (applyJob) or to whichever pending request its "id" correlates
-// with (mirrors proxy.js's poolSocket/handlePoolMessage dispatch).
-func (uc *UpstreamClient) readLoop() {
-	scanner := bufio.NewScanner(uc.mc)
+// readLoop is the single goroutine reading from a specific upstream
+// socket (mc), dispatching every inbound line either to an
+// unsolicited job push (applyJob) or to whichever pending request
+// its "id" correlates with (mirrors proxy.js's
+// poolSocket/handlePoolMessage dispatch).
+//
+// readLoop takes mc explicitly (rather than reading uc.mc itself)
+// because dialAndLogin now starts a fresh readLoop for its own mc
+// BEFORE login() completes — see dialAndLogin's doc comment for why
+// that ordering is required — and by the time a later readLoop
+// invocation's scanner terminates, uc.mc may already have been
+// reassigned to a newer connection by a subsequent, unrelated
+// dialAndLogin call; reading uc.mc here would risk reading (or
+// racing on) the WRONG generation's socket instead of the one this
+// goroutine was actually started for.
+//
+// loggedIn reports whether THIS mc's own login round-trip ever
+// actually completed successfully. When the scanner terminates:
+//   - if uc.closed has fired, this is an explicit Close — no
+//     reconnect attempt.
+//   - if loggedIn is still false, this connection attempt's login
+//     itself failed (dialAndLogin closes mc/cm on login failure,
+//     which is what makes this scanner terminate) and that failure
+//     is already being surfaced as dialAndLogin's own return value
+//     to whichever caller (Connect, or reconnectLoop's own
+//     retry-with-backoff loop) is driving this attempt — starting a
+//     second, independent reconnectLoop from here would be a real
+//     duplicate of that caller's own retry path.
+//   - otherwise, this is a real, unplanned loss of a connection that
+//     HAD successfully logged in: readLoop flips uc.connected false
+//     and hands off to reconnectLoop to redial with backoff, exactly
+//     as this type's own doc comments on Connect and reconnectLoop
+//     already describe. (Fixed in an earlier pass: this hand-off was
+//     documented but never actually wired up — reconnectLoop was
+//     dead code, so a real connection loss previously left the
+//     client permanently down with no automatic recovery and a stuck
+//     Connected()==true reading.)
+func (uc *UpstreamClient) readLoop(mc *leaflib.ManagedConnection, loggedIn *atomic.Bool) {
+	scanner := bufio.NewScanner(mc)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -445,6 +590,23 @@ func (uc *UpstreamClient) readLoop() {
 		}
 		uc.handleLine(line)
 	}
+
+	select {
+	case <-uc.closed:
+		// Explicit Close — no reconnect attempt.
+		return
+	default:
+	}
+	if !loggedIn.Load() {
+		// This connection attempt's own login never completed; the
+		// caller driving dialAndLogin already treats this as a
+		// failed attempt via its return value and will retry/back
+		// off itself. See doc comment above.
+		return
+	}
+	uc.connected.Store(false)
+	uc.logger.Printf("proxy: upstream connection lost, starting reconnect loop: %v", scanner.Err())
+	uc.reconnectLoop()
 }
 
 func (uc *UpstreamClient) handleLine(line string) {
