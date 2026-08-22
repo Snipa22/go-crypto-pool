@@ -1014,6 +1014,117 @@ func xnPrefixedNonceHex(xn string, n uint64) string {
 	return xn + full[len(xn):]
 }
 
+// --- xn-prefix check regression tests (bug fix: RXT must NOT be
+// subject to the xn-prefix check; SHA3X/C29 still must be) ---
+
+// TestSessionSHA3XSubmitWithoutXNPrefixIsRejected is the regression
+// guard for the SHA3X side of the xn-prefix fix: confirms making the
+// check algo-conditional (skipped for RXT) did NOT accidentally
+// disable it for SHA3X, which still requires the real xn-prefix
+// convention (see handleSubmit's doc comment).
+func TestSessionSHA3XSubmitWithoutXNPrefixIsRejected(t *testing.T) {
+	h := newTestHarness(t, 1, 1<<62)
+	sessionID, xn := login(t, h, "addr-sha3x-noxn")
+	jobID := currentJobIDForXN(t, h, xn)
+
+	// Deliberately build a nonce hex string that does NOT start with
+	// this session's own xn (flip the first hex nibble to guarantee a
+	// mismatch regardless of what xn happens to be).
+	badNonce := xnPrefixedNonceHex(xn, 1)
+	badNonce = flipFirstHexNibble(badNonce)
+
+	h.send(Request{ID: 60, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:    sessionID,
+		JobID: jobID,
+		Nonce: badNonce,
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a SHA3X submit whose nonce does not start with the session's own xn to be REJECTED")
+	}
+	if !strings.Contains(resp.Error, "Invalid XNonce") {
+		t.Errorf("expected rejection to be the xn-prefix check (\"Invalid XNonce\"), got %q", resp.Error)
+	}
+}
+
+// TestSessionC29SubmitWithoutXNPrefixIsRejected is the C29 counterpart
+// of the above — same regression guard, different algo.
+func TestSessionC29SubmitWithoutXNPrefixIsRejected(t *testing.T) {
+	h := newC29TestHarness(t, 1, 1)
+	sessionID, xn := login(t, h, "addr-c29-noxn")
+	jobID := currentJobIDForXN(t, h, xn)
+
+	badNonce := xnPrefixedNonceHex(xn, 1)
+	badNonce = flipFirstHexNibble(badNonce)
+
+	cycle := make([]uint64, 42)
+	h.send(Request{ID: 61, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:    sessionID,
+		JobID: jobID,
+		Nonce: badNonce,
+		POW:   cycle,
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a C29 submit whose nonce does not start with the session's own xn to be REJECTED")
+	}
+	if !strings.Contains(resp.Error, "Invalid XNonce") {
+		t.Errorf("expected rejection to be the xn-prefix check (\"Invalid XNonce\"), got %q", resp.Error)
+	}
+}
+
+// TestSessionRXTSubmitWithoutXNPrefixIsNotRejectedByXNCheck is this
+// bug fix's core regression test: an RXT submit whose nonce does NOT
+// start with the session's own xn must NOT be rejected with "Invalid
+// XNonce" (the whole point of the fix — RXT was never designed to use
+// xn nonce partitioning, per rxt.go/createTariMiningBlob). This does
+// not require a real randomx-service daemon: the RandomXValidator here
+// points at an address nothing is listening on, so the submit will
+// still be rejected overall (a real Validate call errors out), but the
+// rejection reason must be the validator/transport error, never the
+// xn-prefix check — proving the xn-prefix branch is genuinely skipped
+// for ALGO_RXT rather than merely returning a different message for
+// the same check.
+func TestSessionRXTSubmitWithoutXNPrefixIsNotRejectedByXNCheck(t *testing.T) {
+	h := newRXTTestHarness(t, 1, 1<<62, "http://127.0.0.1:1") // deliberately unreachable
+	sessionID, xn := login(t, h, "addr-rxt-noxn")
+	jobID := currentJobIDForXN(t, h, xn)
+
+	badNonce := xnPrefixedNonceHex(xn, 0xdeadbeef)
+	badNonce = flipFirstHexNibble(badNonce)
+
+	h.send(Request{ID: 62, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:     sessionID,
+		JobID:  jobID,
+		Nonce:  badNonce,
+		Result: strings.Repeat("00", 32),
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("test setup bug: expected this submit to fail (unreachable RandomX service), not succeed")
+	}
+	if strings.Contains(resp.Error, "Invalid XNonce") {
+		t.Fatalf("BUG REGRESSION: an RXT submit without the xn prefix was rejected by the xn-prefix check (%q) — RXT must be exempt from it", resp.Error)
+	}
+}
+
+// flipFirstHexNibble flips the first hex character of s to a value
+// that is guaranteed different, so the resulting string is guaranteed
+// to no longer start with the original xn prefix (used to build a
+// deliberately xn-mismatched nonce for the regression tests above).
+func flipFirstHexNibble(s string) string {
+	if s == "" {
+		return s
+	}
+	if s[0] == '0' {
+		return "f" + s[1:]
+	}
+	return "0" + s[1:]
+}
+
 func mustJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	buf, err := json.Marshal(v)

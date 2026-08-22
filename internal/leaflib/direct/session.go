@@ -244,9 +244,18 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 	}
 
-	if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
-		return
+	// xn-prefix check: applies to SHA3X and C29 only, NOT RXT — RXT's
+	// own real nonce handling (see rxt.go/createTariMiningBlob and the
+	// real Tari Rust source) treats the full 8-byte big-endian nonce
+	// as one opaque value with no xn hex-prefix partitioning
+	// convention, unlike SHA3X/C29 which do use xn for real
+	// per-session nonce-space partitioning (mirrors solo.Session's own
+	// handleSubmit — see its doc comment for the full rationale).
+	if job.Algo != poolpb.Algo_ALGO_RXT {
+		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
+			return
+		}
 	}
 
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
@@ -270,6 +279,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_C29, Network: s.server.network, PoolType: s.server.poolType,
 			BlockDiff: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
+			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_C29Proof{C29Proof: &poolpb.C29Proof{
 				EdgeBits: c29SubmitEdgeBits, Cycle: submit.POW, Header: job.Header, Nonce: nonce,
 			}},
@@ -289,6 +299,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_RXT, Network: s.server.network, PoolType: s.server.poolType,
 			BlockDiff: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
+			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
 				Blob: blob, SeedHash: job.VmKey, ResultHex: submit.Result,
 			}},
@@ -299,6 +310,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_SHA3X, Network: s.server.network, PoolType: s.server.poolType,
 			BlockDiff: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
+			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_Sha3XProof{Sha3XProof: &poolpb.SHA3XProof{
 				Header: job.Header, Nonce: nonce,
 			}},

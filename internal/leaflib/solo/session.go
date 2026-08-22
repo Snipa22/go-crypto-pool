@@ -371,20 +371,31 @@ const (
 // go-tari-sha3x-solo-stratum's miner.go SubmitJob:
 // `strings.HasPrefix(strings.ToLower(submittedWork.Nonce), m.xn)`)
 // STAYS — it is still a real, useful nonce-composition validity check
-// for BOTH algos (go-tari-c29-solo-stratum's SubmitJob has the exact
-// same xn-prefix check on the exact same hex-STRING representation of
-// the nonce, before decoding it) — but it is no longer the security
-// boundary; it now runs AFTER session-ownership has already been
-// confirmed. This is purely wire-level/session bookkeeping: verified
-// against the real hash math in validator/sha3x.go
-// (sha3xHeaderDiff/GetHeaderDiff) that the full 8-byte nonce is used
-// directly as hash pre-image material with no separate xn encoding —
-// xn is a leading-byte convention miners are expected to respect on
-// their nonce composition, not something baked into the hash function
-// itself, so no change to SHA3XValidator (or C29Validator) was needed
-// or made. DOES enforce per-job used-nonce tracking via
-// Job.MarkNonceUsed, which the previous wire format's implementation
-// never had.
+// for SHA3X and C29 (go-tari-c29-solo-stratum's SubmitJob has the
+// exact same xn-prefix check on the exact same hex-STRING
+// representation of the nonce, before decoding it) — but it is no
+// longer the security boundary; it now runs AFTER session-ownership
+// has already been confirmed. This is purely wire-level/session
+// bookkeeping: verified against the real hash math in
+// validator/sha3x.go (sha3xHeaderDiff/GetHeaderDiff) that the full
+// 8-byte nonce is used directly as hash pre-image material with no
+// separate xn encoding — xn is a leading-byte convention miners are
+// expected to respect on their nonce composition, not something baked
+// into the hash function itself, so no change to SHA3XValidator (or
+// C29Validator) was needed or made. DOES enforce per-job used-nonce
+// tracking via Job.MarkNonceUsed, which the previous wire format's
+// implementation never had.
+//
+// RXT IS EXEMPT from the xn-prefix check (bug fix): RXT's own real
+// nonce handling (see rxt.go/createTariMiningBlob and the real Tari
+// Rust source) treats the full 8-byte big-endian nonce as one opaque
+// value with no xn hex-prefix partitioning convention — unlike
+// SHA3X/C29, RXT miners were never asked to respect an xn leading-byte
+// convention on their nonce composition, so requiring one here was an
+// unconditional carry-over from when this check was written
+// SHA3X/C29-only, predating RXT support, and incorrectly rejected
+// every otherwise-valid RXT submit with "Invalid XNonce". The check
+// below is now algo-conditional and skipped for ALGO_RXT.
 func (s *Session) handleSubmit(req Request) {
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before submit", "")
@@ -422,12 +433,15 @@ func (s *Session) handleSubmit(req Request) {
 
 	// xn-prefix check happens BEFORE nonce decoding/PoW validation —
 	// ported exactly from the legacy ordering and rejection shape, and
-	// identical across both algos (see doc comment above). This is a
-	// real validity check, NOT the security boundary (see doc comment
+	// applies to SHA3X and C29 only, NOT RXT (see doc comment above:
+	// RXT never uses xn nonce partitioning by design). This is a real
+	// validity check, NOT the security boundary (see doc comment
 	// above).
-	if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
-		return
+	if job.Algo != poolpb.Algo_ALGO_RXT {
+		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
+			return
+		}
 	}
 
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
