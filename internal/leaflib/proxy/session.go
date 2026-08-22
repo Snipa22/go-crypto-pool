@@ -7,14 +7,17 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/proxy/metrics"
 )
 
 // ShareValidator is the real local-RandomX-re-validation dependency
@@ -114,6 +117,29 @@ func (s *Session) Run(ctx context.Context) {
 		}
 		s.handleLine(line)
 	}
+	s.server.recordConnectionError(classifyCloseError(scanner.Err()))
+}
+
+// classifyCloseError maps a real bufio.Scanner terminal error from
+// Session.Run's read loop onto the small, fixed set of connection-error
+// categories metrics.Metrics.ConnectionErrorsTotal exposes — mirrors
+// internal/leaflib/solo/session.go's identically-named function and
+// its exact category mapping (see that function's doc comment for the
+// full per-branch rationale, which applies identically here: nil ->
+// remote-eof, a net.Error with Timeout()==true -> idle-timeout,
+// bufio.ErrTooLong -> protocol-error, anything else -> other).
+func classifyCloseError(err error) string {
+	if err == nil {
+		return metrics.ConnErrorRemoteEOF
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return metrics.ConnErrorIdleTimeout
+	}
+	if errors.Is(err, bufio.ErrTooLong) {
+		return metrics.ConnErrorProtocolError
+	}
+	return metrics.ConnErrorOther
 }
 
 func (s *Session) handleLine(line string) {
@@ -220,16 +246,23 @@ func (s *Session) handleGetJob(req Request) {
 //     (difficulty.go's littleEndianDifficulty, the same well-known
 //     CryptoNote/RandomX target/difficulty relationship already used
 //     for Tari's RXT elsewhere in this codebase).
-//  7. THE CORE LEAF-PROXY BEHAVIOR: if that real difficulty meets the
-//     job's real upstream block target, this is a genuine block-level
-//     find — forward it upstream for real via s.server.upstream
-//     (UpstreamClient.SubmitShare). If it only meets the session's own
-//     configured/vardiff share difficulty, it is credited LOCALLY
-//     ONLY (this session's own shareCount/vardiff accept-history) and
-//     NEVER forwarded upstream — mirroring leaf-solo's identical
-//     "accept locally always, only escalate on a genuine block-level
-//     event" shape, just with "forward upstream" in place of
-//     "call GRPC SubmitBlock".
+//  7. THE CORE LEAF-PROXY BEHAVIOR: if that real difficulty meets or
+//     exceeds the job's real upstream pool-requested share difficulty
+//     (Job.UpstreamShareDiff — the SAME target_diff field an ordinary
+//     miner receives on login/getjob, confirmed directly from the
+//     real pool-server source; NOT a network/block-level target,
+//     which this leaf has no visibility into and does not need for
+//     this purpose), it is worth forwarding upstream for real via
+//     s.server.upstream (UpstreamClient.SubmitShare), per the
+//     maintainer's explicit rule: "we only submit shares upstream
+//     when a miner share > the pool's requested diff". If it only
+//     meets the session's own configured/vardiff share difficulty,
+//     it is credited LOCALLY ONLY (this session's own
+//     shareCount/vardiff accept-history) and NEVER forwarded
+//     upstream — mirroring leaf-solo's identical "accept locally
+//     always, only escalate on a genuine block-level event" shape,
+//     just with "forward upstream" in place of "call GRPC
+//     SubmitBlock".
 func (s *Session) handleSubmit(req Request) {
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before submit", "")
@@ -318,16 +351,23 @@ func (s *Session) handleSubmit(req Request) {
 	s.shareCount.Add(1)
 	s.hashesAccumulated.Add(job.StaticDifficulty)
 
-	if job.UpstreamTargetDiff == 0 || diff < job.UpstreamTargetDiff {
-		// Below the real upstream pool's block target: credited
-		// locally only, per the task's explicit requirement — NEVER
+	if job.UpstreamShareDiff == 0 || diff < job.UpstreamShareDiff {
+		// Below the real upstream pool's own requested share
+		// difficulty (Job.UpstreamShareDiff — the same target_diff
+		// field an ordinary miner receives, NOT a network/block-level
+		// target): credited locally only, per the maintainer's
+		// explicit rule ("we only submit shares upstream when a
+		// miner share > the pool's requested diff") — NEVER
 		// forwarded upstream.
+		s.server.recordShareDecision(false)
 		s.writeShareResponse(req.ID, true, "")
 		return
 	}
 
-	// Genuine block-level find: forward for real, upstream, via the
-	// real pool submit RPC.
+	// Meets/exceeds the real upstream pool's own requested share
+	// difficulty: forward it upstream for real, via the real pool
+	// submit RPC.
+	s.server.recordShareDecision(true)
 	accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, 0)
 	if err != nil {
 		s.server.logger.Printf("proxy: upstream submit failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
@@ -337,7 +377,7 @@ func (s *Session) handleSubmit(req Request) {
 	}
 
 	s.blockCount.Add(1)
-	s.server.logger.Printf("proxy: BLOCK-LEVEL FIND forwarded upstream by session %s (address %s) at height %d, upstream job %s, diff %d, accepted=%v", s.sessionID, s.address.Load(), job.Height, job.UpstreamJobID, diff, accepted)
+	s.server.logger.Printf("proxy: share forwarded upstream by session %s (address %s) at height %d, upstream job %s, diff %d, accepted=%v", s.sessionID, s.address.Load(), job.Height, job.UpstreamJobID, diff, accepted)
 	s.server.recordBlock(true)
 	s.writeShareResponse(req.ID, true, "")
 }
@@ -381,7 +421,6 @@ func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 }
 
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
-	s.server.recordShare(accepted)
 	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
 }
 

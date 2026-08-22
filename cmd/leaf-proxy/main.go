@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -75,6 +76,14 @@ type config struct {
 
 	dialTimeout    time.Duration
 	requestTimeout time.Duration
+
+	// metricsListenAddress/maxAddressLabels follow cmd/leaf-solo's
+	// exact established convention for this flag pair (see
+	// leaf-solo's identical -metrics-listen-address/
+	// -max-address-labels doc comments) -- ported to this sibling
+	// binary unchanged, just with the LEAF_PROXY_ prefix.
+	metricsListenAddress string
+	maxAddressLabels     int
 }
 
 func loadConfig() config {
@@ -118,6 +127,9 @@ func loadConfig() config {
 
 	flag.DurationVar(&cfg.dialTimeout, "upstream-dial-timeout", envOrDuration("LEAF_PROXY_UPSTREAM_DIAL_TIMEOUT", 10*time.Second), "timeout for dialing the upstream pool. Env: LEAF_PROXY_UPSTREAM_DIAL_TIMEOUT")
 	flag.DurationVar(&cfg.requestTimeout, "upstream-request-timeout", envOrDuration("LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT", 15*time.Second), "timeout for a single upstream request/response round-trip. Env: LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT")
+
+	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_PROXY_METRICS_LISTEN_ADDRESS", ":9601"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the downstream-facing stratum port). Set to empty string to disable. Env: LEAF_PROXY_METRICS_LISTEN_ADDRESS")
+	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_PROXY_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_PROXY_MAX_ADDRESS_LABELS")
 
 	flag.Parse()
 	return cfg
@@ -232,6 +244,34 @@ func main() {
 
 	server := proxy.NewServer(cm, jobManager, rxValidator, upstream, logger, vardiffCfg, cfg.jobMaxAge)
 	defer server.Shutdown()
+
+	// Real Prometheus /metrics + basic stats HTML page, exactly
+	// mirroring cmd/leaf-solo/main.go's already-working
+	// EnableMetrics/MetricsHandler/StatsHTMLHandler wiring pattern
+	// (see that file for the reference implementation this was
+	// ported from) -- ported unchanged aside from the LEAF_PROXY_
+	// flag/env prefix and leaf-proxy's own metrics.Metrics type.
+	if cfg.metricsListenAddress != "" {
+		server.EnableMetrics(version, cfg.maxAddressLabels)
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", server.MetricsHandler())
+		metricsMux.Handle("/", server.StatsHTMLHandler())
+		metricsSrv := &http.Server{Addr: cfg.metricsListenAddress, Handler: metricsMux}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Printf("metrics/stats HTTP server error: %v", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutdownCtx)
+		}()
+		logger.Printf("serving /metrics and stats page on %s", cfg.metricsListenAddress)
+	} else {
+		logger.Printf("metrics/stats HTTP server disabled (-metrics-listen-address is empty)")
+	}
 
 	ln, err := net.Listen("tcp", cfg.listenAddress)
 	if err != nil {

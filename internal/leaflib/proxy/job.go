@@ -41,8 +41,7 @@ type Job struct {
 
 	// UpstreamJobID is the upstream pool's OWN job_id for the
 	// template this Job was derived from — required to forward a
-	// genuine block-level find (UpstreamClient.SubmitShare's job_id
-	// param).
+	// share upstream (UpstreamClient.SubmitShare's job_id param).
 	UpstreamJobID string
 
 	SeedHash []byte
@@ -56,12 +55,26 @@ type Job struct {
 	// caveat, which applies identically here.
 	StaticDifficulty uint64
 
-	// UpstreamTargetDiff is the REAL block-level difficulty a
-	// downstream submit's RandomX hash must meet for this to be a
-	// genuine block find worth forwarding upstream (see
-	// session.go's handleSubmit) — taken directly from the upstream
-	// pool's own published target_diff for this template.
-	UpstreamTargetDiff uint64
+	// UpstreamShareDiff is the real upstream pool's OWN requested
+	// share difficulty for this template — taken directly from the
+	// upstream pool's own published target_diff field, the exact
+	// same target_diff every ordinary miner receives on login/getjob
+	// (confirmed directly from the real pool-server source,
+	// nodejs-pool-sxmr's lib/pool.js: `target_diff: this.difficulty`
+	// — this.difficulty there IS the pool's own per-connection
+	// requested share difficulty, nothing more).
+	//
+	// This is NOT a claim about network/block-level difficulty —
+	// this leaf has no visibility into that and does not need it for
+	// this purpose. What it IS used for: the maintainer's explicit
+	// rule is "we only submit shares upstream when a miner share >
+	// the pool's requested diff" — a downstream submit whose real,
+	// locally-recomputed difficulty meets or exceeds
+	// UpstreamShareDiff is worth forwarding upstream via a real
+	// "submit" RPC (see session.go's handleSubmit); below it, the
+	// share is credited to the submitting session's own local
+	// stats/vardiff only and is never forwarded.
+	UpstreamShareDiff uint64
 
 	CreatedAt time.Time
 
@@ -145,15 +158,15 @@ func (jm *JobManager) NextJob(difficulty uint64) (*Job, error) {
 		return nil, fmt.Errorf("proxy: generating job id: %w", err)
 	}
 	return &Job{
-		ID:                 id,
-		Blob:               blob,
-		WorkerNonce:        workerNonce,
-		UpstreamJobID:      t.JobID,
-		SeedHash:           t.SeedHash,
-		Height:             t.Height,
-		StaticDifficulty:   difficulty,
-		UpstreamTargetDiff: t.TargetDiff,
-		CreatedAt:          time.Now(),
+		ID:                id,
+		Blob:              blob,
+		WorkerNonce:       workerNonce,
+		UpstreamJobID:     t.JobID,
+		SeedHash:          t.SeedHash,
+		Height:            t.Height,
+		StaticDifficulty:  difficulty,
+		UpstreamShareDiff: t.TargetDiff,
+		CreatedAt:         time.Now(),
 	}, nil
 }
 
