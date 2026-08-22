@@ -69,6 +69,7 @@ import (
 type Server struct {
 	cm         *leaflib.ConnectionManager
 	jobManager *solo.JobManager
+	node       solo.NodeClient
 	validators validator.Registry
 	network    poolpb.Network
 	logger     *log.Logger
@@ -107,10 +108,23 @@ type Server struct {
 type ServerConfig struct {
 	ConnectionManager *leaflib.ConnectionManager
 	JobManager        *solo.JobManager
-	Validators        validator.Registry
-	Network           poolpb.Network
-	Logger            *log.Logger
-	Vardiff           solo.VardiffConfig
+
+	// Node is this leaf's coin-agnostic NodeClient, used by
+	// session.go's handleSubmit to build the real, algo-appropriate
+	// candidate block for a validated share (BuildCandidateBlock) —
+	// see internal/leaflib/solo/node.go's NodeClient doc comment. This
+	// is the SAME real NodeClient (this package's own node.go
+	// implementation, backed by a real per-node-injectable GRPC
+	// client) JobManager was constructed with as its own template
+	// source — see cmd/leaf-direct/main.go's wiring. REQUIRED: a nil
+	// Node means handleSubmit cannot construct a candidate block for
+	// ANY submit, share or block-find alike.
+	Node solo.NodeClient
+
+	Validators validator.Registry
+	Network    poolpb.Network
+	Logger     *log.Logger
+	Vardiff    solo.VardiffConfig
 
 	// Transport is REQUIRED — this is leaf-direct's whole reason for
 	// existing (forwarding validated shares/blocks to the real
@@ -164,7 +178,7 @@ func NewServer(cfg ServerConfig) *Server {
 		logger = log.Default()
 	}
 	s := &Server{
-		cm: cfg.ConnectionManager, jobManager: cfg.JobManager,
+		cm: cfg.ConnectionManager, jobManager: cfg.JobManager, node: cfg.Node,
 		vardiff:          cfg.Vardiff.Normalized(),
 		sessions:         make(map[uint64]*Session),
 		maxAddressLabels: directmetrics.DefaultMaxAddressLabels,

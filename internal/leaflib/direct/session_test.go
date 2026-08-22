@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -71,9 +72,11 @@ type fakeDirectNodeClient struct {
 
 	templateCalls atomic.Int64
 	submitCalls   atomic.Int64
+
+	lastSubmittedBlock *tari_generated.Block
 }
 
-func (f *fakeDirectNodeClient) GetBlockTemplate(_ context.Context, _ string, _ poolpb.Algo) (*tari_generated.GetNewBlockResult, error) {
+func (f *fakeDirectNodeClient) GetBlockTemplate(_ context.Context, _ string, algo poolpb.Algo) (*solo.Job, error) {
 	call := f.templateCalls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -89,7 +92,7 @@ func (f *fakeDirectNodeClient) GetBlockTemplate(_ context.Context, _ string, _ p
 		hash = padded
 	}
 	binary.BigEndian.PutUint64(hash[:8], uint64(call))
-	return &tari_generated.GetNewBlockResult{
+	result := &tari_generated.GetNewBlockResult{
 		BlockHash:       hash,
 		MergeMiningHash: f.mergeMiningHash,
 		VmKey:           f.vmKey,
@@ -97,18 +100,30 @@ func (f *fakeDirectNodeClient) GetBlockTemplate(_ context.Context, _ string, _ p
 			Header: &tari_generated.BlockHeader{Height: f.height},
 		},
 		MinerData: &tari_generated.MinerData{TargetDifficulty: f.targetDifficulty},
-	}, nil
+	}
+	return tariJobFromResult(result, algo)
 }
 
-func (f *fakeDirectNodeClient) GetTipInfo(_ context.Context) (*tari_generated.TipInfoResponse, error) {
+func (f *fakeDirectNodeClient) GetTipInfo(_ context.Context) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return &tari_generated.TipInfoResponse{Metadata: &tari_generated.MetaData{BestBlockHeight: f.height}}, nil
+	return f.height, nil
 }
 
-func (f *fakeDirectNodeClient) SubmitBlock(_ context.Context, _ *tari_generated.Block) (*tari_generated.SubmitBlockResponse, error) {
+func (f *fakeDirectNodeClient) BuildCandidateBlock(job *solo.Job, nonce uint64, proof solo.SubmitProof) (uint64, any, error) {
+	return tariBuildCandidateBlock(job, nonce, proof)
+}
+
+func (f *fakeDirectNodeClient) SubmitBlock(_ context.Context, candidate any) error {
 	f.submitCalls.Add(1)
-	return &tari_generated.SubmitBlockResponse{}, nil
+	block, ok := candidate.(*tari_generated.Block)
+	if !ok {
+		return errors.New("fakeDirectNodeClient.SubmitBlock: candidate is not a *tari_generated.Block")
+	}
+	f.mu.Lock()
+	f.lastSubmittedBlock = block
+	f.mu.Unlock()
+	return nil
 }
 
 var _ solo.NodeClient = (*fakeDirectNodeClient)(nil)
@@ -209,6 +224,7 @@ func newDirectTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *d
 	server := NewServer(ServerConfig{
 		ConnectionManager: cm,
 		JobManager:        jm,
+		Node:              node,
 		Validators:        registry,
 		Network:           poolpb.Network_NETWORK_TESTNET,
 		Transport:         tr,
@@ -370,6 +386,7 @@ func newDirectRXTTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64,
 	server := NewServer(ServerConfig{
 		ConnectionManager: cm,
 		JobManager:        jm,
+		Node:              node,
 		Validators:        registry,
 		Network:           poolpb.Network_NETWORK_TESTNET,
 		Transport:         tr,
@@ -616,10 +633,7 @@ func TestDirectSessionRXTShareCarriesNonZeroTimestamp(t *testing.T) {
 	}
 	nonce := binary.BigEndian.Uint64(nonceBytes)
 
-	var powData []byte
-	if job.Result != nil && job.Result.GetBlock() != nil && job.Result.GetBlock().GetHeader() != nil {
-		powData = job.Result.GetBlock().GetHeader().GetPow().GetPowData()
-	}
+	powData := solo.TariPowDataFromJob(job)
 	blob := createTariMiningBlob(job.Header, nonce, rxtPowAlgoByte, powData)
 
 	realHashHex := realDaemonHashHex(t, serviceURL, job.VmKey, blob)
