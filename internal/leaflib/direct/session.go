@@ -424,7 +424,9 @@ func (s *Session) forwardShare(share *poolpb.Share) {
 	if err := s.server.transport.SubmitShare(ctx, share); err != nil {
 		s.server.logger.Printf("direct: failed to forward share to backend for session %s: %v", s.sessionID, err)
 		s.server.recordTransportError("share")
+		return
 	}
+	s.server.recordTransportSuccess("share")
 }
 
 // forwardBlock reports a found block to the backend for accounting
@@ -445,7 +447,9 @@ func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, block *tari_g
 	if err := s.server.transport.SubmitBlock(ctx, pbBlock); err != nil {
 		s.server.logger.Printf("direct: failed to report found block to backend for session %s: %v", s.sessionID, err)
 		s.server.recordTransportError("block")
+		return
 	}
+	s.server.recordTransportSuccess("block")
 }
 
 // blockHash returns a hex-encoded identifying hash for block, for the

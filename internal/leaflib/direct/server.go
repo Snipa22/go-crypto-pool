@@ -41,6 +41,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
@@ -88,6 +89,18 @@ type Server struct {
 
 	metrics          *directmetrics.Metrics
 	maxAddressLabels int
+
+	// Backend-transport health tracking (statsui.go's Stats() reads
+	// these) — leaf-direct's analogue of leaf-proxy's
+	// UpstreamHealth: there is no persistent backend connection
+	// object to type-assert against (transport.ShareTransport is a
+	// stateless per-call interface, see internal/leaflib/transport),
+	// so instead the last known real outcome (success or failure) of
+	// forwardShare/forwardBlock is tracked directly here.
+	transportOKSoFar    atomic.Bool // starts true: "no known failure yet"
+	transportErrorTotal atomic.Uint64
+	lastTransportKind   atomic.Value // string
+	lastTransportAt     atomic.Value // time.Time
 }
 
 // ServerConfig configures a Server.
@@ -152,13 +165,14 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	s := &Server{
 		cm: cfg.ConnectionManager, jobManager: cfg.JobManager,
-		validators: cfg.Validators, network: cfg.Network, logger: logger,
-		transport: cfg.Transport, multiSubmit: cfg.MultiSubmit, relay: cfg.Relay, algo: cfg.Algo,
-		poolType:         cfg.PoolType,
 		vardiff:          cfg.Vardiff.Normalized(),
 		sessions:         make(map[uint64]*Session),
 		maxAddressLabels: directmetrics.DefaultMaxAddressLabels,
+		validators:       cfg.Validators, network: cfg.Network, logger: logger,
+		transport: cfg.Transport, multiSubmit: cfg.MultiSubmit, relay: cfg.Relay, algo: cfg.Algo,
+		poolType: cfg.PoolType,
 	}
+	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {
 		s.unsubscribe = cfg.JobManager.Subscribe(s.invalidateAndRepushJobs)
 	}
@@ -235,12 +249,30 @@ func (s *Server) recordConnectionError(category string) {
 
 // recordTransportError tracks backend-forwarding failures (share/
 // block), a genuinely new observability axis leaf-solo has no
-// equivalent of (it never forwards anything to a backend).
+// equivalent of (it never forwards anything to a backend). It also
+// updates the live "is the last known real backend call succeeding"
+// health state statsui.go's Stats() surfaces (leaf-direct's analogue
+// of leaf-proxy's UpstreamHealth.Connected()).
 func (s *Server) recordTransportError(kind string) {
+	s.transportOKSoFar.Store(false)
+	s.transportErrorTotal.Add(1)
+	s.lastTransportKind.Store(kind)
+	s.lastTransportAt.Store(time.Now())
 	if s.metrics == nil {
 		return
 	}
 	s.metrics.TransportErrorsTotal.WithLabelValues(kind).Inc()
+}
+
+// recordTransportSuccess marks a real successful backend forward
+// (share/block), flipping the transport health state back to
+// healthy — mirrors recordTransportError's bookkeeping without a
+// counterpart Prometheus metric (a running success total is not
+// currently exported; only the stats page shows it).
+func (s *Server) recordTransportSuccess(kind string) {
+	s.transportOKSoFar.Store(true)
+	s.lastTransportKind.Store(kind)
+	s.lastTransportAt.Store(time.Now())
 }
 
 func (s *Server) invalidateAndRepushJobs() {
