@@ -391,7 +391,7 @@ func main() {
 	}
 
 	server := direct.NewServer(direct.ServerConfig{
-		ConnectionManager: cm, JobManager: jobManager, Validators: validators,
+		ConnectionManager: cm, JobManager: jobManager, Node: node, Validators: validators,
 		Network: networkFromString(cfg.network), Logger: logger, Vardiff: vardiffCfg,
 		Transport: backendTransport, MultiSubmit: multiSubmit, Relay: blockRelay,
 		Algo: algoFromString(cfg.algo), PoolType: poolType,

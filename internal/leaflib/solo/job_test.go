@@ -17,7 +17,13 @@ import (
 
 // fakeNodeClient is a NodeClient test double: no real GRPC, no real
 // Tari base node. It lets job-management/template-refresh logic be
-// tested deterministically.
+// tested deterministically. Its GetBlockTemplate/BuildCandidateBlock
+// build the SAME real Tari-shaped Job/candidate data
+// (tariJobFromResult/tariBuildCandidateBlock, node.go) the production
+// GRPCNodeClient does, so session-level tests exercise the exact real
+// difficulty/candidate-construction logic, not a shadow reimplementation
+// of it — only the RPC transport itself (nodeGRPC's package-level
+// singleton) is faked.
 type fakeNodeClient struct {
 	mu sync.Mutex
 
@@ -65,7 +71,7 @@ type fakeNodeClient struct {
 	lastRequestedAlgo  poolpb.Algo
 }
 
-func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress string, algo poolpb.Algo) (*tari_generated.GetNewBlockResult, error) {
+func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress string, algo poolpb.Algo) (*Job, error) {
 	f.lastRequestedAlgo = algo
 	call := f.templateCalls.Add(1)
 	if f.getBlockTemplateErr != nil {
@@ -74,7 +80,7 @@ func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	blockHash := f.syntheticBlockHash(call)
-	return &tari_generated.GetNewBlockResult{
+	result := &tari_generated.GetNewBlockResult{
 		BlockHash:       blockHash,
 		MergeMiningHash: f.mergeMiningHash,
 		VmKey:           f.vmKey,
@@ -87,7 +93,8 @@ func (f *fakeNodeClient) GetBlockTemplate(_ context.Context, payoutAddress strin
 		MinerData: &tari_generated.MinerData{
 			TargetDifficulty: f.targetDifficulty,
 		},
-	}, nil
+	}
+	return tariJobFromResult(result, algo)
 }
 
 // syntheticBlockHash builds a deterministic, real-shaped (32-byte)
@@ -113,27 +120,33 @@ func (f *fakeNodeClient) syntheticBlockHash(call int64) []byte {
 	return hash
 }
 
-func (f *fakeNodeClient) GetTipInfo(_ context.Context) (*tari_generated.TipInfoResponse, error) {
+func (f *fakeNodeClient) GetTipInfo(_ context.Context) (uint64, error) {
 	f.tipCalls.Add(1)
 	if f.getTipInfoErr != nil {
-		return nil, f.getTipInfoErr
+		return 0, f.getTipInfoErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return &tari_generated.TipInfoResponse{
-		Metadata: &tari_generated.MetaData{BestBlockHeight: f.height},
-	}, nil
+	return f.height, nil
 }
 
-func (f *fakeNodeClient) SubmitBlock(_ context.Context, block *tari_generated.Block) (*tari_generated.SubmitBlockResponse, error) {
+func (f *fakeNodeClient) BuildCandidateBlock(job *Job, nonce uint64, proof SubmitProof) (uint64, any, error) {
+	return tariBuildCandidateBlock(job, nonce, proof)
+}
+
+func (f *fakeNodeClient) SubmitBlock(_ context.Context, candidate any) error {
 	f.submitCalls.Add(1)
+	block, ok := candidate.(*tari_generated.Block)
+	if !ok {
+		return errors.New("fakeNodeClient.SubmitBlock: candidate is not a *tari_generated.Block")
+	}
 	f.mu.Lock()
 	f.lastSubmittedBlock = block
 	f.mu.Unlock()
 	if f.submitBlockErr != nil {
-		return nil, f.submitBlockErr
+		return f.submitBlockErr
 	}
-	return &tari_generated.SubmitBlockResponse{}, nil
+	return nil
 }
 
 func (f *fakeNodeClient) setHeight(h uint64) {
@@ -224,7 +237,7 @@ func TestJobForXNGivesDifferentXNsDifferentJobs(t *testing.T) {
 // behavior.
 func TestJobForXNIsStableForSameXNUntilInvalidated(t *testing.T) {
 	node := &fakeNodeClient{height: 7}
-	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-address"})
+	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-test-address"})
 
 	first, err := jm.JobForXN(context.Background(), "cccc")
 	if err != nil {
@@ -341,7 +354,7 @@ func TestJobManagerStartInvalidatesOnTimerAndTipMovement(t *testing.T) {
 
 func TestJobManagerProbe(t *testing.T) {
 	node := &fakeNodeClient{height: 5}
-	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-address"})
+	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-test-address"})
 
 	if err := jm.Probe(context.Background()); err != nil {
 		t.Fatalf("Probe: %v", err)
@@ -409,7 +422,7 @@ func TestJobMarkNonceUsedIsConcurrencySafe(t *testing.T) {
 // resulting Job, and only one real template fetch should occur.
 func TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate(t *testing.T) {
 	node := &fakeNodeClient{height: 9}
-	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-address"})
+	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-test-address"})
 
 	const n = 50
 	results := make([]*Job, n)

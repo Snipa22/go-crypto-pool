@@ -139,10 +139,7 @@ func TestSessionRXTSubmitAgainstRealRandomXServiceIsAccepted(t *testing.T) {
 	// construction, not something this test needs to reimplement) but
 	// the RESULT HASH below is independently computed against the
 	// real daemon, which is the actual thing under test.
-	var powData []byte
-	if job.Result != nil && job.Result.GetBlock() != nil && job.Result.GetBlock().GetHeader() != nil {
-		powData = job.Result.GetBlock().GetHeader().GetPow().GetPowData()
-	}
+	powData := TariPowDataFromJob(job)
 	blob := createTariMiningBlob(job.Header, nonce, rxtPowAlgoByte, powData)
 
 	// Ground truth: ask the REAL daemon directly, independently of

@@ -291,8 +291,8 @@ func (s *Session) handleSubmit(req solo.Request) {
 			return
 		}
 		var powData []byte
-		if job.Result != nil && job.Result.GetBlock() != nil && job.Result.GetBlock().GetHeader() != nil {
-			powData = job.Result.GetBlock().GetHeader().GetPow().GetPowData()
+		if pd := solo.TariPowDataFromJob(job); pd != nil {
+			powData = pd
 		}
 		blob := createTariMiningBlob(job.Header, nonce, rxtPowAlgoByte, powData)
 		share = &poolpb.Share{
@@ -340,9 +340,14 @@ func (s *Session) handleSubmit(req solo.Request) {
 
 	s.shareCount.Add(1)
 
-	diff, block, err := s.blockCandidate(job, nonce, submit.POW, submit.Result)
+	diff, candidate, err := s.server.node.BuildCandidateBlock(job, nonce, solo.SubmitProof{Cycle: submit.POW, ResultHex: submit.Result})
 	if err != nil {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
+		return
+	}
+	block, ok := candidate.(*tari_generated.Block)
+	if !ok {
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected candidate type %T", candidate))
 		return
 	}
 
@@ -467,34 +472,6 @@ func blockHash(block *tari_generated.Block) (string, error) {
 	// this leaf's own logging/dedup purposes.
 	h := block.GetHeader()
 	return fmt.Sprintf("%x-%d", h.GetNonce(), h.GetHeight()), nil
-}
-
-// blockCandidate mirrors solo.Session's own blockCandidate exactly
-// (same real difficulty math per algo, same real block-cloning) — see
-// this package's wireutil.go for the byte-for-byte ported helpers it
-// calls.
-func (s *Session) blockCandidate(job *solo.Job, nonce uint64, cycle []uint64, resultHex string) (diff uint64, block *tari_generated.Block, err error) {
-	switch job.Algo {
-	case poolpb.Algo_ALGO_C29:
-		diff, err = validator.C29Difficulty(cycle, c29SubmitEdgeBits)
-		if err != nil {
-			return 0, nil, err
-		}
-		return diff, cloneBlockWithC29Proof(job.Result.GetBlock(), nonce, cycle, c29SubmitEdgeBits, validator.C29EdgePacking), nil
-	case poolpb.Algo_ALGO_RXT:
-		hashBytes, hexErr := hex.DecodeString(resultHex)
-		if hexErr != nil {
-			return 0, nil, fmt.Errorf("direct: rxt claimed result hash is not valid hex: %w", hexErr)
-		}
-		diff, err = rxtLittleEndianDifficulty(hashBytes)
-		if err != nil {
-			return 0, nil, err
-		}
-		return diff, cloneBlockWithNonce(job.Result.GetBlock(), nonce), nil
-	default:
-		diff = validator.SHA3XHeaderDiff(nonce, job.Header)
-		return diff, cloneBlockWithNonce(job.Result.GetBlock(), nonce), nil
-	}
 }
 
 func (s *Session) recordJob(job *solo.Job) {

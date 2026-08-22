@@ -10,8 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
-
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -106,10 +104,22 @@ type Job struct {
 	// the base node's MinerData.TargetDifficulty for this template.
 	NetworkTargetDifficulty uint64
 
-	// Result is the full real GRPC response this job was built from —
-	// Result.Block is what gets mutated (Header.Nonce) and submitted via
-	// NodeClient.SubmitBlock when a share meets NetworkTargetDifficulty.
-	Result *tari_generated.GetNewBlockResult
+	// TemplateData is the opaque, coin-specific payload the owning
+	// NodeClient implementation populated this Job from — e.g. for
+	// Tari (GRPCNodeClient/direct.NodeClient) this holds the full real
+	// *tari_generated.GetNewBlockResult GRPC response; for Monero
+	// (MoneroNodeClient) it holds that implementation's own
+	// get_block_template response shape. Nothing in job.go/session.go
+	// ever type-asserts this field directly — only the SAME NodeClient
+	// implementation that populated it does so, inside its own
+	// BuildCandidateBlock (see node.go). Tari's own RXT proof
+	// construction (session.go's handleSubmit, needing the real
+	// pow_data bytes to build the 76-byte mining blob) uses the
+	// explicitly-named escape hatch TariPowDataFromJob (node.go)
+	// instead of reaching into this field directly, keeping the
+	// coin-agnostic shell (Job/JobManager/NodeClient interface) free of
+	// any Tari-specific type assertion.
+	TemplateData any
 
 	// VmKey is the real RandomX seed/key for an ALGO_RXT job, taken
 	// directly from GetNewBlockResult.VmKey (confirmed real field,
@@ -341,26 +351,13 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 	if err != nil {
 		return nil, fmt.Errorf("solo: GetBlockTemplate for xn %s: %w", xn, err)
 	}
-	if result == nil || result.GetBlock() == nil || result.GetBlock().GetHeader() == nil {
-		return nil, fmt.Errorf("solo: GetBlockTemplate returned an incomplete result for xn %s", xn)
+	if result == nil {
+		return nil, fmt.Errorf("solo: GetBlockTemplate returned a nil job for xn %s", xn)
 	}
-
-	id, err := jobIDFromBlockHash(result.GetBlockHash())
-	if err != nil {
-		return nil, fmt.Errorf("solo: deriving job id from block hash for xn %s: %w", xn, err)
-	}
-
-	job := &Job{
-		ID:                      id,
-		Algo:                    jm.cfg.Algo,
-		Height:                  result.GetBlock().GetHeader().GetHeight(),
-		Header:                  result.GetMergeMiningHash(),
-		BlockHash:               result.GetBlockHash(),
-		StaticDifficulty:        difficulty,
-		NetworkTargetDifficulty: result.GetMinerData().GetTargetDifficulty(),
-		Result:                  result,
-		VmKey:                   result.GetVmKey(),
-		CreatedAt:               time.Now(),
+	job := result
+	job.StaticDifficulty = difficulty
+	if job.CreatedAt.IsZero() {
+		job.CreatedAt = time.Now()
 	}
 
 	jm.mu.Lock()
@@ -411,7 +408,7 @@ func (jm *JobManager) RestampDifficulty(ctx context.Context, xn string, difficul
 		BlockHash:               existing.BlockHash,
 		StaticDifficulty:        difficulty,
 		NetworkTargetDifficulty: existing.NetworkTargetDifficulty,
-		Result:                  existing.Result,
+		TemplateData:            existing.TemplateData,
 		VmKey:                   existing.VmKey,
 		CreatedAt:               existing.CreatedAt,
 	}
@@ -493,8 +490,8 @@ func (jm *JobManager) Probe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("solo: GetBlockTemplate probe: %w", err)
 	}
-	if result == nil || result.GetBlock() == nil || result.GetBlock().GetHeader() == nil {
-		return fmt.Errorf("solo: GetBlockTemplate probe returned an incomplete result")
+	if result == nil {
+		return fmt.Errorf("solo: GetBlockTemplate probe returned a nil job")
 	}
 	return nil
 }
@@ -554,15 +551,11 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tip, err := jm.cfg.Node.GetTipInfo(ctx)
+			height, err := jm.cfg.Node.GetTipInfo(ctx)
 			if err != nil {
 				jm.logger.Printf("solo: tip poll failed: %v", err)
 				continue
 			}
-			if tip == nil || tip.GetMetadata() == nil {
-				continue
-			}
-			height := tip.GetMetadata().GetBestBlockHeight()
 			jm.mu.RLock()
 			last := jm.lastTipHeight
 			observed := jm.tipObserved
