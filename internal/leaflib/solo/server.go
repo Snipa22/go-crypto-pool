@@ -94,7 +94,7 @@ func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeC
 		validators:       validators,
 		network:          network,
 		logger:           logger,
-		vardiff:          vardiff.normalized(),
+		vardiff:          vardiff.Normalized(),
 		sessions:         make(map[uint64]*Session),
 		maxAddressLabels: metrics.DefaultMaxAddressLabels,
 	}

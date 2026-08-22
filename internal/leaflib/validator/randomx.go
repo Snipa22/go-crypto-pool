@@ -144,3 +144,40 @@ func (v *RandomXValidator) Validate(ctx context.Context, share *poolpb.Share) (b
 	}
 	return true, nil
 }
+
+// ValidateBlobSeedResult is a small, ADDITIVE convenience entry point
+// alongside Validate above, added for leaf-proxy (mode 3,
+// internal/leaflib/proxy): leaf-proxy assembles its blob+seed+claimed
+// result directly from a downstream miner's submit plus its own
+// worker-nonce-partitioned template copy (see proxy.WorkerTemplate) —
+// it has no natural reason to construct a *poolpb.Share wrapper (that
+// shape exists for leaf-solo/leaf-direct's backend-facing accounting
+// fields like PaymentAddress/BlockHeight/Identifier, none of which
+// this call needs) just to satisfy Validate's signature. This method
+// performs the EXACT SAME real hash-equality check against the same
+// randomx-service-backed RXVerifier as Validate above — it is not a
+// separate/parallel validation path, just a leaner call shape for a
+// caller that already has the three fields in hand. The underlying
+// RandomX-hashing math (verifier.Hash) is untouched.
+func (v *RandomXValidator) ValidateBlobSeedResult(ctx context.Context, blob, seed []byte, resultHex string) (bool, error) {
+	claimed, err := hex.DecodeString(resultHex)
+	if err != nil {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	actual, err := v.verifier.Hash(blob, seed)
+	if err != nil {
+		return false, fmt.Errorf("validator: randomx-service hash request failed: %w", err)
+	}
+	if len(actual) != len(claimed) || len(actual) == 0 {
+		return false, nil
+	}
+	for i := range actual {
+		if actual[i] != claimed[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
