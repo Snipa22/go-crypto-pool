@@ -198,10 +198,19 @@ type testClient struct {
 }
 
 func (h *harness) connect() (*testClient, *Session) {
+	return h.connectAtDifficulty(1000)
+}
+
+// connectAtDifficulty is connect but with a caller-chosen starting
+// difficulty -- added for tests that need session difficulty to be
+// LOW enough for a genuinely-random real hash (e.g. a real RandomX
+// computation, not a hand-picked hashForDifficulty value) to clear the
+// per-share difficulty gate before the block-target check even runs.
+func (h *harness) connectAtDifficulty(startingDifficulty uint64) (*testClient, *Session) {
 	h.t.Helper()
 	serverConn, clientConn := net.Pipe()
 	ctx := context.Background()
-	go h.server.handleConn(ctx, serverConn, 1000)
+	go h.server.handleConn(ctx, serverConn, startingDifficulty)
 
 	c := &testClient{t: h.t, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
 	h.t.Cleanup(func() { _ = clientConn.Close() })
