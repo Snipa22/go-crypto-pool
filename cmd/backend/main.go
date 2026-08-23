@@ -114,6 +114,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Snipa22/go-crypto-pool/internal/backend/addressmap"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/api"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
@@ -122,6 +124,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/payout"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/retention"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/statsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
@@ -477,6 +480,32 @@ func (a disburseRepositoryAdapter) FailPayout(ctx context.Context, payoutID int6
 	return a.repo.FailPayout(ctx, payoutID, errMsg)
 }
 
+// retentionRepositoryAdapter adapts a raw *pgxpool.Pool (rather than
+// *db.Repository) to retention.Repository, since db.ListHeightPartitions/
+// db.DropOldPartitions are free functions taking a pool directly, not
+// db.Repository methods (see internal/backend/db/partition.go) —
+// unlike unlockerRepositoryAdapter/disburseRepositoryAdapter above,
+// which wrap *db.Repository methods.
+type retentionRepositoryAdapter struct {
+	pool *pgxpool.Pool
+}
+
+func (a retentionRepositoryAdapter) ListHeightPartitions(ctx context.Context, algo, poolType string) ([]retention.HeightPartition, error) {
+	rows, err := db.ListHeightPartitions(ctx, a.pool, algo, poolType)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]retention.HeightPartition, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, retention.HeightPartition{Name: r.Name, RangeStart: r.RangeStart, RangeEnd: r.RangeEnd})
+	}
+	return out, nil
+}
+
+func (a retentionRepositoryAdapter) DropOldPartitions(ctx context.Context, algo, poolType string, belowHeight int64) ([]string, error) {
+	return db.DropOldPartitions(ctx, a.pool, algo, poolType, belowHeight)
+}
+
 // payoutTrigger adapts a *payout.Calculator into unlocker.PayoutTrigger
 // — the concrete implementation the unlocker's Config.PayoutTrigger
 // field is set to in production (see buildPayoutCalculator/run()
@@ -643,6 +672,106 @@ func buildPayoutCalculator(repo *db.Repository, m *metrics.Metrics) (calc *payou
 }
 
 const defaultPPLNSShareMulti = 2
+
+// defaultRetentionPollInterval is this command's PLACEHOLDER default
+// poll cadence for the shares retention/cleanup job — see
+// buildRetentionConfig's doc comment for the env var that overrides
+// it. An hourly cadence is a reasonable starting point: dropping a
+// whole partition is cheap (a catalog DROP TABLE, not a row scan — see
+// internal/backend/retention's package doc comment), so there is no
+// real cost to checking often, but there is also no benefit to
+// checking every few seconds when partitions only age out on the
+// order of HeightPartitionBucketSize blocks at a time.
+const defaultRetentionPollInterval = 1 * time.Hour
+
+// buildRetentionConfig reads the GCPOOL_RETENTION_* environment
+// variables and returns a ready-to-use retention.Config plus whether
+// the retention job should actually be started (ok == false when
+// no retention window was configured at all — a deployment that
+// hasn't set any GCPOOL_RETENTION_* variable keeps every share
+// forever, exactly like today, mirroring buildUnlockerConfig/
+// buildDisburseEngine's "config knob absent -> feature disabled"
+// convention).
+//
+//	GCPOOL_RETENTION_POLL_INTERVAL          (optional) how often the
+//	                                         retention job re-evaluates
+//	                                         every target, as a
+//	                                         time.ParseDuration string
+//	                                         (e.g. "1h"). Default "1h".
+//	                                         Only consulted if at least
+//	                                         one retention window below
+//	                                         is configured.
+//	GCPOOL_RETENTION_BLOCKS                 (optional) the DEFAULT
+//	                                         retention window, in block-
+//	                                         height units, applied to
+//	                                         every (algo, pool_type)
+//	                                         combination in db.ValidAlgos
+//	                                         x db.ValidPoolTypes that
+//	                                         does not have a more
+//	                                         specific override below.
+//	                                         Unset means "no default" —
+//	                                         a combination with neither
+//	                                         this nor its own override
+//	                                         set is never touched by the
+//	                                         retention job.
+//	GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS
+//	                                         (optional) per-combination
+//	                                         override of the retention
+//	                                         window above, e.g.
+//	                                         GCPOOL_RETENTION_RXT_PPLNS_BLOCKS.
+//	                                         ALGO/POOL_TYPE are the
+//	                                         exact db.ValidAlgos/
+//	                                         db.ValidPoolTypes string
+//	                                         values. Set to "0" (or any
+//	                                         value <=0) to explicitly
+//	                                         disable retention for one
+//	                                         combination even when
+//	                                         GCPOOL_RETENTION_BLOCKS is
+//	                                         set for everything else.
+func buildRetentionConfig() (cfg retention.Config, ok bool, err error) {
+	pollInterval := defaultRetentionPollInterval
+	if raw := os.Getenv("GCPOOL_RETENTION_POLL_INTERVAL"); raw != "" {
+		pollInterval, err = time.ParseDuration(raw)
+		if err != nil {
+			return cfg, false, fmt.Errorf("GCPOOL_RETENTION_POLL_INTERVAL: %w", err)
+		}
+	}
+	cfg.PollInterval = pollInterval
+
+	defaultBlocksSet := false
+	var defaultBlocks int64
+	if raw := os.Getenv("GCPOOL_RETENTION_BLOCKS"); raw != "" {
+		v, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil {
+			return cfg, false, fmt.Errorf("GCPOOL_RETENTION_BLOCKS: %w", parseErr)
+		}
+		defaultBlocks = v
+		defaultBlocksSet = true
+	}
+
+	for _, algo := range db.ValidAlgos {
+		for _, poolType := range db.ValidPoolTypes {
+			blocks := defaultBlocks
+			set := defaultBlocksSet
+			envName := fmt.Sprintf("GCPOOL_RETENTION_%s_%s_BLOCKS", algo, poolType)
+			if raw := os.Getenv(envName); raw != "" {
+				v, parseErr := strconv.ParseInt(raw, 10, 64)
+				if parseErr != nil {
+					return cfg, false, fmt.Errorf("%s: %w", envName, parseErr)
+				}
+				blocks = v
+				set = true
+			}
+			if !set || blocks <= 0 {
+				continue
+			}
+			cfg.Targets = append(cfg.Targets, retention.Target{Algo: algo, PoolType: poolType, RetentionBlocks: blocks})
+			ok = true
+		}
+	}
+
+	return cfg, ok, nil
+}
 
 // defaultDisbursePollInterval/defaultDisburseMaxDestinationsPerBatch
 // are this command's PLACEHOLDER defaults for the disbursement
@@ -827,6 +956,12 @@ func buildTariDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *d
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "block" {
 		if err := runBlockCommand(os.Args[2:]); err != nil {
+			log.Fatalf("backend: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "retention" {
+		if err := runRetentionCommand(os.Args[2:]); err != nil {
 			log.Fatalf("backend: %v", err)
 		}
 		return
@@ -1017,6 +1152,19 @@ func run() error {
 		go u.RunLoop(ctx)
 	} else {
 		log.Print("backend: block unlocker disabled (neither GCPOOL_TARI_GRPC_ADDR nor GCPOOL_MONERO_RPC_ADDR is set)")
+	}
+
+	retentionCfg, retentionEnabled, err := buildRetentionConfig()
+	if err != nil {
+		return fmt.Errorf("configuring share retention/cleanup: %w", err)
+	}
+	if retentionEnabled {
+		retentionCfg.Metrics = m
+		rr := retention.New(retentionRepositoryAdapter{pool: pool}, retentionCfg)
+		log.Printf("backend: share retention/cleanup enabled, polling every %s for %d target(s): %v", retentionCfg.PollInterval, len(retentionCfg.Targets), retentionCfg.Targets)
+		go rr.RunLoop(ctx)
+	} else {
+		log.Print("backend: share retention/cleanup disabled (no GCPOOL_RETENTION_BLOCKS or GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS set); shares accumulate forever until an operator configures a retention window")
 	}
 
 	disburseEngine, moneroWalletClient, disburseInterval, disburseEnabled, err := buildDisburseEngine(repo, m)

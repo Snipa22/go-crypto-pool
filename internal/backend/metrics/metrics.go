@@ -161,6 +161,27 @@ type Metrics struct {
 	// value" from "the poller is broken"; this counter can).
 	WalletBalancePollErrorsTotal *prometheus.CounterVec
 
+	// RetentionPartitionsDroppedTotal counts every `shares`
+	// block_height leaf partition actually dropped by the
+	// internal/backend/retention poll loop's whole-partition
+	// DROP TABLE (never a row-level DELETE — see that package's
+	// doc comment), labeled by algo and pool_type. A partition
+	// dropping to zero rows would still count 1 here per
+	// partition, not per row — this is a partition-count metric,
+	// not a rows-reclaimed estimate.
+	RetentionPartitionsDroppedTotal *prometheus.CounterVec
+	// RetentionRunDuration observes wall-clock time for one
+	// target's (algo, pool_type) worth of one retention RunOnce
+	// pass (listing existing partitions + dropping any that aged
+	// out), labeled by algo and pool_type.
+	RetentionRunDuration *prometheus.HistogramVec
+	// RetentionRunErrorsTotal counts every target evaluation within
+	// a retention pass that failed (listing or dropping partitions
+	// errored), labeled by algo and pool_type. A target skipped
+	// because RetentionBlocks <= 0 is not an error and does not
+	// increment this.
+	RetentionRunErrorsTotal *prometheus.CounterVec
+
 	// StatsRequestsTotal counts every request handled by
 	// internal/backend/statsapi's read-only miner stats endpoints,
 	// labeled by endpoint (balance/hashrate/hashrate_workers) and
@@ -286,6 +307,22 @@ func New(version string) *Metrics {
 		Name: "stats_requests_total",
 		Help: "Total number of requests handled by the read-only miner stats API (internal/backend/statsapi), by endpoint and result (ok/rejected/error).",
 	}, []string{"endpoint", "result"})
+
+	m.RetentionPartitionsDroppedTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "retention_partitions_dropped_total",
+		Help: "Total number of shares block_height leaf partitions dropped by the retention job's whole-partition DROP TABLE, by algo and pool_type.",
+	}, []string{"algo", "pool_type"})
+
+	m.RetentionRunDuration = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "retention_run_duration_seconds",
+		Help:    "Wall-clock time for one (algo, pool_type) target's evaluation in one retention RunOnce pass.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"algo", "pool_type"})
+
+	m.RetentionRunErrorsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "retention_run_errors_total",
+		Help: "Total number of retention target evaluations that failed (listing or dropping partitions errored), by algo and pool_type.",
+	}, []string{"algo", "pool_type"})
 
 	m.StatsRequestDuration = registerHistogramVec(reg, prometheus.HistogramOpts{
 		Name:    "stats_request_duration_seconds",
