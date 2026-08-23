@@ -10,9 +10,12 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Port is one `ports` row.
@@ -143,6 +146,24 @@ type NetworkStats struct {
 	BlocksFound     int64
 	LastBlockAt     *time.Time
 	LastBlockHeight *int64
+
+	// NetworkHeight/NetworkDifficulty/NetworkEstimatedHashrateHS/
+	// NetworkStateUpdatedAt are the REAL, live chain-state fields
+	// this same query LEFT JOINs in from `network_state` -- see
+	// that table's migration doc comment and
+	// internal/backend/networkpoller's package doc comment for how
+	// they get there. All four are nil/zero-valued together when
+	// no poller has ever successfully written a network_state row
+	// for this (algo, network) -- e.g. a deployment that hasn't
+	// configured GCPOOL_TARI_GRPC_ADDR/GCPOOL_MONERO_RPC_ADDR yet.
+	// Deliberately independent of SharesSum/ShareCount above (this
+	// pool's own local share-derived hashrate estimate) -- see
+	// network_state's migration doc comment for why the two must
+	// never be conflated.
+	NetworkHeight             *int64
+	NetworkDifficulty         *float64
+	NetworkEstimatedHashrateHS *float64
+	NetworkStateUpdatedAt     *time.Time
 }
 
 // NetworkStatsSince aggregates every `shares` row for (algo, network)
@@ -182,5 +203,72 @@ func (r *Repository) NetworkStatsSince(ctx context.Context, algo, network string
 	s.LastBlockHeight = maxHeight
 	s.LastBlockAt = maxAt
 
+	// Real, live chain-state fields (see NetworkStats.NetworkHeight's
+	// doc comment) -- a LEFT JOIN-shaped lookup via a second query
+	// rather than an actual SQL JOIN against the two aggregates
+	// above, since network_state is a single-row-per-(algo,network)
+	// side table with no natural join key against `shares`/`blocks`
+	// rows themselves. No row existing here (no poller configured/
+	// has not run yet) is not an error -- s's four Network* fields
+	// simply stay nil.
+	const networkStateStmt = `
+		SELECT height, difficulty, estimated_hashrate_hs, updated_at
+		FROM network_state
+		WHERE algo = $1 AND network = $2`
+	var nHeight *int64
+	var nDifficulty *float64
+	var nHashrate *float64
+	var nUpdatedAt *time.Time
+	err := r.pool.QueryRow(ctx, networkStateStmt, algo, network).Scan(&nHeight, &nDifficulty, &nHashrate, &nUpdatedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return NetworkStats{}, fmt.Errorf("db: querying network_state for %s/%s: %w", algo, network, err)
+	}
+	s.NetworkHeight = nHeight
+	s.NetworkDifficulty = nDifficulty
+	s.NetworkEstimatedHashrateHS = nHashrate
+	s.NetworkStateUpdatedAt = nUpdatedAt
+
 	return s, nil
+}
+
+// NetworkState is one real, live chain-state snapshot this backend's
+// networkpoller has recorded for one (algo, network) -- see
+// migrations/0005_network_state.up.sql's doc comment for the full
+// rationale/field semantics.
+type NetworkState struct {
+	Height              int64
+	Difficulty          *float64
+	EstimatedHashrateHS *float64
+	BestBlockHash       string
+	Source              string
+	PolledAt            time.Time
+}
+
+// UpsertNetworkState records src's real, live chain-state snapshot as
+// the current network_state row for (algo, network), overwriting
+// whatever was there before -- see that table's migration doc
+// comment for why this is an upsert-only, single-row-per-key table
+// rather than an append-only time series.
+func (r *Repository) UpsertNetworkState(ctx context.Context, algo, network string, src NetworkState) error {
+	if err := ValidateAlgo(algo); err != nil {
+		return err
+	}
+	if err := ValidateNetwork(network); err != nil {
+		return err
+	}
+	const stmt = `
+		INSERT INTO network_state (algo, network, height, difficulty, estimated_hashrate_hs, best_block_hash, source, polled_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+		ON CONFLICT (algo, network) DO UPDATE SET
+			height = EXCLUDED.height,
+			difficulty = EXCLUDED.difficulty,
+			estimated_hashrate_hs = EXCLUDED.estimated_hashrate_hs,
+			best_block_hash = EXCLUDED.best_block_hash,
+			source = EXCLUDED.source,
+			polled_at = EXCLUDED.polled_at,
+			updated_at = now()`
+	if _, err := r.pool.Exec(ctx, stmt, algo, network, src.Height, src.Difficulty, src.EstimatedHashrateHS, src.BestBlockHash, src.Source, src.PolledAt); err != nil {
+		return fmt.Errorf("db: upserting network_state for %s/%s: %w", algo, network, err)
+	}
+	return nil
 }

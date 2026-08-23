@@ -88,6 +88,19 @@ type NetworkStatsRecord struct {
 	BlocksFound     int64
 	LastBlockAt     *time.Time
 	LastBlockHeight *int64
+
+	// NetworkHeight/NetworkDifficulty/NetworkEstimatedHashrateHS/
+	// NetworkStateUpdatedAt mirror db.NetworkStats' identically named
+	// fields -- the REAL, live upstream-chain state a poller
+	// (internal/backend/networkpoller) has recorded, independent of
+	// SharesSum/ShareCount's pool-local share-derived figures above.
+	// All nil together if no poller has ever successfully recorded a
+	// snapshot for this (algo, network) -- see handleStats' doc
+	// comment on how that renders in the JSON response.
+	NetworkHeight              *int64
+	NetworkDifficulty          *float64
+	NetworkEstimatedHashrateHS *float64
+	NetworkStateUpdatedAt      *time.Time
 }
 
 // Repository is the narrow, read-only persistence surface this
@@ -220,6 +233,22 @@ func (h *Handler) handlePools(w http.ResponseWriter, r *http.Request) {
 }
 
 // statsResponse is the JSON shape /api/v1/network/stats returns.
+//
+// EstimatedHashrateHS remains this POOL's own local, share-derived
+// hashrate estimate (see EstimateHashrateHS) -- unchanged from before
+// this field's real-network counterparts below were added, so
+// existing consumers of this endpoint are not silently broken. The
+// Network* fields are the NEW, separate, REAL chain-wide figures
+// (subsystem gap audit items 2+4): what the actual upstream network
+// this pool mines against is doing right now, as last observed by
+// internal/backend/networkpoller's real, live RPC/GRPC poll loop --
+// NOT derived from this backend's own `shares` table at all. All four
+// are omitted from the response (rather than rendered as 0/null) when
+// no poller has ever successfully recorded a snapshot for this
+// (algo, network) -- e.g. neither GCPOOL_TARI_GRPC_ADDR nor
+// GCPOOL_MONERO_RPC_ADDR is configured -- so a consumer can reliably
+// tell "no real network data available yet" apart from "the real
+// network genuinely has 0 hashrate".
 type statsResponse struct {
 	Algo                string  `json:"algo"`
 	Network             string  `json:"network"`
@@ -230,6 +259,11 @@ type statsResponse struct {
 	BlocksFound         int64   `json:"blocks_found"`
 	LastBlockHeight     *int64  `json:"last_block_height,omitempty"`
 	LastBlockAt         *string `json:"last_block_at,omitempty"`
+
+	NetworkHeight              *int64   `json:"network_height,omitempty"`
+	NetworkDifficulty          *float64 `json:"network_difficulty,omitempty"`
+	NetworkEstimatedHashrateHS *float64 `json:"network_estimated_hashrate_hs,omitempty"`
+	NetworkStateUpdatedAt      *string  `json:"network_state_updated_at,omitempty"`
 }
 
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -263,6 +297,12 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		lastBlockAt = &s
 	}
 
+	var networkStateUpdatedAt *string
+	if stats.NetworkStateUpdatedAt != nil {
+		s := stats.NetworkStateUpdatedAt.UTC().Format(time.RFC3339)
+		networkStateUpdatedAt = &s
+	}
+
 	writeJSON(w, http.StatusOK, statsResponse{
 		Algo:                algo,
 		Network:             network,
@@ -273,5 +313,10 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		BlocksFound:         stats.BlocksFound,
 		LastBlockHeight:     stats.LastBlockHeight,
 		LastBlockAt:         lastBlockAt,
+
+		NetworkHeight:              stats.NetworkHeight,
+		NetworkDifficulty:          stats.NetworkDifficulty,
+		NetworkEstimatedHashrateHS: stats.NetworkEstimatedHashrateHS,
+		NetworkStateUpdatedAt:      networkStateUpdatedAt,
 	})
 }
