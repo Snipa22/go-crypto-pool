@@ -80,6 +80,7 @@ type Server struct {
 	relay       *relay.Relay
 	algo        poolpb.Algo
 	poolType    poolpb.PoolType
+	poolID      int32
 
 	vardiff solo.VardiffConfig
 
@@ -186,6 +187,16 @@ type ServerConfig struct {
 	// "pool_type is required", since there is no safe silent default
 	// for something that determines real payout accounting semantics.
 	PoolType poolpb.PoolType
+
+	// PoolID is the real, operator-assigned static integer identifying
+	// this leaf-direct process's pool-server source (see
+	// internal/proto/share.proto's Share.pool_id doc comment for the
+	// full rationale/history). Stamped onto every real poolpb.Share/
+	// poolpb.Block this leaf forwards to the backend (see session.go's
+	// handleSubmit share-construction switch and forwardBlock),
+	// unconditionally. Set at startup from cmd/leaf-direct's own
+	// -pool-id/LEAF_DIRECT_POOL_ID flag.
+	PoolID int32
 }
 
 // NewServer constructs a Server.
@@ -201,7 +212,7 @@ func NewServer(cfg ServerConfig) *Server {
 		maxAddressLabels: directmetrics.DefaultMaxAddressLabels,
 		validators:       cfg.Validators, network: cfg.Network, logger: logger,
 		transport: cfg.Transport, multiSubmit: cfg.MultiSubmit, relay: cfg.Relay, algo: cfg.Algo,
-		poolType: cfg.PoolType,
+		poolType: cfg.PoolType, poolID: cfg.PoolID,
 	}
 	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {

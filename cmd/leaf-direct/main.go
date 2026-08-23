@@ -62,6 +62,18 @@ type config struct {
 	algo            string
 	poolType        string
 
+	// poolID is LEAF_DIRECT_POOL_ID / -pool-id: the real, static,
+	// operator-assigned integer identifying this leaf-direct
+	// process's pool-server source (see internal/proto/share.proto's
+	// Share.pool_id doc comment for the full rationale/history).
+	// REQUIRED -- no safe silent default, since an unset pool_id
+	// would defeat the entire purpose of pool-source tracking (every
+	// leaf silently reporting as pool_id=0 is indistinguishable from
+	// "not configured" and makes the backend's real, wired-up
+	// pool_id-broken-out stats endpoint (GET
+	// /api/v1/stats/hashrate/sources) useless).
+	poolID int
+
 	randomXServiceURL string
 
 	startingDifficulty uint64
@@ -133,6 +145,7 @@ func loadConfig() config {
 	flag.IntVar(&cfg.trustMin, "trust-min", envOrInt("LEAF_DIRECT_TRUST_MIN", 0), "real probability floor -- 0/unset uses the documented default (20). Env: LEAF_DIRECT_TRUST_MIN")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_DIRECT_ALGO", "sha3x"), "which single mining algorithm this leaf-direct process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_DIRECT_ALGO")
 	flag.StringVar(&cfg.poolType, "pool-type", envOr("LEAF_DIRECT_POOL_TYPE", ""), "real pool payout model stamped onto every share/block forwarded to the backend: pplns|pps|prop|solo. REQUIRED (no safe silent default -- determines real payout accounting semantics). Env: LEAF_DIRECT_POOL_TYPE")
+	flag.IntVar(&cfg.poolID, "pool-id", envOrInt("LEAF_DIRECT_POOL_ID", 0), "real, static, operator-assigned pool-server-source identifier stamped onto every share/block forwarded to the backend (see internal/proto/share.proto's Share.pool_id doc comment). REQUIRED, must be > 0 (no safe silent default -- see this flag's own field doc comment on config.poolID for why 0/unset is not a safe fallback). Env: LEAF_DIRECT_POOL_ID")
 	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_DIRECT_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (only consulted when -algo=rxt). Env: LEAF_DIRECT_RANDOMX_SERVICE_URL")
 
 	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_DIRECT_STARTING_DIFFICULTY", 10000), "starting share difficulty for a newly-connected session. Env: LEAF_DIRECT_STARTING_DIFFICULTY")
@@ -367,6 +380,9 @@ func main() {
 	if !ok {
 		logger.Fatalf("LEAF_DIRECT_POOL_TYPE (or -pool-type) is required and must be one of pplns|pps|prop|solo, got %q -- the backend correctly rejects any share/block whose pool_type is left unset", cfg.poolType)
 	}
+	if cfg.poolID <= 0 {
+		logger.Fatalf("LEAF_DIRECT_POOL_ID (or -pool-id) is required and must be a positive integer, got %d -- an unset/zero pool_id would defeat the entire purpose of pool-source tracking", cfg.poolID)
+	}
 
 	ports, err := resolvePorts(cfg)
 	if err != nil {
@@ -482,7 +498,7 @@ func main() {
 		ConnectionManager: cm, JobManager: jobManager, Node: node, Validators: validators,
 		Network: networkFromString(cfg.network), Logger: logger, Vardiff: vardiffCfg,
 		Transport: backendTransport, MultiSubmit: multiSubmit, Relay: blockRelay,
-		Algo: algoFromString(cfg.algo), PoolType: poolType,
+		Algo: algoFromString(cfg.algo), PoolType: poolType, PoolID: int32(cfg.poolID),
 	})
 	defer server.Shutdown()
 

@@ -366,7 +366,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			return
 		}
 		share = &poolpb.Share{
-			Algo: poolpb.Algo_ALGO_RXM, Network: s.server.network, PoolType: s.server.poolType,
+			Algo: poolpb.Algo_ALGO_RXM, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: safeInt64(job.StaticDifficulty), Shares: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
@@ -381,7 +381,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 		nonce = binary.BigEndian.Uint64(nonceBytes)
 		share = &poolpb.Share{
-			Algo: poolpb.Algo_ALGO_C29, Network: s.server.network, PoolType: s.server.poolType,
+			Algo: poolpb.Algo_ALGO_C29, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: safeInt64(job.StaticDifficulty), Shares: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
@@ -401,7 +401,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 		blob := createTariMiningBlob(job.Header, nonce, rxtPowAlgoByte, powData)
 		share = &poolpb.Share{
-			Algo: poolpb.Algo_ALGO_RXT, Network: s.server.network, PoolType: s.server.poolType,
+			Algo: poolpb.Algo_ALGO_RXT, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: safeInt64(job.StaticDifficulty), Shares: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
@@ -412,7 +412,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 	default:
 		nonce = binary.LittleEndian.Uint64(nonceBytes)
 		share = &poolpb.Share{
-			Algo: poolpb.Algo_ALGO_SHA3X, Network: s.server.network, PoolType: s.server.poolType,
+			Algo: poolpb.Algo_ALGO_SHA3X, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: safeInt64(job.StaticDifficulty), Shares: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
@@ -614,7 +614,7 @@ func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex 
 	pbBlock := &poolpb.Block{
 		Algo: job.Algo, Network: s.server.network, Hash: blockHashHex,
 		Difficulty: share.GetBlockDiff(), Height: int64(job.Height),
-		Timestamp: time.Now().Unix(), PoolType: s.server.poolType, Valid: true,
+		Timestamp: time.Now().Unix(), PoolType: s.server.poolType, PoolId: s.server.poolID, Valid: true,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
