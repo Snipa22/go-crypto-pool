@@ -1,4 +1,4 @@
--- 0005_network_state.up.sql
+-- 0006_network_state.up.sql
 --
 -- Adds `network_state`: the persistence layer for internal/backend/
 -- networkpoller's real, live poll loop -- periodically querying the
