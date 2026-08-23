@@ -52,6 +52,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -140,6 +141,17 @@ type config struct {
 
 	metricsListenAddress string
 	maxAddressLabels     int
+
+	// addressFlagsFile / addressFlagsPollInterval configure the real,
+	// manual ban/forced-minimum-difficulty enforcement described in
+	// internal/leaflib/addressflags's package doc comment.
+	// addressFlagsFile empty (the default) disables the feature
+	// entirely -- leaf-solo has no backend to poll instead (see this
+	// binary's own doc comment: "there is no share-forwarding to a
+	// backend anywhere in this binary"), so this local, operator-
+	// maintained JSON file is the only real Source available to it.
+	addressFlagsFile         string
+	addressFlagsPollInterval time.Duration
 }
 
 func loadConfig() config {
@@ -187,6 +199,9 @@ func loadConfig() config {
 
 	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_SOLO_METRICS_LISTEN_ADDRESS", ":9600"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the miner-facing stratum port). Set to empty string to disable. Env: LEAF_SOLO_METRICS_LISTEN_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_SOLO_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_SOLO_MAX_ADDRESS_LABELS")
+
+	flag.StringVar(&cfg.addressFlagsFile, "address-flags-file", envOr("LEAF_SOLO_ADDRESS_FLAGS_FILE", ""), "path to a local, operator-maintained JSON file of manually banned/forced-minimum-difficulty payment addresses (see internal/leaflib/addressflags.FileSource's doc comment for the file format). Empty (default) disables the feature entirely -- leaf-solo has no backend to poll instead. Env: LEAF_SOLO_ADDRESS_FLAGS_FILE")
+	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_SOLO_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often -address-flags-file is re-read. Ignored if -address-flags-file is unset. Env: LEAF_SOLO_ADDRESS_FLAGS_POLL_INTERVAL")
 
 	flag.Parse()
 	return cfg
@@ -493,6 +508,18 @@ func main() {
 		}
 		server.EnableTrust(trustCfg)
 		logger.Printf("trusted-miner RandomX-validation skip ENABLED for RXT/RXM (threshold=%d penalty=%d change=%d min=%d -- 0 means the documented default is in effect)", cfg.trustThreshold, cfg.trustPenalty, cfg.trustChange, cfg.trustMin)
+	}
+
+	// Real, manual ban/forced-minimum-difficulty enforcement (see
+	// internal/leaflib/addressflags's package doc comment). Disabled
+	// (server.addressFlags stays nil) unless -address-flags-file/
+	// LEAF_SOLO_ADDRESS_FLAGS_FILE is set -- leaf-solo has no backend
+	// to poll instead, so a local file is the only real Source.
+	if cfg.addressFlagsFile != "" {
+		flagsCache := addressflags.NewCache(addressflags.NewFileSource(cfg.addressFlagsFile), cfg.addressFlagsPollInterval, logger)
+		flagsCache.Start(ctx)
+		server.EnableAddressFlags(flagsCache)
+		logger.Printf("manual ban/forced-minimum-difficulty enforcement ENABLED, polling %s every %s", cfg.addressFlagsFile, cfg.addressFlagsPollInterval)
 	}
 
 	if cfg.metricsListenAddress != "" {

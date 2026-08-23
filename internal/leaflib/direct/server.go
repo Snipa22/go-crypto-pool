@@ -48,6 +48,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	directmetrics "github.com/Snipa22/go-crypto-pool/internal/leaflib/direct/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
@@ -88,6 +89,15 @@ type Server struct {
 	// the default — every share is always fully validated unless a
 	// caller explicitly opts in via EnableTrust.
 	trustConfig solo.TrustConfig
+
+	// addressFlags mirrors solo.Server's own identical field exactly
+	// -- see that field's doc comment. leaf-direct's Cache is fed by
+	// a real backend poll (addressflags.HTTPSource) rather than
+	// leaf-solo's local file (addressflags.FileSource) -- see
+	// cmd/leaf-direct/main.go's wiring -- but the enforcement logic
+	// in session.go's handleLogin/vardiff.go's maybeRetarget is
+	// identical either way.
+	addressFlags *addressflags.Cache
 
 	mu       sync.RWMutex
 	sessions map[uint64]*Session
@@ -232,6 +242,12 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetr
 func (s *Server) EnableTrust(cfg solo.TrustConfig) {
 	s.trustConfig = cfg.Normalized()
 	s.trustConfig.Enabled = cfg.Enabled
+}
+
+// EnableAddressFlags mirrors solo.Server's own identical method
+// exactly -- see that method's doc comment.
+func (s *Server) EnableAddressFlags(cache *addressflags.Cache) {
+	s.addressFlags = cache
 }
 
 // MetricsHandler returns the Prometheus /metrics HTTP handler if

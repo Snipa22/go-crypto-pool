@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -53,6 +54,19 @@ type Server struct {
 	// default — every share is always fully validated unless a
 	// caller explicitly opts in via EnableTrust.
 	trustConfig TrustConfig
+
+	// addressFlags is nil unless EnableAddressFlags has been called
+	// -- the real, manual ban/forced-minimum-difficulty enforcement
+	// point (see internal/leaflib/addressflags's package doc comment
+	// for the full rationale on why this belongs here, at the leaf,
+	// rather than at the backend). nil means every login is accepted
+	// regardless of what the backend's address_flags table (or a
+	// leaf-solo operator's local flags file) says -- the same "opt-in,
+	// no surprise behavior change for a caller that never wires this"
+	// story EnableTrust/EnableMetrics already have. Consulted by
+	// session.go's handleLogin (ban rejection + starting-difficulty
+	// floor) and vardiff.go's maybeRetarget (retarget floor).
+	addressFlags *addressflags.Cache
 
 	mu       sync.RWMutex
 	sessions map[uint64]*Session
@@ -145,6 +159,17 @@ func (s *Server) EnableTrust(cfg TrustConfig) {
 	// above already preserved it correctly; this call is here only
 	// for clarity that Enabled is a deliberate, unmodified pass-through.
 	s.trustConfig.Enabled = cfg.Enabled
+}
+
+// EnableAddressFlags opts this server into the real, manual ban/
+// forced-minimum-difficulty enforcement described on the addressFlags
+// field's own doc comment. cache should already have had Start called
+// on it (see cmd/leaf-solo/main.go) so it is serving a real, already-
+// polled snapshot by the time the first miner connection arrives;
+// EnableAddressFlags itself does not start any polling -- it only
+// wires an already-running Cache into this Server's enforcement path.
+func (s *Server) EnableAddressFlags(cache *addressflags.Cache) {
+	s.addressFlags = cache
 }
 
 // MetricsHandler returns the Prometheus /metrics HTTP handler if

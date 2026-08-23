@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/direct"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
@@ -90,6 +91,18 @@ type config struct {
 	backendShareTimeout time.Duration
 	backendBlockTimeout time.Duration
 
+	// addressFlagsPollInterval configures the real, manual ban/
+	// forced-minimum-difficulty enforcement described in
+	// internal/leaflib/addressflags's package doc comment. Unlike
+	// leaf-solo, leaf-direct always has a real backend connection
+	// (LEAF_DIRECT_BACKEND_BASE_URL, above) already configured, so
+	// it always polls the backend's own GET
+	// /api/v1/leaf/address-flags endpoint (addressflags.HTTPSource)
+	// for this rather than needing a separate file/URL flag -- there
+	// is no way to disable this feature short of the backend never
+	// having anything flagged, which is exactly the common case.
+	addressFlagsPollInterval time.Duration
+
 	// submitNodesRaw is LEAF_DIRECT_SUBMIT_NODES: a comma-separated
 	// list of ADDITIONAL GRPC node addresses (beyond the primary
 	// template-source node, which is always included too) to submit a
@@ -144,6 +157,7 @@ func loadConfig() config {
 	flag.StringVar(&cfg.backendAuthValue, "backend-auth-value", envOr("LEAF_DIRECT_BACKEND_AUTH_VALUE", ""), "value for -backend-auth-header. Env: LEAF_DIRECT_BACKEND_AUTH_VALUE")
 	flag.DurationVar(&cfg.backendShareTimeout, "backend-share-timeout", envOrDuration("LEAF_DIRECT_BACKEND_SHARE_TIMEOUT", 5*time.Second), "per-call timeout forwarding a share to the backend. Env: LEAF_DIRECT_BACKEND_SHARE_TIMEOUT")
 	flag.DurationVar(&cfg.backendBlockTimeout, "backend-block-timeout", envOrDuration("LEAF_DIRECT_BACKEND_BLOCK_TIMEOUT", 10*time.Second), "per-call timeout reporting a found block to the backend. Env: LEAF_DIRECT_BACKEND_BLOCK_TIMEOUT")
+	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_DIRECT_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often the backend's GET /api/v1/leaf/address-flags endpoint is polled for manual ban/forced-minimum-difficulty state (see internal/leaflib/addressflags). Env: LEAF_DIRECT_ADDRESS_FLAGS_POLL_INTERVAL")
 
 	flag.StringVar(&cfg.submitNodesRaw, "submit-nodes", envOr("LEAF_DIRECT_SUBMIT_NODES", ""), "comma-separated list of ADDITIONAL Tari base node GRPC addresses (beyond -node-grpc-address, which is always included) to submit a genuine block find to, in real parallel. Env: LEAF_DIRECT_SUBMIT_NODES")
 
@@ -483,6 +497,19 @@ func main() {
 		server.EnableTrust(trustCfg)
 		logger.Printf("trusted-miner RandomX-validation skip ENABLED for RXT/RXM (threshold=%d penalty=%d change=%d min=%d -- 0 means the documented default is in effect)", cfg.trustThreshold, cfg.trustPenalty, cfg.trustChange, cfg.trustMin)
 	}
+
+	// Real, manual ban/forced-minimum-difficulty enforcement (see
+	// internal/leaflib/addressflags's package doc comment). Unlike
+	// leaf-solo (which has no backend to poll), leaf-direct always
+	// polls the real backend it is already configured to forward
+	// shares/blocks to.
+	addressFlagsCache := addressflags.NewCache(
+		addressflags.NewHTTPSource(cfg.backendBaseURL, cfg.backendAuthHeader, cfg.backendAuthValue),
+		cfg.addressFlagsPollInterval, logger,
+	)
+	addressFlagsCache.Start(ctx)
+	server.EnableAddressFlags(addressFlagsCache)
+	logger.Printf("manual ban/forced-minimum-difficulty enforcement ENABLED, polling %s%s every %s", cfg.backendBaseURL, "/api/v1/leaf/address-flags", cfg.addressFlagsPollInterval)
 
 	if cfg.metricsListenAddress != "" {
 		server.EnableMetrics(version, cfg.maxAddressLabels)

@@ -42,7 +42,16 @@ func (s *Session) maybeRetarget() {
 	curDiff := s.currentDifficulty.Load()
 	hashes := s.hashesAccumulated.Load()
 
-	newDiff, changed := leaflib.ComputeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, cfg.MinDifficulty, cfg.MaxDifficulty)
+	// Mirrors solo.Session's own maybeRetarget exactly -- see that
+	// method's doc comment for the full rationale: an operator-forced
+	// minimum difficulty must never be undercut by a vardiff
+	// retarget.
+	minDiff := cfg.MinDifficulty
+	if floor := s.forcedMinDifficulty.Load(); floor > minDiff {
+		minDiff = floor
+	}
+
+	newDiff, changed := leaflib.ComputeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, minDiff, cfg.MaxDifficulty)
 	if !changed {
 		return
 	}
