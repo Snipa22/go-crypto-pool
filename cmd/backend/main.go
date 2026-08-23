@@ -224,6 +224,7 @@ func (a repositoryAdapter) InsertBlock(ctx context.Context, b api.BlockRecord) e
 		Unlocked:   b.Unlocked,
 		Valid:      b.Valid,
 		Value:      b.Value,
+		PoolID:     b.PoolID,
 	})
 }
 

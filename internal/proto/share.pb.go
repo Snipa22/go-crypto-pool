@@ -432,6 +432,22 @@ func (x *SHA3XProof) GetNonce() uint64 {
 // backend. Every field the backend needs for accounting/payout is
 // present without decoding raw_proof; raw_proof is optional supporting
 // data for a future secondary/audit validator only.
+//
+// pool_id (below) is this repo's scoped-down analogue of the legacy
+// nodejs-pool stack's /poolInit registration: the legacy pool ran
+// several worker processes that registered themselves at startup and
+// got handed back a numeric pool id, which was then stamped on every
+// share so operators could tell which physical pool-server process
+// produced it. go-crypto-pool has no multi-process cluster
+// coordination at all (confirmed with Alex, 2026-08-23) — there is no
+// runtime registration handshake to reproduce. Instead, pool_id is
+// simply a static, operator-assigned integer every leaf-direct process
+// is configured with at startup (see cmd/leaf-direct's
+// -pool-id/LEAF_DIRECT_POOL_ID) and stamps on every Share/Block it
+// forwards, unconditionally. It answers the same "which pool-server
+// instance produced this row" question the legacy field did, without
+// any of the process-registration machinery that question doesn't
+// need here.
 type Share struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Algo           Algo                   `protobuf:"varint,1,opt,name=algo,proto3,enum=pool.v1.Algo" json:"algo,omitempty"`
@@ -642,18 +658,23 @@ func (*Share_Sha3XProof) isShare_RawProof() {}
 
 // Block represents a block found and reported by a leaf.
 type Block struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Algo          Algo                   `protobuf:"varint,1,opt,name=algo,proto3,enum=pool.v1.Algo" json:"algo,omitempty"`
-	Network       Network                `protobuf:"varint,2,opt,name=network,proto3,enum=pool.v1.Network" json:"network,omitempty"`
-	Hash          string                 `protobuf:"bytes,3,opt,name=hash,proto3" json:"hash,omitempty"`
-	Difficulty    int64                  `protobuf:"varint,4,opt,name=difficulty,proto3" json:"difficulty,omitempty"`
-	Shares        int64                  `protobuf:"varint,5,opt,name=shares,proto3" json:"shares,omitempty"`
-	Timestamp     int64                  `protobuf:"varint,6,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	PoolType      PoolType               `protobuf:"varint,7,opt,name=pool_type,json=poolType,proto3,enum=pool.v1.PoolType" json:"pool_type,omitempty"`
-	Unlocked      bool                   `protobuf:"varint,8,opt,name=unlocked,proto3" json:"unlocked,omitempty"`
-	Valid         bool                   `protobuf:"varint,9,opt,name=valid,proto3" json:"valid,omitempty"`
-	Value         *int64                 `protobuf:"varint,10,opt,name=value,proto3,oneof" json:"value,omitempty"`
-	Height        int64                  `protobuf:"varint,11,opt,name=height,proto3" json:"height,omitempty"` // block_height wasn't in the legacy Block message; added since the backend needs it for the same overflow reasons as Share
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Algo       Algo                   `protobuf:"varint,1,opt,name=algo,proto3,enum=pool.v1.Algo" json:"algo,omitempty"`
+	Network    Network                `protobuf:"varint,2,opt,name=network,proto3,enum=pool.v1.Network" json:"network,omitempty"`
+	Hash       string                 `protobuf:"bytes,3,opt,name=hash,proto3" json:"hash,omitempty"`
+	Difficulty int64                  `protobuf:"varint,4,opt,name=difficulty,proto3" json:"difficulty,omitempty"`
+	Shares     int64                  `protobuf:"varint,5,opt,name=shares,proto3" json:"shares,omitempty"`
+	Timestamp  int64                  `protobuf:"varint,6,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	PoolType   PoolType               `protobuf:"varint,7,opt,name=pool_type,json=poolType,proto3,enum=pool.v1.PoolType" json:"pool_type,omitempty"`
+	Unlocked   bool                   `protobuf:"varint,8,opt,name=unlocked,proto3" json:"unlocked,omitempty"`
+	Valid      bool                   `protobuf:"varint,9,opt,name=valid,proto3" json:"valid,omitempty"`
+	Value      *int64                 `protobuf:"varint,10,opt,name=value,proto3,oneof" json:"value,omitempty"`
+	Height     int64                  `protobuf:"varint,11,opt,name=height,proto3" json:"height,omitempty"` // block_height wasn't in the legacy Block message; added since the backend needs it for the same overflow reasons as Share
+	// pool_id mirrors Share.pool_id (see that field's doc comment) —
+	// the same static, operator-assigned pool-server-source identifier,
+	// stamped on a found block's report exactly like it is on every
+	// share.
+	PoolId        int32 `protobuf:"varint,12,opt,name=pool_id,json=poolId,proto3" json:"pool_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -765,6 +786,13 @@ func (x *Block) GetHeight() int64 {
 	return 0
 }
 
+func (x *Block) GetPoolId() int32 {
+	if x != nil {
+		return x.PoolId
+	}
+	return 0
+}
+
 var File_internal_proto_share_proto protoreflect.FileDescriptor
 
 const file_internal_proto_share_proto_rawDesc = "" +
@@ -809,7 +837,7 @@ const file_internal_proto_share_proto_rawDesc = "" +
 	"sha3xProof\x12#\n" +
 	"\rtrusted_share\x18\x10 \x01(\bR\ftrustedShareB\v\n" +
 	"\traw_proofB\r\n" +
-	"\v_payment_id\"\xdf\x02\n" +
+	"\v_payment_id\"\xf8\x02\n" +
 	"\x05Block\x12!\n" +
 	"\x04algo\x18\x01 \x01(\x0e2\r.pool.v1.AlgoR\x04algo\x12*\n" +
 	"\anetwork\x18\x02 \x01(\x0e2\x10.pool.v1.NetworkR\anetwork\x12\x12\n" +
@@ -824,7 +852,8 @@ const file_internal_proto_share_proto_rawDesc = "" +
 	"\x05valid\x18\t \x01(\bR\x05valid\x12\x19\n" +
 	"\x05value\x18\n" +
 	" \x01(\x03H\x00R\x05value\x88\x01\x01\x12\x16\n" +
-	"\x06height\x18\v \x01(\x03R\x06heightB\b\n" +
+	"\x06height\x18\v \x01(\x03R\x06height\x12\x17\n" +
+	"\apool_id\x18\f \x01(\x05R\x06poolIdB\b\n" +
 	"\x06_value*V\n" +
 	"\x04Algo\x12\x14\n" +
 	"\x10ALGO_UNSPECIFIED\x10\x00\x12\f\n" +

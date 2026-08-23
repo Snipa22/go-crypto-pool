@@ -87,6 +87,7 @@ type BlockRecord struct {
 	Unlocked   bool
 	Valid      bool
 	Value      *int64
+	PoolID     int32
 }
 
 // HeightPartitionBucketSize is passed to InsertShare's bucketSize
@@ -491,5 +492,6 @@ func blockToRecord(b *poolpb.Block) BlockRecord {
 		Unlocked:   b.GetUnlocked(),
 		Valid:      b.GetValid(),
 		Value:      value,
+		PoolID:     b.GetPoolId(),
 	}
 }
