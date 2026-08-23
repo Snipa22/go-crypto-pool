@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeRepo is an in-memory Repository test double, mirroring
@@ -76,6 +79,109 @@ func testConfig() Config {
 		DevDonationPercent:     10,
 		PoolDevDonationPercent: 5,
 		PPLNSShareMulti:        2,
+	}
+}
+
+// TestRunForMaturedBlock_DispatchesByPoolTypeAndApplies exercises the
+// unlocker-facing entry point end to end for each supported pool_type
+// — the same dispatch cmd/backend's payoutTrigger adapter relies on.
+func TestRunForMaturedBlock_DispatchesByPoolTypeAndApplies(t *testing.T) {
+	reward := int64(100000)
+	repo := &fakeRepo{
+		sharesByKey: map[string][]ShareRow{
+			key("RXM", "PPS", 100): {{Shares: 1000, PaymentAddress: "alice"}},
+		},
+		soloByKey: map[string]ShareRow{
+			key("RXM", "SOLO", 100): {Shares: 1, PaymentAddress: "solo-winner"},
+		},
+	}
+	c := New(repo, testConfig())
+
+	result, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PPS", 100, 1000, &reward)
+	if err != nil {
+		t.Fatalf("RunForMaturedBlock(PPS): %v", err)
+	}
+	if result.Credited == 0 || result.TotalPaid == 0 {
+		t.Fatalf("RunForMaturedBlock(PPS): got %+v, want a non-trivial credited result", result)
+	}
+	foundAlice := false
+	for _, cc := range repo.credits {
+		if cc.paymentAddress == "alice" {
+			foundAlice = true
+		}
+	}
+	if !foundAlice {
+		t.Fatalf("RunForMaturedBlock(PPS): expected a CreditBalance call for alice, got %+v", repo.credits)
+	}
+
+	repo.credits = nil
+	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "SOLO", 100, 1000, &reward); err != nil {
+		t.Fatalf("RunForMaturedBlock(SOLO): %v", err)
+	}
+	foundSolo := false
+	for _, cc := range repo.credits {
+		if cc.paymentAddress == "solo-winner" {
+			foundSolo = true
+		}
+	}
+	if !foundSolo {
+		t.Fatalf("RunForMaturedBlock(SOLO): expected a CreditBalance call for solo-winner, got %+v", repo.credits)
+	}
+}
+
+// TestRunForMaturedBlock_NilRewardIsAnError confirms a block whose
+// blocks.value column hasn't been populated yet is refused rather
+// than silently treated as a zero-reward payout cycle.
+func TestRunForMaturedBlock_NilRewardIsAnError(t *testing.T) {
+	c := New(&fakeRepo{}, testConfig())
+	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PPS", 100, 1000, nil); err == nil {
+		t.Fatal("RunForMaturedBlock: got nil error for a nil blockReward, want an error")
+	}
+}
+
+// TestRunForMaturedBlock_UnsupportedPoolTypeIsAnError confirms PROP
+// (a real pool_type value in this schema's enum, see migrations) is
+// rejected cleanly rather than causing a panic, since this package
+// has no calculatePropPayments equivalent.
+func TestRunForMaturedBlock_UnsupportedPoolTypeIsAnError(t *testing.T) {
+	reward := int64(1000)
+	c := New(&fakeRepo{}, testConfig())
+	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PROP", 100, 1000, &reward); err == nil {
+		t.Fatal("RunForMaturedBlock: got nil error for pool_type PROP, want an error")
+	}
+}
+
+// TestRunForMaturedBlock_RecordsMetrics confirms the real
+// metrics.Metrics collectors (not a mock) are actually incremented/
+// observed by a successful cycle.
+func TestRunForMaturedBlock_RecordsMetrics(t *testing.T) {
+	reward := int64(1000)
+	repo := &fakeRepo{sharesByKey: map[string][]ShareRow{
+		key("RXM", "PPS", 5): {{Shares: 10, PaymentAddress: "alice"}},
+	}}
+	m := metrics.New("test")
+	cfg := testConfig()
+	cfg.Metrics = m
+	c := New(repo, cfg)
+
+	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PPS", 5, 100, &reward); err != nil {
+		t.Fatalf("RunForMaturedBlock: %v", err)
+	}
+
+	if got := testutil.ToFloat64(m.PayoutCyclesTotal.WithLabelValues("RXM", "PPS", metrics.PayoutResultSuccess)); got != 1 {
+		t.Fatalf("PayoutCyclesTotal success = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.PayoutAmountCreditedTotal.WithLabelValues("RXM", "TESTNET")); got <= 0 {
+		t.Fatalf("PayoutAmountCreditedTotal = %v, want > 0", got)
+	}
+
+	// A failing cycle (unsupported pool_type) must be counted as an
+	// error, not a success, and must not add to amount credited.
+	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PROP", 5, 100, &reward); err == nil {
+		t.Fatal("expected an error for pool_type PROP")
+	}
+	if got := testutil.ToFloat64(m.PayoutCyclesTotal.WithLabelValues("RXM", "PROP", metrics.PayoutResultError)); got != 1 {
+		t.Fatalf("PayoutCyclesTotal error = %v, want 1", got)
 	}
 }
 

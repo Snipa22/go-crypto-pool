@@ -66,6 +66,22 @@
 //	                         (coinbase spend maturity) — a sensible
 //	                         starting default, but still operator-
 //	                         tunable via this variable, not hardcoded.
+//	GCPOOL_PAYOUT_FEE_ADDRESS (optional) pool operator fee-collection
+//	                         payment address. When set, every block
+//	                         the unlocker marks matured also triggers
+//	                         a real internal/backend/payout.Calculator
+//	                         PPS/PPLNS/Solo payout cycle for that
+//	                         block, crediting miner balances. When
+//	                         unset, blocks still mature/unlock
+//	                         correctly — they are simply never
+//	                         auto-paid out. See
+//	                         buildPayoutCalculator's doc comment for
+//	                         the rest of this feature's env vars
+//	                         (GCPOOL_PAYOUT_COIN_DEV_ADDRESS,
+//	                         GCPOOL_PAYOUT_POOL_DEV_ADDRESS,
+//	                         GCPOOL_PAYOUT_{PPS,PPLNS,SOLO}_FEE_PERCENT,
+//	                         GCPOOL_PAYOUT_{,POOL_}DEV_DONATION_PERCENT,
+//	                         GCPOOL_PAYOUT_PPLNS_SHARE_MULTI).
 package main
 
 import (
@@ -85,6 +101,8 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/api"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/payout"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -119,6 +137,25 @@ func parseNetwork(raw string) (poolpb.Network, error) {
 		return poolpb.Network_NETWORK_TESTNET, nil
 	default:
 		return poolpb.Network_NETWORK_UNSPECIFIED, fmt.Errorf("GCPOOL_NETWORK: unrecognized value %q, want \"mainnet\" or \"testnet\"", raw)
+	}
+}
+
+// networkDBString maps a poolpb.Network to the exact "MAINNET"/
+// "TESTNET" string this schema's network columns/CHECK constraints
+// use (see migrations/0001_initial_schema.up.sql) — deliberately
+// separate from poolpb.Network's own generated String() method (which
+// would render "NETWORK_MAINNET"/"NETWORK_TESTNET" instead), mirroring
+// internal/backend/api's own private networkString helper since this
+// command needs the identical mapping for payoutTrigger's network
+// field but cannot import that unexported function.
+func networkDBString(n poolpb.Network) string {
+	switch n {
+	case poolpb.Network_NETWORK_MAINNET:
+		return "MAINNET"
+	case poolpb.Network_NETWORK_TESTNET:
+		return "TESTNET"
+	default:
+		return ""
 	}
 }
 
@@ -182,11 +219,14 @@ func (a unlockerRepositoryAdapter) PendingBlocks(ctx context.Context, algo strin
 	out := make([]unlocker.Block, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, unlocker.Block{
-			ID:      r.ID,
-			Algo:    r.Algo,
-			Network: r.Network,
-			Hash:    r.Hash,
-			Height:  r.Height,
+			ID:         r.ID,
+			Algo:       r.Algo,
+			Network:    r.Network,
+			Hash:       r.Hash,
+			Height:     r.Height,
+			PoolType:   r.PoolType,
+			Difficulty: r.Difficulty,
+			Value:      r.Value,
 		})
 	}
 	return out, nil
@@ -194,6 +234,62 @@ func (a unlockerRepositoryAdapter) PendingBlocks(ctx context.Context, algo strin
 
 func (a unlockerRepositoryAdapter) SetBlockStatus(ctx context.Context, id int64, valid, unlocked bool) error {
 	return a.repo.SetBlockStatus(ctx, id, valid, unlocked)
+}
+
+// payoutRepositoryAdapter adapts *db.Repository (whose SharesAtHeight/
+// SoloShare/CreditBalance operate on db.PayoutShare) to
+// payout.Repository (which operates on payout.ShareRow), mirroring
+// repositoryAdapter/unlockerRepositoryAdapter's role above.
+type payoutRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a payoutRepositoryAdapter) SharesAtHeight(ctx context.Context, algo, poolType string, height int64) ([]payout.ShareRow, error) {
+	rows, err := a.repo.SharesAtHeight(ctx, algo, poolType, height)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]payout.ShareRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, payout.ShareRow{
+			Shares:         r.Shares,
+			PaymentAddress: r.PaymentAddress,
+			PaymentID:      r.PaymentID,
+		})
+	}
+	return out, nil
+}
+
+func (a payoutRepositoryAdapter) SoloShare(ctx context.Context, algo string, height int64) (payout.ShareRow, bool, error) {
+	r, found, err := a.repo.SoloShare(ctx, algo, height)
+	if err != nil {
+		return payout.ShareRow{}, false, err
+	}
+	return payout.ShareRow{
+		Shares:         r.Shares,
+		PaymentAddress: r.PaymentAddress,
+		PaymentID:      r.PaymentID,
+	}, found, nil
+}
+
+func (a payoutRepositoryAdapter) CreditBalance(ctx context.Context, algo, network, paymentAddress string, paymentID *string, amount int64) error {
+	return a.repo.CreditBalance(ctx, algo, network, paymentAddress, paymentID, amount)
+}
+
+// payoutTrigger adapts a *payout.Calculator into unlocker.PayoutTrigger
+// — the concrete implementation the unlocker's Config.PayoutTrigger
+// field is set to in production (see buildPayoutCalculator/run()
+// below). network is fixed at construction time (this backend's own
+// configured network — see GCPOOL_NETWORK), matching every other
+// network-scoped write path in this command.
+type payoutTrigger struct {
+	calc    *payout.Calculator
+	network string
+}
+
+func (t payoutTrigger) TriggerPayout(ctx context.Context, b unlocker.Block) error {
+	_, err := t.calc.RunForMaturedBlock(ctx, b.Algo, t.network, b.PoolType, b.Height, b.Difficulty, b.Value)
+	return err
 }
 
 // tariAlgos is every algo string mined against a Tari base node —
@@ -264,6 +360,89 @@ func sortedKeys(m map[string]unlocker.CoinConfig) []string {
 	return keys
 }
 
+// parsePercentEnv parses an optional percentage (0-100) environment
+// variable, returning def if raw is unset/empty. Mirrors
+// buildUnlockerConfig's *ParseInt-then-error-wrap style for its own
+// numeric env vars.
+func parsePercentEnv(name, raw string, def float64) (float64, error) {
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	return v, nil
+}
+
+// buildPayoutCalculator reads the GCPOOL_PAYOUT_* environment
+// variables and returns a ready-to-use *payout.Calculator plus
+// whether payout calculation should actually be wired into the
+// unlocker's matured-block trigger (ok == false when
+// GCPOOL_PAYOUT_FEE_ADDRESS is unset — a deployment that hasn't
+// configured a fee address yet gets correct chain-maturity tracking
+// out of the unlocker alone, exactly mirroring buildUnlockerConfig's
+// own opt-in story for GCPOOL_TARI_GRPC_ADDR/GCPOOL_MONERO_RPC_ADDR).
+//
+//	GCPOOL_PAYOUT_FEE_ADDRESS       (required to enable payout) pool
+//	                                operator fee-collection address.
+//	GCPOOL_PAYOUT_COIN_DEV_ADDRESS  (optional) coin developer donation
+//	                                address.
+//	GCPOOL_PAYOUT_POOL_DEV_ADDRESS  (optional) pool software developer
+//	                                donation address.
+//	GCPOOL_PAYOUT_PPS_FEE_PERCENT, GCPOOL_PAYOUT_PPLNS_FEE_PERCENT,
+//	GCPOOL_PAYOUT_SOLO_FEE_PERCENT (optional) per-pool-type operator
+//	                                fee percentage (0-100). Default 0.
+//	GCPOOL_PAYOUT_DEV_DONATION_PERCENT,
+//	GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT (optional) donation split
+//	                                percentage (0-100) of each fee cut.
+//	                                Default 0 (no donation split).
+//	GCPOOL_PAYOUT_PPLNS_SHARE_MULTI (optional) PPLNS window multiplier.
+//	                                Default 2 (a placeholder, operator-
+//	                                tunable value — see payout.Config's
+//	                                doc comment).
+func buildPayoutCalculator(repo *db.Repository, m *metrics.Metrics) (calc *payout.Calculator, ok bool, err error) {
+	feeAddress := os.Getenv("GCPOOL_PAYOUT_FEE_ADDRESS")
+	if feeAddress == "" {
+		return nil, false, nil
+	}
+
+	cfg := payout.Config{
+		FeeAddress:      feeAddress,
+		CoinDevAddress:  os.Getenv("GCPOOL_PAYOUT_COIN_DEV_ADDRESS"),
+		PoolDevAddress:  os.Getenv("GCPOOL_PAYOUT_POOL_DEV_ADDRESS"),
+		PPLNSShareMulti: defaultPPLNSShareMulti,
+		Metrics:         m,
+	}
+
+	if cfg.PPSFeePercent, err = parsePercentEnv("GCPOOL_PAYOUT_PPS_FEE_PERCENT", os.Getenv("GCPOOL_PAYOUT_PPS_FEE_PERCENT"), 0); err != nil {
+		return nil, false, err
+	}
+	if cfg.PPLNSFeePercent, err = parsePercentEnv("GCPOOL_PAYOUT_PPLNS_FEE_PERCENT", os.Getenv("GCPOOL_PAYOUT_PPLNS_FEE_PERCENT"), 0); err != nil {
+		return nil, false, err
+	}
+	if cfg.SoloFeePercent, err = parsePercentEnv("GCPOOL_PAYOUT_SOLO_FEE_PERCENT", os.Getenv("GCPOOL_PAYOUT_SOLO_FEE_PERCENT"), 0); err != nil {
+		return nil, false, err
+	}
+	if cfg.DevDonationPercent, err = parsePercentEnv("GCPOOL_PAYOUT_DEV_DONATION_PERCENT", os.Getenv("GCPOOL_PAYOUT_DEV_DONATION_PERCENT"), 0); err != nil {
+		return nil, false, err
+	}
+	if cfg.PoolDevDonationPercent, err = parsePercentEnv("GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT", os.Getenv("GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT"), 0); err != nil {
+		return nil, false, err
+	}
+	if raw := os.Getenv("GCPOOL_PAYOUT_PPLNS_SHARE_MULTI"); raw != "" {
+		v, parseErr := strconv.ParseFloat(raw, 64)
+		if parseErr != nil {
+			return nil, false, fmt.Errorf("GCPOOL_PAYOUT_PPLNS_SHARE_MULTI: %w", parseErr)
+		}
+		cfg.PPLNSShareMulti = v
+	}
+
+	return payout.New(payoutRepositoryAdapter{repo: repo}, cfg), true, nil
+}
+
+const defaultPPLNSShareMulti = 2
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("backend: %v", err)
@@ -299,17 +478,39 @@ func run() error {
 	defer pool.Close()
 
 	repo := db.NewRepository(pool)
+
+	// m is shared across the HTTP API handler, the unlocker, and the
+	// payout calculator so every real Prometheus metric this process
+	// produces (shares/blocks ingestion, unlocker poll passes, payout
+	// cycles) is served on the one GET /metrics endpoint api.Handler
+	// already exposes, rather than standing up a second registry/
+	// listener just for the backend's internal poll loops.
+	m := metrics.New(Version)
 	handler := api.NewHandler(repositoryAdapter{repo: repo}, api.Config{
 		AuthHeaderName:  authHeaderName,
 		AuthHeaderValue: authHeaderValue,
 		Network:         network,
 		Version:         Version,
+		Metrics:         m,
 	})
 
 	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig()
 	if err != nil {
 		return fmt.Errorf("configuring block unlocker: %w", err)
 	}
+	unlockerCfg.Metrics = m
+
+	payoutCalc, payoutEnabled, err := buildPayoutCalculator(repo, m)
+	if err != nil {
+		return fmt.Errorf("configuring payout calculator: %w", err)
+	}
+	if payoutEnabled {
+		unlockerCfg.PayoutTrigger = payoutTrigger{calc: payoutCalc, network: networkDBString(network)}
+		log.Print("backend: payout calculation enabled, wired into the block unlocker's matured-block trigger")
+	} else {
+		log.Print("backend: payout calculation disabled (GCPOOL_PAYOUT_FEE_ADDRESS not set); blocks will still be marked matured/unlocked, just never auto-paid out")
+	}
+
 	if unlockerEnabled {
 		u := unlocker.New(unlockerRepositoryAdapter{repo: repo}, unlockerCfg)
 		log.Printf("backend: block unlocker enabled, polling every %s for algos %v", unlockerCfg.PollInterval, sortedKeys(unlockerCfg.Coins))

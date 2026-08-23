@@ -44,6 +44,29 @@ const (
 	UnknownLabel = "unknown"
 )
 
+// Outcome label values for unlocker_blocks_total — the same
+// vocabulary internal/backend/unlocker.PassResult already reports as
+// counts, mirrored here per-block instead of per-pass so a single
+// block's fate is directly queryable/alertable. "pending" is
+// deliberately NOT one of these values: a block left pending is, by
+// definition, not a terminal outcome yet and generates no event here
+// (see unlocker.checkBlock's decision table) — only Verify errors,
+// maturation, and orphaning are.
+const (
+	UnlockerOutcomeMatured  = "matured"
+	UnlockerOutcomeOrphaned = "orphaned"
+	UnlockerOutcomeError    = "error"
+)
+
+// Result label values for payout_cycles_total — whether one
+// matured-block payout calculation (Calculate{PPS,PPLNS,Solo} +
+// Apply, see internal/backend/payout.Calculator) completed and
+// credited balances, or failed partway through.
+const (
+	PayoutResultSuccess = "success"
+	PayoutResultError   = "error"
+)
+
 // Metrics holds every Prometheus collector the backend registers, plus
 // the registry they live in. It is constructed via New and is safe for
 // concurrent use (all wrapped Prometheus collectors are).
@@ -56,6 +79,32 @@ type Metrics struct {
 	BlockInsertDuration  prometheus.Histogram
 	HTTPRequestsInFlight prometheus.Gauge
 	BuildInfo            *prometheus.GaugeVec
+
+	// UnlockerBlocksTotal counts every terminal per-block outcome
+	// the poll loop in internal/backend/unlocker produces — matured,
+	// orphaned, or a Verify/SetBlockStatus error — labeled by algo
+	// and outcome (see UnlockerOutcome* above). "Pending" blocks
+	// never increment this (see those constants' doc comment).
+	UnlockerBlocksTotal *prometheus.CounterVec
+	// UnlockerPollDuration observes wall-clock time for one algo's
+	// worth of one Unlocker.RunOnce pass (fetching + verifying every
+	// pending block for that algo), labeled by algo.
+	UnlockerPollDuration *prometheus.HistogramVec
+
+	// PayoutCyclesTotal counts every payout calculation cycle
+	// (internal/backend/payout.Calculator's Calculate{PPS,PPLNS,
+	// Solo} + Apply, triggered once per matured block by the
+	// unlocker), labeled by algo, pool_type, and result (success/
+	// error — see PayoutResult* above).
+	PayoutCyclesTotal *prometheus.CounterVec
+	// PayoutAmountCreditedTotal is the running total of atomic units
+	// credited to miner balances by successful payout cycles,
+	// labeled by algo and network. Cumulative — a Counter, not the
+	// current balance table state.
+	PayoutAmountCreditedTotal *prometheus.CounterVec
+	// PayoutCycleDuration observes wall-clock time for one payout
+	// calculation cycle, labeled by algo and pool_type.
+	PayoutCycleDuration *prometheus.HistogramVec
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -109,6 +158,33 @@ func New(version string) *Metrics {
 		Help: "Always 1; version label carries the running build's version string.",
 	}, []string{"version"})
 	m.BuildInfo.WithLabelValues(version).Set(1)
+
+	m.UnlockerBlocksTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "unlocker_blocks_total",
+		Help: "Total number of pending blocks resolved to a terminal outcome by the block unlocker, by algo and outcome (matured/orphaned/error).",
+	}, []string{"algo", "outcome"})
+
+	m.UnlockerPollDuration = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "unlocker_poll_duration_seconds",
+		Help:    "Wall-clock time for one algo's pending-block poll pass in the block unlocker, by algo.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"algo"})
+
+	m.PayoutCyclesTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "payout_cycles_total",
+		Help: "Total number of payout calculation cycles run, by algo, pool_type, and result (success/error).",
+	}, []string{"algo", "pool_type", "result"})
+
+	m.PayoutAmountCreditedTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "payout_amount_credited_total",
+		Help: "Cumulative atomic units credited to miner balances by successful payout cycles, by algo and network.",
+	}, []string{"algo", "network"})
+
+	m.PayoutCycleDuration = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "payout_cycle_duration_seconds",
+		Help:    "Wall-clock time for one payout calculation cycle (Calculate + Apply), by algo and pool_type.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"algo", "pool_type"})
 
 	return m
 }
@@ -183,4 +259,18 @@ func registerHistogram(reg *prometheus.Registry, opts prometheus.HistogramOpts) 
 		log.Printf("metrics: failed to register histogram %s: %v", opts.Name, err)
 	}
 	return h
+}
+
+func registerHistogramVec(reg *prometheus.Registry, opts prometheus.HistogramOpts, labels []string) *prometheus.HistogramVec {
+	hv := prometheus.NewHistogramVec(opts, labels)
+	if err := reg.Register(hv); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
+				return existing
+			}
+		}
+		log.Printf("metrics: failed to register histogram vec %s: %v", opts.Name, err)
+	}
+	return hv
 }

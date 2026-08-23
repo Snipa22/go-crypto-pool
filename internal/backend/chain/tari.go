@@ -134,6 +134,7 @@ func (v *TariVerifier) Verify(_ context.Context, hashHex string, height int64) (
 		Orphaned:      orphaned,
 		Confirmations: int64(headerResp.GetConfirmations()),
 		CanonicalHash: canonicalHashHex,
+		Reward:        int64(headerResp.GetReward()),
 	}, nil
 }
 

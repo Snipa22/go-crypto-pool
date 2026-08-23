@@ -78,6 +78,7 @@ type moneroBlockHeaderByHeightResult struct {
 		Height       uint64 `json:"height"`
 		Depth        uint64 `json:"depth"`
 		OrphanStatus bool   `json:"orphan_status"`
+		Reward       uint64 `json:"reward"`
 	} `json:"block_header"`
 	Status string `json:"status"`
 }
@@ -162,6 +163,7 @@ func (v *MoneroVerifier) Verify(ctx context.Context, hashHex string, height int6
 		Orphaned:      orphaned,
 		Confirmations: int64(result.BlockHeader.Depth),
 		CanonicalHash: canonicalHash,
+		Reward:        int64(result.BlockHeader.Reward),
 	}, nil
 }
 

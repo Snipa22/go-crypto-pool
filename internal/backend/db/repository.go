@@ -126,14 +126,19 @@ func (r *Repository) InsertBlock(ctx context.Context, b Block) error {
 // internal/backend/unlocker) still needs to independently verify
 // against the real chain — i.e. valid = TRUE (never yet found
 // invalid/orphaned) AND unlocked = FALSE (not yet confirmed mature).
-// Only the columns the unlocker's ChainVerifier.Verify call actually
-// needs are carried here.
+// Carries pool_type/difficulty/value in addition to the columns the
+// unlocker's ChainVerifier.Verify call itself needs, since the
+// unlocker also uses this row to trigger a payout.Calculator run
+// once a block resolves to matured (see unlocker.PayoutTrigger).
 type PendingBlock struct {
-	ID      int64
-	Algo    string
-	Network string
-	Hash    string
-	Height  int64
+	ID         int64
+	Algo       string
+	Network    string
+	PoolType   string
+	Hash       string
+	Height     int64
+	Difficulty int64
+	Value      *int64
 }
 
 // PendingBlocks returns every blocks row with valid = TRUE AND
@@ -148,7 +153,7 @@ func (r *Repository) PendingBlocks(ctx context.Context, algo string) ([]PendingB
 	}
 
 	const stmt = `
-		SELECT id, algo, network, hash, height
+		SELECT id, algo, network, pool_type, hash, height, difficulty, value
 		FROM blocks
 		WHERE algo = $1 AND valid = TRUE AND unlocked = FALSE
 		ORDER BY id ASC`
@@ -161,7 +166,7 @@ func (r *Repository) PendingBlocks(ctx context.Context, algo string) ([]PendingB
 	var out []PendingBlock
 	for rows.Next() {
 		var pb PendingBlock
-		if err := rows.Scan(&pb.ID, &pb.Algo, &pb.Network, &pb.Hash, &pb.Height); err != nil {
+		if err := rows.Scan(&pb.ID, &pb.Algo, &pb.Network, &pb.PoolType, &pb.Hash, &pb.Height, &pb.Difficulty, &pb.Value); err != nil {
 			return nil, fmt.Errorf("db: scanning pending block row: %w", err)
 		}
 		out = append(out, pb)

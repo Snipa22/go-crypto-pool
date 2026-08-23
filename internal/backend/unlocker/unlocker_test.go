@@ -51,6 +51,19 @@ func (f *fakeVerifier) Verify(_ context.Context, hashHex string, _ int64) (chain
 	return f.results[hashHex], nil
 }
 
+// fakePayoutTrigger records every Block it's invoked with, so tests
+// can assert on exactly what value made it through checkBlock's
+// override logic (see TestRunOnce_PayoutTriggerReceivesFreshRewardNotStaleValue).
+type fakePayoutTrigger struct {
+	calls []Block
+	err   error
+}
+
+func (f *fakePayoutTrigger) TriggerPayout(_ context.Context, b Block) error {
+	f.calls = append(f.calls, b)
+	return f.err
+}
+
 func TestRunOnce_MaturedBlock(t *testing.T) {
 	repo := &fakeRepo{pending: map[string][]Block{
 		"RXM": {{ID: 1, Algo: "RXM", Hash: "deadbeef", Height: 100}},
@@ -230,5 +243,48 @@ func TestRunLoop_ZeroPollIntervalReturnsImmediately(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("RunLoop with PollInterval<=0 did not return immediately")
+	}
+}
+
+// TestRunOnce_PayoutTriggerReceivesFreshRewardNotStaleValue is the
+// real regression test for a real correctness bug: PayoutTrigger must
+// receive the block's REAL, CURRENT reward as reported by this same
+// poll pass's chain.VerifyResult.Reward, never whatever stale value
+// blocks.value happened to hold from submission time. Deliberately
+// configures the pending block's Value to a wrong/stale number and
+// confirms checkBlock overwrites it before invoking the trigger.
+func TestRunOnce_PayoutTriggerReceivesFreshRewardNotStaleValue(t *testing.T) {
+	staleValue := int64(999999999) // deliberately wrong -- must never reach the trigger
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{ID: 1, Algo: "RXM", Hash: "deadbeef", Height: 100, PoolType: "SOLO", Difficulty: 12345, Value: &staleValue}},
+	}}
+	const freshReward = int64(600000000000) // the real, current reward Verify reports
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{
+		"deadbeef": {Found: true, Confirmations: 60, Reward: freshReward},
+	}}
+	trigger := &fakePayoutTrigger{}
+	u := New(repo, Config{Coins: map[string]CoinConfig{
+		"RXM": {Verifier: verifier, MaturityDepth: 60},
+	}, PayoutTrigger: trigger})
+
+	result := u.RunOnce(context.Background())
+	if result.Matured != 1 {
+		t.Fatalf("RunOnce: got %+v, want 1 matured", result)
+	}
+	if len(trigger.calls) != 1 {
+		t.Fatalf("PayoutTrigger.TriggerPayout called %d times, want 1", len(trigger.calls))
+	}
+	got := trigger.calls[0]
+	if got.Value == nil {
+		t.Fatal("PayoutTrigger received a nil Value, want the fresh reward")
+	}
+	if *got.Value != freshReward {
+		t.Fatalf("PayoutTrigger received Value=%d, want the fresh chain.VerifyResult.Reward=%d (stale blocks.value was %d)",
+			*got.Value, freshReward, staleValue)
+	}
+	// Confirm the other pass-through fields (needed for dispatch)
+	// still arrive correctly alongside the corrected Value.
+	if got.PoolType != "SOLO" || got.Difficulty != 12345 {
+		t.Fatalf("PayoutTrigger received PoolType=%q Difficulty=%d, want SOLO/12345 unchanged", got.PoolType, got.Difficulty)
 	}
 }

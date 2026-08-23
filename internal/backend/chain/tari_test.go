@@ -53,6 +53,7 @@ func TestTariVerifier_CanonicalAndConfirmed(t *testing.T) {
 		header: &tari_generated.BlockHeaderResponse{
 			Header:        &tari_generated.BlockHeader{Hash: hashBytes, Height: 100},
 			Confirmations: 12,
+			Reward:        60000000,
 		},
 		blocksByHt: map[uint64][]*tari_generated.Block{100: {blockWithHash(hashHex)}},
 	}
@@ -67,6 +68,9 @@ func TestTariVerifier_CanonicalAndConfirmed(t *testing.T) {
 	}
 	if got.Confirmations != 12 {
 		t.Fatalf("Verify: got Confirmations=%d, want 12", got.Confirmations)
+	}
+	if got.Reward != 60000000 {
+		t.Fatalf("Verify: got Reward=%d, want 60000000 (from the real BlockHeaderResponse.Reward field, the SAME real GetHeaderByHash call already made for hash/confirmation checking -- no extra RPC)", got.Reward)
 	}
 	if hex.EncodeToString(rpc.gotHash) != hashHex {
 		t.Fatalf("Verify: GetHeaderByHash called with hash %x, want %s", rpc.gotHash, hashHex)
