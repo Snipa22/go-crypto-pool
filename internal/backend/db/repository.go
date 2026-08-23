@@ -270,6 +270,31 @@ func (r *Repository) SetBlockStatus(ctx context.Context, id int64, valid, unlock
 	return nil
 }
 
+// GetBlockByID returns one full `blocks` row by primary key, or a
+// wrapped pgx.ErrNoRows if id does not match any row. This exists
+// purely for ops-facing read access (the manual block invalidate/
+// re-lock CLI subcommands in cmd/backend use it to show the operator
+// exactly what they are about to change, and what changed, on either
+// side of a SetBlockStatus call) — nothing in the normal
+// share/block-ingestion or unlocker write paths needs to fetch a
+// single block by id, so this was not previously exposed.
+func (r *Repository) GetBlockByID(ctx context.Context, id int64) (Block, error) {
+	const stmt = `
+		SELECT algo, network, pool_type, hash, height, difficulty, shares,
+		       block_timestamp, unlocked, valid, value
+		FROM blocks
+		WHERE id = $1`
+	var b Block
+	err := r.pool.QueryRow(ctx, stmt, id).Scan(
+		&b.Algo, &b.Network, &b.PoolType, &b.Hash, &b.Height, &b.Difficulty, &b.Shares,
+		&b.Timestamp, &b.Unlocked, &b.Valid, &b.Value,
+	)
+	if err != nil {
+		return Block{}, fmt.Errorf("db: getting block %d: %w", id, err)
+	}
+	return b, nil
+}
+
 // PayoutShare is one `shares` row as needed by internal/backend/payout
 // (payout.ShareRow's DB-facing counterpart — kept as its own type for
 // the same dependency-direction reason unlocker.Block/db.PendingBlock

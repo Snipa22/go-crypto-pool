@@ -814,7 +814,24 @@ func buildTariDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *d
 	return disburse.New(disburseRepositoryAdapter{repo: repo}, cfg), walletClient, interval, true, nil
 }
 
+// main runs the backend server by default (no args, or any args not
+// starting with "block") -- unchanged from before this file's own
+// "block" subcommand was added, so existing deployments invoking this
+// binary with no arguments keep working exactly as before.
+//
+// `backend block invalidate ...` / `backend block relock ...` are a
+// separate, manual ops-triggered CLI path (see blockcli.go) that never
+// starts the HTTP server or any background poll loop -- they open a
+// DB connection, make one SetBlockStatus call, print the result, and
+// exit.
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "block" {
+		if err := runBlockCommand(os.Args[2:]); err != nil {
+			log.Fatalf("backend: %v", err)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		log.Fatalf("backend: %v", err)
 	}
