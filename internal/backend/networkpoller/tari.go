@@ -8,6 +8,8 @@ import (
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/nodeGRPC"
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // tariNodeRPC is the narrow slice of go-tari-grpc-lib/v3's nodeGRPC
@@ -72,6 +74,20 @@ const (
 //     window independently, so these three numbers really do differ
 //     per algo.
 //
+// GetNetworkState is NOT universally reachable: it's confirmed live
+// against the real Esmeralda testnet base node to come back
+// PermissionDenied/Unauthenticated (some real node operators run
+// grpc_server_allow_methods allowlists that admit GetTipInfo but not
+// GetNetworkState) -- a real, RPC-permission-scoped restriction, not
+// a transient/connectivity failure. FetchNetworkState treats exactly
+// that class of error as "this node just doesn't expose per-algo
+// hashrate" and degrades to a real height/hash State with a nil
+// EstimatedHashrateHS, rather than failing the whole poll (which
+// would also blank out the real, independently-fetched tip
+// height/hash for no good reason). Any OTHER GetNetworkState error
+// (Unavailable, real connection drop, etc.) still fails the fetch --
+// see isTariMethodForbidden below for the exact code set.
+//
 // Difficulty is deliberately left nil (see State.Difficulty's doc
 // comment): resolving one clean, current, PER-ALGO difficulty figure
 // for a three-way merge-mined chain from a single cheap RPC call is
@@ -116,9 +132,15 @@ func (s *TariNetworkSource) FetchNetworkState(_ context.Context) (State, error) 
 	meta := tip.GetMetadata()
 
 	netState, err := s.rpc.GetNetworkState()
-	if err != nil {
+	if err != nil && !isTariMethodForbidden(err) {
 		return State{}, fmt.Errorf("networkpoller: tari: GetNetworkState: %w", err)
 	}
+	// isTariMethodForbidden(err) case: this base node's real GRPC
+	// permission scope doesn't admit GetNetworkState (confirmed live
+	// against Esmeralda testnet -- see TariNetworkSource's doc
+	// comment). netState is nil here, so the hashrate block below is
+	// skipped and this State comes back with a real height/hash and
+	// a nil EstimatedHashrateHS instead of failing the whole fetch.
 
 	var hashrate *float64
 	if netState != nil {
@@ -151,4 +173,30 @@ func (s *TariNetworkSource) FetchNetworkState(_ context.Context) (State, error) 
 		EstimatedHashrateHS: hashrate,
 		BestBlockHash:       hex.EncodeToString(meta.GetBestBlockHash()),
 	}, nil
+}
+
+// isTariMethodForbidden reports whether err is the real base node
+// GRPC server telling us a method exists but this connection isn't
+// permitted to call it -- PermissionDenied/Unauthenticated (an
+// explicit grpc_server_allow_methods-style rejection) or Unimplemented
+// (some real node builds/configs report a disabled method this way
+// instead). This is exactly the class of error confirmed live against
+// the real Esmeralda testnet base node for GetNetworkState: a real
+// RPC-permission scope restriction, not a transient/connectivity
+// failure, so it should degrade this Source's hashrate field to nil
+// rather than fail the whole fetch. Errors that aren't a real GRPC
+// status (e.g. plain connection-refused errors, which status.FromError
+// maps to codes.Unknown) fall through as real failures, same as
+// before.
+func isTariMethodForbidden(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch st.Code() {
+	case codes.PermissionDenied, codes.Unauthenticated, codes.Unimplemented:
+		return true
+	default:
+		return false
+	}
 }

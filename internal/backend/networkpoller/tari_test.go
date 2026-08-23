@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeTariRPC struct {
@@ -122,6 +124,44 @@ func TestTariNetworkSource_GetNetworkStateError(t *testing.T) {
 
 	if _, err := s.FetchNetworkState(context.Background()); err == nil {
 		t.Fatal("expected an error when GetNetworkState fails")
+	}
+}
+
+// TestTariNetworkSource_GetNetworkStatePermissionDenied is the
+// regression test for the real, live-confirmed bug: the real
+// Esmeralda testnet base node returns PermissionDenied for
+// GetNetworkState (its real GRPC permission scope doesn't admit that
+// method), which used to fail this Source's ENTIRE fetch -- including
+// the real, independently-fetched, always-available tip height/hash
+// from GetTipInfo. A PermissionDenied/Unauthenticated/Unimplemented
+// GetNetworkState error must degrade to a real State with a nil
+// EstimatedHashrateHS instead.
+func TestTariNetworkSource_GetNetworkStatePermissionDenied(t *testing.T) {
+	hashBytes, _ := hex.DecodeString("deadbeef")
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.Unauthenticated, codes.Unimplemented} {
+		t.Run(code.String(), func(t *testing.T) {
+			rpc := &fakeTariRPC{
+				tip: &tari_generated.TipInfoResponse{
+					Metadata: &tari_generated.MetaData{BestBlockHeight: 5000, BestBlockHash: hashBytes},
+				},
+				netErr: status.Error(code, "method not allowed on this node"),
+			}
+			s := newTariNetworkSourceWithRPC(rpc, TariAlgoRandomX)
+
+			state, err := s.FetchNetworkState(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if state.Height != 5000 {
+				t.Fatalf("height = %d, want 5000 (real tip data must survive a forbidden GetNetworkState)", state.Height)
+			}
+			if state.BestBlockHash != "deadbeef" {
+				t.Fatalf("best block hash = %q, want deadbeef", state.BestBlockHash)
+			}
+			if state.EstimatedHashrateHS != nil {
+				t.Fatalf("estimated hashrate = %v, want nil when GetNetworkState is forbidden", *state.EstimatedHashrateHS)
+			}
+		})
 	}
 }
 
