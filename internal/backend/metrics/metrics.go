@@ -67,6 +67,17 @@ const (
 	PayoutResultError   = "error"
 )
 
+// Result label values for disbursement_batches_total — whether one
+// real on-chain transfer batch (internal/backend/disburse.Engine)
+// was actually sent, failed at the wallet RPC layer, or was skipped
+// before ever attempting a Transfer call (e.g. insufficient unlocked
+// wallet balance for this cycle — see disburse.go's doc comment).
+const (
+	DisbursementResultSent    = "sent"
+	DisbursementResultFailed  = "failed"
+	DisbursementResultSkipped = "skipped"
+)
+
 // Metrics holds every Prometheus collector the backend registers, plus
 // the registry they live in. It is constructed via New and is safe for
 // concurrent use (all wrapped Prometheus collectors are).
@@ -105,6 +116,27 @@ type Metrics struct {
 	// PayoutCycleDuration observes wall-clock time for one payout
 	// calculation cycle, labeled by algo and pool_type.
 	PayoutCycleDuration *prometheus.HistogramVec
+
+	// DisbursementBatchesTotal counts every real on-chain transfer
+	// batch internal/backend/disburse.Engine attempts, labeled by
+	// algo, network, and result (sent/failed/skipped — see
+	// DisbursementResult* above).
+	DisbursementBatchesTotal *prometheus.CounterVec
+	// DisbursementAmountSentTotal is the running total of atomic
+	// units actually sent on-chain by successful disbursement
+	// batches, labeled by algo and network. Cumulative — mirrors
+	// PayoutAmountCreditedTotal's role on the credit side.
+	DisbursementAmountSentTotal *prometheus.CounterVec
+	// DisbursementFeeTotal is the running total of real on-chain
+	// network fees paid by successful disbursement batches, labeled
+	// by algo and network — the hot wallet's own cost of paying
+	// out, never deducted from any miner's balance.
+	DisbursementFeeTotal *prometheus.CounterVec
+	// DisbursementCycleDuration observes wall-clock time for one
+	// full disbursement cycle (RunOnce: balance query + every
+	// batch's Transfer call + bookkeeping), labeled by algo and
+	// network.
+	DisbursementCycleDuration *prometheus.HistogramVec
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -185,6 +217,27 @@ func New(version string) *Metrics {
 		Help:    "Wall-clock time for one payout calculation cycle (Calculate + Apply), by algo and pool_type.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"algo", "pool_type"})
+
+	m.DisbursementBatchesTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "disbursement_batches_total",
+		Help: "Total number of real on-chain transfer batches attempted by the payout disbursement engine, by algo, network, and result (sent/failed/skipped).",
+	}, []string{"algo", "network", "result"})
+
+	m.DisbursementAmountSentTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "disbursement_amount_sent_total",
+		Help: "Cumulative atomic units actually sent on-chain by successful disbursement batches, by algo and network.",
+	}, []string{"algo", "network"})
+
+	m.DisbursementFeeTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "disbursement_fee_total",
+		Help: "Cumulative real on-chain network fees paid by successful disbursement batches (hot wallet cost, never deducted from miner balances), by algo and network.",
+	}, []string{"algo", "network"})
+
+	m.DisbursementCycleDuration = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "disbursement_cycle_duration_seconds",
+		Help:    "Wall-clock time for one full disbursement cycle (balance query + every batch's Transfer call + bookkeeping), by algo and network.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"algo", "network"})
 
 	return m
 }

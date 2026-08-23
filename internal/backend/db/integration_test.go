@@ -47,6 +47,7 @@ func resetSchema(t *testing.T, pool *pgxpool.Pool) {
 	for _, stmt := range []string{
 		"DROP TABLE IF EXISTS ports CASCADE",
 		"DROP TABLE IF EXISTS pools CASCADE",
+		"DROP TABLE IF EXISTS payouts CASCADE",
 		"DROP TABLE IF EXISTS balance CASCADE",
 		"DROP TABLE IF EXISTS miner_identifiers CASCADE",
 		"DROP TABLE IF EXISTS blocks CASCADE",
@@ -267,5 +268,95 @@ func TestIntegrationDropOldPartitions(t *testing.T) {
 	}
 	if len(after) != len(before)-1 {
 		t.Errorf("expected partition count to drop by exactly 1 (from %d), got %d", len(before), len(after))
+	}
+}
+
+// TestIntegrationDisbursementLifecycle exercises the real
+// PayableBalances -> RecordPendingPayout -> CompletePayoutSent/
+// FailPayout flow internal/backend/disburse.Engine drives, against a
+// real Postgres transaction (CompletePayoutSent's atomic debit +
+// payouts-row update).
+func TestIntegrationDisbursementLifecycle(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+
+	repo := db.NewRepository(pool)
+
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 1000); err != nil {
+		t.Fatalf("CreditBalance(alice): %v", err)
+	}
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "bob", nil, 50); err != nil {
+		t.Fatalf("CreditBalance(bob): %v", err)
+	}
+
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	if err != nil {
+		t.Fatalf("PayableBalances: %v", err)
+	}
+	if len(payable) != 1 || payable[0].PaymentAddress != "alice" {
+		t.Fatalf("PayableBalances(min=100): got %+v, want exactly alice (bob is below the threshold)", payable)
+	}
+
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", []int64{payable[0].ID}, payable[0].PendingBalance)
+	if err != nil {
+		t.Fatalf("RecordPendingPayout: %v", err)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, "SELECT status FROM payouts WHERE id = $1", payoutID).Scan(&status); err != nil {
+		t.Fatalf("querying payout status: %v", err)
+	}
+	if status != "PENDING" {
+		t.Fatalf("got payout status %q immediately after RecordPendingPayout, want PENDING", status)
+	}
+
+	if err := repo.CompletePayoutSent(ctx, payoutID, []db.DisburseEntry{{BalanceID: payable[0].ID, Amount: payable[0].PendingBalance}}, "deadbeeftxhash", 42); err != nil {
+		t.Fatalf("CompletePayoutSent: %v", err)
+	}
+
+	var pendingBalance, paidBalance int64
+	if err := pool.QueryRow(ctx, "SELECT pending_balance, paid_balance FROM balance WHERE payment_address = 'alice'").Scan(&pendingBalance, &paidBalance); err != nil {
+		t.Fatalf("querying alice's balance: %v", err)
+	}
+	if pendingBalance != 0 || paidBalance != 1000 {
+		t.Errorf("got pending_balance=%d paid_balance=%d, want 0/1000 after CompletePayoutSent", pendingBalance, paidBalance)
+	}
+
+	var txHash string
+	var fee int64
+	if err := pool.QueryRow(ctx, "SELECT status, tx_hash, fee FROM payouts WHERE id = $1", payoutID).Scan(&status, &txHash, &fee); err != nil {
+		t.Fatalf("querying completed payout row: %v", err)
+	}
+	if status != "SENT" || txHash != "deadbeeftxhash" || fee != 42 {
+		t.Errorf("got status=%q tx_hash=%q fee=%d, want SENT/deadbeeftxhash/42", status, txHash, fee)
+	}
+
+	// bob is still owed 50 and never touched by the above -- a second,
+	// separate cycle attempt for him that fails must not touch his
+	// balance at all.
+	payoutID2, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", []int64{payable[0].ID + 1}, 50)
+	if err != nil {
+		t.Fatalf("RecordPendingPayout(bob): %v", err)
+	}
+	if err := repo.FailPayout(ctx, payoutID2, "not enough unlocked money"); err != nil {
+		t.Fatalf("FailPayout(bob): %v", err)
+	}
+	var bobPending int64
+	if err := pool.QueryRow(ctx, "SELECT pending_balance FROM balance WHERE payment_address = 'bob'").Scan(&bobPending); err != nil {
+		t.Fatalf("querying bob's balance: %v", err)
+	}
+	if bobPending != 50 {
+		t.Errorf("got bob's pending_balance=%d after a FAILED payout, want it untouched at 50", bobPending)
+	}
+	var failStatus, failErr string
+	if err := pool.QueryRow(ctx, "SELECT status, error FROM payouts WHERE id = $1", payoutID2).Scan(&failStatus, &failErr); err != nil {
+		t.Fatalf("querying failed payout row: %v", err)
+	}
+	if failStatus != "FAILED" || failErr != "not enough unlocked money" {
+		t.Errorf("got status=%q error=%q, want FAILED/\"not enough unlocked money\"", failStatus, failErr)
 	}
 }

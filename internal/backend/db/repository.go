@@ -301,3 +301,161 @@ func (r *Repository) CreditBalance(ctx context.Context, algo, network, paymentAd
 	}
 	return nil
 }
+
+// PayableBalance is one `balance` row whose pending_balance meets or
+// exceeds a disbursement cycle's minimum payout threshold — the
+// real-schema source internal/backend/disburse.Repository.PayableBalances
+// draws from to decide who gets paid this cycle.
+type PayableBalance struct {
+	ID             int64
+	PaymentAddress string
+	PaymentID      *string
+	PendingBalance int64
+}
+
+// PayableBalances returns every `balance` row for (algo, network)
+// whose pending_balance >= minPayout, oldest (lowest id) first —
+// deterministic ordering so repeated disbursement cycles process the
+// same backlog in the same order rather than an unspecified one.
+// minPayout <= 0 returns every balance row with a positive pending
+// balance (a "no minimum" disbursement policy is a legitimate
+// operator choice, not a caller error).
+func (r *Repository) PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
+	if err := ValidateAlgo(algo); err != nil {
+		return nil, err
+	}
+	if minPayout < 0 {
+		minPayout = 0
+	}
+
+	const stmt = `
+		SELECT id, payment_address, payment_id, pending_balance
+		FROM balance
+		WHERE algo = $1 AND network = $2 AND pending_balance > 0 AND pending_balance >= $3
+		ORDER BY id ASC`
+	rows, err := r.pool.Query(ctx, stmt, algo, network, minPayout)
+	if err != nil {
+		return nil, fmt.Errorf("db: querying payable balances: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PayableBalance
+	for rows.Next() {
+		var b PayableBalance
+		if err := rows.Scan(&b.ID, &b.PaymentAddress, &b.PaymentID, &b.PendingBalance); err != nil {
+			return nil, fmt.Errorf("db: scanning payable balance row: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterating payable balance rows: %w", err)
+	}
+	return out, nil
+}
+
+// DisburseEntry is one balance row's contribution to a single real
+// on-chain transfer — the real-schema counterpart of
+// disburse.PayoutEntry, kept as this package's own type for the same
+// dependency-direction reason PayoutShare/ShareRow are kept separate
+// (see internal/backend/payout's doc comment).
+type DisburseEntry struct {
+	BalanceID int64
+	Amount    int64
+}
+
+// RecordPendingPayout inserts a PENDING `payouts` row for one about-
+// to-be-attempted real Transfer RPC call, BEFORE that call is made.
+// See migrations/0002_wallet_disbursements.up.sql's doc comment for
+// why this ordering matters: it makes "the RPC call itself crashed
+// this process" a recoverable/auditable state instead of a silently
+// lost one (an operator can always find every attempted disbursement
+// by querying this table, even ones that never got a further status
+// update because the process died mid-call).
+func (r *Repository) RecordPendingPayout(ctx context.Context, algo, network string, balanceIDs []int64, amount int64) (int64, error) {
+	if err := ValidateAlgo(algo); err != nil {
+		return 0, err
+	}
+
+	const stmt = `
+		INSERT INTO payouts (algo, network, status, balance_ids, amount)
+		VALUES ($1, $2, 'PENDING', $3, $4)
+		RETURNING id`
+	var id int64
+	if err := r.pool.QueryRow(ctx, stmt, algo, network, balanceIDs, amount).Scan(&id); err != nil {
+		return 0, fmt.Errorf("db: recording pending payout: %w", err)
+	}
+	return id, nil
+}
+
+// CompletePayoutSent atomically (single DB transaction) debits every
+// entry's amount from pending_balance and credits it to paid_balance
+// on the matching `balance` row, then flips the `payouts` row
+// identified by payoutID to SENT with the real tx_hash/fee the
+// Transfer RPC call reported. Both writes happen in the same
+// transaction specifically so a crash between them can never leave a
+// SENT payout with balances that were never actually debited (or
+// vice versa) — the real, irreversible on-chain transfer has already
+// happened by the time this is called (see disburse.go), so this
+// step is bookkeeping that must not itself introduce a new
+// consistency gap.
+func (r *Repository) CompletePayoutSent(ctx context.Context, payoutID int64, entries []DisburseEntry, txHash string, fee int64) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("db: completing payout %d: beginning transaction: %w", payoutID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, e := range entries {
+		const debitStmt = `
+			UPDATE balance
+			SET pending_balance = pending_balance - $2,
+			    paid_balance = paid_balance + $2,
+			    updated_at = now()
+			WHERE id = $1`
+		tag, err := tx.Exec(ctx, debitStmt, e.BalanceID, e.Amount)
+		if err != nil {
+			return fmt.Errorf("db: completing payout %d: debiting balance %d: %w", payoutID, e.BalanceID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("db: completing payout %d: no such balance row %d", payoutID, e.BalanceID)
+		}
+	}
+
+	const payoutStmt = `
+		UPDATE payouts
+		SET status = 'SENT', tx_hash = $2, fee = $3, completed_at = now()
+		WHERE id = $1`
+	tag, err := tx.Exec(ctx, payoutStmt, payoutID, txHash, fee)
+	if err != nil {
+		return fmt.Errorf("db: completing payout %d: updating payouts row: %w", payoutID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("db: completing payout %d: no such payouts row", payoutID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("db: completing payout %d: committing transaction: %w", payoutID, err)
+	}
+	return nil
+}
+
+// FailPayout flips the `payouts` row identified by payoutID to
+// FAILED with the given error message. Deliberately does NOT touch
+// any `balance` row — a failed Transfer RPC call means no real coin
+// moved, so the underlying balances remain payable and are simply
+// picked up again by the next disbursement cycle's
+// PayableBalances call (see disburse.go).
+func (r *Repository) FailPayout(ctx context.Context, payoutID int64, errMsg string) error {
+	const stmt = `
+		UPDATE payouts
+		SET status = 'FAILED', error = $2, completed_at = now()
+		WHERE id = $1`
+	tag, err := r.pool.Exec(ctx, stmt, payoutID, errMsg)
+	if err != nil {
+		return fmt.Errorf("db: failing payout %d: %w", payoutID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("db: failing payout %d: no such payouts row", payoutID)
+	}
+	return nil
+}

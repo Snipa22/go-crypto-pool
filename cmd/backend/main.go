@@ -82,6 +82,22 @@
 //	                         GCPOOL_PAYOUT_{PPS,PPLNS,SOLO}_FEE_PERCENT,
 //	                         GCPOOL_PAYOUT_{,POOL_}DEV_DONATION_PERCENT,
 //	                         GCPOOL_PAYOUT_PPLNS_SHARE_MULTI).
+//	GCPOOL_MONERO_WALLET_RPC_ADDR (optional) base URL of a real
+//	                         monero-wallet-rpc endpoint (e.g.
+//	                         "http://127.0.0.1:18083"). When set, the
+//	                         real internal/backend/disburse.Engine
+//	                         periodically pays out every miner's
+//	                         accrued pending_balance via a real
+//	                         on-chain transfer (internal/backend/wallet.
+//	                         MoneroWalletRPC). When unset, balances
+//	                         still accrue correctly, they simply
+//	                         aren't disbursed on-chain automatically.
+//	                         See buildDisburseEngine's doc comment for
+//	                         the rest of this feature's env vars
+//	                         (GCPOOL_MONERO_WALLET_RPC_{USER,PASSWORD},
+//	                         GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC,
+//	                         GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH,
+//	                         GCPOOL_DISBURSE_POLL_INTERVAL).
 package main
 
 import (
@@ -101,9 +117,11 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/api"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/disburse"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/payout"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -276,6 +294,49 @@ func (a payoutRepositoryAdapter) CreditBalance(ctx context.Context, algo, networ
 	return a.repo.CreditBalance(ctx, algo, network, paymentAddress, paymentID, amount)
 }
 
+// disburseRepositoryAdapter adapts *db.Repository (whose
+// PayableBalances/RecordPendingPayout/CompletePayoutSent/FailPayout
+// operate on db.PayableBalance/db.DisburseEntry) to
+// disburse.Repository (which operates on disburse.PayableBalance/
+// disburse.DebitEntry), mirroring payoutRepositoryAdapter's role
+// above.
+type disburseRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a disburseRepositoryAdapter) PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]disburse.PayableBalance, error) {
+	rows, err := a.repo.PayableBalances(ctx, algo, network, minPayout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]disburse.PayableBalance, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, disburse.PayableBalance{
+			ID:             r.ID,
+			PaymentAddress: r.PaymentAddress,
+			PaymentID:      r.PaymentID,
+			PendingBalance: r.PendingBalance,
+		})
+	}
+	return out, nil
+}
+
+func (a disburseRepositoryAdapter) RecordPendingPayout(ctx context.Context, algo, network string, balanceIDs []int64, amount int64) (int64, error) {
+	return a.repo.RecordPendingPayout(ctx, algo, network, balanceIDs, amount)
+}
+
+func (a disburseRepositoryAdapter) CompletePayoutSent(ctx context.Context, payoutID int64, entries []disburse.DebitEntry, txHash string, fee int64) error {
+	dbEntries := make([]db.DisburseEntry, 0, len(entries))
+	for _, e := range entries {
+		dbEntries = append(dbEntries, db.DisburseEntry{BalanceID: e.BalanceID, Amount: e.Amount})
+	}
+	return a.repo.CompletePayoutSent(ctx, payoutID, dbEntries, txHash, fee)
+}
+
+func (a disburseRepositoryAdapter) FailPayout(ctx context.Context, payoutID int64, errMsg string) error {
+	return a.repo.FailPayout(ctx, payoutID, errMsg)
+}
+
 // payoutTrigger adapts a *payout.Calculator into unlocker.PayoutTrigger
 // — the concrete implementation the unlocker's Config.PayoutTrigger
 // field is set to in production (see buildPayoutCalculator/run()
@@ -443,6 +504,94 @@ func buildPayoutCalculator(repo *db.Repository, m *metrics.Metrics) (calc *payou
 
 const defaultPPLNSShareMulti = 2
 
+// defaultDisbursePollInterval/defaultDisburseMaxDestinationsPerBatch
+// are this command's PLACEHOLDER defaults for the disbursement
+// engine's env vars — see this file's package doc comment for why
+// these are operator-tunable rather than baked-in protocol constants.
+const (
+	defaultDisbursePollInterval            = 10 * time.Minute
+	defaultDisburseMaxDestinationsPerBatch = 15
+)
+
+// buildDisburseEngine reads the GCPOOL_MONERO_WALLET_RPC_* /
+// GCPOOL_DISBURSE_* environment variables and returns a ready-to-use
+// *disburse.Engine plus whether the real payout-disbursement loop
+// should actually be started (ok == false when
+// GCPOOL_MONERO_WALLET_RPC_ADDR is unset — a deployment that hasn't
+// configured a wallet RPC endpoint yet still gets correct payout
+// CALCULATION (crediting pending_balance, via buildPayoutCalculator
+// above), it simply never auto-disburses those balances on-chain).
+// Disbursement is Monero-only today — internal/backend/wallet has no
+// Tari-family WalletClient implementation yet, mirroring
+// GCPOOL_MONERO_RPC_ADDR's coin-specific scope on the chain-
+// verification side.
+//
+//	GCPOOL_MONERO_WALLET_RPC_ADDR     (required to enable disbursement)
+//	                                  base URL of a real monero-wallet-rpc
+//	                                  endpoint (e.g. "http://127.0.0.1:18083").
+//	GCPOOL_MONERO_WALLET_RPC_USER,
+//	GCPOOL_MONERO_WALLET_RPC_PASSWORD (optional) HTTP Digest auth
+//	                                  credentials, matching whatever
+//	                                  --rpc-login the real
+//	                                  monero-wallet-rpc process was
+//	                                  started with. Both empty means
+//	                                  no auth is attempted.
+//	GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC (optional) minimum pending_balance
+//	                                  (atomic units) required before a
+//	                                  miner is paid out at all. Default 0.
+//	GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH (optional) cap on
+//	                                  destinations per real Transfer
+//	                                  call. Default 15.
+//	GCPOOL_DISBURSE_POLL_INTERVAL     (optional) how often the
+//	                                  disbursement engine runs a cycle,
+//	                                  as a time.ParseDuration string.
+//	                                  Default "10m".
+func buildDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, interval time.Duration, ok bool, err error) {
+	addr := os.Getenv("GCPOOL_MONERO_WALLET_RPC_ADDR")
+	if addr == "" {
+		return nil, 0, false, nil
+	}
+
+	var opts []wallet.Option
+	user := os.Getenv("GCPOOL_MONERO_WALLET_RPC_USER")
+	pass := os.Getenv("GCPOOL_MONERO_WALLET_RPC_PASSWORD")
+	if user != "" || pass != "" {
+		opts = append(opts, wallet.WithDigestAuth(user, pass))
+	}
+	walletClient := wallet.NewMoneroWalletRPC(addr, opts...)
+
+	cfg := disburse.Config{
+		Wallet:                  walletClient,
+		MaxDestinationsPerBatch: defaultDisburseMaxDestinationsPerBatch,
+		Metrics:                 m,
+	}
+	if raw := os.Getenv("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC"); raw != "" {
+		v, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil {
+			return nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC: %w", parseErr)
+		}
+		cfg.MinPayoutAtomic = v
+	}
+	if raw := os.Getenv("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH"); raw != "" {
+		v, parseErr := strconv.Atoi(raw)
+		if parseErr != nil {
+			return nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH: %w", parseErr)
+		}
+		cfg.MaxDestinationsPerBatch = v
+	}
+
+	interval = defaultDisbursePollInterval
+	if raw := os.Getenv("GCPOOL_DISBURSE_POLL_INTERVAL"); raw != "" {
+		v, parseErr := time.ParseDuration(raw)
+		if parseErr != nil {
+			return nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_POLL_INTERVAL: %w", parseErr)
+		}
+		interval = v
+	}
+
+	return disburse.New(disburseRepositoryAdapter{repo: repo}, cfg), interval, true, nil
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("backend: %v", err)
@@ -517,6 +666,18 @@ func run() error {
 		go u.RunLoop(ctx)
 	} else {
 		log.Print("backend: block unlocker disabled (neither GCPOOL_TARI_GRPC_ADDR nor GCPOOL_MONERO_RPC_ADDR is set)")
+	}
+
+	disburseEngine, disburseInterval, disburseEnabled, err := buildDisburseEngine(repo, m)
+	if err != nil {
+		return fmt.Errorf("configuring payout disbursement engine: %w", err)
+	}
+	if disburseEnabled {
+		targets := []disburse.Target{{Algo: "RXM", Network: networkDBString(network)}}
+		log.Printf("backend: payout disbursement engine enabled, polling every %s for %v", disburseInterval, targets)
+		go disburseEngine.RunLoop(ctx, targets, disburseInterval)
+	} else {
+		log.Print("backend: payout disbursement engine disabled (GCPOOL_MONERO_WALLET_RPC_ADDR not set); pending_balance will still accrue, it just won't be auto-paid out on-chain")
 	}
 
 	srv := &http.Server{
