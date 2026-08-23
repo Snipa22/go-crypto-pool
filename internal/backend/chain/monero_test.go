@@ -49,6 +49,7 @@ func TestMoneroVerifier_CanonicalAndConfirmed(t *testing.T) {
 				"hash":   "deadbeef",
 				"height": height,
 				"depth":  60,
+				"reward": 600000000000,
 			},
 		}, nil
 	})
@@ -64,6 +65,9 @@ func TestMoneroVerifier_CanonicalAndConfirmed(t *testing.T) {
 	}
 	if got.Confirmations != 60 {
 		t.Fatalf("Verify: got Confirmations=%d, want 60", got.Confirmations)
+	}
+	if got.Reward != 600000000000 {
+		t.Fatalf("Verify: got Reward=%d, want 600000000000 (from the real get_block_header_by_height response's own \"reward\" field, the SAME real call already made for hash/confirmation checking -- no extra RPC)", got.Reward)
 	}
 }
 

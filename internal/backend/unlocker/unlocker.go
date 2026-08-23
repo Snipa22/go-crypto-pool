@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 )
 
 // Block is the minimal shape the Unlocker needs for one pending block
@@ -36,6 +37,43 @@ type Block struct {
 	Network string
 	Hash    string
 	Height  int64
+
+	// PoolType and Difficulty are only needed for the optional
+	// PayoutTrigger path below (see Config.PayoutTrigger) —
+	// checkBlock's own chain-maturity logic never reads them. They
+	// mirror db.PendingBlock's identical fields exactly.
+	//
+	// Value starts as whatever blocks.value held at submission time
+	// (populated from db.PendingBlock, possibly nil), but checkBlock
+	// OVERWRITES it with the real, current chain.VerifyResult.Reward
+	// from this same poll pass's Verify call before invoking
+	// PayoutTrigger — see checkBlock's own comment for why the fresh
+	// value is used instead of the stale submission-time one. By the
+	// time PayoutTrigger.TriggerPayout runs, Value is always the real,
+	// live reward.
+	PoolType   string
+	Difficulty int64
+	Value      *int64
+}
+
+// PayoutTrigger is invoked once for every block RunOnce/checkBlock
+// resolves as matured, after the corresponding SetBlockStatus(valid=
+// true, unlocked=true) call has already succeeded — i.e. this is the
+// hook that wires internal/backend/payout.Calculator's real PPS/
+// PPLNS/Solo payout math onto "a block just became payable", without
+// this package needing to import internal/backend/payout directly
+// (same narrow-interface pattern as Repository above).
+//
+// A TriggerPayout error is logged and counted (see
+// Config.Metrics.PayoutCyclesTotal) but never changes checkBlock's
+// own outcome or reverts the block's now-matured/unlocked status —
+// the chain-maturity determination and the payout calculation are
+// deliberately independent failure domains: a payout bug must not
+// make this codebase forget that a block matured, and a stuck payout
+// can always be retried out-of-band (e.g. a manual admin re-run)
+// without re-verifying the chain.
+type PayoutTrigger interface {
+	TriggerPayout(ctx context.Context, b Block) error
 }
 
 // Repository is the narrow persistence surface Unlocker depends on.
@@ -86,6 +124,25 @@ type Config struct {
 	// log.Printf if nil. Exists as a seam so tests can capture output
 	// without depending on the log package's global state.
 	Logf func(format string, args ...any)
+
+	// PayoutTrigger, if non-nil, is called once for every block a
+	// poll pass resolves as matured (see PayoutTrigger's doc comment
+	// above). nil means no payout calculation is triggered at all —
+	// same "config knob absent -> feature disabled" convention as
+	// Coins above; a deployment that hasn't wired
+	// internal/backend/payout in yet still gets correct chain-
+	// maturity tracking out of this package alone.
+	PayoutTrigger PayoutTrigger
+
+	// Metrics, if non-nil, is the metrics.Metrics instance RunOnce
+	// increments/observes (unlocker_blocks_total,
+	// unlocker_poll_duration_seconds). If nil, metrics are simply
+	// not recorded — this package works perfectly well without a
+	// Metrics instance, it just loses observability. cmd/backend
+	// wires in the same *metrics.Metrics instance the HTTP API
+	// serves on GET /metrics, so unlocker/payout metrics show up on
+	// that one process-wide endpoint rather than a second one.
+	Metrics *metrics.Metrics
 }
 
 // Unlocker runs Config's poll loop against a Repository.
@@ -129,6 +186,7 @@ type PassResult struct {
 func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 	var total PassResult
 	for algo, coinCfg := range u.cfg.Coins {
+		pollStart := time.Now()
 		pending, err := u.repo.PendingBlocks(ctx, algo)
 		if err != nil {
 			u.logf("unlocker: %s: listing pending blocks: %v", algo, err)
@@ -141,18 +199,37 @@ func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 			case err != nil:
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: %v", algo, b.ID, b.Height, b.Hash, err)
 				total.Errors++
+				u.observeOutcome(algo, metrics.UnlockerOutcomeError)
 			case outcome == outcomeMatured:
 				total.Matured++
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: matured, marking unlocked", algo, b.ID, b.Height, b.Hash)
+				u.observeOutcome(algo, metrics.UnlockerOutcomeMatured)
 			case outcome == outcomeOrphaned:
 				total.Orphaned++
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: orphaned, marking invalid+unlocked", algo, b.ID, b.Height, b.Hash)
+				u.observeOutcome(algo, metrics.UnlockerOutcomeOrphaned)
 			default:
 				total.Pending++
 			}
 		}
+		if u.cfg.Metrics != nil {
+			u.cfg.Metrics.UnlockerPollDuration.WithLabelValues(algo).Observe(time.Since(pollStart).Seconds())
+		}
 	}
 	return total
+}
+
+// observeOutcome increments Config.Metrics.UnlockerBlocksTotal for one
+// resolved block, a no-op if no Metrics is configured. outcome is one
+// of metrics.UnlockerOutcomeMatured/Orphaned/Error, passed as a plain
+// string here to avoid an import cycle concern that doesn't actually
+// exist (metrics doesn't import unlocker) — kept as a private helper
+// purely to keep RunOnce's switch above readable.
+func (u *Unlocker) observeOutcome(algo, outcome string) {
+	if u.cfg.Metrics == nil {
+		return
+	}
+	u.cfg.Metrics.UnlockerBlocksTotal.WithLabelValues(algo, outcome).Inc()
 }
 
 // RunLoop calls RunOnce every cfg.PollInterval until ctx is canceled.
@@ -234,6 +311,26 @@ func (u *Unlocker) checkBlock(ctx context.Context, b Block, coinCfg CoinConfig) 
 	}
 	if err := u.repo.SetBlockStatus(ctx, b.ID, true, true); err != nil {
 		return outcomePending, fmt.Errorf("marking matured block unlocked: %w", err)
+	}
+	if u.cfg.PayoutTrigger != nil {
+		// Use the REAL, CURRENT reward the chain just reported in
+		// this same Verify call (result.Reward), not whatever value
+		// (if any) blocks.value held at submission time — block
+		// rewards can change between submission and maturity, and
+		// this is the one, single real chain query this pass makes
+		// for this block, so it's the freshest data available. See
+		// chain.VerifyResult.Reward's doc comment for the full
+		// reasoning.
+		b.Value = &result.Reward
+		if err := u.cfg.PayoutTrigger.TriggerPayout(ctx, b); err != nil {
+			// Deliberately does not change the return outcome/error
+			// here — the block itself has already matured/unlocked
+			// successfully (see PayoutTrigger's doc comment on why
+			// this is a separate failure domain). Just log it; the
+			// trigger implementation itself is responsible for its
+			// own PayoutCyclesTotal error accounting.
+			u.logf("unlocker: %s: block id=%d height=%d hash=%s: payout trigger failed: %v", b.Algo, b.ID, b.Height, b.Hash, err)
+		}
 	}
 	return outcomeMatured, nil
 }

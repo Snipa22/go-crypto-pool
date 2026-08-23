@@ -57,6 +57,9 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
+
+	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 )
 
 // ShareRow is one row from the `shares` table, as needed for payout
@@ -132,6 +135,14 @@ type Config struct {
 	// global.config.pplns.shareMulti (the "N" in PPLNS: the payout
 	// window is shareMulti * block-difficulty worth of shares).
 	PPLNSShareMulti float64
+
+	// Metrics, if non-nil, is the metrics.Metrics instance
+	// RunForMaturedBlock increments/observes (payout_cycles_total,
+	// payout_amount_credited_total, payout_cycle_duration_seconds).
+	// If nil, metrics are simply not recorded. See
+	// unlocker.Config.Metrics's doc comment for why cmd/backend
+	// wires in one shared instance across packages.
+	Metrics *metrics.Metrics
 }
 
 // Payment is one accumulated payout-cycle entry — the Go analog of one
@@ -385,4 +396,63 @@ func (c *Calculator) Apply(ctx context.Context, algo, network string, data map[s
 		result.Credited++
 	}
 	return result, nil
+}
+
+// RunForMaturedBlock is the single entry point unlocker.PayoutTrigger
+// implementations call (see cmd/backend's adapter): given one
+// just-matured block's algo/network/pool_type/height/difficulty/
+// reward, it dispatches to the matching Calculate{PPS,PPLNS,Solo}
+// function, Applies the result, and instruments the whole cycle on
+// cfg.Metrics (a no-op if cfg.Metrics is nil).
+//
+// poolType "PROP" is not a caller error — PROP blocks exist in this
+// schema's pool_type enum (see migrations) but this package has no
+// calculatePropPayments equivalent ported from legacy yet (legacy's
+// own blockManager.js never implemented one either) — so it returns a
+// plain error here, counted same as any other failed cycle, rather
+// than panicking on an unrecognized case.
+//
+// blockReward nil (blocks.value is a nullable column — see
+// migrations) means this block's real reward hasn't been recorded
+// yet; RunForMaturedBlock refuses to guess and returns an error
+// rather than silently paying out zero.
+func (c *Calculator) RunForMaturedBlock(ctx context.Context, algo, network, poolType string, height, blockDifficulty int64, blockReward *int64) (result ApplyResult, err error) {
+	start := time.Now()
+	defer func() {
+		if c.cfg.Metrics == nil {
+			return
+		}
+		c.cfg.Metrics.PayoutCycleDuration.WithLabelValues(algo, poolType).Observe(time.Since(start).Seconds())
+		outcome := metrics.PayoutResultSuccess
+		if err != nil {
+			outcome = metrics.PayoutResultError
+		}
+		c.cfg.Metrics.PayoutCyclesTotal.WithLabelValues(algo, poolType, outcome).Inc()
+		if err == nil {
+			c.cfg.Metrics.PayoutAmountCreditedTotal.WithLabelValues(algo, network).Add(float64(result.TotalPaid))
+		}
+	}()
+
+	if blockReward == nil {
+		return ApplyResult{}, fmt.Errorf("payout: RunForMaturedBlock: block reward (blocks.value) is not set for %s height %d", algo, height)
+	}
+	reward := *blockReward
+
+	var data map[string]*Payment
+	switch poolType {
+	case "PPS":
+		data, err = c.CalculatePPS(ctx, algo, height, blockDifficulty, reward)
+	case "PPLNS":
+		data, err = c.CalculatePPLNS(ctx, algo, height, blockDifficulty, reward)
+	case "SOLO":
+		data, err = c.CalculateSolo(ctx, algo, height, reward)
+	default:
+		err = fmt.Errorf("payout: RunForMaturedBlock: unsupported pool_type %q", poolType)
+	}
+	if err != nil {
+		return ApplyResult{}, err
+	}
+
+	result, err = c.Apply(ctx, algo, network, data)
+	return result, err
 }

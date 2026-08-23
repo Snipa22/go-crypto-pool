@@ -59,6 +59,24 @@ type VerifyResult struct {
 	// key their decisions off Orphaned, not off comparing this field
 	// themselves.
 	CanonicalHash string
+
+	// Reward is the real coinbase reward for this block, as reported
+	// live by the node/daemon in the SAME real RPC response Verify
+	// already makes for hash/orphan/confirmation checking — no
+	// additional RPC call is needed for either coin family:
+	//   - Tari: BlockHeaderResponse.GetReward() (confirmed present on
+	//     the real GetHeaderByHash response this session).
+	//   - Monero: the real get_block_header_by_height response's own
+	//     "reward" field (confirmed present via a real live daemon
+	//     call this session).
+	// This is deliberately the REAL, CURRENT reward at verification
+	// time, not whatever value (if any) was recorded on the blocks
+	// row at submission time — block rewards can change (halvings,
+	// protocol changes) between submission and maturity, and a payout
+	// engine paying out a stale reward would be a real, if rare,
+	// correctness bug. Only meaningful when Found is true and
+	// Orphaned is false; 0 for an orphaned/not-found result.
+	Reward int64
 }
 
 // ChainVerifier is the coin-agnostic interface internal/backend/unlocker
