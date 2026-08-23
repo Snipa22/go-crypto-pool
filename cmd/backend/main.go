@@ -386,11 +386,15 @@ func (a networkAPIRepositoryAdapter) NetworkStatsSince(ctx context.Context, algo
 		return networkapi.NetworkStatsRecord{}, err
 	}
 	return networkapi.NetworkStatsRecord{
-		SharesSum:       s.SharesSum,
-		ShareCount:      s.ShareCount,
-		BlocksFound:     s.BlocksFound,
-		LastBlockAt:     s.LastBlockAt,
-		LastBlockHeight: s.LastBlockHeight,
+		SharesSum:                  s.SharesSum,
+		ShareCount:                 s.ShareCount,
+		BlocksFound:                s.BlocksFound,
+		LastBlockAt:                s.LastBlockAt,
+		LastBlockHeight:            s.LastBlockHeight,
+		NetworkHeight:              s.NetworkHeight,
+		NetworkDifficulty:          s.NetworkDifficulty,
+		NetworkEstimatedHashrateHS: s.NetworkEstimatedHashrateHS,
+		NetworkStateUpdatedAt:      s.NetworkStateUpdatedAt,
 	}, nil
 }
 
