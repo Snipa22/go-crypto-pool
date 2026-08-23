@@ -172,10 +172,19 @@ func (h *Handler) Metrics() *metrics.Metrics {
 // describe.
 func (h *Handler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	return mux
+}
+
+// RegisterRoutes registers this Handler's routes onto mux. Safe to
+// call on a mux that already has other, disjoint routes registered
+// (e.g. internal/backend/statsapi.Handler's read-only miner stats
+// routes, which cmd/backend mounts on the same listener) — this
+// package never registers anything under /api/v1/stats/.
+func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/share", h.instrumentInFlight(http.HandlerFunc(h.handleShare)))
 	mux.Handle("POST /api/v1/block", h.instrumentInFlight(http.HandlerFunc(h.handleBlock)))
 	mux.Handle("GET /metrics", h.m.Handler())
-	return mux
 }
 
 // instrumentInFlight wraps next so http_requests_in_flight tracks
