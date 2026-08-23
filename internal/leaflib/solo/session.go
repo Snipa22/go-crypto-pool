@@ -54,6 +54,13 @@ type Session struct {
 	loggedIn atomic.Bool
 	address  atomic.Value // string
 	worker   atomic.Value // string
+	// agent is the real miner software/version string the miner
+	// self-reported at login (LoginRequest.Agent — e.g.
+	// "XMRig/6.21.0"), stored verbatim and unvalidated (miner-
+	// controlled, diagnostic-only; never used in any accept/reject
+	// decision). Empty for a session that has not logged in yet, or
+	// whose miner sent no "agent" field.
+	agent atomic.Value // string
 
 	// --- SECURITY FIX: per-session job ownership (jobList/jobLog) ---
 	//
@@ -156,6 +163,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now(), jobLog: make(map[string]*Job), jobHistorySize: defaultSessionJobHistorySize}
 	s.address.Store("")
 	s.worker.Store("")
+	s.agent.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
 	return s
 }
@@ -270,6 +278,7 @@ func (s *Session) handleLogin(req Request) {
 
 	s.address.Store(login.Login)
 	s.worker.Store(worker)
+	s.agent.Store(login.Agent)
 	s.loggedIn.Store(true)
 
 	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())

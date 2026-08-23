@@ -232,9 +232,12 @@ func (s *Server) sessionSnapshots() []directmetrics.SessionSnapshot {
 	out := make([]directmetrics.SessionSnapshot, 0, len(s.sessions))
 	for _, sess := range s.sessions {
 		addr, _ := sess.address.Load().(string)
+		agent, _ := sess.agent.Load().(string)
 		out = append(out, directmetrics.SessionSnapshot{
 			Address: addr, RemoteIP: directmetrics.RemoteIPOf(sess.mc.RemoteAddr()),
 			Difficulty: sess.currentDifficulty.Load(),
+			Agent:      agent,
+			Hashrate:   leaflib.EstimateHashrateHz(sess.hashesAccumulated.Load(), sess.connectedAt),
 		})
 	}
 	return out
