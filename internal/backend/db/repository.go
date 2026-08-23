@@ -119,3 +119,74 @@ func (r *Repository) InsertBlock(ctx context.Context, b Block) error {
 	}
 	return nil
 }
+
+// PendingBlock is one row of `blocks` that the unlocker (see
+// internal/backend/unlocker) still needs to independently verify
+// against the real chain — i.e. valid = TRUE (never yet found
+// invalid/orphaned) AND unlocked = FALSE (not yet confirmed mature).
+// Only the columns the unlocker's ChainVerifier.Verify call actually
+// needs are carried here.
+type PendingBlock struct {
+	ID      int64
+	Algo    string
+	Network string
+	Hash    string
+	Height  int64
+}
+
+// PendingBlocks returns every blocks row with valid = TRUE AND
+// unlocked = FALSE for the given algo, oldest (lowest id) first — the
+// unlocker's poll loop calls this once per configured algo on every
+// tick. algo is validated the same way InsertBlock's is; an invalid
+// algo is a caller bug, not a legitimate "no rows" outcome, so it is
+// reported as an error rather than silently returning an empty slice.
+func (r *Repository) PendingBlocks(ctx context.Context, algo string) ([]PendingBlock, error) {
+	if err := ValidateAlgo(algo); err != nil {
+		return nil, err
+	}
+
+	const stmt = `
+		SELECT id, algo, network, hash, height
+		FROM blocks
+		WHERE algo = $1 AND valid = TRUE AND unlocked = FALSE
+		ORDER BY id ASC`
+	rows, err := r.pool.Query(ctx, stmt, algo)
+	if err != nil {
+		return nil, fmt.Errorf("db: querying pending blocks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PendingBlock
+	for rows.Next() {
+		var pb PendingBlock
+		if err := rows.Scan(&pb.ID, &pb.Algo, &pb.Network, &pb.Hash, &pb.Height); err != nil {
+			return nil, fmt.Errorf("db: scanning pending block row: %w", err)
+		}
+		out = append(out, pb)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterating pending block rows: %w", err)
+	}
+	return out, nil
+}
+
+// SetBlockStatus updates one blocks row's valid/unlocked columns by
+// id — the unlocker's own write path once ChainVerifier.Verify has
+// resolved a pending block's real chain status (matured -> valid,
+// unlocked; orphaned -> !valid, unlocked; the third, "still
+// confirming" outcome does not call this at all and simply leaves the
+// row pending for the next poll). Returns an error (rather than
+// silently no-op'ing) if id does not match any row, since that
+// indicates the unlocker and the blocks table have drifted out of
+// sync with each other.
+func (r *Repository) SetBlockStatus(ctx context.Context, id int64, valid, unlocked bool) error {
+	const stmt = `UPDATE blocks SET valid = $2, unlocked = $3 WHERE id = $1`
+	tag, err := r.pool.Exec(ctx, stmt, id, valid, unlocked)
+	if err != nil {
+		return fmt.Errorf("db: updating block %d status: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("db: updating block %d status: no such block", id)
+	}
+	return nil
+}
