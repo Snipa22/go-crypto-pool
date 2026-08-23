@@ -849,6 +849,54 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	}
 }
 
+// TestDirectSessionBlockFindCarriesNonZeroShares is a regression test
+// for the confirmed bug where blocks.shares (and shares.shares) were
+// always 0 for every real found block: forwardBlock never set
+// poolpb.Block.Shares, and the poolpb.Share{} construction sites in
+// handleSubmit never set poolpb.Share.Shares either, so there was
+// nothing non-zero to pass through in the first place. Both the
+// forwarded Share and the forwarded Block for a genuine block find
+// must now carry the job's real share difficulty (job.StaticDifficulty)
+// in their Shares field.
+func TestDirectSessionBlockFindCarriesNonZeroShares(t *testing.T) {
+	h := newDirectTestHarness(t, 1, 1)
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-shares"))
+
+	jobID := directCurrentJobIDForXN(t, h, xn)
+	h.send(solo.Request{ID: 4, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
+		ID:    sessionID,
+		JobID: jobID,
+		Nonce: directXNPrefixedNonceHex(xn, 888),
+	})})
+	resp := h.recvShareResponse()
+	if !resp.Result {
+		t.Fatalf("expected the block-finding share to be accepted, got %#v", resp)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for h.transport.blockCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	h.transport.mu.Lock()
+	defer h.transport.mu.Unlock()
+	if len(h.transport.shares) != 1 {
+		t.Fatalf("expected exactly 1 forwarded share, got %d", len(h.transport.shares))
+	}
+	if got := h.transport.shares[0].GetShares(); got == 0 {
+		t.Errorf("forwarded share must carry a non-zero Shares value, got %d", got)
+	}
+	if len(h.transport.blocks) != 1 {
+		t.Fatalf("expected exactly 1 forwarded block, got %d", len(h.transport.blocks))
+	}
+	if got := h.transport.blocks[0].GetShares(); got == 0 {
+		t.Errorf("forwarded block must carry a non-zero Shares value (was always 0 before this fix), got %d", got)
+	}
+	if shareShares, blockShares := h.transport.shares[0].GetShares(), h.transport.blocks[0].GetShares(); shareShares != blockShares {
+		t.Errorf("block.Shares (%d) should match the winning share's own Shares (%d)", blockShares, shareShares)
+	}
+}
+
 func TestDirectSessionSubmitCryptographicallyInvalid(t *testing.T) {
 	h := newDirectTestHarness(t, 1<<63, 1<<63)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-3"))
