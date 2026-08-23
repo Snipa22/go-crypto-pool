@@ -7,8 +7,10 @@ require (
 	github.com/Snipa22/go-tari-grpc-lib/v3 v3.2.0
 	github.com/Snipa22/go-tari-lib v1.2.0
 	github.com/Snipa22/go-xmr-lib v0.2.5
+	github.com/gtank/ristretto255 v0.2.0
 	github.com/holiman/uint256 v1.3.2
 	github.com/jackc/pgx/v5 v5.7.5
+	github.com/mr-tron/base58 v1.3.0
 	github.com/nats-io/nats-server/v2 v2.14.5
 	github.com/nats-io/nats.go v1.53.1
 	github.com/prometheus/client_golang v1.24.1
@@ -20,6 +22,7 @@ require (
 )
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/antithesishq/antithesis-sdk-go v0.7.2-default-no-op // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
