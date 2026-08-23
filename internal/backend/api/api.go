@@ -42,26 +42,6 @@ import (
 // from unbounded-body-based resource exhaustion.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-// ErrAddressBanned / ErrShareDifficultyTooLow are the two REAL,
-// operator-flag-driven (manual, never automated-detection) rejection
-// outcomes handleShare needs to distinguish from a generic insert
-// failure -- both are terminal "the address is deliberately being
-// excluded" outcomes, not transient DB errors, so they get their own
-// HTTP status codes and metrics.ResultRejected (not ResultError, which
-// is reserved for genuine unexpected insert failures).
-//
-// This package intentionally does NOT import internal/backend/db (see
-// this file's own package doc comment on the dependency direction),
-// so it cannot reference db.ErrAddressBanned/db.ErrShareDifficultyTooLow
-// directly. Instead, cmd/backend's repositoryAdapter.InsertShare (the
-// one place both packages meet) translates those into these sentinel
-// errors via errors.Is before returning from the ShareBlockRepository
-// call -- see cmd/backend/main.go's repositoryAdapter.InsertShare.
-var (
-	ErrAddressBanned         = errors.New("share: payment address is banned")
-	ErrShareDifficultyTooLow = errors.New("share: difficulty below operator-forced minimum for this payment address")
-)
-
 // ShareBlockRepository is the narrow persistence surface the handlers
 // depend on. It is intentionally an interface (rather than the concrete
 // *db.Repository type) so tests can inject a fake/mock without needing a
@@ -282,24 +262,6 @@ func (h *Handler) handleShare(w http.ResponseWriter, r *http.Request) {
 	err = h.repo.InsertShare(r.Context(), record, HeightPartitionBucketSize)
 	h.m.ShareInsertDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
-		switch {
-		case errors.Is(err, ErrAddressBanned):
-			// A real, operator-set ban -- not a transient DB
-			// problem, so this is Rejected (not Error) and gets
-			// its own 403, distinguishable from the generic 400s
-			// validateShare/checkNetwork above already produce.
-			h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultRejected).Inc()
-			writeErr(w, http.StatusForbidden, "payment address is banned")
-			return
-		case errors.Is(err, ErrShareDifficultyTooLow):
-			// Likewise a real, operator-set floor, not a DB
-			// error -- Rejected, not Error. 409 Conflict: the
-			// share itself was well-formed, it just conflicts
-			// with this address's currently-enforced minimum.
-			h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultRejected).Inc()
-			writeErr(w, http.StatusConflict, "share difficulty below operator-forced minimum for this payment address")
-			return
-		}
 		h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultError).Inc()
 		writeErr(w, http.StatusInternalServerError, "insert failed")
 		return

@@ -4,15 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -284,41 +281,6 @@ func TestHandleShare_DBErrorReturns500WithoutLeakingDetail(t *testing.T) {
 	}
 	if bytes.Contains(rr.Body.Bytes(), []byte("10.0.0.5")) {
 		t.Errorf("response body leaked internal error detail: %s", rr.Body.String())
-	}
-}
-
-func TestHandleShare_AddressBanned_Returns403AndRejectedMetric(t *testing.T) {
-	repo := &fakeRepo{shareErr: fmt.Errorf("%w: addr-1", ErrAddressBanned)}
-	h := NewHandler(repo, Config{})
-	rr := postProto(t, h.Mux(), "/api/v1/share", validShare(), nil)
-
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403; body=%s", rr.Code, rr.Body.String())
-	}
-	if len(repo.shares) != 0 {
-		t.Errorf("expected no insert recorded (fake returns the error before appending), got %d", len(repo.shares))
-	}
-	if got := testutil.ToFloat64(h.m.SharesTotal.WithLabelValues("RXT", "TESTNET", "PPLNS", metrics.ResultRejected)); got != 1 {
-		t.Errorf("shares_total{result=rejected} = %v, want 1 (a ban must be Rejected, not Error)", got)
-	}
-	if got := testutil.ToFloat64(h.m.SharesTotal.WithLabelValues("RXT", "TESTNET", "PPLNS", metrics.ResultError)); got != 0 {
-		t.Errorf("shares_total{result=error} = %v, want 0", got)
-	}
-}
-
-func TestHandleShare_DifficultyTooLow_Returns409AndRejectedMetric(t *testing.T) {
-	repo := &fakeRepo{shareErr: fmt.Errorf("%w: addr-1 submitted diff 10, floor is 1000", ErrShareDifficultyTooLow)}
-	h := NewHandler(repo, Config{})
-	rr := postProto(t, h.Mux(), "/api/v1/share", validShare(), nil)
-
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409; body=%s", rr.Code, rr.Body.String())
-	}
-	if got := testutil.ToFloat64(h.m.SharesTotal.WithLabelValues("RXT", "TESTNET", "PPLNS", metrics.ResultRejected)); got != 1 {
-		t.Errorf("shares_total{result=rejected} = %v, want 1 (a forced-difficulty floor rejection must be Rejected, not Error)", got)
-	}
-	if got := testutil.ToFloat64(h.m.SharesTotal.WithLabelValues("RXT", "TESTNET", "PPLNS", metrics.ResultError)); got != 0 {
-		t.Errorf("shares_total{result=error} = %v, want 0", got)
 	}
 }
 
