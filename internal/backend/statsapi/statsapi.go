@@ -38,6 +38,15 @@
 //     Same computation as /hashrate, but broken out per worker/rig
 //     identifier instead of summed across all of an address's workers.
 //
+//   - GET /api/v1/stats/hashrate/sources?payment_address=<addr>&algo=<ALGO>
+//     [&network=<NETWORK>][&payment_id=<id>][&window=<seconds>]
+//     Same computation as /hashrate, but broken out per pool_id (the
+//     static, operator-assigned pool-server-source identifier every
+//     leaf-direct process stamps on its own shares) instead of summed
+//     across all sources — lets an operator running more than one
+//     leaf-direct process against this backend see hashrate/share
+//     volume attributed per physical pool-server instance.
+//
 // network is optional on every endpoint above ONLY when this Handler
 // was constructed with a configured Config.Network (poolpb.Network,
 // mirroring api.Config.Network's role) — in that case an omitted
@@ -492,6 +501,57 @@ func (h *Handler) handleHashrateWorkers(w http.ResponseWriter, r *http.Request) 
 		"payment_id":      paymentID,
 		"window_seconds":  windowSeconds,
 		"workers":         out,
+	})
+}
+
+// poolSourceHashrateRow is one pool-server-source's entry in
+// /api/v1/stats/hashrate/sources' response.
+type poolSourceHashrateRow struct {
+	PoolID              int32   `json:"pool_id"`
+	ShareCount          int64   `json:"share_count"`
+	SharesSum           int64   `json:"shares_sum"`
+	EstimatedHashrateHS float64 `json:"estimated_hashrate_hs"`
+}
+
+// handleHashrateSources implements GET /api/v1/stats/hashrate/sources
+// — the pool_id-broken-out analogue of handleHashrateWorkers (see
+// PoolSourceShareStatsRecord's doc comment for what pool_id means and
+// why this is the endpoint that makes it useful).
+func (h *Handler) handleHashrateSources(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	algo, network, paymentAddress, paymentID, windowSeconds, err := h.parseHashrateQuery(r)
+	if err != nil {
+		h.m.ObserveRequest("hashrate_sources", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	since := time.Now().Add(-time.Duration(windowSeconds) * time.Second).Unix()
+	rows, err := h.repo.PoolSourceShareStatsSince(r.Context(), algo, network, paymentAddress, paymentID, since)
+	if err != nil {
+		h.m.ObserveRequest("hashrate_sources", "error", time.Since(start))
+		writeJSONErr(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+
+	out := make([]poolSourceHashrateRow, 0, len(rows))
+	for _, sr := range rows {
+		out = append(out, poolSourceHashrateRow{
+			PoolID:              sr.PoolID,
+			ShareCount:          sr.ShareCount,
+			SharesSum:           sr.SharesSum,
+			EstimatedHashrateHS: EstimateHashrateHS(sr.SharesSum, windowSeconds),
+		})
+	}
+
+	h.m.ObserveRequest("hashrate_sources", "ok", time.Since(start))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"algo":            algo,
+		"network":         network,
+		"payment_address": paymentAddress,
+		"payment_id":      paymentID,
+		"window_seconds":  windowSeconds,
+		"sources":         out,
 	})
 }
 

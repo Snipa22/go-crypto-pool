@@ -16,6 +16,7 @@ type fakeRepo struct {
 	balances    []BalanceRecord
 	shareStats  ShareStatsRecord
 	workerStats []WorkerShareStatsRecord
+	poolSources []PoolSourceShareStatsRecord
 	err         error
 
 	gotAlgo, gotNetwork, gotAddr string
@@ -45,6 +46,14 @@ func (f *fakeRepo) WorkerShareStatsSince(_ context.Context, algo, network, payme
 	}
 	f.gotAlgo, f.gotNetwork, f.gotAddr, f.gotPaymentID, f.gotSince = algo, network, paymentAddress, paymentID, sinceUnix
 	return f.workerStats, nil
+}
+
+func (f *fakeRepo) PoolSourceShareStatsSince(_ context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]PoolSourceShareStatsRecord, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.gotAlgo, f.gotNetwork, f.gotAddr, f.gotPaymentID, f.gotSince = algo, network, paymentAddress, paymentID, sinceUnix
+	return f.poolSources, nil
 }
 
 func doGet(t *testing.T, mux *http.ServeMux, target string) *httptest.ResponseRecorder {
@@ -218,6 +227,43 @@ func TestHandleHashrateWorkers_OK(t *testing.T) {
 	}
 	if resp.Workers[0].Identifier != "rig-1" || resp.Workers[0].SharesSum != 500 {
 		t.Errorf("unexpected worker[0]: %+v", resp.Workers[0])
+	}
+}
+
+func TestHandleHashrateSources_OK(t *testing.T) {
+	repo := &fakeRepo{poolSources: []PoolSourceShareStatsRecord{
+		{PoolID: 1, SharesSum: 700, ShareCount: 7},
+		{PoolID: 2, SharesSum: 300, ShareCount: 3},
+	}}
+	h := NewHandler(repo, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/sources?payment_address=addr-1&algo=RXT&network=TESTNET&window=100")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Sources []poolSourceHashrateRow `json:"sources"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Sources) != 2 {
+		t.Fatalf("expected 2 sources, got %d", len(resp.Sources))
+	}
+	if resp.Sources[0].PoolID != 1 || resp.Sources[0].SharesSum != 700 {
+		t.Errorf("unexpected source[0]: %+v", resp.Sources[0])
+	}
+	wantHS := float64(700) * hashesPerDifficultyUnit / 100
+	if resp.Sources[0].EstimatedHashrateHS != wantHS {
+		t.Errorf("estimated hashrate = %v, want %v", resp.Sources[0].EstimatedHashrateHS, wantHS)
+	}
+}
+
+func TestHandleHashrateSources_MissingAlgo(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/sources?payment_address=addr-1&network=TESTNET")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
 	}
 }
 
