@@ -437,7 +437,12 @@ func (s *Session) handleSubmit(req Request) {
 	// RXT never uses xn nonce partitioning by design). This is a real
 	// validity check, NOT the security boundary (see doc comment
 	// above).
-	if job.Algo != poolpb.Algo_ALGO_RXT {
+	// ALGO_RXM (Monero) is exempted from the xn-prefix check for the
+	// same reason as ALGO_RXT (see doc comment above): a real
+	// Monero-family miner (xmrig, etc.) treats the full nonce field as
+	// one opaque value it controls end-to-end, with no xn hex-prefix
+	// partitioning convention on this leaf's wire protocol.
+	if job.Algo != poolpb.Algo_ALGO_RXT && job.Algo != poolpb.Algo_ALGO_RXM {
 		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 			return
@@ -455,6 +460,43 @@ func (s *Session) handleSubmit(req Request) {
 		share *poolpb.Share
 	)
 	switch job.Algo {
+	case poolpb.Algo_ALGO_RXM:
+		// Real Monero submit wire shape: no "pow" field (C29-only);
+		// the miner's claimed RandomX result hash rides in the
+		// existing generic "result" field (submit.Result), matching
+		// RXT's own convention. Nonce is decoded LITTLE-ENDIAN,
+		// matching MoneroNodeClient.BuildCandidateBlock's own
+		// binary.LittleEndian.PutUint32 write of the low 4 bytes into
+		// the real block header nonce field (monero_node.go) — the
+		// low 32 bits of this uint64 are what actually end up in the
+		// block; a miner must send them little-endian for the wire
+		// nonce to round-trip to the same 4 bytes BuildCandidateBlock
+		// patches in.
+		nonce = binary.LittleEndian.Uint64(nonceBytes)
+		if submit.Result == "" {
+			s.writeShareResponse(req.ID, false, "monero (rxm) submit requires a claimed result hash in \"result\"")
+			return
+		}
+		blob, blobErr := MoneroHashingBlobForSubmit(job, nonce)
+		if blobErr != nil {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("failed to build monero randomx verification blob: %v", blobErr))
+			return
+		}
+		share = &poolpb.Share{
+			Algo:           poolpb.Algo_ALGO_RXM,
+			Network:        s.server.network,
+			BlockDiff:      safeInt64(job.StaticDifficulty),
+			BlockHeight:    int64(job.Height),
+			PaymentAddress: s.address.Load().(string),
+			Identifier:     s.worker.Load().(string),
+			RawProof: &poolpb.Share_RandomxProof{
+				RandomxProof: &poolpb.RandomXProof{
+					Blob:      blob,
+					SeedHash:  job.VmKey,
+					ResultHex: submit.Result,
+				},
+			},
+		}
 	case poolpb.Algo_ALGO_C29:
 		// Real C29 submit wire shape, ported exactly from
 		// go-tari-c29-solo-stratum's messages.MinerRPCSubmit: the
@@ -769,7 +811,7 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	// "seed_hash" field — mirrors XMRig's own stratum job-JSON
 	// convention for RandomX-family coins. SHA3X/C29 jobs have no
 	// VmKey, so this is simply omitted (omitempty) for them.
-	if job.Algo == poolpb.Algo_ALGO_RXT && len(job.VmKey) > 0 {
+	if (job.Algo == poolpb.Algo_ALGO_RXT || job.Algo == poolpb.Algo_ALGO_RXM) && len(job.VmKey) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.VmKey)
 	}
 	return payload
@@ -791,6 +833,15 @@ func algoWireName(algo poolpb.Algo) string {
 		return "c29"
 	case poolpb.Algo_ALGO_RXT:
 		return "rxt"
+	case poolpb.Algo_ALGO_RXM:
+		// "rx/0" is the real wire algo string a real Monero-family
+		// miner (XMRig et al.) actually expects/recognizes — confirmed
+		// earlier this session from real pool-server source
+		// (nodejs-pool-sxmr's lib/pool.js), and already used
+		// identically by leaf-proxy's own real Monero wiring. NOT
+		// "rxm" — that's this repo's own internal poolpb.Algo protobuf
+		// enum name, which must never leak onto the miner-facing wire.
+		return "rx/0"
 	default:
 		return "sha3x"
 	}

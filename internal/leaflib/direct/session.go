@@ -4,6 +4,7 @@ package direct
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -251,7 +252,11 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// convention, unlike SHA3X/C29 which do use xn for real
 	// per-session nonce-space partitioning (mirrors solo.Session's own
 	// handleSubmit — see its doc comment for the full rationale).
-	if job.Algo != poolpb.Algo_ALGO_RXT {
+	// ALGO_RXM (Monero) is exempted from the xn-prefix check for the
+	// same reason as ALGO_RXT (see solo.Session's own handleSubmit doc
+	// comment): a real Monero-family miner treats the full nonce field
+	// as one opaque value it controls end-to-end.
+	if job.Algo != poolpb.Algo_ALGO_RXT && job.Algo != poolpb.Algo_ALGO_RXM {
 		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 			return
@@ -269,6 +274,31 @@ func (s *Session) handleSubmit(req solo.Request) {
 		share *poolpb.Share
 	)
 	switch job.Algo {
+	case poolpb.Algo_ALGO_RXM:
+		// Mirrors solo.Session's own ALGO_RXM handling exactly (same
+		// little-endian nonce convention, same
+		// solo.MoneroHashingBlobForSubmit escape hatch for the real
+		// RandomX verification blob) — see that method's doc comment
+		// for the full rationale.
+		nonce = binary.LittleEndian.Uint64(nonceBytes)
+		if submit.Result == "" {
+			s.writeShareResponse(req.ID, false, "monero (rxm) submit requires a claimed result hash in \"result\"")
+			return
+		}
+		blob, blobErr := solo.MoneroHashingBlobForSubmit(job, nonce)
+		if blobErr != nil {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("failed to build monero randomx verification blob: %v", blobErr))
+			return
+		}
+		share = &poolpb.Share{
+			Algo: poolpb.Algo_ALGO_RXM, Network: s.server.network, PoolType: s.server.poolType,
+			BlockDiff: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
+			Timestamp: time.Now().Unix(),
+			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
+				Blob: blob, SeedHash: job.VmKey, ResultHex: submit.Result,
+			}},
+		}
 	case poolpb.Algo_ALGO_C29:
 		if len(submit.POW) != c29SubmitCycleSize {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("pow must carry exactly %d edges for a C29 cycle, got %d", c29SubmitCycleSize, len(submit.POW)))
@@ -345,11 +375,6 @@ func (s *Session) handleSubmit(req solo.Request) {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
 		return
 	}
-	block, ok := candidate.(*tari_generated.Block)
-	if !ok {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected candidate type %T", candidate))
-		return
-	}
 
 	// GENUINE DIFFERENCE FROM leaf-solo: every validated share (not
 	// just block-level finds) is forwarded to the real backend over
@@ -373,24 +398,72 @@ func (s *Session) handleSubmit(req solo.Request) {
 		return
 	}
 
-	// Meets full block difficulty: this is a genuine block find. Unlike
-	// leaf-solo (single node.SubmitBlock call), leaf-direct submits in
-	// real parallel to every configured GRPC node
-	// (s.server.multiSubmit), with "at least one acceptance = success"
-	// semantics, and best-effort broadcasts the find over the NATS
-	// relay (s.server.relayPublish) — see this package's doc comment
-	// and multisubmit.go/internal/leaflib/relay for the full design.
-	results, ok := s.server.submitBlockDirect(context.Background(), block)
-	if !ok {
+	// Meets full block difficulty: this is a genuine block find.
+	// Dispatch is coin-aware: for Tari (candidate is a real
+	// *tari_generated.Block), leaf-direct submits in real parallel to
+	// every configured GRPC node (s.server.multiSubmit), with "at
+	// least one acceptance = success" semantics, and best-effort
+	// broadcasts the find over the NATS relay (s.server.relay.Publish)
+	// — see this package's doc comment and multisubmit.go/
+	// internal/leaflib/relay for the full design. For Monero
+	// (candidate is a real nonce-patched blocktemplate_blob []byte —
+	// MoneroNodeClient.BuildCandidateBlock's own contract,
+	// monero_node.go), there is genuinely no multi-node-submit path
+	// yet: MultiNodeSubmitter (multisubmit.go) is Tari-GRPC-specific
+	// (its blockSubmitClient interface is literally
+	// SubmitBlock(*tari_generated.Block)) — a KNOWN, EXPLICITLY
+	// DEFERRED GAP (see this repo's PR description), not silently
+	// papered over. The real, working priority path instead: a single
+	// real submission via this leaf's own configured
+	// s.server.node.SubmitBlock (this leaf's ONE MoneroNodeClient
+	// connection, the same one JobManager already uses as its
+	// template source).
+	var (
+		submitOK     bool
+		blockHashHex string
+	)
+	switch job.Algo {
+	case poolpb.Algo_ALGO_RXM:
+		blob, ok := candidate.([]byte)
+		if !ok {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
+			return
+		}
+		if submitErr := s.server.node.SubmitBlock(context.Background(), candidate); submitErr != nil {
+			submitOK = false
+			s.server.logger.Printf("direct: monero BLOCK SUBMIT FAILED (single-node; multi-node Monero submit is a known, deferred gap) for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, submitErr)
+		} else {
+			submitOK = true
+		}
+		sum := sha256.Sum256(blob)
+		blockHashHex = hex.EncodeToString(sum[:])
+	default:
+		block, ok := candidate.(*tari_generated.Block)
+		if !ok {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected candidate type %T", candidate))
+			return
+		}
+		var results []NodeSubmitResult
+		results, submitOK = s.server.submitBlockDirect(context.Background(), block)
+		if !submitOK {
+			s.hashesAccumulated.Add(job.StaticDifficulty)
+			s.server.logger.Printf("direct: BLOCK SUBMIT FAILED at every configured node for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, results)
+			s.server.recordBlock(false)
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: rejected/failed at every configured node (%d configured)", len(results)))
+			return
+		}
+		blockHashHex, _ = blockHash(block)
+	}
+
+	if !submitOK {
 		s.hashesAccumulated.Add(job.StaticDifficulty)
-		s.server.logger.Printf("direct: BLOCK SUBMIT FAILED at every configured node for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, results)
 		s.server.recordBlock(false)
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: rejected/failed at every configured node (%d configured)", len(results)))
+		s.writeShareResponse(req.ID, false, "invalid block: rejected/failed at the configured node")
 		return
 	}
 
 	s.blockCount.Add(1)
-	s.server.logger.Printf("direct: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, accepted-by=%v", s.sessionID, s.address.Load(), job.Height, job.ID, diff, acceptedAddresses(results))
+	s.server.logger.Printf("direct: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.address.Load(), job.Height, job.ID, diff, blockHashHex)
 	s.server.recordBlock(true)
 	s.hashesAccumulated.Add(job.StaticDifficulty)
 	s.writeShareResponse(req.ID, true, "")
@@ -399,7 +472,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// visibility — the backend does not need per-node dispatch detail,
 	// only that a block was found and submitted, see
 	// transport.ShareTransport.SubmitBlock's doc comment).
-	s.forwardBlock(share, job, block)
+	s.forwardBlock(share, job, blockHashHex)
 
 	go s.server.jobManager.InvalidateAll()
 }
@@ -437,13 +510,17 @@ func (s *Session) forwardShare(share *poolpb.Share) {
 // forwardBlock reports a found block to the backend for accounting
 // purposes (see handleSubmit's doc comment — the backend does not
 // need per-node dispatch detail, that's logged locally only).
-func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, block *tari_generated.Block) {
+// blockHashHex is a coin-agnostic, already-hex-encoded identifying
+// hash for the found block (Tari: blockHash(block); Monero: sha256 of
+// the submitted candidate blob — see handleSubmit's coin-aware
+// dispatch), computed by the caller since this method no longer
+// assumes a *tari_generated.Block shape.
+func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex string) {
 	if s.server.transport == nil {
 		return
 	}
-	hash, _ := blockHash(block)
 	pbBlock := &poolpb.Block{
-		Algo: job.Algo, Network: s.server.network, Hash: hash,
+		Algo: job.Algo, Network: s.server.network, Hash: blockHashHex,
 		Difficulty: share.GetBlockDiff(), Height: int64(job.Height),
 		Timestamp: time.Now().Unix(), PoolType: s.server.poolType, Valid: true,
 	}
@@ -544,7 +621,7 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 		Target: diffToTargetHex(job.StaticDifficulty),
 		XN:     s.xn,
 	}
-	if job.Algo == poolpb.Algo_ALGO_RXT && len(job.VmKey) > 0 {
+	if (job.Algo == poolpb.Algo_ALGO_RXT || job.Algo == poolpb.Algo_ALGO_RXM) && len(job.VmKey) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.VmKey)
 	}
 	return payload
