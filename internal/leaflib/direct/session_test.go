@@ -850,14 +850,26 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 }
 
 // TestDirectSessionBlockFindCarriesNonZeroShares is a regression test
-// for the confirmed bug where blocks.shares (and shares.shares) were
-// always 0 for every real found block: forwardBlock never set
-// poolpb.Block.Shares, and the poolpb.Share{} construction sites in
-// handleSubmit never set poolpb.Share.Shares either, so there was
-// nothing non-zero to pass through in the first place. Both the
-// forwarded Share and the forwarded Block for a genuine block find
-// must now carry the job's real share difficulty (job.StaticDifficulty)
-// in their Shares field.
+// for the confirmed bug where shares.shares was always 0 for every
+// real submitted share: the poolpb.Share{} construction sites in
+// handleSubmit never set poolpb.Share.Shares, so there was nothing
+// non-zero to pass through in the first place. A forwarded Share must
+// now carry the job's real share difficulty (job.StaticDifficulty)
+// in its Shares field -- this is the exact real PPLNS convention
+// (nodejs-pool-sxmr's lib/pool.js: `shares: job.difficulty` at
+// recordShareData's real Share.encode call site).
+//
+// The forwarded Block's own Shares field is intentionally left 0 at
+// insert time here too, matching that SAME real reference exactly
+// (recordShareData's real Block.encode call: `shares: 0`) -- a
+// block's real share-window total is a SEPARATE, later aggregation
+// (sum of every share since the previous same-pool_type block), not
+// the single winning share's own difficulty. Setting
+// poolpb.Block.Shares from the winning share alone would put a real,
+// non-zero, but semantically WRONG value into blocks.shares (see the
+// subsystem gap audit's item 13: blocks.shares display-column
+// population is real, separate follow-up work, not fixed by this
+// commit).
 func TestDirectSessionBlockFindCarriesNonZeroShares(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-shares"))
@@ -889,11 +901,8 @@ func TestDirectSessionBlockFindCarriesNonZeroShares(t *testing.T) {
 	if len(h.transport.blocks) != 1 {
 		t.Fatalf("expected exactly 1 forwarded block, got %d", len(h.transport.blocks))
 	}
-	if got := h.transport.blocks[0].GetShares(); got == 0 {
-		t.Errorf("forwarded block must carry a non-zero Shares value (was always 0 before this fix), got %d", got)
-	}
-	if shareShares, blockShares := h.transport.shares[0].GetShares(), h.transport.blocks[0].GetShares(); shareShares != blockShares {
-		t.Errorf("block.Shares (%d) should match the winning share's own Shares (%d)", blockShares, shareShares)
+	if got := h.transport.blocks[0].GetShares(); got != 0 {
+		t.Errorf("forwarded block's Shares must stay 0 at insert time (matches the real legacy reference exactly -- the real share-window total is a separate later aggregation, not the winning share's own difficulty), got %d", got)
 	}
 }
 

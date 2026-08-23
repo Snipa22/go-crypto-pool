@@ -564,7 +564,7 @@ func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex 
 	}
 	pbBlock := &poolpb.Block{
 		Algo: job.Algo, Network: s.server.network, Hash: blockHashHex,
-		Difficulty: share.GetBlockDiff(), Shares: share.GetShares(), Height: int64(job.Height),
+		Difficulty: share.GetBlockDiff(), Height: int64(job.Height),
 		Timestamp: time.Now().Unix(), PoolType: s.server.poolType, Valid: true,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
