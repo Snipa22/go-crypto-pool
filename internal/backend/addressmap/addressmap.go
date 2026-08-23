@@ -48,6 +48,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	tariaddress "github.com/Snipa22/go-tari-lib/address"
+	xmraddress "github.com/Snipa22/go-xmr-lib/support"
 )
 
 // maxBodyBytes bounds how much of a POST body we will read. The
@@ -56,12 +59,12 @@ import (
 const maxBodyBytes = 1 << 16 // 64 KiB
 
 // maxAddressLen is a generous upper bound on a well-formed Monero or
-// Tari address's length, used only to reject obviously-malformed
-// input before it reaches the database -- NOT a real address-format
-// validator (this package does not decode/verify Monero base58 or
-// Tari's own address encoding; that would require importing coin-
-// specific address-parsing logic this repo does not currently have
-// for either coin on the backend side).
+// Tari address's length, used only as a cheap pre-check to reject
+// absurdly long input before it reaches the real, coin-specific
+// byte-exact decoders (validateXMRAddress/validateTariAddress below)
+// -- those functions do the actual address-format verification via
+// github.com/Snipa22/go-xmr-lib and github.com/Snipa22/go-tari-lib
+// respectively; this constant is not itself a format validator.
 const maxAddressLen = 512
 
 // Record mirrors db.AddressMap field-for-field (see that package's
@@ -131,10 +134,9 @@ func writeJSONErr(w http.ResponseWriter, status int, msg string) {
 }
 
 // validateAddress rejects the obviously-malformed cases (empty,
-// whitespace-only, or absurdly long) without attempting real
-// coin-specific address decoding -- see this package's doc comment
-// on maxAddressLen for why that's a deliberate scope limit, not an
-// oversight.
+// whitespace-only, or absurdly long) common to both coins, ahead of
+// the coin-specific byte-exact decoding done by validateXMRAddress/
+// validateTariAddress below.
 func validateAddress(field, addr string) error {
 	if strings.TrimSpace(addr) == "" {
 		return errors.New(field + " is required")
@@ -145,33 +147,76 @@ func validateAddress(field, addr string) error {
 	return nil
 }
 
-// validateTariAddress additionally checks a real, cheap structural
-// invariant: length. nodejs-pool-sxmr's own /user/updateTariAddress
-// route (lib/api.js) also checked a "12"/"14" prefix, but that check
-// is MAINNET-specific -- a real Esmeralda testnet address (e.g. the
-// one already in this project's own Vault test fixtures,
-// f2GYDtVpj6yx8ZRPez2fsaU3VBAfVzcYycb3boUqMz1C9cZdJ7CrAkhhYoqRRNJPjwRSKqfd2caRe9jv8ZKwAwDGbvD,
-// 91 chars, starts "f2") uses a genuinely different real network-byte
-// prefix and would be wrongly rejected by that check. Since this
-// backend explicitly supports both MAINNET and TESTNET (see
-// ValidateNetwork), and this package does not have a verified,
-// network-aware table of every real Tari network-byte prefix, only
-// the length invariant (Tari addresses are consistently 90-91 base58
-// chars across networks) is enforced here -- deliberately more
-// permissive than the legacy mainnet-only reference, not a stricter
-// invention. A real, byte-exact prefix table sourced from Tari's own
-// address-encoding source (not guessed) would be a legitimate future
-// tightening, but shipping a wrong restrictive check that silently
-// blocks real testnet addresses is a worse failure mode than this
-// permissive one.
+// validateTariAddress performs real, byte-exact Tari address
+// validation via github.com/Snipa22/go-tari-lib's address package --
+// a byte-exact Go port of the real Tari Base Layer tari_address
+// implementation (see that package's doc comment). address.Parse
+// tries emoji, then base58, then hex encodings (mirroring Rust's
+// `impl FromStr for TariAddress`) and, along the way, verifies the
+// DammSum checksum, the network byte against the real, current set
+// of Tari network wire-byte values, the features byte, and --
+// critically -- that the embedded public key(s) decode to a
+// canonical compressed Ristretto255 point (RFC 9496), not just that
+// the string is the right length.
+//
+// This deliberately supersedes the previous length-only placeholder
+// (see git history on this function): that check was a permissive
+// stand-in adopted specifically because this package had no real,
+// network-aware validator; it explicitly called out a byte-exact
+// prefix table "sourced from Tari's own address-encoding source" as
+// the legitimate future tightening, which is exactly what
+// go-tari-lib's address package is. It naturally accepts the same
+// real Esmeralda testnet address
+// (f2GYDtVpj6yx8ZRPez2fsaU3VBAfVzcYycb3boUqMz1C9cZdJ7CrAkhhYoqRRNJPjwRSKqfd2caRe9jv8ZKwAwDGbvD)
+// that motivated the permissive length-only check, because Esmeralda
+// is one of the real network bytes address.NetworkFromByte accepts --
+// but it now also rejects addresses with a right-length but wrong/
+// corrupted checksum, network byte, features byte, or non-canonical
+// public key, none of which the length check could ever catch.
 func validateTariAddress(addr string) error {
 	if err := validateAddress("tari_address", addr); err != nil {
 		return err
 	}
-	if len(addr) < 90 || len(addr) > 200 {
-		return errors.New("tari_address does not look like a valid Tari address (expected roughly 90+ base58 chars)")
+	if _, err := tariaddress.Parse(addr); err != nil {
+		return errors.New("tari_address is not a valid Tari address: " + err.Error())
 	}
 	return nil
+}
+
+// validateXMRAddress performs real, checksum-verified Monero address
+// validation via github.com/Snipa22/go-xmr-lib's support package
+// (already a dependency of this repo's wallet-transfer engine, see
+// internal/backend/disburse). support.IsValidMainnet/IsValidTestnet
+// base58-decode the address and verify its trailing 4-byte Keccak
+// checksum against the address's own payload -- a real structural
+// check, not a length heuristic -- then confirm the leading network-
+// tag byte is one of Monero's real mainnet (0x12 standard, 0x2a
+// integrated, 0x13 subaddress, 0x11 -- legacy) or testnet (0x35
+// standard/subaddress, 0x3f integrated) tag bytes. Both are checked
+// (rather than picking one based on some pool-network hint) because
+// this package's xmr_address field is not itself scoped to a single
+// pool/network row -- see this package's own doc comment on why
+// address-mapping is a genuinely separate, network-agnostic surface
+// from api/statsapi/networkapi's per-(algo,network) scoping.
+func validateXMRAddress(addr string) error {
+	if err := validateAddress("xmr_address", addr); err != nil {
+		return err
+	}
+	validMain, err := xmraddress.IsValidMainnet(addr)
+	if err != nil {
+		return errors.New("xmr_address is not a valid Monero address: " + err.Error())
+	}
+	if validMain {
+		return nil
+	}
+	validTest, err := xmraddress.IsValidTestnet(addr)
+	if err != nil {
+		return errors.New("xmr_address is not a valid Monero address: " + err.Error())
+	}
+	if validTest {
+		return nil
+	}
+	return errors.New("xmr_address is not a valid Monero address (bad checksum or unrecognized network byte)")
 }
 
 // upsertRequest is the JSON body POST /api/v1/address-map expects.
@@ -191,7 +236,7 @@ func (h *Handler) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateAddress("xmr_address", req.XMRAddress); err != nil {
+	if err := validateXMRAddress(req.XMRAddress); err != nil {
 		writeJSONErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -221,7 +266,7 @@ type getResponse struct {
 
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	xmrAddress := r.URL.Query().Get("xmr_address")
-	if err := validateAddress("xmr_address", xmrAddress); err != nil {
+	if err := validateXMRAddress(xmrAddress); err != nil {
 		writeJSONErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
