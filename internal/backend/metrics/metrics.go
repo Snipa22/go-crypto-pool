@@ -137,6 +137,28 @@ type Metrics struct {
 	// batch's Transfer call + bookkeeping), labeled by algo and
 	// network.
 	DisbursementCycleDuration *prometheus.HistogramVec
+
+	// WalletBalance is the hot wallet's real, currently-reported
+	// balance, labeled by algo, network, and kind
+	// (available/pending_incoming/pending_outgoing/timelocked — see
+	// WalletBalanceKind* below). A Gauge, not a Counter: this is a
+	// live, point-in-time snapshot of what the wallet reports on
+	// each scrape, populated by a dedicated background poll loop
+	// (see cmd/backend's buildWalletStatsPoller) rather than pushed
+	// inline from disburse.Engine's own GetBalance calls, so it
+	// stays fresh even between disbursement cycles. Monero's
+	// wallet.Balance only has Total/Unlocked (mapped onto
+	// available/pending_outgoing here — see the poller's own doc
+	// comment for the exact mapping); Tari's GetBalanceResponse has
+	// all four real fields natively.
+	WalletBalance *prometheus.GaugeVec
+	// WalletBalancePollErrorsTotal counts every failed
+	// WalletClient.GetBalance call the stats poller makes, labeled
+	// by algo and network — a stuck/unreachable wallet RPC should be
+	// visible here even though WalletBalance itself simply stops
+	// updating (a Gauge can't distinguish "still the last real
+	// value" from "the poller is broken"; this counter can).
+	WalletBalancePollErrorsTotal *prometheus.CounterVec
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -237,6 +259,15 @@ func New(version string) *Metrics {
 		Name:    "disbursement_cycle_duration_seconds",
 		Help:    "Wall-clock time for one full disbursement cycle (balance query + every batch's Transfer call + bookkeeping), by algo and network.",
 		Buckets: prometheus.DefBuckets,
+	}, []string{"algo", "network"})
+
+	m.WalletBalance = registerGaugeVec(reg, prometheus.GaugeOpts{
+		Name: "wallet_balance_atomic",
+		Help: "Real, currently-reported hot-wallet balance in atomic units, by algo, network, and kind (available/pending_incoming/pending_outgoing/timelocked).",
+	}, []string{"algo", "network", "kind"})
+	m.WalletBalancePollErrorsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "wallet_balance_poll_errors_total",
+		Help: "Total number of failed WalletClient.GetBalance calls made by the wallet-stats poller, by algo and network.",
 	}, []string{"algo", "network"})
 
 	return m
