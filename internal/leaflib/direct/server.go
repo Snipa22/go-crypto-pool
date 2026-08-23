@@ -82,6 +82,13 @@ type Server struct {
 
 	vardiff solo.VardiffConfig
 
+	// trustConfig gates the real, legacy-ported probabilistic
+	// RandomX-validation-skip mechanism for RXT/RXM shares (see
+	// solo/trust.go). Zero-value TrustConfig{} (Enabled: false) is
+	// the default — every share is always fully validated unless a
+	// caller explicitly opts in via EnableTrust.
+	trustConfig solo.TrustConfig
+
 	mu       sync.RWMutex
 	sessions map[uint64]*Session
 
@@ -213,6 +220,18 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetr
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	return m
+}
+
+// EnableTrust opts this server into the real, legacy-ported
+// probabilistic RandomX-validation-skip mechanism for RXT/RXM shares
+// (see solo/trust.go's doc comment for the full reference algorithm
+// and citation) — mirrors solo.Server's own identical EnableTrust
+// exactly. Must be called before serving any connections to take
+// effect for them — sessions capture s.trustConfig once, at
+// newSession time.
+func (s *Server) EnableTrust(cfg solo.TrustConfig) {
+	s.trustConfig = cfg.Normalized()
+	s.trustConfig.Enabled = cfg.Enabled
 }
 
 // MetricsHandler returns the Prometheus /metrics HTTP handler if

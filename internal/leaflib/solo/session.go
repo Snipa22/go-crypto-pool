@@ -62,6 +62,12 @@ type Session struct {
 	// whose miner sent no "agent" field.
 	agent atomic.Value // string
 
+	// trust is nil unless server.trustConfig.Enabled at newSession
+	// time — see trust.go's MinerTrust. Captured once per session
+	// (mirroring the real reference's per-Miner, per-connection trust
+	// object, which never persists across a reconnect).
+	trust *MinerTrust
+
 	// --- SECURITY FIX: per-session job ownership (jobList/jobLog) ---
 	//
 	// Ported from go-tari-sha3x-solo-stratum's minerStruct
@@ -165,6 +171,9 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	s.worker.Store("")
 	s.agent.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
+	if server.trustConfig.Enabled {
+		s.trust = NewMinerTrust(server.trustConfig)
+	}
 	return s
 }
 
@@ -609,14 +618,46 @@ func (s *Session) handleSubmit(req Request) {
 		return
 	}
 
-	valid, err := v.Validate(context.Background(), share)
-	if err != nil && err != validator.ErrWrongProofType {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
-		return
+	// Real, legacy-ported trusted-miner validation skip (see
+	// trust.go) — only ever considered for RXT/RXM, the two
+	// RandomX-family algos where full validation is a real,
+	// service-backed RandomX hash genuinely expensive to compute at
+	// scale; SHA3X/C29 are cheap local computation with no analogous
+	// mechanism in the reference and are always fully validated
+	// regardless of s.trust. ShouldSkipValidation itself already
+	// returns false for a nil/disabled s.trust, so this is safe to
+	// call unconditionally.
+	var valid bool
+	skipped := IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
+	if skipped {
+		// Trusted share: the miner's own claimed result is taken on
+		// faith, no real RandomX hash is computed — ported exactly
+		// from the reference's `hash = new Buffer(resultHash, 'hex')`
+		// branch (see trust.go's doc comment). This is, by
+		// definition, "valid" for the purpose of crediting the share;
+		// RecordOutcome below is still called with the real,
+		// eventual accept/reject outcome once BuildCandidateBlock's
+		// own difficulty check runs against the miner's claimed
+		// result, exactly like the reference calls handleMinerData
+		// unconditionally regardless of which processShare branch
+		// ran.
+		valid = true
+	} else {
+		valid, err = v.Validate(context.Background(), share)
+		if err != nil && err != validator.ErrWrongProofType {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+			return
+		}
 	}
 	if !valid {
+		if IsRandomXFamily(job.Algo) {
+			s.trust.RecordOutcome(false)
+		}
 		s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
 		return
+	}
+	if IsRandomXFamily(job.Algo) {
+		s.trust.RecordOutcome(true)
 	}
 
 	// Valid share (met the configured static share difficulty). This is

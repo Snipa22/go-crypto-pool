@@ -68,6 +68,10 @@ type Session struct {
 	// diagnostic-only.
 	agent atomic.Value // string
 
+	// trust is nil unless server.trustConfig.Enabled at newSession
+	// time — see solo.MinerTrust and solo/trust.go's doc comment.
+	trust *solo.MinerTrust
+
 	// --- per-session job ownership, mirroring solo.Session's own
 	// SECURITY FIX (PR #14) exactly: see solo/session.go's Session
 	// type doc comment for the full rationale. Ported here verbatim
@@ -102,6 +106,9 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	s.worker.Store("")
 	s.agent.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
+	if server.trustConfig.Enabled {
+		s.trust = solo.NewMinerTrust(server.trustConfig)
+	}
 	return s
 }
 
@@ -365,14 +372,31 @@ func (s *Session) handleSubmit(req solo.Request) {
 		return
 	}
 
-	valid, err := v.Validate(context.Background(), share)
-	if err != nil && err != validator.ErrWrongProofType {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
-		return
+	// Real, legacy-ported trusted-miner validation skip — mirrors
+	// solo.Session's own identical handleSubmit gating exactly (see
+	// solo/trust.go's doc comment). Only RXT/RXM ever consider a
+	// skip; SHA3X/C29 are always fully validated regardless of
+	// s.trust's state.
+	var valid bool
+	skipped := solo.IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
+	if skipped {
+		valid = true
+	} else {
+		valid, err = v.Validate(context.Background(), share)
+		if err != nil && err != validator.ErrWrongProofType {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+			return
+		}
 	}
 	if !valid {
+		if solo.IsRandomXFamily(job.Algo) {
+			s.trust.RecordOutcome(false)
+		}
 		s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
 		return
+	}
+	if solo.IsRandomXFamily(job.Algo) {
+		s.trust.RecordOutcome(true)
 	}
 
 	s.shareCount.Add(1)
