@@ -31,6 +31,14 @@ See `migrations/0001_initial_schema.up.sql` for the full DDL. Summary:
   `algo`/`network` discriminator column (a gap in the legacy SXMR schema
   that this project's architecture review flagged). `pools`/`ports`
   carry `network` (mainnet/testnet) as a hard requirement.
+  `miner_identifiers` is populated by `Repository.InsertShare` itself:
+  every real, accepted share upserts its (algo, network,
+  payment_address, payment_id, worker_name) identity row in the same
+  DB transaction as the shares insert, advancing `last_share` to that
+  share's own timestamp (never regressing it on an out-of-order/late
+  submission — see `UpsertMinerIdentifier`'s doc comment). This closes
+  what was previously a schema-exists-but-unused gap: nothing wrote to
+  this table before.
 
 - **`payouts`** (migration `0002_wallet_disbursements`) — a permanent,
   unpartitioned audit log of every real on-chain disbursement attempt

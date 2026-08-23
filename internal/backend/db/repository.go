@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -64,6 +66,16 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 // normally be HeightPartitionBucketSize; it is a parameter here (rather
 // than implicit) for the same reason EnsureHeightPartition takes it
 // explicitly.
+//
+// It also upserts the submitting miner's `miner_identifiers` row (see
+// UpsertMinerIdentifier) in the same DB transaction as the shares
+// insert, so every real, accepted share both (a) lands in `shares` and
+// (b) keeps that miner's identifier row's last_share freshness marker
+// current — this is the fix for the schema-exists-but-unpopulated gap
+// `miner_identifiers` previously had: nothing wrote to it. Doing both
+// writes in one transaction means a share can never be recorded without
+// its identifier's last_share being bumped (or vice versa) even if the
+// process crashes mid-call.
 func (r *Repository) InsertShare(ctx context.Context, s Share, bucketSize int64) error {
 	if err := ValidateAlgo(s.Algo); err != nil {
 		return err
@@ -75,6 +87,12 @@ func (r *Repository) InsertShare(ctx context.Context, s Share, bucketSize int64)
 		return err
 	}
 
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("db: inserting share: beginning transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	const stmt = `
 		INSERT INTO shares (
 			algo, network, pool_type, pool_id, block_height, shares,
@@ -83,13 +101,67 @@ func (r *Repository) InsertShare(ctx context.Context, s Share, bucketSize int64)
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
 		)`
-	_, err := r.pool.Exec(ctx, stmt,
+	if _, err := tx.Exec(ctx, stmt,
 		s.Algo, s.Network, s.PoolType, s.PoolID, s.BlockHeight, s.Shares,
 		s.PaymentAddress, s.PaymentID, s.FoundBlock, s.BlockDiff,
 		s.Timestamp, s.Identifier, s.TrustedShare,
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("db: inserting share: %w", err)
+	}
+
+	lastShare := time.Unix(s.Timestamp, 0).UTC()
+	if err := upsertMinerIdentifierTx(ctx, tx, s.Algo, s.Network, s.PaymentAddress, s.PaymentID, s.Identifier, lastShare); err != nil {
+		return fmt.Errorf("db: inserting share: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("db: inserting share: committing transaction: %w", err)
+	}
+	return nil
+}
+
+// UpsertMinerIdentifier records that (algo, network, paymentAddress,
+// paymentID, workerName) submitted a real share at lastShare,
+// inserting a fresh `miner_identifiers` row if this exact identity
+// (per uq_miner_identifiers_identity) has never been seen before, or
+// advancing its last_share column otherwise. last_share only ever
+// moves forward (GREATEST(miner_identifiers.last_share, EXCLUDED.last_share))
+// so an out-of-order/delayed share submission can never regress a
+// miner's freshness marker backwards.
+//
+// This is exported (in addition to being called from InsertShare on
+// every real ingested share) so other real write paths — tests, and
+// any future backfill/reconciliation tooling — can populate/advance
+// the same row without duplicating the upsert SQL.
+func (r *Repository) UpsertMinerIdentifier(ctx context.Context, algo, network, paymentAddress string, paymentID *string, workerName string, lastShare time.Time) error {
+	if err := ValidateAlgo(algo); err != nil {
+		return err
+	}
+	if err := ValidateNetwork(network); err != nil {
+		return err
+	}
+	if paymentAddress == "" {
+		return fmt.Errorf("db: UpsertMinerIdentifier: payment_address is required")
+	}
+	return upsertMinerIdentifierTx(ctx, r.pool, algo, network, paymentAddress, paymentID, workerName, lastShare)
+}
+
+// minerIdentifierExecer is the subset of pgxpool.Pool/pgx.Tx that
+// upsertMinerIdentifierTx needs, so the same SQL/logic runs
+// identically whether called inside InsertShare's transaction (a
+// pgx.Tx) or standalone via UpsertMinerIdentifier (the plain pool).
+type minerIdentifierExecer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func upsertMinerIdentifierTx(ctx context.Context, exec minerIdentifierExecer, algo, network, paymentAddress string, paymentID *string, workerName string, lastShare time.Time) error {
+	const stmt = `
+		INSERT INTO miner_identifiers (algo, network, payment_address, payment_id, worker_name, last_share)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (algo, network, payment_address, (COALESCE(payment_id, '')), worker_name)
+		DO UPDATE SET last_share = GREATEST(COALESCE(miner_identifiers.last_share, EXCLUDED.last_share), EXCLUDED.last_share)`
+	if _, err := exec.Exec(ctx, stmt, algo, network, paymentAddress, paymentID, workerName, lastShare); err != nil {
+		return fmt.Errorf("db: upserting miner identifier for %s: %w", paymentAddress, err)
 	}
 	return nil
 }

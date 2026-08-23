@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -45,6 +46,7 @@ func resetSchema(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	for _, stmt := range []string{
+		"DROP TABLE IF EXISTS address_map CASCADE",
 		"DROP TABLE IF EXISTS ports CASCADE",
 		"DROP TABLE IF EXISTS pools CASCADE",
 		"DROP TABLE IF EXISTS payouts CASCADE",
@@ -156,6 +158,64 @@ func TestIntegrationInsertShareAndBlockAndPartitionPruning(t *testing.T) {
 	}
 	if blockCount != 1 {
 		t.Errorf("expected 1 block, got %d", blockCount)
+	}
+
+	// Every real share InsertShare accepted above must have populated
+	// (not left empty) the matching miner_identifiers row, with
+	// last_share set from that share's own timestamp — this is the
+	// gap this test now covers: miner_identifiers previously had
+	// schema but no writer.
+	var identifierCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM miner_identifiers").Scan(&identifierCount); err != nil {
+		t.Fatalf("counting miner_identifiers: %v", err)
+	}
+	if identifierCount != len(samples) {
+		t.Errorf("expected %d miner_identifiers rows (one per distinct identity), got %d", len(samples), identifierCount)
+	}
+
+	var lastShare time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT last_share FROM miner_identifiers
+		WHERE algo = 'RXT' AND network = 'TESTNET' AND payment_address = 'addr-rxt-low' AND worker_name = 'worker-1'
+	`).Scan(&lastShare); err != nil {
+		t.Fatalf("querying miner_identifiers last_share: %v", err)
+	}
+	if !lastShare.Equal(time.Unix(1700000000, 0).UTC()) {
+		t.Errorf("expected last_share = %v, got %v", time.Unix(1700000000, 0).UTC(), lastShare)
+	}
+
+	// A second, later share from the same identity must advance
+	// last_share (upsert, not a duplicate row); an out-of-order
+	// earlier share must NOT regress it backwards.
+	if err := repo.InsertShare(ctx, db.Share{
+		Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1,
+		BlockHeight: 50, Shares: 1000, PaymentAddress: "addr-rxt-low",
+		Identifier: "worker-1", Timestamp: 1700000100,
+	}, db.HeightPartitionBucketSize); err != nil {
+		t.Fatalf("InsertShare (later, same identity): %v", err)
+	}
+	if err := repo.InsertShare(ctx, db.Share{
+		Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1,
+		BlockHeight: 50, Shares: 1000, PaymentAddress: "addr-rxt-low",
+		Identifier: "worker-1", Timestamp: 1699999999, // earlier than the first share
+	}, db.HeightPartitionBucketSize); err != nil {
+		t.Fatalf("InsertShare (out-of-order, same identity): %v", err)
+	}
+
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM miner_identifiers").Scan(&identifierCount); err != nil {
+		t.Fatalf("counting miner_identifiers after repeat shares: %v", err)
+	}
+	if identifierCount != len(samples) {
+		t.Errorf("expected repeat shares from the same identity to upsert (still %d rows), got %d", len(samples), identifierCount)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT last_share FROM miner_identifiers
+		WHERE algo = 'RXT' AND network = 'TESTNET' AND payment_address = 'addr-rxt-low' AND worker_name = 'worker-1'
+	`).Scan(&lastShare); err != nil {
+		t.Fatalf("querying miner_identifiers last_share after repeat shares: %v", err)
+	}
+	if !lastShare.Equal(time.Unix(1700000100, 0).UTC()) {
+		t.Errorf("expected last_share advanced to the newest share's timestamp %v, got %v (out-of-order share must not regress it)", time.Unix(1700000100, 0).UTC(), lastShare)
 	}
 
 	// InsertShare with a high height should have auto-created a new
