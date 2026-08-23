@@ -226,7 +226,10 @@ func (h *vardiffHarness) connectAndLogin(address string) (*vardiffClient, *Sessi
 	h.t.Cleanup(func() { _ = clientConn.Close() })
 
 	req := Request{ID: 1, JsonRPC: "2.0", Method: "login"}
-	params, err := json.Marshal(LoginRequest{Login: address, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})
+	// address is a short, readable test label; see
+	// address_helper_test.go's realTariTestAddress doc comment for
+	// why it must be mapped to a real, valid Tari address here.
+	params, err := json.Marshal(LoginRequest{Login: realTariTestAddress(address), Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})
 	if err != nil {
 		h.t.Fatalf("marshal login params: %v", err)
 	}

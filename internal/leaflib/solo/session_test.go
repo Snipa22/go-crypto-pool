@@ -260,7 +260,7 @@ func (h *testHarness) recvJobPush() JobPush {
 func TestSessionLoginPushesInitialJob(t *testing.T) {
 	h := newTestHarness(t, 1000, 1<<62)
 
-	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: "some-tari-address", Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
+	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realTariTestAddress("some-tari-address"), Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
 	resp := h.recvLoginResponse()
 
 	if resp.ID != 1 {
@@ -827,7 +827,11 @@ func TestSessionJobHistoryIsBounded(t *testing.T) {
 // respectively.
 func login(t *testing.T, h *testHarness, address string) (sessionID, xn string) {
 	t.Helper()
-	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: address, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
+	// address is a short, readable test label; it is deterministically
+	// mapped to a real, byte-exact-valid Tari address here (see
+	// address_helper_test.go's realTariTestAddress doc comment) since
+	// handleLogin now performs real, coin-aware address validation.
+	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realTariTestAddress(address), Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
 	resp := h.recvLoginResponse()
 	if resp.Result.Status != "OK" {
 		t.Fatalf("login failed: status=%q", resp.Result.Status)

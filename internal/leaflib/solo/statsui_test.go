@@ -51,7 +51,7 @@ func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 	n, _ := httpResp.Body.Read(buf)
 	body := string(buf[:n])
 
-	if !strings.Contains(body, "stats-ui-test-address") {
+	if !strings.Contains(body, realTariTestAddress("stats-ui-test-address")) {
 		t.Errorf("expected the connected session's address in the rendered page, got:\n%s", body)
 	}
 	if !strings.Contains(body, "<html") {
@@ -108,13 +108,13 @@ func TestServerStats_ReportsPerSessionAndAddressBreakdown(t *testing.T) {
 	st = h.server.Stats()
 	foundOne, foundTwo := false, false
 	for _, ac := range st.MinersByAddress {
-		if ac.Address == "addr-one" {
+		if ac.Address == realTariTestAddress("addr-one") {
 			foundOne = true
 			if ac.Count < 1 {
 				t.Errorf("addr-one count = %d, want >= 1", ac.Count)
 			}
 		}
-		if ac.Address == "addr-two" {
+		if ac.Address == realTariTestAddress("addr-two") {
 			foundTwo = true
 		}
 	}
