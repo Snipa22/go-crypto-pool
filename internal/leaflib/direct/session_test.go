@@ -231,6 +231,7 @@ func newDirectTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *d
 		MultiSubmit:       multi,
 		Algo:              poolpb.Algo_ALGO_SHA3X,
 		PoolType:          poolpb.PoolType_POOL_TYPE_SOLO,
+		PoolID:            42,
 	})
 
 	serverConn, clientConn := net.Pipe()
@@ -393,6 +394,7 @@ func newDirectRXTTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64,
 		MultiSubmit:       multi,
 		Algo:              poolpb.Algo_ALGO_RXT,
 		PoolType:          poolpb.PoolType_POOL_TYPE_SOLO,
+		PoolID:            42,
 	})
 
 	serverConn, clientConn := net.Pipe()
@@ -544,6 +546,7 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 		MultiSubmit:       multi,
 		Algo:              poolpb.Algo_ALGO_C29,
 		PoolType:          poolpb.PoolType_POOL_TYPE_SOLO,
+		PoolID:            42,
 	})
 	serverConn, clientConn := net.Pipe()
 	go server.handleConn(ctx, serverConn, 1)
@@ -790,6 +793,9 @@ func TestDirectSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 	if got := h.transport.shares[0].GetPoolType(); got != poolpb.PoolType_POOL_TYPE_SOLO {
 		t.Errorf("forwarded share must carry the server's configured PoolType (SOLO), got %v", got)
 	}
+	if got := h.transport.shares[0].GetPoolId(); got != 42 {
+		t.Errorf("forwarded share must carry the server's configured PoolID (42), got %v", got)
+	}
 }
 
 // TestDirectSessionSubmitMeetingBlockDifficulty exercises the full
@@ -837,15 +843,23 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	if got := h.transport.shares[0].GetPoolType(); got != poolpb.PoolType_POOL_TYPE_SOLO {
 		t.Errorf("forwarded block-finding share must carry the server's configured PoolType (SOLO), got %v", got)
 	}
+	if got := h.transport.shares[0].GetPoolId(); got != 42 {
+		t.Errorf("forwarded block-finding share must carry the server's configured PoolID (42), got %v", got)
+	}
 	h.transport.mu.Lock()
 	blocksLen := len(h.transport.blocks)
 	var blockPoolType poolpb.PoolType
+	var blockPoolID int32
 	if blocksLen > 0 {
 		blockPoolType = h.transport.blocks[0].GetPoolType()
+		blockPoolID = h.transport.blocks[0].GetPoolId()
 	}
 	h.transport.mu.Unlock()
 	if blocksLen > 0 && blockPoolType != poolpb.PoolType_POOL_TYPE_SOLO {
 		t.Errorf("forwarded block must carry the server's configured PoolType (SOLO), got %v", blockPoolType)
+	}
+	if blocksLen > 0 && blockPoolID != 42 {
+		t.Errorf("forwarded block must carry the server's configured PoolID (42), got %v", blockPoolID)
 	}
 }
 
