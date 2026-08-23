@@ -193,7 +193,7 @@ type repositoryAdapter struct {
 }
 
 func (a repositoryAdapter) InsertShare(ctx context.Context, s api.ShareRecord, bucketSize int64) error {
-	return a.repo.InsertShare(ctx, db.Share{
+	err := a.repo.InsertShare(ctx, db.Share{
 		Algo:           s.Algo,
 		Network:        s.Network,
 		PoolType:       s.PoolType,
@@ -208,6 +208,17 @@ func (a repositoryAdapter) InsertShare(ctx context.Context, s api.ShareRecord, b
 		Identifier:     s.Identifier,
 		TrustedShare:   s.TrustedShare,
 	}, bucketSize)
+	// Translate the db package's real ban/forced-difficulty
+	// sentinel errors into api's own sentinel errors -- this
+	// adapter is the one place both packages meet (see api.go's
+	// doc comment on why api.go itself cannot import db directly).
+	switch {
+	case errors.Is(err, db.ErrAddressBanned):
+		return fmt.Errorf("%w: %w", api.ErrAddressBanned, err)
+	case errors.Is(err, db.ErrShareDifficultyTooLow):
+		return fmt.Errorf("%w: %w", api.ErrShareDifficultyTooLow, err)
+	}
+	return err
 }
 
 func (a repositoryAdapter) InsertBlock(ctx context.Context, b api.BlockRecord) error {
@@ -962,6 +973,12 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "retention" {
 		if err := runRetentionCommand(os.Args[2:]); err != nil {
+			log.Fatalf("backend: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "address" {
+		if err := runAddressCommand(os.Args[2:]); err != nil {
 			log.Fatalf("backend: %v", err)
 		}
 		return

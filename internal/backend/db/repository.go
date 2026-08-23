@@ -87,6 +87,15 @@ func (r *Repository) InsertShare(ctx context.Context, s Share, bucketSize int64)
 		return err
 	}
 
+	// Manual, operator-flag-driven ban/forced-min-difficulty
+	// enforcement -- see addressflags.go and migrations/
+	// 0004_address_flags.up.sql. Checked before any partition/
+	// insert work: a banned or under-floor share must never reach
+	// `shares` at all.
+	if err := r.checkAddressFlags(ctx, s.PaymentAddress, s.BlockDiff); err != nil {
+		return err
+	}
+
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("db: inserting share: beginning transaction: %w", err)

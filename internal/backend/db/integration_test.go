@@ -46,6 +46,7 @@ func resetSchema(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	for _, stmt := range []string{
+		"DROP TABLE IF EXISTS address_flags CASCADE",
 		"DROP TABLE IF EXISTS address_map CASCADE",
 		"DROP TABLE IF EXISTS ports CASCADE",
 		"DROP TABLE IF EXISTS pools CASCADE",
