@@ -190,8 +190,23 @@ type Metrics struct {
 	// cardinality).
 	StatsRequestsTotal *prometheus.CounterVec
 	// StatsRequestDuration observes wall-clock time for one
-	// statsapi request, labeled by endpoint.
+	// read-only miner stats API request, labeled by endpoint.
 	StatsRequestDuration *prometheus.HistogramVec
+
+	// NetworkPollsTotal counts every real, live upstream chain-state
+	// query internal/backend/networkpoller's poll loop makes (a real
+	// Tari GRPC GetTipInfo+GetNetworkState pair, or a real monerod
+	// get_info call), labeled by algo, network, and result
+	// (ok/error). This is entirely independent of StatsRequestsTotal
+	// above -- that counts inbound HTTP requests to this backend's
+	// own read-only stats API; this counts outbound queries this
+	// backend makes to the REAL upstream network it mines against
+	// (subsystem gap audit items 2+4).
+	NetworkPollsTotal *prometheus.CounterVec
+	// NetworkPollDuration observes wall-clock time for one Target's
+	// worth of one networkpoller poll pass, labeled by algo and
+	// network.
+	NetworkPollDuration *prometheus.HistogramVec
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -330,7 +345,28 @@ func New(version string) *Metrics {
 		Buckets: prometheus.DefBuckets,
 	}, []string{"endpoint"})
 
+	m.NetworkPollsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "network_poll_total",
+		Help: "Total number of real, live upstream chain-state queries made by the network-state poller, by algo, network, and result (ok/error).",
+	}, []string{"algo", "network", "result"})
+
+	m.NetworkPollDuration = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "network_poll_duration_seconds",
+		Help:    "Wall-clock time for one algo/network target's real upstream chain-state query in the network-state poller, by algo and network.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"algo", "network"})
+
 	return m
+}
+
+// ObserveNetworkPoll increments NetworkPollsTotal and records
+// NetworkPollDuration for one internal/backend/networkpoller.Poller
+// pass against one Target, satisfying networkpoller.Metrics without
+// that package needing to import this one's collector types
+// directly (mirrors ObserveRequest's role for statsapi).
+func (m *Metrics) ObserveNetworkPoll(algo, network, result string, duration time.Duration) {
+	m.NetworkPollsTotal.WithLabelValues(algo, network, result).Inc()
+	m.NetworkPollDuration.WithLabelValues(algo, network).Observe(duration.Seconds())
 }
 
 // ObserveRequest increments StatsRequestsTotal and records
