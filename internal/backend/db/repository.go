@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -187,6 +189,110 @@ func (r *Repository) SetBlockStatus(ctx context.Context, id int64, valid, unlock
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("db: updating block %d status: no such block", id)
+	}
+	return nil
+}
+
+// PayoutShare is one `shares` row as needed by internal/backend/payout
+// (payout.ShareRow's DB-facing counterpart — kept as its own type for
+// the same dependency-direction reason unlocker.Block/db.PendingBlock
+// are kept separate, see unlocker.Repository's doc comment).
+type PayoutShare struct {
+	Shares         int64
+	PaymentAddress string
+	PaymentID      *string
+}
+
+// SharesAtHeight returns every `shares` row for (algo, poolType,
+// height), newest share_timestamp first — the real-schema equivalent
+// of nodejs-pool-sxmr's `SELECT * FROM shares WHERE block_height = ?
+// order by time desc`, scoped by this schema's algo/pool_type
+// partition columns instead of a post-hoc pool_type filter (see
+// internal/backend/payout's doc comment for why that's equivalent).
+func (r *Repository) SharesAtHeight(ctx context.Context, algo, poolType string, height int64) ([]PayoutShare, error) {
+	if err := ValidateAlgo(algo); err != nil {
+		return nil, err
+	}
+	if err := ValidatePoolType(poolType); err != nil {
+		return nil, err
+	}
+
+	const stmt = `
+		SELECT shares, payment_address, payment_id
+		FROM shares
+		WHERE algo = $1 AND pool_type = $2 AND block_height = $3
+		ORDER BY share_timestamp DESC`
+	rows, err := r.pool.Query(ctx, stmt, algo, poolType, height)
+	if err != nil {
+		return nil, fmt.Errorf("db: querying shares at height %d: %w", height, err)
+	}
+	defer rows.Close()
+
+	var out []PayoutShare
+	for rows.Next() {
+		var s PayoutShare
+		if err := rows.Scan(&s.Shares, &s.PaymentAddress, &s.PaymentID); err != nil {
+			return nil, fmt.Errorf("db: scanning share row: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterating share rows: %w", err)
+	}
+	return out, nil
+}
+
+// SoloShare returns the single found_block=TRUE SOLO row for (algo,
+// height) — the real-schema equivalent of nodejs-pool-sxmr's `SELECT *
+// FROM shares WHERE block_height = ? AND found_block IS TRUE LIMIT 1`,
+// additionally scoped to algo (see internal/backend/payout's doc
+// comment: this schema partitions by algo, legacy's commingled table
+// did not). found is false, with no error, when no such row exists yet
+// — an expected state for a block that hasn't been fully processed,
+// not a caller error.
+func (r *Repository) SoloShare(ctx context.Context, algo string, height int64) (PayoutShare, bool, error) {
+	if err := ValidateAlgo(algo); err != nil {
+		return PayoutShare{}, false, err
+	}
+
+	const stmt = `
+		SELECT shares, payment_address, payment_id
+		FROM shares
+		WHERE algo = $1 AND pool_type = 'SOLO' AND block_height = $2 AND found_block IS TRUE
+		ORDER BY share_timestamp DESC
+		LIMIT 1`
+	var s PayoutShare
+	err := r.pool.QueryRow(ctx, stmt, algo, height).Scan(&s.Shares, &s.PaymentAddress, &s.PaymentID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return PayoutShare{}, false, nil
+		}
+		return PayoutShare{}, false, fmt.Errorf("db: querying solo share at height %d: %w", height, err)
+	}
+	return s, true, nil
+}
+
+// CreditBalance adds amount to the pending balance for (algo, network,
+// paymentAddress, paymentID), inserting a new zero-balance row first
+// if none exists yet — the real-schema equivalent of nodejs-pool-sxmr's
+// createBalanceQueue (account-ensure) followed by balanceQueue
+// (increment), collapsed into a single upsert against this schema's
+// uq_balance_identity unique index (algo, network, payment_address,
+// COALESCE(payment_id, ”)).
+func (r *Repository) CreditBalance(ctx context.Context, algo, network, paymentAddress string, paymentID *string, amount int64) error {
+	if err := ValidateAlgo(algo); err != nil {
+		return err
+	}
+
+	const stmt = `
+		INSERT INTO balance (algo, network, payment_address, payment_id, pending_balance)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (algo, network, payment_address, (COALESCE(payment_id, '')))
+		DO UPDATE SET pending_balance = balance.pending_balance + EXCLUDED.pending_balance,
+		              updated_at = now()`
+	_, err := r.pool.Exec(ctx, stmt, algo, network, paymentAddress, paymentID, amount)
+	if err != nil {
+		return fmt.Errorf("db: crediting balance for %s: %w", paymentAddress, err)
 	}
 	return nil
 }
