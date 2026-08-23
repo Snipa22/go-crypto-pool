@@ -78,6 +78,12 @@ func algoWireName(algo poolpb.Algo) string {
 		return "c29"
 	case poolpb.Algo_ALGO_RXT:
 		return "rxt"
+	case poolpb.Algo_ALGO_RXM:
+		// "rx/0" is the real wire algo string a real Monero-family
+		// miner actually expects — mirrors solo's own algoWireName and
+		// leaf-proxy's own real Monero wiring, NOT the internal
+		// poolpb.Algo enum name "rxm".
+		return "rx/0"
 	default:
 		return "sha3x"
 	}

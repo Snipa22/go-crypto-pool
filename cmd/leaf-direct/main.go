@@ -51,6 +51,8 @@ type config struct {
 	listenAddress   string
 	payoutAddress   string
 	network         string
+	coin            string
+	monerodURL      string
 	algo            string
 	poolType        string
 
@@ -100,11 +102,13 @@ type config struct {
 func loadConfig() config {
 	cfg := config{}
 
-	flag.StringVar(&cfg.nodeGRPCAddress, "node-grpc-address", envOr("LEAF_NODE_GRPC_ADDRESS", ""), "Tari base node GRPC address (host:port); also the primary template-source AND is always included in the multi-node submit set. Env: LEAF_NODE_GRPC_ADDRESS")
+	flag.StringVar(&cfg.nodeGRPCAddress, "node-grpc-address", envOr("LEAF_NODE_GRPC_ADDRESS", ""), "Tari base node GRPC address (host:port); also the primary template-source AND is always included in the multi-node submit set. REQUIRED when -coin=tari (the default); ignored for -coin=monero. Env: LEAF_NODE_GRPC_ADDRESS")
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_DIRECT_LISTEN_ADDRESS", ":4444"), "miner-facing TCP listen address. Env: LEAF_DIRECT_LISTEN_ADDRESS")
 	flag.StringVar(&cfg.payoutAddress, "payout-address", envOr("LEAF_DIRECT_PAYOUT_ADDRESS", ""), "pool payout/coinbase address for fetched block templates. Env: LEAF_DIRECT_PAYOUT_ADDRESS")
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_DIRECT_NETWORK", "testnet"), "network tag for share/block records: mainnet|testnet. Env: LEAF_DIRECT_NETWORK")
-	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_DIRECT_ALGO", "sha3x"), "which single mining algorithm this leaf-direct process serves: sha3x (default), c29, or rxt. Env: LEAF_DIRECT_ALGO")
+	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_DIRECT_COIN", "tari"), "which coin/PoW family this leaf-direct process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_DIRECT_COIN")
+	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_DIRECT_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081). REQUIRED when -coin=monero; ignored for -coin=tari. Env: LEAF_DIRECT_MONEROD_URL")
+	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_DIRECT_ALGO", "sha3x"), "which single mining algorithm this leaf-direct process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_DIRECT_ALGO")
 	flag.StringVar(&cfg.poolType, "pool-type", envOr("LEAF_DIRECT_POOL_TYPE", ""), "real pool payout model stamped onto every share/block forwarded to the backend: pplns|pps|prop|solo. REQUIRED (no safe silent default -- determines real payout accounting semantics). Env: LEAF_DIRECT_POOL_TYPE")
 	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_DIRECT_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (only consulted when -algo=rxt). Env: LEAF_DIRECT_RANDOMX_SERVICE_URL")
 
@@ -248,6 +252,23 @@ func algoFromString(s string) poolpb.Algo {
 	}
 }
 
+// isMoneroCoin mirrors leaf-solo's own isMoneroCoin exactly -- see
+// that function's doc comment.
+func isMoneroCoin(coin string) bool {
+	return strings.EqualFold(strings.TrimSpace(coin), "monero")
+}
+
+// resolveAlgo mirrors leaf-solo's own resolveAlgo exactly: for
+// -coin=monero, always ALGO_RXM regardless of -algo; for -coin=tari
+// (the default), algoFromString(cfg.algo) exactly as before Monero
+// support existed.
+func resolveAlgo(cfg config) poolpb.Algo {
+	if isMoneroCoin(cfg.coin) {
+		return poolpb.Algo_ALGO_RXM
+	}
+	return algoFromString(cfg.algo)
+}
+
 // poolTypeFromString parses the real string convention mirrored from
 // internal/backend/api/api.go's own (private, unexported) poolTypeString
 // reverse-mapping (PPLNS/PPS/PROP/SOLO), accepted here case-insensitively
@@ -299,7 +320,17 @@ func main() {
 	cfg := loadConfig()
 	logger := log.New(os.Stdout, "leaf-direct: ", log.LstdFlags|log.Lmicroseconds)
 
-	if cfg.nodeGRPCAddress == "" {
+	if isMoneroCoin(cfg.coin) {
+		if strings.TrimSpace(cfg.monerodURL) == "" {
+			logger.Fatal("LEAF_DIRECT_MONEROD_URL (or -monerod-url) is required when -coin=monero")
+		}
+		if cfg.nodeGRPCAddress != "" {
+			logger.Printf("note: -coin=monero -- ignoring -node-grpc-address/LEAF_NODE_GRPC_ADDRESS (%s); no Tari GRPC daemon is involved", cfg.nodeGRPCAddress)
+		}
+		if cfg.submitNodesRaw != "" {
+			logger.Printf("note: -coin=monero -- ignoring -submit-nodes/LEAF_DIRECT_SUBMIT_NODES (%s); real multi-node Monero block submission is a known, deferred gap (MultiNodeSubmitter is Tari-GRPC-specific) -- see this leaf's own doc comment. Monero block finds submit via a single real MoneroNodeClient.SubmitBlock call instead.", cfg.submitNodesRaw)
+		}
+	} else if cfg.nodeGRPCAddress == "" {
 		logger.Fatal("LEAF_NODE_GRPC_ADDRESS (or -node-grpc-address) is required")
 	}
 	if cfg.payoutAddress == "" {
@@ -325,18 +356,33 @@ func main() {
 		logger.Printf("port tier: address=%s starting-difficulty=%d desc=%s", p.Address, p.Difficulty, desc)
 	}
 	logger.Printf("vardiff bounds [%d, %d], target time %ds, retarget interval %s", cfg.minDifficulty, cfg.maxDifficulty, cfg.vardiffTargetTime, cfg.vardiffInterval)
-	logger.Printf("connecting to primary Tari base node GRPC at %s", cfg.nodeGRPCAddress)
 
-	node, err := direct.NewNodeClient(cfg.nodeGRPCAddress)
-	if err != nil {
-		logger.Fatalf("failed to construct primary node client for %s: %v", cfg.nodeGRPCAddress, err)
+	// Real coin-conditional NodeClient construction. For -coin=tari
+	// (default), this is direct.NewNodeClient's own real
+	// per-call-injectable GRPC client (unchanged). For -coin=monero,
+	// this is solo.NewMoneroNodeClient -- the SAME real implementation
+	// leaf-solo uses, satisfying the identical coin-agnostic
+	// solo.NodeClient interface direct.NodeClient also implements, so
+	// JobManager/Server/session.go's handleSubmit are unaffected by
+	// which one gets constructed here.
+	var node solo.NodeClient
+	if isMoneroCoin(cfg.coin) {
+		logger.Printf("connecting to Monero daemon (monerod JSON-RPC) at %s", cfg.monerodURL)
+		node = solo.NewMoneroNodeClient(cfg.monerodURL)
+	} else {
+		logger.Printf("connecting to primary Tari base node GRPC at %s", cfg.nodeGRPCAddress)
+		tariNode, err := direct.NewNodeClient(cfg.nodeGRPCAddress)
+		if err != nil {
+			logger.Fatalf("failed to construct primary node client for %s: %v", cfg.nodeGRPCAddress, err)
+		}
+		node = tariNode
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	jobManager := solo.NewJobManager(solo.JobManagerConfig{
-		Node: node, PayoutAddress: cfg.payoutAddress, Algo: algoFromString(cfg.algo),
+		Node: node, PayoutAddress: cfg.payoutAddress, Algo: resolveAlgo(cfg),
 		StaticDifficulty: ports[0].Difficulty, RefreshInterval: cfg.refreshInterval,
 		TipPollInterval: cfg.tipPollInterval, JobMaxAge: cfg.jobMaxAge, Logger: logger,
 	})
@@ -369,16 +415,34 @@ func main() {
 	defer func() { _ = backendTransport.Close() }()
 	logger.Printf("forwarding validated shares/blocks to backend at %s", cfg.backendBaseURL)
 
-	// Real direct parallel multi-node GRPC block submission -- the
-	// primary node's own address is always included (see
-	// resolveSubmitNodes).
-	submitAddrs := resolveSubmitNodes(cfg.nodeGRPCAddress, cfg.submitNodesRaw)
-	multiSubmit, err := direct.NewMultiNodeSubmitter(submitAddrs, logger)
-	if err != nil {
-		logger.Fatalf("failed to construct multi-node block submitter: %v", err)
+	// Real direct parallel multi-node GRPC block submission -- Tari
+	// only (MultiNodeSubmitter's blockSubmitClient interface is
+	// genuinely SubmitBlock(*tari_generated.Block)-shaped -- see
+	// multisubmit.go). For -coin=monero this is left nil/unconfigured
+	// on purpose: real multi-node Monero block submission is a KNOWN,
+	// EXPLICITLY DEFERRED gap (see this binary's own doc comment and
+	// the PR description) -- session.go's handleSubmit instead submits
+	// a genuine Monero block find via a single real
+	// node.SubmitBlock(MoneroNodeClient) call, which is this leaf's
+	// one configured monerod connection (the same one JobManager uses
+	// as its template source).
+	var multiSubmit *direct.MultiNodeSubmitter
+	if !isMoneroCoin(cfg.coin) {
+		submitAddrs := resolveSubmitNodes(cfg.nodeGRPCAddress, cfg.submitNodesRaw)
+		var err error
+		multiSubmit, err = direct.NewMultiNodeSubmitter(submitAddrs, logger)
+		if err != nil {
+			logger.Fatalf("failed to construct multi-node block submitter: %v", err)
+		}
+		logger.Printf("multi-node block submit configured for %d node(s): %v", len(submitAddrs), submitAddrs)
+	} else {
+		logger.Printf("multi-node block submit disabled for -coin=monero (known, deferred gap -- single-node MoneroNodeClient.SubmitBlock is the real, working priority path)")
 	}
-	defer func() { _ = multiSubmit.Close() }()
-	logger.Printf("multi-node block submit configured for %d node(s): %v", len(submitAddrs), submitAddrs)
+	defer func() {
+		if multiSubmit != nil {
+			_ = multiSubmit.Close()
+		}
+	}()
 
 	// Optional, best-effort NATS relay -- a complete no-op if
 	// LEAF_DIRECT_RELAY_NATS_URL is unset (see internal/leaflib/relay).

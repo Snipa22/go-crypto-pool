@@ -144,6 +144,51 @@ func TariPowDataFromJob(job *Job) []byte {
 	return result.GetBlock().GetHeader().GetPow().GetPowData()
 }
 
+// MoneroHashingBlobForSubmit is the explicitly-named escape hatch
+// (mirroring TariPowDataFromJob above) that session-level submit
+// handling (this package's own session.go, and leaf-direct's
+// internal/leaflib/direct/session.go) uses to build the real RandomX
+// verification input for an ALGO_RXM (Monero) submit.
+//
+// WHY THIS EXISTS: job.Header for a Monero job holds the UNPATCHED
+// blockhashing_blob (nonce field still zero — see MoneroNodeClient's
+// GetBlockTemplate, monero_node.go) because BuildCandidateBlock patches
+// the nonce into the SEPARATE full blocktemplate_blob for submission,
+// not into job.Header. validator.RandomXValidator needs the nonce
+// actually patched into the hashing blob (the real pre-image Monero's
+// own RandomX hashes) to verify a miner's claimed result hash — so this
+// function re-derives job's real nonce offset (via the SAME real,
+// never-hardcoded varint walk documented on monero_node.go) and returns
+// a patched COPY, leaving job/job.TemplateData untouched.
+//
+// Returns an error if job.TemplateData does not hold a real
+// *moneroTemplateData (i.e. this is not actually a Monero job) so
+// callers can distinguish "not applicable" from "applicable but
+// malformed" exactly like TariPowDataFromJob's nil-vs-error contract
+// for Tari's RXT.
+func MoneroHashingBlobForSubmit(job *Job, nonce uint64) ([]byte, error) {
+	if job == nil {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForSubmit: nil job")
+	}
+	data, ok := job.TemplateData.(*moneroTemplateData)
+	if !ok || data == nil {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForSubmit: job.TemplateData does not hold a real *moneroTemplateData (algo %v)", job.Algo)
+	}
+	nonceOffset, err := parseMoneroBlockHeaderNonceOffset(data.HashingBlob)
+	if err != nil {
+		return nil, fmt.Errorf("solo: monero: re-parsing nonce offset for RandomX verification blob: %w", err)
+	}
+	if nonceOffset+4 > len(data.HashingBlob) {
+		return nil, fmt.Errorf("solo: monero: nonce offset %d + 4 exceeds hashing blob length %d", nonceOffset, len(data.HashingBlob))
+	}
+	blob := make([]byte, len(data.HashingBlob))
+	copy(blob, data.HashingBlob)
+	var nonceBuf [4]byte
+	binary.LittleEndian.PutUint32(nonceBuf[:], uint32(nonce))
+	copy(blob[nonceOffset:nonceOffset+4], nonceBuf[:])
+	return blob, nil
+}
+
 // GRPCNodeClient is the production NodeClient, backed by
 // go-tari-grpc-lib/v3's nodeGRPC package against a real Tari base node.
 type GRPCNodeClient struct{}

@@ -69,12 +69,33 @@ type config struct {
 	payoutAddress   string
 	network         string
 
+	// coin selects which coin/PoW family this leaf-solo process talks
+	// to for its block source: "tari" (default, unchanged behavior --
+	// GRPCNodeClient against a real Tari base node) or "monero" (a
+	// real MoneroNodeClient against a real monerod JSON-RPC daemon --
+	// see monerodURL below). This governs NodeClient construction and
+	// forces algo to ALGO_RXM below; it does NOT touch the wire
+	// protocol layer at all (protocol.go's JSON-RPC 2.0 dialect is
+	// already Monero-compatible).
+	coin string
+
+	// monerodURL is the real monerod JSON-RPC base URL (e.g.
+	// "http://148.163.90.157:28081") this leaf talks to when
+	// -coin/LEAF_SOLO_COIN is "monero". Ignored/unused for coin=tari.
+	// REQUIRED when coin=monero -- see main's own validation.
+	monerodURL string
+
 	// algo selects which SINGLE mining algorithm this leaf-solo
-	// process serves: "sha3x" (default) or "c29". See loadConfig's
-	// LEAF_SOLO_ALGO doc comment for why a simple single-algo-per-
-	// process flag was chosen over per-port algo selection for this
-	// pass, and why leaving it unset preserves the already-deployed
-	// CT132 leaf-solo.service's SHA3X-only behavior exactly.
+	// process serves: "sha3x" (default), "c29", or "rxt" -- for
+	// coin=tari only. See loadConfig's LEAF_SOLO_ALGO doc comment for
+	// why a simple single-algo-per-process flag was chosen over
+	// per-port algo selection for this pass, and why leaving it unset
+	// preserves the already-deployed CT132 leaf-solo.service's
+	// SHA3X-only behavior exactly. When coin=monero, this flag's
+	// value is ignored entirely -- Monero has genuinely only one algo
+	// (plain RandomX/rx), so algoFromString always returns ALGO_RXM
+	// for coin=monero regardless of what -algo is set to (see
+	// resolveAlgo below).
 	algo string
 
 	// randomXServiceURL is the RandomX-verification HTTP daemon address
@@ -108,12 +129,14 @@ type config struct {
 func loadConfig() config {
 	cfg := config{}
 
-	flag.StringVar(&cfg.nodeGRPCAddress, "node-grpc-address", envOr("LEAF_NODE_GRPC_ADDRESS", ""), "Tari base node GRPC address (host:port). Env: LEAF_NODE_GRPC_ADDRESS")
+	flag.StringVar(&cfg.nodeGRPCAddress, "node-grpc-address", envOr("LEAF_NODE_GRPC_ADDRESS", ""), "Tari base node GRPC address (host:port). REQUIRED when -coin=tari (the default); ignored for -coin=monero. Env: LEAF_NODE_GRPC_ADDRESS")
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_SOLO_LISTEN_ADDRESS", ":4444"), "miner-facing TCP listen address. Env: LEAF_SOLO_LISTEN_ADDRESS")
 	flag.StringVar(&cfg.payoutAddress, "payout-address", envOr("LEAF_SOLO_PAYOUT_ADDRESS", ""), "solo payout address; found-block coinbase rewards go here. Env: LEAF_SOLO_PAYOUT_ADDRESS")
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_SOLO_NETWORK", "testnet"), "network tag for share/diagnostic records: mainnet|testnet. Env: LEAF_SOLO_NETWORK")
-	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default), c29, or rxt. Env: LEAF_SOLO_ALGO")
-	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_SOLO_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (only consulted when -algo=rxt). Env: LEAF_SOLO_RANDOMX_SERVICE_URL")
+	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_SOLO_COIN", "tari"), "which coin/PoW family this leaf-solo process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_SOLO_COIN")
+	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_SOLO_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081), no trailing slash or /json_rpc suffix required. REQUIRED when -coin=monero; ignored for -coin=tari. Env: LEAF_SOLO_MONEROD_URL")
+	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_SOLO_ALGO")
+	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_SOLO_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (consulted for -algo=rxt, and for -coin=monero's real RandomX/rx validation -- both share the same real randomx-service-backed RandomXValidator). Env: LEAF_SOLO_RANDOMX_SERVICE_URL")
 
 	// LEAF_SOLO_STARTING_DIFFICULTY replaces the old, now-removed
 	// LEAF_SOLO_DIFFICULTY (which used to be THE only difficulty any
@@ -297,7 +320,9 @@ func networkFromString(s string) poolpb.Network {
 // algoFromString parses -algo/LEAF_SOLO_ALGO. Defaults to
 // poolpb.Algo_ALGO_SHA3X for any unrecognized value (including the
 // empty string), matching this leaf's pre-multi-algo behavior exactly
-// when the flag/env var is left unset.
+// when the flag/env var is left unset. Only meaningful for -coin=tari
+// -- resolveAlgo (below) is what main actually calls, and it overrides
+// this entirely to ALGO_RXM for -coin=monero.
 func algoFromString(s string) poolpb.Algo {
 	switch s {
 	case "c29":
@@ -309,11 +334,42 @@ func algoFromString(s string) poolpb.Algo {
 	}
 }
 
+// isMoneroCoin reports whether cfg.coin/-coin selects the real Monero
+// path (case-insensitive, tolerant of surrounding whitespace) -- the
+// single normalization point every coin-conditional branch in main
+// below consults, so "Monero"/"MONERO"/" monero " all behave
+// identically.
+func isMoneroCoin(coin string) bool {
+	return strings.EqualFold(strings.TrimSpace(coin), "monero")
+}
+
+// resolveAlgo is what main actually calls to get the real
+// poolpb.Algo this leaf-solo process serves: for -coin=monero, this is
+// ALWAYS poolpb.Algo_ALGO_RXM (Monero genuinely has only one algo --
+// plain RandomX/rx -- so there is no meaningful per-process -algo
+// choice to make for it, unlike Tari's SHA3X/C29/RXT), regardless of
+// whatever -algo/LEAF_SOLO_ALGO happens to be set to; for -coin=tari
+// (the default), this is algoFromString(cfg.algo) exactly as before
+// Monero support existed.
+func resolveAlgo(cfg config) poolpb.Algo {
+	if isMoneroCoin(cfg.coin) {
+		return poolpb.Algo_ALGO_RXM
+	}
+	return algoFromString(cfg.algo)
+}
+
 func main() {
 	cfg := loadConfig()
 	logger := log.New(os.Stdout, "leaf-solo: ", log.LstdFlags|log.Lmicroseconds)
 
-	if cfg.nodeGRPCAddress == "" {
+	if isMoneroCoin(cfg.coin) {
+		if strings.TrimSpace(cfg.monerodURL) == "" {
+			logger.Fatal("LEAF_SOLO_MONEROD_URL (or -monerod-url) is required when -coin=monero")
+		}
+		if cfg.nodeGRPCAddress != "" {
+			logger.Printf("note: -coin=monero -- ignoring -node-grpc-address/LEAF_NODE_GRPC_ADDRESS (%s); no Tari GRPC daemon is involved", cfg.nodeGRPCAddress)
+		}
+	} else if cfg.nodeGRPCAddress == "" {
 		logger.Fatal("LEAF_NODE_GRPC_ADDRESS (or -node-grpc-address) is required")
 	}
 	if cfg.payoutAddress == "" {
@@ -333,9 +389,20 @@ func main() {
 	}
 	logger.Printf("vardiff bounds [%d, %d], target time %ds, retarget interval %s", cfg.minDifficulty, cfg.maxDifficulty, cfg.vardiffTargetTime, cfg.vardiffInterval)
 	logger.Printf("job max age (security: per-job expiry independent of tip invalidation): %s", cfg.jobMaxAge)
-	logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
 
-	node := solo.NewGRPCNodeClient(cfg.nodeGRPCAddress)
+	// Real coin-conditional NodeClient construction: both
+	// implementations satisfy the exact same coin-agnostic
+	// solo.NodeClient interface (node.go), so everything downstream
+	// (JobManager, Server, session.go's handleSubmit) is unaffected by
+	// which one gets constructed here.
+	var node solo.NodeClient
+	if isMoneroCoin(cfg.coin) {
+		logger.Printf("connecting to Monero daemon (monerod JSON-RPC) at %s", cfg.monerodURL)
+		node = solo.NewMoneroNodeClient(cfg.monerodURL)
+	} else {
+		logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
+		node = solo.NewGRPCNodeClient(cfg.nodeGRPCAddress)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -343,7 +410,7 @@ func main() {
 	jobManager := solo.NewJobManager(solo.JobManagerConfig{
 		Node:          node,
 		PayoutAddress: cfg.payoutAddress,
-		Algo:          algoFromString(cfg.algo),
+		Algo:          resolveAlgo(cfg),
 		// StaticDifficulty is only the JobForXN fallback default (see
 		// JobManagerConfig.StaticDifficulty's doc comment) — every
 		// real session created by Server.handleConn goes through
