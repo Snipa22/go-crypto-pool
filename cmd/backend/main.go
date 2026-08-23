@@ -510,6 +510,7 @@ const defaultPPLNSShareMulti = 2
 // these are operator-tunable rather than baked-in protocol constants.
 const (
 	defaultDisbursePollInterval            = 10 * time.Minute
+	defaultWalletStatsPollInterval         = 1 * time.Minute
 	defaultDisburseMaxDestinationsPerBatch = 15
 )
 
@@ -546,10 +547,10 @@ const (
 //	                                  disbursement engine runs a cycle,
 //	                                  as a time.ParseDuration string.
 //	                                  Default "10m".
-func buildDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, interval time.Duration, ok bool, err error) {
+func buildDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
 	addr := os.Getenv("GCPOOL_MONERO_WALLET_RPC_ADDR")
 	if addr == "" {
-		return nil, 0, false, nil
+		return nil, nil, 0, false, nil
 	}
 
 	var opts []wallet.Option
@@ -558,7 +559,7 @@ func buildDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disbu
 	if user != "" || pass != "" {
 		opts = append(opts, wallet.WithDigestAuth(user, pass))
 	}
-	walletClient := wallet.NewMoneroWalletRPC(addr, opts...)
+	walletClient = wallet.NewMoneroWalletRPC(addr, opts...)
 
 	cfg := disburse.Config{
 		Wallet:                  walletClient,
@@ -568,14 +569,14 @@ func buildDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disbu
 	if raw := os.Getenv("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC"); raw != "" {
 		v, parseErr := strconv.ParseInt(raw, 10, 64)
 		if parseErr != nil {
-			return nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC: %w", parseErr)
+			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC: %w", parseErr)
 		}
 		cfg.MinPayoutAtomic = v
 	}
 	if raw := os.Getenv("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH"); raw != "" {
 		v, parseErr := strconv.Atoi(raw)
 		if parseErr != nil {
-			return nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH: %w", parseErr)
+			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH: %w", parseErr)
 		}
 		cfg.MaxDestinationsPerBatch = v
 	}
@@ -584,17 +585,184 @@ func buildDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disbu
 	if raw := os.Getenv("GCPOOL_DISBURSE_POLL_INTERVAL"); raw != "" {
 		v, parseErr := time.ParseDuration(raw)
 		if parseErr != nil {
-			return nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_POLL_INTERVAL: %w", parseErr)
+			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_POLL_INTERVAL: %w", parseErr)
 		}
 		interval = v
 	}
 
-	return disburse.New(disburseRepositoryAdapter{repo: repo}, cfg), interval, true, nil
+	return disburse.New(disburseRepositoryAdapter{repo: repo}, cfg), walletClient, interval, true, nil
+}
+
+// buildTariDisburseEngine is buildDisburseEngine's Tari counterpart.
+// It is a genuinely SEPARATE *disburse.Engine (not a second Target on
+// the Monero one) because the two coins need two different real
+// wallet backends AND, critically, a different
+// MaxDestinationsPerBatch: TariWalletGRPC.Transfer refuses more than
+// one destination per call (see that method's own doc comment for
+// the real double-payment risk this constraint prevents — Tari's
+// real Transfer RPC reports success/failure per recipient, but this
+// codebase's WalletClient contract is strictly all-or-nothing, and
+// until that interface carries real per-destination results, a
+// multi-destination Tari batch could see some recipients genuinely
+// paid on-chain while the whole call still reports failure, leaving
+// disburse.Engine's own safety logic unable to tell which ones to
+// debit — this is NOT a stylistic choice, MaxDestinationsPerBatch
+// MUST be 1 for any Tari disburse.Engine, enforced by both this
+// function (hardcoded, not reachable via env var) and TariWalletGRPC
+// itself as a defense-in-depth pair).
+//
+//	GCPOOL_TARI_WALLET_GRPC_ADDR      (required to enable Tari
+//	                                  disbursement) address (host:port)
+//	                                  of a real Tari console/base
+//	                                  wallet GRPC endpoint.
+//	GCPOOL_TARI_WALLET_FEE_PER_GRAM   (optional) default fee_per_gram
+//	                                  for a Transfer whose Priority is
+//	                                  zero. See wallet.WithFeePerGram's
+//	                                  doc comment. Default: whatever
+//	                                  wallet.NewTariWalletGRPC's own
+//	                                  default is (see that package).
+//	GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC,
+//	GCPOOL_DISBURSE_POLL_INTERVAL     shared with the Monero engine's
+//	                                  identically-named env vars (see
+//	                                  buildDisburseEngine) — both
+//	                                  engines read the same values,
+//	                                  since there is no real reason a
+//	                                  deployment would want a
+//	                                  different minimum payout or poll
+//	                                  cadence per coin.
+func buildTariDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
+	addr := os.Getenv("GCPOOL_TARI_WALLET_GRPC_ADDR")
+	if addr == "" {
+		return nil, nil, 0, false, nil
+	}
+
+	var opts []wallet.TariOption
+	if raw := os.Getenv("GCPOOL_TARI_WALLET_FEE_PER_GRAM"); raw != "" {
+		v, parseErr := strconv.ParseUint(raw, 10, 64)
+		if parseErr != nil {
+			return nil, nil, 0, false, fmt.Errorf("GCPOOL_TARI_WALLET_FEE_PER_GRAM: %w", parseErr)
+		}
+		opts = append(opts, wallet.WithFeePerGram(v))
+	}
+	walletClient = wallet.NewTariWalletGRPC(addr, opts...)
+
+	cfg := disburse.Config{
+		Wallet: walletClient,
+		// Hardcoded, not env-var-configurable -- see this function's
+		// own doc comment for why 1 is the only safe value for Tari
+		// today.
+		MaxDestinationsPerBatch: 1,
+		Metrics:                 m,
+	}
+	if raw := os.Getenv("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC"); raw != "" {
+		v, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil {
+			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC: %w", parseErr)
+		}
+		cfg.MinPayoutAtomic = v
+	}
+
+	interval = defaultDisbursePollInterval
+	if raw := os.Getenv("GCPOOL_DISBURSE_POLL_INTERVAL"); raw != "" {
+		v, parseErr := time.ParseDuration(raw)
+		if parseErr != nil {
+			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_POLL_INTERVAL: %w", parseErr)
+		}
+		interval = v
+	}
+
+	return disburse.New(disburseRepositoryAdapter{repo: repo}, cfg), walletClient, interval, true, nil
 }
 
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("backend: %v", err)
+	}
+}
+
+// walletStatsTarget pairs a coin-agnostic wallet.WalletClient with
+// the algo/network labels its GetBalance results should be reported
+// under on the shared WalletBalance gauge.
+type walletStatsTarget struct {
+	algo    string
+	network string
+	client  wallet.WalletClient
+}
+
+// walletBalanceKind* are the four real, distinct balance components
+// this codebase reports (see metrics.Metrics.WalletBalance's doc
+// comment). Monero's own wallet.Balance only ever populates
+// available/pending_outgoing (see MoneroWalletRPC.GetBalance/
+// TariWalletGRPC.GetBalance's respective Total/Unlocked mappings);
+// exposing the full four-kind label set uniformly, even when a given
+// coin's WalletClient can't populate all of them, keeps every
+// wallet's balance queryable with the same PromQL regardless of coin
+// — a deployment scraping wallet_balance_atomic doesn't need to know
+// which coin backs which algo to write one dashboard panel.
+const (
+	walletBalanceKindAvailable       = "available"
+	walletBalanceKindPendingIncoming = "pending_incoming"
+	walletBalanceKindPendingOutgoing = "pending_outgoing"
+	walletBalanceKindTimelocked      = "timelocked"
+)
+
+// runWalletStatsPoller periodically calls GetBalance on every real
+// configured wallet and records the result on m.WalletBalance, until
+// ctx is canceled. This is deliberately independent of
+// disburse.Engine's own internal GetBalance calls (see
+// disburse.go's insufficient-funds check) — that check only runs
+// once per disbursement cycle and is not exported anywhere callers
+// outside the engine can observe, whereas this poller exists purely
+// to keep wallet_balance_atomic fresh on GET /metrics regardless of
+// how often (or whether) a disbursement cycle actually runs.
+//
+// Note on real field coverage: today, WalletClient.GetBalance's
+// coin-agnostic Balance type only carries Total/Unlocked (see
+// wallet.go's doc comment) -- MoneroWalletRPC and TariWalletGRPC both
+// project their coin's richer real balance response down onto those
+// two fields already (see each implementation's own GetBalance).
+// This poller reports Unlocked as "available" and (Total-Unlocked)
+// as "pending_outgoing" (the same real interpretation
+// disburse.Engine's own insufficient-funds check already relies on:
+// Unlocked is what's actually spendable right now). It does NOT
+// report pending_incoming/timelocked as genuinely distinct numbers
+// -- both are folded into Total today, so they are reported here as
+// 0 rather than a fabricated split. Surfacing Tari's real, richer
+// four-field GetBalanceResponse (which DOES have all four natively)
+// would require extending WalletClient.GetBalance's return type, a
+// deliberate interface change for whoever picks that up next, not
+// something to improvise inline in this poller.
+func runWalletStatsPoller(ctx context.Context, m *metrics.Metrics, targets []walletStatsTarget, interval time.Duration) {
+	if interval <= 0 {
+		log.Print("backend: wallet-stats poller: interval <= 0, not starting")
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	pollOnce := func() {
+		for _, t := range targets {
+			bal, err := t.client.GetBalance(ctx)
+			if err != nil {
+				m.WalletBalancePollErrorsTotal.WithLabelValues(t.algo, t.network).Inc()
+				log.Printf("backend: wallet-stats poller: %s/%s: GetBalance: %v", t.algo, t.network, err)
+				continue
+			}
+			m.WalletBalance.WithLabelValues(t.algo, t.network, walletBalanceKindAvailable).Set(float64(bal.Unlocked))
+			m.WalletBalance.WithLabelValues(t.algo, t.network, walletBalanceKindPendingOutgoing).Set(float64(bal.Total - bal.Unlocked))
+			m.WalletBalance.WithLabelValues(t.algo, t.network, walletBalanceKindPendingIncoming).Set(0)
+			m.WalletBalance.WithLabelValues(t.algo, t.network, walletBalanceKindTimelocked).Set(0)
+		}
+	}
+
+	pollOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pollOnce()
+		}
 	}
 }
 
@@ -668,7 +836,7 @@ func run() error {
 		log.Print("backend: block unlocker disabled (neither GCPOOL_TARI_GRPC_ADDR nor GCPOOL_MONERO_RPC_ADDR is set)")
 	}
 
-	disburseEngine, disburseInterval, disburseEnabled, err := buildDisburseEngine(repo, m)
+	disburseEngine, moneroWalletClient, disburseInterval, disburseEnabled, err := buildDisburseEngine(repo, m)
 	if err != nil {
 		return fmt.Errorf("configuring payout disbursement engine: %w", err)
 	}
@@ -678,6 +846,45 @@ func run() error {
 		go disburseEngine.RunLoop(ctx, targets, disburseInterval)
 	} else {
 		log.Print("backend: payout disbursement engine disabled (GCPOOL_MONERO_WALLET_RPC_ADDR not set); pending_balance will still accrue, it just won't be auto-paid out on-chain")
+	}
+
+	tariDisburseEngine, tariWalletClient, tariDisburseInterval, tariDisburseEnabled, err := buildTariDisburseEngine(repo, m)
+	if err != nil {
+		return fmt.Errorf("configuring Tari payout disbursement engine: %w", err)
+	}
+	if tariDisburseEnabled {
+		targets := make([]disburse.Target, 0, len(tariAlgos))
+		for _, algo := range tariAlgos {
+			targets = append(targets, disburse.Target{Algo: algo, Network: networkDBString(network)})
+		}
+		log.Printf("backend: Tari payout disbursement engine enabled, polling every %s for %v (max 1 destination/batch, see buildTariDisburseEngine)", tariDisburseInterval, targets)
+		go tariDisburseEngine.RunLoop(ctx, targets, tariDisburseInterval)
+	} else {
+		log.Print("backend: Tari payout disbursement engine disabled (GCPOOL_TARI_WALLET_GRPC_ADDR not set); pending_balance will still accrue, it just won't be auto-paid out on-chain")
+	}
+
+	var walletStatsTargets []walletStatsTarget
+	if moneroWalletClient != nil {
+		walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: "RXM", network: networkDBString(network), client: moneroWalletClient})
+	}
+	if tariWalletClient != nil {
+		for _, algo := range tariAlgos {
+			walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: algo, network: networkDBString(network), client: tariWalletClient})
+		}
+	}
+	if len(walletStatsTargets) > 0 {
+		walletStatsInterval := defaultWalletStatsPollInterval
+		if raw := os.Getenv("GCPOOL_WALLET_STATS_POLL_INTERVAL"); raw != "" {
+			v, parseErr := time.ParseDuration(raw)
+			if parseErr != nil {
+				return fmt.Errorf("GCPOOL_WALLET_STATS_POLL_INTERVAL: %w", parseErr)
+			}
+			walletStatsInterval = v
+		}
+		log.Printf("backend: wallet-stats poller enabled, polling every %s for %d target(s)", walletStatsInterval, len(walletStatsTargets))
+		go runWalletStatsPoller(ctx, m, walletStatsTargets, walletStatsInterval)
+	} else {
+		log.Print("backend: wallet-stats poller disabled (no wallet RPC configured for either coin)")
 	}
 
 	srv := &http.Server{
