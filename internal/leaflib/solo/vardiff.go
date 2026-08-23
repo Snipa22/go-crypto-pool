@@ -89,7 +89,20 @@ func (s *Session) maybeRetarget() {
 	curDiff := s.currentDifficulty.Load()
 	hashes := s.hashesAccumulated.Load()
 
-	newDiff, changed := computeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, cfg.MinDifficulty, cfg.MaxDifficulty)
+	// An operator-forced minimum difficulty (see session.go's
+	// handleLogin and internal/leaflib/addressflags's package doc
+	// comment) must never be undercut by a vardiff retarget for the
+	// lifetime of this connection -- raising the effective floor here
+	// to at least s.forcedMinDifficulty (0 when unset, a complete
+	// no-op) is the ONLY change from the server's own configured
+	// cfg.MinDifficulty; the ceiling (cfg.MaxDifficulty) and every
+	// other part of the retarget algorithm are untouched.
+	minDiff := cfg.MinDifficulty
+	if floor := s.forcedMinDifficulty.Load(); floor > minDiff {
+		minDiff = floor
+	}
+
+	newDiff, changed := computeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, minDiff, cfg.MaxDifficulty)
 	if !changed {
 		return
 	}

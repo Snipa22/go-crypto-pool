@@ -124,6 +124,19 @@ type Session struct {
 	// retarget can touch it, and no shared/global state is involved.
 	currentDifficulty atomic.Uint64
 
+	// forcedMinDifficulty is this session's own operator-forced
+	// difficulty floor (0 = none), captured from
+	// addressflags.Cache.Get at login time (handleLogin below) and
+	// never mutated afterward for the lifetime of the connection --
+	// a mid-connection ban/floor change takes effect on this miner's
+	// NEXT login, not retroactively on an already-established
+	// session (mirrors how a vardiff retarget only ever affects this
+	// session's own future jobs, never rewrites history). vardiff.go's
+	// maybeRetarget reads this on every retarget tick to make sure
+	// its own MinDifficulty floor is never allowed to undercut an
+	// operator's explicit forced minimum.
+	forcedMinDifficulty atomic.Uint64
+
 	// hashesAccumulated is the difficulty-weighted accept-history
 	// accumulator (go-tari-sha3x-solo-stratum's minerStruct.hashes):
 	// incremented by the job's current StaticDifficulty on every
@@ -289,6 +302,30 @@ func (s *Session) handleLogin(req Request) {
 		return
 	}
 
+	// REAL enforcement point for the manual ban/forced-minimum-
+	// difficulty system (see internal/leaflib/addressflags's package
+	// doc comment for the full rationale on why this belongs here,
+	// at login time on the leaf, rather than at the backend). Nil
+	// s.server.addressFlags (the default -- see EnableAddressFlags'
+	// doc comment) means every address is treated as unflagged,
+	// identical to this feature not existing at all.
+	//
+	// Checked and rejected BEFORE the address is stored/loggedIn is
+	// flipped and BEFORE any job is fetched -- a banned address never
+	// becomes this session's payout address for any purpose, and
+	// never receives a job template, exactly mirroring how an invalid
+	// address is rejected above.
+	var forcedFloor uint64
+	if s.server.addressFlags != nil {
+		flags := s.server.addressFlags.Get(login.Login)
+		if flags.Banned {
+			s.server.logger.Printf("solo: rejecting login for banned address %s (session %s)", login.Login, s.sessionID)
+			s.writeGeneralResponse(req.ID, "this address is banned from this pool", "")
+			return
+		}
+		forcedFloor = flags.ForcedMinDifficulty
+	}
+
 	worker := login.Pass
 	if login.RigID != "" {
 		worker = login.RigID
@@ -301,6 +338,23 @@ func (s *Session) handleLogin(req Request) {
 	s.worker.Store(worker)
 	s.agent.Store(login.Agent)
 	s.loggedIn.Store(true)
+
+	// A forced minimum difficulty always wins over the port tier's
+	// own configured starting difficulty -- an operator explicitly
+	// floored this address because the port's default was
+	// inappropriate for it (e.g. a known low-power rig previously
+	// share-flooding at the port default), so silently starting it
+	// below that floor and waiting for vardiff to eventually correct
+	// it would defeat the point of the floor being enforced AT LOGIN
+	// at all.
+	startDiff := s.currentDifficulty.Load()
+	if forcedFloor > 0 {
+		s.forcedMinDifficulty.Store(forcedFloor)
+		if forcedFloor > startDiff {
+			startDiff = forcedFloor
+			s.currentDifficulty.Store(startDiff)
+		}
+	}
 
 	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
 	if err != nil {

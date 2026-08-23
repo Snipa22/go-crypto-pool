@@ -87,7 +87,10 @@ type Session struct {
 
 	connectedAt       time.Time
 	currentDifficulty atomic.Uint64
-	hashesAccumulated atomic.Uint64
+	// forcedMinDifficulty mirrors solo.Session's own field exactly --
+	// see that field's doc comment.
+	forcedMinDifficulty atomic.Uint64
+	hashesAccumulated   atomic.Uint64
 }
 
 func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64) *Session {
@@ -189,6 +192,27 @@ func (s *Session) handleLogin(req solo.Request) {
 		return
 	}
 
+	// REAL enforcement point for the manual ban/forced-minimum-
+	// difficulty system -- mirrors solo.Session's own handleLogin
+	// exactly (see internal/leaflib/addressflags's package doc
+	// comment for the full rationale). leaf-direct's own
+	// addressflags.Cache is fed by a real backend poll
+	// (addressflags.HTTPSource against the backend's GET
+	// /api/v1/leaf/address-flags — see cmd/leaf-direct/main.go)
+	// rather than leaf-solo's local file, but the enforcement logic
+	// here is identical: nil s.server.addressFlags means every
+	// address is treated as unflagged.
+	var forcedFloor uint64
+	if s.server.addressFlags != nil {
+		flags := s.server.addressFlags.Get(login.Login)
+		if flags.Banned {
+			s.server.logger.Printf("direct: rejecting login for banned address %s (session %s)", login.Login, s.sessionID)
+			s.writeGeneralResponse(req.ID, "this address is banned from this pool", "")
+			return
+		}
+		forcedFloor = flags.ForcedMinDifficulty
+	}
+
 	worker := login.Pass
 	if login.RigID != "" {
 		worker = login.RigID
@@ -201,6 +225,18 @@ func (s *Session) handleLogin(req solo.Request) {
 	s.worker.Store(worker)
 	s.agent.Store(login.Agent)
 	s.loggedIn.Store(true)
+
+	// A forced minimum difficulty always wins over the port tier's
+	// own configured starting difficulty -- mirrors solo.Session's
+	// own handleLogin exactly (see that method's doc comment).
+	startDiff := s.currentDifficulty.Load()
+	if forcedFloor > 0 {
+		s.forcedMinDifficulty.Store(forcedFloor)
+		if forcedFloor > startDiff {
+			startDiff = forcedFloor
+			s.currentDifficulty.Store(startDiff)
+		}
+	}
 
 	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
 	if err != nil {

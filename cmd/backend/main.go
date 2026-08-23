@@ -121,6 +121,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/disburse"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/leafflagsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/payout"
@@ -361,6 +362,34 @@ func (a networkAPIRepositoryAdapter) NetworkStatsSince(ctx context.Context, algo
 		LastBlockAt:     s.LastBlockAt,
 		LastBlockHeight: s.LastBlockHeight,
 	}, nil
+}
+
+// leafFlagsRepositoryAdapter adapts *db.Repository (whose
+// ListAddressFlags operates on db.AddressFlag) to
+// leafflagsapi.Repository (which operates on leafflagsapi.Flag — a
+// deliberately narrower, leaf-facing projection with no audit
+// metadata; see that package's doc comment for why), mirroring
+// networkAPIRepositoryAdapter's role above for the real, read-only
+// GET /api/v1/leaf/address-flags endpoint leaf-direct polls (see
+// internal/leaflib/addressflags.HTTPSource).
+type leafFlagsRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a leafFlagsRepositoryAdapter) ListActiveAddressFlags(ctx context.Context) ([]leafflagsapi.Flag, error) {
+	rows, err := a.repo.ListAddressFlags(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]leafflagsapi.Flag, 0, len(rows))
+	for _, f := range rows {
+		out = append(out, leafflagsapi.Flag{
+			PaymentAddress:      f.PaymentAddress,
+			Banned:              f.Banned,
+			ForcedMinDifficulty: f.ForcedMinDifficulty,
+		})
+	}
+	return out, nil
 }
 
 // unlockerRepositoryAdapter adapts *db.Repository (whose
@@ -1135,6 +1164,18 @@ func run() error {
 	// statsHandler above (whole-pool vs. single-miner).
 	networkAPIHandler := networkapi.NewHandler(networkAPIRepositoryAdapter{repo: repo})
 
+	// leafFlagsHandler serves the real, read-only GET
+	// /api/v1/leaf/address-flags endpoint leaf-direct polls to learn
+	// about manually-flagged (banned / forced-minimum-difficulty)
+	// payment addresses -- see internal/backend/leafflagsapi's
+	// package doc comment for how this differs from (and does NOT
+	// replace) the address_flags CLI's own write-side, which stays
+	// CLI-only/-yes-gated. leaf-solo, which has no backend connection
+	// at all, uses a local file-based source instead (see
+	// internal/leaflib/addressflags.FileSource) and never talks to
+	// this endpoint.
+	leafFlagsHandler := leafflagsapi.NewHandler(leafFlagsRepositoryAdapter{repo: repo})
+
 	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig()
 	if err != nil {
 		return fmt.Errorf("configuring block unlocker: %w", err)
@@ -1229,6 +1270,7 @@ func run() error {
 	statsHandler.RegisterRoutes(mux)
 	addressMapHandler.RegisterRoutes(mux)
 	networkAPIHandler.RegisterRoutes(mux)
+	leafFlagsHandler.RegisterRoutes(mux)
 
 	srv := &http.Server{
 		Addr:              listenAddr,
