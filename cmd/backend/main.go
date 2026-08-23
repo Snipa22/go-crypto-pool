@@ -30,6 +30,42 @@
 //	                         must prevent. Every submitted Share/Block
 //	                         must carry this exact network or it is
 //	                         rejected with 400.
+//	GCPOOL_TARI_GRPC_ADDR    (optional) host:port of a real Tari base
+//	                         node's GRPC endpoint. When set, the block
+//	                         unlocker (internal/backend/unlocker) polls
+//	                         every pending ALGO_RXT/ALGO_C29/ALGO_SHA3X
+//	                         block against it (internal/backend/chain.
+//	                         TariVerifier) to detect maturity/orphaning.
+//	                         When unset, those algos' blocks are simply
+//	                         never auto-unlocked — a deliberate opt-in,
+//	                         not a startup failure, since not every
+//	                         deployment mines every coin.
+//	GCPOOL_MONERO_RPC_ADDR   (optional) base URL of a real monerod
+//	                         JSON-RPC endpoint (e.g.
+//	                         "http://127.0.0.1:18081"). When set, the
+//	                         unlocker polls every pending ALGO_RXM block
+//	                         against it (internal/backend/chain.
+//	                         MoneroVerifier). Same opt-in behavior as
+//	                         GCPOOL_TARI_GRPC_ADDR above.
+//	GCPOOL_UNLOCKER_POLL_INTERVAL (optional) how often the unlocker
+//	                         re-checks pending blocks, as a
+//	                         time.ParseDuration string (e.g. "60s").
+//	                         Default "60s". Only consulted if at least
+//	                         one of the two RPC addrs above is set.
+//	GCPOOL_UNLOCKER_TARI_MATURITY (optional) confirmations required
+//	                         before a Tari-family block (RXT/C29/SHA3X)
+//	                         is marked unlocked/payable. Default 60 —
+//	                         a PLACEHOLDER, operationally-tunable value,
+//	                         not a Tari protocol constant; pool
+//	                         operators should set this to their own
+//	                         real reorg-safety requirement.
+//	GCPOOL_UNLOCKER_MONERO_MATURITY (optional) confirmations required
+//	                         before an RXM block is marked unlocked/
+//	                         payable. Default 60, mirroring Monero's
+//	                         own real CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW
+//	                         (coinbase spend maturity) — a sensible
+//	                         starting default, but still operator-
+//	                         tunable via this variable, not hardcoded.
 package main
 
 import (
@@ -40,16 +76,30 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/api"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
 const defaultListenAddr = ":8080"
+
+// defaultUnlockerPollInterval/defaultTariMaturity/defaultMoneroMaturity
+// are this command's PLACEHOLDER defaults for the unlocker's env vars
+// — see this file's package doc comment for why these are
+// operator-tunable rather than baked-in protocol constants.
+const (
+	defaultUnlockerPollInterval = 60 * time.Second
+	defaultTariMaturity         = int64(60)
+	defaultMoneroMaturity       = int64(60)
+)
 
 // Version is the backend's build version, recorded on the
 // backend_build_info Prometheus gauge. Overridable at build time via
@@ -115,6 +165,105 @@ func (a repositoryAdapter) InsertBlock(ctx context.Context, b api.BlockRecord) e
 	})
 }
 
+// unlockerRepositoryAdapter adapts *db.Repository (whose
+// PendingBlocks/SetBlockStatus operate on db.PendingBlock) to
+// unlocker.Repository (which operates on unlocker.Block), mirroring
+// repositoryAdapter's role above for the ingestion side — see
+// unlocker.Repository's doc comment for why this indirection exists.
+type unlockerRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a unlockerRepositoryAdapter) PendingBlocks(ctx context.Context, algo string) ([]unlocker.Block, error) {
+	rows, err := a.repo.PendingBlocks(ctx, algo)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]unlocker.Block, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, unlocker.Block{
+			ID:      r.ID,
+			Algo:    r.Algo,
+			Network: r.Network,
+			Hash:    r.Hash,
+			Height:  r.Height,
+		})
+	}
+	return out, nil
+}
+
+func (a unlockerRepositoryAdapter) SetBlockStatus(ctx context.Context, id int64, valid, unlocked bool) error {
+	return a.repo.SetBlockStatus(ctx, id, valid, unlocked)
+}
+
+// tariAlgos is every algo string mined against a Tari base node —
+// mirrors internal/leaflib/solo/node.go's tariPowAlgo grouping exactly
+// (SHA3X, C29, RXT all speak to the same base node GRPC surface; only
+// RXM is Monero).
+var tariAlgos = []string{"RXT", "C29", "SHA3X"}
+
+// buildUnlockerConfig reads the GCPOOL_TARI_GRPC_ADDR/
+// GCPOOL_MONERO_RPC_ADDR/GCPOOL_UNLOCKER_* environment variables (see
+// this file's package doc comment) and returns a ready-to-use
+// unlocker.Config plus whether any verifier was actually configured
+// (ok == false means the caller should not start the unlocker at all
+// — see run()).
+func buildUnlockerConfig() (cfg unlocker.Config, ok bool, err error) {
+	cfg.Coins = map[string]unlocker.CoinConfig{}
+
+	pollInterval := defaultUnlockerPollInterval
+	if raw := os.Getenv("GCPOOL_UNLOCKER_POLL_INTERVAL"); raw != "" {
+		pollInterval, err = time.ParseDuration(raw)
+		if err != nil {
+			return cfg, false, fmt.Errorf("GCPOOL_UNLOCKER_POLL_INTERVAL: %w", err)
+		}
+	}
+	cfg.PollInterval = pollInterval
+
+	if addr := os.Getenv("GCPOOL_TARI_GRPC_ADDR"); addr != "" {
+		maturity := defaultTariMaturity
+		if raw := os.Getenv("GCPOOL_UNLOCKER_TARI_MATURITY"); raw != "" {
+			m, parseErr := strconv.ParseInt(raw, 10, 64)
+			if parseErr != nil {
+				return cfg, false, fmt.Errorf("GCPOOL_UNLOCKER_TARI_MATURITY: %w", parseErr)
+			}
+			maturity = m
+		}
+		verifier := chain.NewTariVerifier(addr)
+		for _, algo := range tariAlgos {
+			cfg.Coins[algo] = unlocker.CoinConfig{Verifier: verifier, MaturityDepth: maturity}
+		}
+		ok = true
+	}
+
+	if addr := os.Getenv("GCPOOL_MONERO_RPC_ADDR"); addr != "" {
+		maturity := defaultMoneroMaturity
+		if raw := os.Getenv("GCPOOL_UNLOCKER_MONERO_MATURITY"); raw != "" {
+			m, parseErr := strconv.ParseInt(raw, 10, 64)
+			if parseErr != nil {
+				return cfg, false, fmt.Errorf("GCPOOL_UNLOCKER_MONERO_MATURITY: %w", parseErr)
+			}
+			maturity = m
+		}
+		cfg.Coins["RXM"] = unlocker.CoinConfig{Verifier: chain.NewMoneroVerifier(addr), MaturityDepth: maturity}
+		ok = true
+	}
+
+	return cfg, ok, nil
+}
+
+// sortedKeys returns m's keys sorted, purely for deterministic,
+// readable startup log output (buildUnlockerConfig's map iteration
+// order is otherwise unspecified).
+func sortedKeys(m map[string]unlocker.CoinConfig) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("backend: %v", err)
@@ -156,6 +305,18 @@ func run() error {
 		Network:         network,
 		Version:         Version,
 	})
+
+	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig()
+	if err != nil {
+		return fmt.Errorf("configuring block unlocker: %w", err)
+	}
+	if unlockerEnabled {
+		u := unlocker.New(unlockerRepositoryAdapter{repo: repo}, unlockerCfg)
+		log.Printf("backend: block unlocker enabled, polling every %s for algos %v", unlockerCfg.PollInterval, sortedKeys(unlockerCfg.Coins))
+		go u.RunLoop(ctx)
+	} else {
+		log.Print("backend: block unlocker disabled (neither GCPOOL_TARI_GRPC_ADDR nor GCPOOL_MONERO_RPC_ADDR is set)")
+	}
 
 	srv := &http.Server{
 		Addr:              listenAddr,
