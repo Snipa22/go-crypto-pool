@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	directmetrics "github.com/Snipa22/go-crypto-pool/internal/leaflib/direct/metrics"
 )
 
@@ -17,14 +18,22 @@ import (
 // bookkeeping as leaf-solo; BlockCount here means a genuine found
 // block, same as solo, NOT leaf-proxy's "forwarded upstream" sense).
 type SessionStat struct {
-	SessionID         string
-	Address           string
-	Worker            string
+	SessionID string
+	Address   string
+	Worker    string
+	// Agent is the real miner software/version string the miner
+	// self-reported at login (solo.LoginRequest.Agent) — mirrors
+	// solo/server.go's SessionStat.Agent exactly.
+	Agent             string
 	RemoteAddr        string
 	ConnectedAt       time.Time
 	CurrentDifficulty uint64
 	ShareCount        uint64
 	BlockCount        uint64
+	// EstimatedHashrate mirrors solo/server.go's own
+	// SessionStat.EstimatedHashrate exactly (see
+	// leaflib.EstimateHashrateHz's doc comment for the formula).
+	EstimatedHashrate float64
 }
 
 // AddressCount is one entry in Stats.MinersByAddress: a mining/payout
@@ -103,6 +112,7 @@ func (s *Server) Stats() Stats {
 
 		addr, _ := sess.address.Load().(string)
 		worker, _ := sess.worker.Load().(string)
+		agent, _ := sess.agent.Load().(string)
 		remoteIP := directmetrics.RemoteIPOf(sess.mc.RemoteAddr())
 		diff := sess.currentDifficulty.Load()
 
@@ -122,11 +132,13 @@ func (s *Server) Stats() Stats {
 			SessionID:         sess.sessionID,
 			Address:           addr,
 			Worker:            worker,
+			Agent:             agent,
 			RemoteAddr:        remoteAddr,
 			ConnectedAt:       sess.connectedAt,
 			CurrentDifficulty: diff,
 			ShareCount:        sess.shareCount.Load(),
 			BlockCount:        sess.blockCount.Load(),
+			EstimatedHashrate: leaflib.EstimateHashrateHz(sess.hashesAccumulated.Load(), sess.connectedAt),
 		})
 	}
 
@@ -243,6 +255,7 @@ var statsPageTemplate = template.Must(template.New("direct-stats").Funcs(templat
 		}
 		return time.Since(t).Round(time.Second).String()
 	},
+	"formatHashrate": formatHashrate,
 }).Parse(statsPageHTML))
 
 const statsPageHTML = `<!DOCTYPE html>
@@ -309,16 +322,18 @@ const statsPageHTML = `<!DOCTYPE html>
   <h2>Connected sessions</h2>
   {{if .Stats.Sessions}}
   <table>
-    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Remote address</th><th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Shares</th><th>Blocks</th></tr>
+    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Agent</th><th>Remote address</th><th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Blocks</th></tr>
     {{range .Stats.Sessions}}
     <tr>
       <td>{{.SessionID}}</td>
       <td>{{if .Address}}{{.Address}}{{else}}<span class="empty">(not logged in)</span>{{end}}</td>
       <td>{{.Worker}}</td>
+      <td>{{if .Agent}}{{.Agent}}{{else}}<span class="empty">(unknown)</span>{{end}}</td>
       <td>{{.RemoteAddr}}</td>
       <td>{{formatTime .ConnectedAt}}</td>
       <td>{{connDuration .ConnectedAt}}</td>
       <td>{{.CurrentDifficulty}}</td>
+      <td>{{formatHashrate .EstimatedHashrate}}</td>
       <td>{{.ShareCount}}</td>
       <td>{{.BlockCount}}</td>
     </tr>
@@ -337,6 +352,20 @@ type statsPageData struct {
 	Stats            Stats
 	MaxAddressLabels int
 	AddressCapped    bool
+}
+
+// formatHashrate mirrors solo/statsui.go's own formatHashrate exactly.
+func formatHashrate(hz float64) string {
+	if hz <= 0 {
+		return "0 H/s"
+	}
+	units := []string{"H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s"}
+	i := 0
+	for hz >= 1000 && i < len(units)-1 {
+		hz /= 1000
+		i++
+	}
+	return fmt.Sprintf("%.2f %s", hz, units[i])
 }
 
 // StatsHTMLHandler serves the basic stats UI page described above,

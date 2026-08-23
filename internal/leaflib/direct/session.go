@@ -62,6 +62,11 @@ type Session struct {
 	loggedIn  atomic.Bool
 	address   atomic.Value // string
 	worker    atomic.Value // string
+	// agent mirrors solo.Session's own agent field exactly: the real
+	// miner software/version string self-reported at login
+	// (solo.LoginRequest.Agent), stored verbatim and unvalidated,
+	// diagnostic-only.
+	agent atomic.Value // string
 
 	// --- per-session job ownership, mirroring solo.Session's own
 	// SECURITY FIX (PR #14) exactly: see solo/session.go's Session
@@ -95,6 +100,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	}
 	s.address.Store("")
 	s.worker.Store("")
+	s.agent.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
 	return s
 }
@@ -174,6 +180,7 @@ func (s *Session) handleLogin(req solo.Request) {
 
 	s.address.Store(login.Login)
 	s.worker.Store(worker)
+	s.agent.Store(login.Agent)
 	s.loggedIn.Store(true)
 
 	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())

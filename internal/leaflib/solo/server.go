@@ -146,10 +146,13 @@ func (s *Server) sessionSnapshots() []metrics.SessionSnapshot {
 	out := make([]metrics.SessionSnapshot, 0, len(s.sessions))
 	for _, sess := range s.sessions {
 		addr, _ := sess.address.Load().(string)
+		agent, _ := sess.agent.Load().(string)
 		out = append(out, metrics.SessionSnapshot{
 			Address:    addr,
+			Agent:      agent,
 			RemoteIP:   metrics.RemoteIPOf(sess.mc.RemoteAddr()),
 			Difficulty: sess.currentDifficulty.Load(),
+			Hashrate:   leaflib.EstimateHashrateHz(sess.hashesAccumulated.Load(), sess.connectedAt),
 		})
 	}
 	return out
@@ -303,14 +306,26 @@ func (s *Server) Shutdown() {
 // SessionStat is one connected session's real, point-in-time
 // diagnostic snapshot, used by both Stats() and the stats HTML page.
 type SessionStat struct {
-	SessionID         string
-	Address           string
-	Worker            string
+	SessionID string
+	Address   string
+	Worker    string
+	// Agent is the real miner software/version string the miner
+	// self-reported at login (LoginRequest.Agent) — see
+	// session.go's Session.agent doc comment. Empty if not logged
+	// in, or the miner sent no "agent" field.
+	Agent             string
 	RemoteAddr        string
 	ConnectedAt       time.Time
 	CurrentDifficulty uint64
 	ShareCount        uint64
 	BlockCount        uint64
+	// EstimatedHashrate is this session's real, per-session
+	// estimated hashrate in hashes/second, derived from its own
+	// difficulty-weighted accept-history accumulator and connection
+	// age — see leaflib.EstimateHashrateHz's doc comment for the
+	// full formula/rationale (industry-standard difficulty*2^32/time
+	// approximation, not a cryptographically exact hash count).
+	EstimatedHashrate float64
 }
 
 // AddressCount is one entry in Stats.MinersByAddress: a mining/payout
@@ -361,6 +376,7 @@ func (s *Server) Stats() Stats {
 
 		addr, _ := sess.address.Load().(string)
 		worker, _ := sess.worker.Load().(string)
+		agent, _ := sess.agent.Load().(string)
 		remoteIP := metrics.RemoteIPOf(sess.mc.RemoteAddr())
 		diff := sess.currentDifficulty.Load()
 
@@ -380,11 +396,13 @@ func (s *Server) Stats() Stats {
 			SessionID:         sess.sessionID,
 			Address:           addr,
 			Worker:            worker,
+			Agent:             agent,
 			RemoteAddr:        remoteAddr,
 			ConnectedAt:       sess.connectedAt,
 			CurrentDifficulty: diff,
 			ShareCount:        sess.shareCount.Load(),
 			BlockCount:        sess.blockCount.Load(),
+			EstimatedHashrate: leaflib.EstimateHashrateHz(sess.hashesAccumulated.Load(), sess.connectedAt),
 		})
 	}
 

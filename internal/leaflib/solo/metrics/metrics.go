@@ -96,6 +96,15 @@ type SessionSnapshot struct {
 	// Difficulty is the session's current (post-vardiff) share
 	// difficulty at the moment of the snapshot.
 	Difficulty uint64
+	// Agent is the real miner software/version string the session's
+	// miner self-reported at login (solo.LoginRequest.Agent), or ""
+	// if not logged in / not sent. Miner-controlled, diagnostic-only
+	// — never used in any accept/reject decision.
+	Agent string
+	// Hashrate is this session's real, per-session estimated
+	// hashrate in hashes/second at the moment of the snapshot (see
+	// leaflib.EstimateHashrateHz's doc comment for the formula).
+	Hashrate float64
 }
 
 // SnapshotFunc returns the current set of connected sessions. It is
@@ -234,6 +243,21 @@ var (
 		"Current number of connected sessions per mining/payout address (live snapshot, capped cardinality — overflow addresses are aggregated into address=\"other\").",
 		[]string{"address"}, nil,
 	)
+	// minerHashrateByAddressDesc reports the real, summed per-session
+	// estimated hashrate (leaflib.EstimateHashrateHz) of every
+	// currently-connected session, aggregated by mining/payout
+	// address and subject to the EXACT SAME cardinality cap as
+	// minersByAddressDesc above (CapAddressHashrates, the float64
+	// analogue of CapAddressCounts) — an address is attacker-
+	// controllable (any login string), so this gauge's cardinality
+	// must be bounded identically to the miners-by-address gauge it
+	// is aggregated alongside, never per raw session (session IDs
+	// are even more attacker-controllable via connection churn).
+	minerHashrateByAddressDesc = prometheus.NewDesc(
+		"leaf_miner_hashrate_hash_per_second",
+		"Real, per-address SUM of currently-connected sessions' estimated hashrate in hashes/second (see leaflib.EstimateHashrateHz's doc comment for the difficulty*2^32/time estimation formula — an industry-standard approximation, not a cryptographically exact hash count). Same capped cardinality as leaf_miners_by_address; overflow aggregated into address=\"other\".",
+		[]string{"address"}, nil,
+	)
 )
 
 // vardiffDifficultyBuckets covers LEAF_SOLO_MIN_DIFFICULTY..
@@ -264,6 +288,7 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 
 	ipSet := make(map[string]struct{}, len(snaps))
 	addrCounts := make(map[string]int)
+	addrHashrates := make(map[string]float64)
 	hist := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "leaf_vardiff_current_difficulty",
 		Help:    "Distribution of currently-connected sessions' current (post-vardiff) share difficulty, recomputed on every scrape.",
@@ -275,6 +300,7 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 		}
 		if s.Address != "" {
 			addrCounts[s.Address]++
+			addrHashrates[s.Address] += s.Hashrate
 		}
 		hist.Observe(float64(s.Difficulty))
 	}
@@ -288,6 +314,14 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	}
 	if other > 0 {
 		ch <- prometheus.MustNewConstMetric(minersByAddressDesc, prometheus.GaugeValue, float64(other), OtherAddressLabel)
+	}
+
+	keptRates, otherRate := CapAddressHashrates(addrHashrates, m.maxAddressLabels)
+	for addr, rate := range keptRates {
+		ch <- prometheus.MustNewConstMetric(minerHashrateByAddressDesc, prometheus.GaugeValue, rate, addr)
+	}
+	if otherRate > 0 {
+		ch <- prometheus.MustNewConstMetric(minerHashrateByAddressDesc, prometheus.GaugeValue, otherRate, OtherAddressLabel)
 	}
 }
 
@@ -333,6 +367,52 @@ func CapAddressCounts(counts map[string]int, max int) (kept map[string]int, othe
 			kept[items[i].addr] = items[i].count
 		} else {
 			otherTotal += items[i].count
+		}
+	}
+	return kept, otherTotal
+}
+
+// CapAddressHashrates is CapAddressCounts' float64 analogue, used to
+// bound leaf_miner_hashrate_hash_per_second's cardinality identically
+// to leaf_miners_by_address's (see minerHashrateByAddressDesc's doc
+// comment): if rates already has max or fewer distinct addresses, it
+// is returned unchanged with otherTotal == 0. Otherwise the top
+// (max-1) addresses by rate (ties broken by address, for deterministic
+// output) are kept verbatim and every remaining address's rate is
+// summed into otherTotal, under OtherAddressLabel.
+func CapAddressHashrates(rates map[string]float64, max int) (kept map[string]float64, otherTotal float64) {
+	if max <= 0 {
+		max = DefaultMaxAddressLabels
+	}
+	if len(rates) <= max {
+		return rates, 0
+	}
+
+	type kv struct {
+		addr string
+		rate float64
+	}
+	items := make([]kv, 0, len(rates))
+	for a, r := range rates {
+		items = append(items, kv{a, r})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].rate != items[j].rate {
+			return items[i].rate > items[j].rate
+		}
+		return items[i].addr < items[j].addr
+	})
+
+	keepN := max - 1
+	if keepN < 0 {
+		keepN = 0
+	}
+	kept = make(map[string]float64, keepN)
+	for i := 0; i < len(items); i++ {
+		if i < keepN {
+			kept[items[i].addr] = items[i].rate
+		} else {
+			otherTotal += items[i].rate
 		}
 	}
 	return kept, otherTotal

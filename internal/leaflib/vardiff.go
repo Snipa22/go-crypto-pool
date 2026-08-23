@@ -131,3 +131,42 @@ func ComputeRetarget(curDiff, hashes uint64, connSeconds, targetTime int, minDif
 	}
 	return nd, true
 }
+
+// hashesPerDifficultyUnit is the standard difficulty-to-hash-attempts
+// conversion factor (2^32) that nearly every real Stratum-style mining
+// pool codebase (ckpool, node-stratum-pool, nodejs-pool, and the legacy
+// go-tari-*-solo-stratum family this repo already ports from elsewhere)
+// uses to turn a difficulty-weighted accept-history accumulator into an
+// approximate hashes/second figure: a single accepted share at
+// difficulty D represents, on expectation, D * 2^32 hash attempts. This
+// is an APPROXIMATION — the real work-per-difficulty-unit is genuinely
+// algo-specific (SHA3X/C29/RandomX all have different real per-attempt
+// cost) — but it is the industry-standard shape operators expect from a
+// "real hashrate" figure on a stats page/gauge, and it is exactly the
+// same convention this repo's own vardiff formula already implicitly
+// assumes (ComputeRetarget above treats hashesAccumulated/connSeconds as
+// directly comparable to a difficulty value).
+const hashesPerDifficultyUnit = 4294967296 // 2^32
+
+// EstimateHashrateHz estimates a session's real, per-session hashrate in
+// hashes/second from its difficulty-weighted accept-history accumulator
+// (hashesAccumulated — the same counter ComputeRetarget above consumes;
+// see solo/session.go's Session.hashesAccumulated doc comment: the sum
+// of job.StaticDifficulty over every share accepted so far, never reset
+// for the life of the connection) and the connection's age (elapsed
+// wall-clock time since connectedAt).
+//
+// Returns 0 for a session that has not yet been credited with any
+// accepted-share difficulty, or whose connectedAt is in the future/now
+// (guards a possible negative/zero elapsed duration rather than
+// dividing by a non-positive number).
+func EstimateHashrateHz(hashesAccumulated uint64, connectedAt time.Time) float64 {
+	if hashesAccumulated == 0 {
+		return 0
+	}
+	elapsed := time.Since(connectedAt).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(hashesAccumulated) * hashesPerDifficultyUnit / elapsed
+}
