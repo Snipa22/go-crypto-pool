@@ -38,6 +38,17 @@ func ValidatePoolType(poolType string) error {
 	return fmt.Errorf("db: unknown pool_type %q (want one of %v)", poolType, ValidPoolTypes)
 }
 
+// ValidateNetwork reports whether network is one of the known
+// network column values (see ValidNetworks).
+func ValidateNetwork(network string) error {
+	for _, n := range ValidNetworks {
+		if n == network {
+			return nil
+		}
+	}
+	return fmt.Errorf("db: unknown network %q (want one of %v)", network, ValidNetworks)
+}
+
 // heightPartitionParent returns the name of the (algo, pool_type)
 // partitioned table that owns block_height RANGE leaf partitions, e.g.
 // "shares_rxt_pplns". Caller must have already validated algo/poolType.

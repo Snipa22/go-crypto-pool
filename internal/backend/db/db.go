@@ -40,6 +40,13 @@ var ValidAlgos = []string{"RXT", "C29", "SHA3X", "RXM"}
 // matching the PoolType enum in internal/proto/share.proto.
 var ValidPoolTypes = []string{"SOLO", "PPS", "PPLNS", "PROP"}
 
+// ValidNetworks is the fixed set of network column values, matching
+// the Network enum in internal/proto/share.proto (string form). Used
+// by the read-only miner stats surface (stats.go) to validate an
+// optional network filter the same way ValidateAlgo already validates
+// algo everywhere else in this package.
+var ValidNetworks = []string{"MAINNET", "TESTNET"}
+
 // Config holds the settings needed to establish the backend's Postgres
 // connection pool.
 type Config struct {

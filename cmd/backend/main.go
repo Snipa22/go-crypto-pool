@@ -120,6 +120,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/disburse"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/payout"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/statsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -218,6 +219,60 @@ func (a repositoryAdapter) InsertBlock(ctx context.Context, b api.BlockRecord) e
 		Valid:      b.Valid,
 		Value:      b.Value,
 	})
+}
+
+// statsRepositoryAdapter adapts *db.Repository (whose MinerBalances/
+// ShareStatsSince/WorkerShareStatsSince operate on db.Balance/
+// db.ShareStats/db.WorkerShareStats) to statsapi.Repository (which
+// operates on statsapi.BalanceRecord/ShareStatsRecord/
+// WorkerShareStatsRecord), mirroring repositoryAdapter's role above
+// for the read-only miner stats API.
+type statsRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a statsRepositoryAdapter) MinerBalances(ctx context.Context, paymentAddress, algo, network string, paymentID *string) ([]statsapi.BalanceRecord, error) {
+	rows, err := a.repo.MinerBalances(ctx, paymentAddress, algo, network, paymentID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]statsapi.BalanceRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, statsapi.BalanceRecord{
+			Algo:           r.Algo,
+			Network:        r.Network,
+			PaymentAddress: r.PaymentAddress,
+			PaymentID:      r.PaymentID,
+			PendingBalance: r.PendingBalance,
+			PaidBalance:    r.PaidBalance,
+			UpdatedAt:      r.UpdatedAt,
+		})
+	}
+	return out, nil
+}
+
+func (a statsRepositoryAdapter) ShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (statsapi.ShareStatsRecord, error) {
+	s, err := a.repo.ShareStatsSince(ctx, algo, network, paymentAddress, paymentID, sinceUnix)
+	if err != nil {
+		return statsapi.ShareStatsRecord{}, err
+	}
+	return statsapi.ShareStatsRecord{SharesSum: s.SharesSum, ShareCount: s.ShareCount}, nil
+}
+
+func (a statsRepositoryAdapter) WorkerShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]statsapi.WorkerShareStatsRecord, error) {
+	rows, err := a.repo.WorkerShareStatsSince(ctx, algo, network, paymentAddress, paymentID, sinceUnix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]statsapi.WorkerShareStatsRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, statsapi.WorkerShareStatsRecord{
+			Identifier: r.Identifier,
+			SharesSum:  r.SharesSum,
+			ShareCount: r.ShareCount,
+		})
+	}
+	return out, nil
 }
 
 // unlockerRepositoryAdapter adapts *db.Repository (whose
@@ -811,6 +866,17 @@ func run() error {
 		Metrics:         m,
 	})
 
+	// statsHandler serves the read-only, unauthenticated miner stats
+	// API (GET /api/v1/stats/*) on the same listener as the
+	// ingestion API above — see internal/backend/statsapi's package
+	// doc comment for why this is a genuinely separate Handler/
+	// trust-boundary rather than new routes bolted onto handler
+	// itself.
+	statsHandler := statsapi.NewHandler(statsRepositoryAdapter{repo: repo}, statsapi.Config{
+		Network: network,
+		Metrics: m,
+	})
+
 	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig()
 	if err != nil {
 		return fmt.Errorf("configuring block unlocker: %w", err)
@@ -887,9 +953,13 @@ func run() error {
 		log.Print("backend: wallet-stats poller disabled (no wallet RPC configured for either coin)")
 	}
 
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+	statsHandler.RegisterRoutes(mux)
+
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           handler.Mux(),
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

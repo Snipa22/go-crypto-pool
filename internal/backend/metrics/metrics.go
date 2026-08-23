@@ -17,6 +17,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -159,6 +160,17 @@ type Metrics struct {
 	// updating (a Gauge can't distinguish "still the last real
 	// value" from "the poller is broken"; this counter can).
 	WalletBalancePollErrorsTotal *prometheus.CounterVec
+
+	// StatsRequestsTotal counts every request handled by
+	// internal/backend/statsapi's read-only miner stats endpoints,
+	// labeled by endpoint (balance/hashrate/hashrate_workers) and
+	// result (ok/rejected/error) — deliberately NOT labeled by
+	// payment address (see this package's doc comment on unbounded
+	// cardinality).
+	StatsRequestsTotal *prometheus.CounterVec
+	// StatsRequestDuration observes wall-clock time for one
+	// statsapi request, labeled by endpoint.
+	StatsRequestDuration *prometheus.HistogramVec
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -270,7 +282,27 @@ func New(version string) *Metrics {
 		Help: "Total number of failed WalletClient.GetBalance calls made by the wallet-stats poller, by algo and network.",
 	}, []string{"algo", "network"})
 
+	m.StatsRequestsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "stats_requests_total",
+		Help: "Total number of requests handled by the read-only miner stats API (internal/backend/statsapi), by endpoint and result (ok/rejected/error).",
+	}, []string{"endpoint", "result"})
+
+	m.StatsRequestDuration = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "stats_request_duration_seconds",
+		Help:    "Wall-clock time for one read-only miner stats API request, by endpoint.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"endpoint"})
+
 	return m
+}
+
+// ObserveRequest increments StatsRequestsTotal and records
+// StatsRequestDuration for one statsapi request, satisfying
+// statsapi.StatsMetrics without that package needing to import this
+// one's collector types directly.
+func (m *Metrics) ObserveRequest(endpoint, result string, duration time.Duration) {
+	m.StatsRequestsTotal.WithLabelValues(endpoint, result).Inc()
+	m.StatsRequestDuration.WithLabelValues(endpoint).Observe(duration.Seconds())
 }
 
 // Handler returns the standard Prometheus text-exposition HTTP handler
