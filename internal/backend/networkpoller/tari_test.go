@@ -11,10 +11,10 @@ import (
 )
 
 type fakeTariRPC struct {
-	tip       *tari_generated.TipInfoResponse
-	tipErr    error
-	netState  *tari_generated.GetNetworkStateResponse
-	netErr    error
+	tip      *tari_generated.TipInfoResponse
+	tipErr   error
+	netState *tari_generated.GetNetworkStateResponse
+	netErr   error
 }
 
 func (f *fakeTariRPC) GetTipInfo() (*tari_generated.TipInfoResponse, error) {
