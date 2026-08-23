@@ -74,7 +74,7 @@ func TestDirectSessionRXTTrustedShareSkipsRealRandomXValidation(t *testing.T) {
 		cancel: cancel,
 	}
 
-	sessionID, xn := directLogin(t, h, "addr-rxt-trust")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-rxt-trust"))
 	jobID := directCurrentJobIDForXN(t, h, xn)
 
 	h.server.mu.RLock()

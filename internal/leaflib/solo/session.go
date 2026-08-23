@@ -277,6 +277,18 @@ func (s *Session) handleLogin(req Request) {
 		return
 	}
 
+	// Real, coin-aware payment-address validation (address.go's
+	// ValidateAddressForAlgo), dispatched on this leaf's own
+	// configured JobManager algo — the same algo every job this
+	// leaf produces is stamped with (job.go's Job.Algo). Rejected
+	// BEFORE the address is stored/loggedIn is flipped, so an
+	// invalid address never becomes this session's payout address
+	// for any subsequently-accepted share.
+	if err := ValidateAddressForAlgo(s.server.jobManager.Algo(), login.Login); err != nil {
+		s.writeGeneralResponse(req.ID, err.Error(), "")
+		return
+	}
+
 	worker := login.Pass
 	if login.RigID != "" {
 		worker = login.RigID

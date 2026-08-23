@@ -21,7 +21,7 @@ import (
 // of the same name.
 func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
-	_, xn := directLogin(t, h, "stats-ui-test-address")
+	_, xn := directLogin(t, h, realTariTestAddress("stats-ui-test-address"))
 
 	jobID := directCurrentJobIDForXN(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -52,7 +52,7 @@ func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 	n, _ := httpResp.Body.Read(buf)
 	body := string(buf[:n])
 
-	if !strings.Contains(body, "stats-ui-test-address") {
+	if !strings.Contains(body, realTariTestAddress("stats-ui-test-address")) {
 		t.Errorf("expected the connected session's address in the rendered page, got:\n%s", body)
 	}
 	if !strings.Contains(body, "<html") {
@@ -103,25 +103,25 @@ func TestServerStats_ReportsPerSessionAndAddressBreakdown(t *testing.T) {
 		hN := &directTestHarness{t: t, server: h.server, jm: h.jm, node: h.node, transport: h.transport, submit: h.submit, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
 		directLogin(t, hN, address)
 	}
-	spawn("addr-one")
-	spawn("addr-two")
+	spawn(realTariTestAddress("addr-one"))
+	spawn(realTariTestAddress("addr-two"))
 
 	st := h.server.Stats()
 	if st.ActiveSessions < 2 {
 		t.Errorf("ActiveSessions = %d, want >= 2", st.ActiveSessions)
 	}
-	directLogin(t, h, "addr-one") // h itself becomes a 3rd connected session
+	directLogin(t, h, realTariTestAddress("addr-one")) // h itself becomes a 3rd connected session
 
 	st = h.server.Stats()
 	foundOne, foundTwo := false, false
 	for _, ac := range st.MinersByAddress {
-		if ac.Address == "addr-one" {
+		if ac.Address == realTariTestAddress("addr-one") {
 			foundOne = true
 			if ac.Count < 1 {
 				t.Errorf("addr-one count = %d, want >= 1", ac.Count)
 			}
 		}
-		if ac.Address == "addr-two" {
+		if ac.Address == realTariTestAddress("addr-two") {
 			foundTwo = true
 		}
 	}
@@ -179,7 +179,7 @@ func TestServerStats_ReflectsRealBackendTransportHealth(t *testing.T) {
 
 	// A real successful forward (via the actual session.go code path)
 	// must keep/confirm the healthy state.
-	_, xn := directLogin(t, h, "backend-health-test-address")
+	_, xn := directLogin(t, h, realTariTestAddress("backend-health-test-address"))
 	jobID := directCurrentJobIDForXN(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		JobID: jobID,
@@ -225,7 +225,7 @@ func TestServerStats_ReflectsRealBackendTransportHealth(t *testing.T) {
 func sprintfAddr(i int) string {
 	const letters = "0123456789"
 	if i < len(letters) {
-		return "flood-addr-" + string(letters[i])
+		return realTariTestAddress("flood-addr-" + string(letters[i]))
 	}
-	return "flood-addr-x"
+	return realTariTestAddress("flood-addr-x")
 }

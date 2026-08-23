@@ -301,6 +301,17 @@ func NewJobManager(cfg JobManagerConfig) *JobManager {
 	}
 }
 
+// Algo returns this JobManager's own configured (and already
+// backward-compatibility-normalized — see NewJobManager) mining
+// algorithm. Exported so session-level login handling (session.go's
+// handleLogin) can dispatch real, coin-aware payment-address
+// validation (address.go's ValidateAddressForAlgo) on the SAME algo
+// value every other per-job decision in this leaf already keys off,
+// without duplicating JobManagerConfig's own normalization logic.
+func (jm *JobManager) Algo() poolpb.Algo {
+	return jm.cfg.Algo
+}
+
 // JobForXN returns the current Job for the given per-session xn,
 // generating and caching a brand new, independently-randomized block
 // template the first time this xn is seen (or after the cache has been

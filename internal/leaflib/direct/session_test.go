@@ -425,7 +425,7 @@ func newDirectRXTTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64,
 // out) -- what matters is the REASON is never the xn-prefix check.
 func TestDirectSessionRXTSubmitWithoutXNPrefixIsNotRejectedByXNCheck(t *testing.T) {
 	h := newDirectRXTTestHarness(t, 1, 1<<62, "http://127.0.0.1:1") // deliberately unreachable
-	sessionID, xn := directLogin(t, h, "addr-rxt-noxn")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-rxt-noxn"))
 	jobID := directCurrentJobIDForXN(t, h, xn)
 
 	badNonce := directXNPrefixedNonceHexBigEndian(xn, 0xdeadbeef)
@@ -455,7 +455,7 @@ func TestDirectSessionRXTSubmitWithoutXNPrefixIsNotRejectedByXNCheck(t *testing.
 // disable the check for SHA3X in leaf-direct.
 func TestDirectSessionSHA3XSubmitWithoutXNPrefixIsStillRejected(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
-	sessionID, xn := directLogin(t, h, "addr-sha3x-noxn")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-sha3x-noxn"))
 	jobID := directCurrentJobIDForXN(t, h, xn)
 
 	badNonce := directXNPrefixedNonceHex(xn, 1)
@@ -486,7 +486,7 @@ func TestDirectSessionSHA3XSubmitWithoutXNPrefixIsStillRejected(t *testing.T) {
 // Timestamp before being forwarded to the backend transport.
 func TestDirectSessionSHA3XShareCarriesNonZeroTimestamp(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
-	sessionID, xn := directLogin(t, h, "addr-sha3x-ts")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-sha3x-ts"))
 	jobID := directCurrentJobIDForXN(t, h, xn)
 
 	before := time.Now().Unix()
@@ -553,7 +553,7 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = clientConn.Close() })
 
-	sessionID, xn := directLogin(t, h, "addr-c29-ts")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-c29-ts"))
 	jobID := directCurrentJobIDForXN(t, h, xn)
 
 	before := time.Now().Unix()
@@ -618,7 +618,7 @@ func TestDirectSessionRXTShareCarriesNonZeroTimestamp(t *testing.T) {
 	_ = conn.Close()
 
 	h := newDirectRXTTestHarness(t, 1, 1<<62, serviceURL)
-	sessionID, xn := directLogin(t, h, "addr-rxt-ts")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-rxt-ts"))
 	jobID := directCurrentJobIDForXN(t, h, xn)
 
 	job, err := h.jm.JobForXN(context.Background(), xn)
@@ -727,7 +727,7 @@ func mustDirectJSON(t *testing.T, v any) json.RawMessage {
 func TestDirectSessionLoginPushesInitialJob(t *testing.T) {
 	h := newDirectTestHarness(t, 1000, 1<<62)
 
-	h.send(solo.Request{ID: 1, Method: "login", Params: mustDirectJSON(t, solo.LoginRequest{Login: "some-tari-address", Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
+	h.send(solo.Request{ID: 1, Method: "login", Params: mustDirectJSON(t, solo.LoginRequest{Login: realTariTestAddress("some-tari-address"), Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
 	resp := h.recvLoginResponse()
 
 	if resp.Result.Status != "OK" {
@@ -762,7 +762,7 @@ func TestDirectSessionGetJobWithoutLoginIsRejected(t *testing.T) {
 // since this share does not meet block difficulty.
 func TestDirectSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
-	sessionID, xn := directLogin(t, h, "addr-1")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-1"))
 
 	jobID := directCurrentJobIDForXN(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -800,7 +800,7 @@ func TestDirectSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 // own genuinely new wiring vs. leaf-solo.
 func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1)
-	sessionID, xn := directLogin(t, h, "addr-2")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-2"))
 
 	jobID := directCurrentJobIDForXN(t, h, xn)
 	h.send(solo.Request{ID: 3, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -851,7 +851,7 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 
 func TestDirectSessionSubmitCryptographicallyInvalid(t *testing.T) {
 	h := newDirectTestHarness(t, 1<<63, 1<<63)
-	sessionID, xn := directLogin(t, h, "addr-3")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-3"))
 
 	jobID := directCurrentJobIDForXN(t, h, xn)
 	h.send(solo.Request{ID: 4, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -877,7 +877,7 @@ func TestDirectSessionSubmitCryptographicallyInvalid(t *testing.T) {
 
 func TestDirectSessionSubmitUnknownJobIDIsRejected(t *testing.T) {
 	h := newDirectTestHarness(t, 1000, 1<<62)
-	sessionID, xn := directLogin(t, h, "addr-4")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-4"))
 
 	h.send(solo.Request{ID: 6, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:    sessionID,
@@ -896,7 +896,7 @@ func TestDirectSessionSubmitUnknownJobIDIsRejected(t *testing.T) {
 
 func TestDirectSessionSubmitDuplicateNonceIsRejected(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
-	sessionID, xn := directLogin(t, h, "addr-6")
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-6"))
 
 	jobID := directCurrentJobIDForXN(t, h, xn)
 	submit := func() solo.ShareResponse {
@@ -946,8 +946,8 @@ func TestDirectSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
 	hA := &directTestHarness{t: t, server: h.server, jm: h.jm, node: h.node, transport: h.transport, submit: h.submit, client: clientA, reader: bufio.NewReader(clientA), writer: bufio.NewWriter(clientA)}
 	hB := &directTestHarness{t: t, server: h.server, jm: h.jm, node: h.node, transport: h.transport, submit: h.submit, client: clientB, reader: bufio.NewReader(clientB), writer: bufio.NewWriter(clientB)}
 
-	sessionIDA, xnA := directLogin(t, hA, "addr-owner-a")
-	_, xnB := directLogin(t, hB, "addr-attacker-b")
+	sessionIDA, xnA := directLogin(t, hA, realTariTestAddress("addr-owner-a"))
+	_, xnB := directLogin(t, hB, realTariTestAddress("addr-attacker-b"))
 	if xnA == xnB {
 		t.Fatalf("expected sessions A and B to get different xn values, both got %q", xnA)
 	}

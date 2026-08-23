@@ -177,6 +177,18 @@ func (s *Session) handleLogin(req solo.Request) {
 		return
 	}
 
+	// Real, coin-aware payment-address validation, mirroring
+	// solo.Session's own handleLogin exactly (see that method's doc
+	// comment) — leaf-direct already carries its own configured
+	// poolpb.Algo on Server (s.server.algo, see server.go), the same
+	// algo every job this leaf produces is stamped with, so no
+	// JobManager.Algo() indirection is needed here the way solo's
+	// own handleLogin needs it.
+	if err := solo.ValidateAddressForAlgo(s.server.algo, login.Login); err != nil {
+		s.writeGeneralResponse(req.ID, err.Error(), "")
+		return
+	}
+
 	worker := login.Pass
 	if login.RigID != "" {
 		worker = login.RigID
