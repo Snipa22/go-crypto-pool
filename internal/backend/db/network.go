@@ -160,10 +160,10 @@ type NetworkStats struct {
 	// pool's own local share-derived hashrate estimate) -- see
 	// network_state's migration doc comment for why the two must
 	// never be conflated.
-	NetworkHeight             *int64
-	NetworkDifficulty         *float64
+	NetworkHeight              *int64
+	NetworkDifficulty          *float64
 	NetworkEstimatedHashrateHS *float64
-	NetworkStateUpdatedAt     *time.Time
+	NetworkStateUpdatedAt      *time.Time
 }
 
 // NetworkStatsSince aggregates every `shares` row for (algo, network)

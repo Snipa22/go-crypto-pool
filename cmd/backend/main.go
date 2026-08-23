@@ -124,6 +124,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/leafflagsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkapi"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/networkpoller"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/payout"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/retention"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/statsapi"
@@ -142,6 +143,13 @@ const (
 	defaultUnlockerPollInterval = 60 * time.Second
 	defaultTariMaturity         = int64(60)
 	defaultMoneroMaturity       = int64(60)
+
+	// defaultNetworkPollerInterval is internal/backend/networkpoller's
+	// own PLACEHOLDER default poll interval, mirroring
+	// defaultUnlockerPollInterval's role/rationale above for the
+	// same reasons -- operator-tunable via
+	// GCPOOL_NETWORK_POLLER_POLL_INTERVAL, not a protocol constant.
+	defaultNetworkPollerInterval = 60 * time.Second
 )
 
 // Version is the backend's build version, recorded on the
@@ -384,6 +392,30 @@ func (a networkAPIRepositoryAdapter) NetworkStatsSince(ctx context.Context, algo
 		LastBlockAt:     s.LastBlockAt,
 		LastBlockHeight: s.LastBlockHeight,
 	}, nil
+}
+
+// networkPollerRepositoryAdapter adapts *db.Repository (whose
+// UpsertNetworkState operates on db.NetworkState) to
+// networkpoller.Repository (which operates on
+// networkpoller.RepoState), mirroring networkAPIRepositoryAdapter's
+// role above for the write side of the same network_state table --
+// see internal/backend/networkpoller's package doc comment for how
+// this differs in direction from networkAPIRepositoryAdapter (writes
+// the real, live upstream chain-state snapshot vs. reads it back out
+// for networkapi's HTTP surface).
+type networkPollerRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a networkPollerRepositoryAdapter) UpsertNetworkState(ctx context.Context, algo, network string, state networkpoller.RepoState) error {
+	return a.repo.UpsertNetworkState(ctx, algo, network, db.NetworkState{
+		Height:              state.Height,
+		Difficulty:          state.Difficulty,
+		EstimatedHashrateHS: state.EstimatedHashrateHS,
+		BestBlockHash:       state.BestBlockHash,
+		Source:              state.Source,
+		PolledAt:            state.PolledAt,
+	})
 }
 
 // leafFlagsRepositoryAdapter adapts *db.Repository (whose
@@ -639,6 +671,52 @@ func sortedKeys(m map[string]unlocker.CoinConfig) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// buildNetworkPollerConfig reads the same GCPOOL_TARI_GRPC_ADDR/
+// GCPOOL_MONERO_RPC_ADDR environment variables buildUnlockerConfig
+// consumes (see this file's package doc comment) plus the poller-
+// specific GCPOOL_NETWORK_POLLER_POLL_INTERVAL, and returns a
+// ready-to-use networkpoller.Config plus whether any real upstream
+// Source was actually configured (ok == false means the caller
+// should not start the poller at all -- mirrors buildUnlockerConfig's
+// own opt-in story exactly).
+//
+// Deliberately does NOT call nodeGRPC.InitNodeGRPC itself: when
+// GCPOOL_TARI_GRPC_ADDR is set, buildUnlockerConfig's own
+// chain.NewTariVerifier call already does so exactly once (see
+// networkpoller.TariNetworkSource's doc comment for why only one
+// InitNodeGRPC call's worth of address should be live per process),
+// and run() below only calls this function after buildUnlockerConfig
+// has already run.
+func buildNetworkPollerConfig(network poolpb.Network, m *metrics.Metrics) (cfg networkpoller.Config, ok bool, err error) {
+	pollInterval := defaultNetworkPollerInterval
+	if raw := os.Getenv("GCPOOL_NETWORK_POLLER_POLL_INTERVAL"); raw != "" {
+		pollInterval, err = time.ParseDuration(raw)
+		if err != nil {
+			return cfg, false, fmt.Errorf("GCPOOL_NETWORK_POLLER_POLL_INTERVAL: %w", err)
+		}
+	}
+	cfg.PollInterval = pollInterval
+	cfg.Metrics = m
+
+	netStr := networkDBString(network)
+
+	if os.Getenv("GCPOOL_TARI_GRPC_ADDR") != "" {
+		cfg.Targets = append(cfg.Targets,
+			networkpoller.Target{Algo: "RXT", Network: netStr, Source: networkpoller.NewTariNetworkSource(networkpoller.TariAlgoRandomX)},
+			networkpoller.Target{Algo: "C29", Network: netStr, Source: networkpoller.NewTariNetworkSource(networkpoller.TariAlgoCuckaroo)},
+			networkpoller.Target{Algo: "SHA3X", Network: netStr, Source: networkpoller.NewTariNetworkSource(networkpoller.TariAlgoSHA3X)},
+		)
+		ok = true
+	}
+
+	if addr := os.Getenv("GCPOOL_MONERO_RPC_ADDR"); addr != "" {
+		cfg.Targets = append(cfg.Targets, networkpoller.Target{Algo: "RXM", Network: netStr, Source: networkpoller.NewMoneroNetworkSource(addr)})
+		ok = true
+	}
+
+	return cfg, ok, nil
 }
 
 // parsePercentEnv parses an optional percentage (0-100) environment
@@ -1221,6 +1299,24 @@ func run() error {
 		go u.RunLoop(ctx)
 	} else {
 		log.Print("backend: block unlocker disabled (neither GCPOOL_TARI_GRPC_ADDR nor GCPOOL_MONERO_RPC_ADDR is set)")
+	}
+
+	// networkPollerCfg/networkPollerEnabled: the real, live upstream
+	// chain-state poll loop (internal/backend/networkpoller) --
+	// deliberately built AFTER buildUnlockerConfig/unlockerEnabled
+	// above, since that call is what performs this process' one
+	// real nodeGRPC.InitNodeGRPC call for GCPOOL_TARI_GRPC_ADDR (see
+	// buildNetworkPollerConfig's own doc comment).
+	networkPollerCfg, networkPollerEnabled, err := buildNetworkPollerConfig(network, m)
+	if err != nil {
+		return fmt.Errorf("configuring network-state poller: %w", err)
+	}
+	if networkPollerEnabled {
+		np := networkpoller.New(networkPollerRepositoryAdapter{repo: repo}, networkPollerCfg)
+		log.Printf("backend: network-state poller enabled, polling every %s for %d target(s)", networkPollerCfg.PollInterval, len(networkPollerCfg.Targets))
+		go np.RunLoop(ctx)
+	} else {
+		log.Print("backend: network-state poller disabled (neither GCPOOL_TARI_GRPC_ADDR nor GCPOOL_MONERO_RPC_ADDR is set); network_state stays empty and networkapi's Network* stats fields simply read back as nil")
 	}
 
 	retentionCfg, retentionEnabled, err := buildRetentionConfig()
