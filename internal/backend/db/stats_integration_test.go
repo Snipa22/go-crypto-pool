@@ -71,9 +71,9 @@ func TestIntegrationMinerBalancesAndShareStats(t *testing.T) {
 	shares := []db.Share{
 		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1, BlockHeight: 10, Shares: 100, PaymentAddress: "addr-1", Identifier: "rig-1", Timestamp: 1000},
 		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1, BlockHeight: 10, Shares: 200, PaymentAddress: "addr-1", Identifier: "rig-2", Timestamp: 1500},
-		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1, BlockHeight: 10, Shares: 999, PaymentAddress: "addr-1", Identifier: "rig-1", Timestamp: 500}, // too old, excluded by since=1000
+		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1, BlockHeight: 10, Shares: 999, PaymentAddress: "addr-1", Identifier: "rig-1", Timestamp: 500},  // too old, excluded by since=1000
 		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1, BlockHeight: 10, Shares: 300, PaymentAddress: "addr-2", Identifier: "rig-3", Timestamp: 1200}, // different address, excluded
-		{Algo: "C29", Network: "TESTNET", PoolType: "SOLO", PoolID: 1, BlockHeight: 10, Shares: 400, PaymentAddress: "addr-1", Identifier: "rig-1", Timestamp: 1200}, // different algo, excluded from RXT query
+		{Algo: "C29", Network: "TESTNET", PoolType: "SOLO", PoolID: 1, BlockHeight: 10, Shares: 400, PaymentAddress: "addr-1", Identifier: "rig-1", Timestamp: 1200},  // different algo, excluded from RXT query
 	}
 	for _, s := range shares {
 		if err := repo.InsertShare(ctx, s, db.HeightPartitionBucketSize); err != nil {
@@ -132,3 +132,40 @@ func TestIntegrationMinerBalancesValidation(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+func TestIntegrationPoolSourceShareStatsSince(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+	repo := db.NewRepository(pool)
+
+	shares := []db.Share{
+		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1, BlockHeight: 10, Shares: 100, PaymentAddress: "addr-1", Identifier: "rig-1", Timestamp: 1000},
+		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 2, BlockHeight: 10, Shares: 400, PaymentAddress: "addr-1", Identifier: "rig-2", Timestamp: 1500},
+		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 1, BlockHeight: 10, Shares: 999, PaymentAddress: "addr-1", Identifier: "rig-1", Timestamp: 500},  // too old, excluded by since=1000
+		{Algo: "RXT", Network: "TESTNET", PoolType: "PPLNS", PoolID: 2, BlockHeight: 10, Shares: 300, PaymentAddress: "addr-2", Identifier: "rig-3", Timestamp: 1200}, // different address, excluded
+	}
+	for _, s := range shares {
+		if err := repo.InsertShare(ctx, s, db.HeightPartitionBucketSize); err != nil {
+			t.Fatalf("InsertShare(%+v): %v", s, err)
+		}
+	}
+
+	sources, err := repo.PoolSourceShareStatsSince(ctx, "RXT", "TESTNET", "addr-1", nil, 1000)
+	if err != nil {
+		t.Fatalf("PoolSourceShareStatsSince: %v", err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("expected 2 pool-source rows, got %d: %+v", len(sources), sources)
+	}
+	// Ordered by SharesSum descending: pool_id=2 (400) before pool_id=1 (100).
+	if sources[0].PoolID != 2 || sources[0].SharesSum != 400 {
+		t.Errorf("sources[0] = %+v, want pool_id=2/400", sources[0])
+	}
+	if sources[1].PoolID != 1 || sources[1].SharesSum != 100 {
+		t.Errorf("sources[1] = %+v, want pool_id=1/100", sources[1])
+	}
+}

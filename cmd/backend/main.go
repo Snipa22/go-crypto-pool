@@ -282,6 +282,27 @@ func (a statsRepositoryAdapter) WorkerShareStatsSince(ctx context.Context, algo,
 	return out, nil
 }
 
+// PoolSourceShareStatsSince adapts *db.Repository's
+// PoolSourceShareStatsSince (which operates on db.PoolSourceShareStats)
+// to statsapi.Repository's PoolSourceShareStatsSince (which operates
+// on statsapi.PoolSourceShareStatsRecord), mirroring
+// WorkerShareStatsSince's adapter above.
+func (a statsRepositoryAdapter) PoolSourceShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]statsapi.PoolSourceShareStatsRecord, error) {
+	rows, err := a.repo.PoolSourceShareStatsSince(ctx, algo, network, paymentAddress, paymentID, sinceUnix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]statsapi.PoolSourceShareStatsRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, statsapi.PoolSourceShareStatsRecord{
+			PoolID:     r.PoolID,
+			SharesSum:  r.SharesSum,
+			ShareCount: r.ShareCount,
+		})
+	}
+	return out, nil
+}
+
 // addressMapRepositoryAdapter adapts *db.Repository (whose
 // UpsertAddressMap/GetAddressMap operate on db.AddressMap) to
 // addressmap.Repository (which operates on addressmap.Record),
