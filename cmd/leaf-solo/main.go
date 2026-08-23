@@ -85,6 +85,22 @@ type config struct {
 	// REQUIRED when coin=monero -- see main's own validation.
 	monerodURL string
 
+	// trustEnabled/trustThreshold/trustPenalty/trustChange/trustMin
+	// configure the real, legacy-ported probabilistic
+	// RandomX-validation-skip mechanism for RXT/RXM shares (see
+	// internal/leaflib/solo/trust.go's doc comment for the full
+	// reference algorithm and citation). Disabled by default (every
+	// share always fully validated, identical to this mechanism not
+	// existing). Only ever consulted for RXT/RXM jobs; a SHA3X/C29
+	// leaf-solo process can enable this flag with zero effect, since
+	// isRandomXFamily gates it at the actual submit-handling call
+	// site, not here.
+	trustEnabled   bool
+	trustThreshold int
+	trustPenalty   int
+	trustChange    int
+	trustMin       int
+
 	// algo selects which SINGLE mining algorithm this leaf-solo
 	// process serves: "sha3x" (default), "c29", or "rxt" -- for
 	// coin=tari only. See loadConfig's LEAF_SOLO_ALGO doc comment for
@@ -135,6 +151,11 @@ func loadConfig() config {
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_SOLO_NETWORK", "testnet"), "network tag for share/diagnostic records: mainnet|testnet. Env: LEAF_SOLO_NETWORK")
 	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_SOLO_COIN", "tari"), "which coin/PoW family this leaf-solo process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_SOLO_COIN")
 	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_SOLO_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081), no trailing slash or /json_rpc suffix required. REQUIRED when -coin=monero; ignored for -coin=tari. Env: LEAF_SOLO_MONEROD_URL")
+	flag.BoolVar(&cfg.trustEnabled, "trust-enabled", envOr("LEAF_SOLO_TRUST_ENABLED", "false") == "true", "enable the real, legacy-ported probabilistic RandomX-validation-skip mechanism for RXT/RXM shares (see internal/leaflib/solo/trust.go). Disabled by default -- every share is always fully, cryptographically validated. Has no effect for SHA3X/C29. Env: LEAF_SOLO_TRUST_ENABLED (\"true\" to enable)")
+	flag.IntVar(&cfg.trustThreshold, "trust-threshold", envOrInt("LEAF_SOLO_TRUST_THRESHOLD", 0), "real trust-ramp threshold gate (see trust.go's TrustConfig.Threshold) -- 0/unset uses the documented default (10). Env: LEAF_SOLO_TRUST_THRESHOLD")
+	flag.IntVar(&cfg.trustPenalty, "trust-penalty", envOrInt("LEAF_SOLO_TRUST_PENALTY", 0), "real trust-ramp penalty gate, re-armed after any rejected share (see trust.go's TrustConfig.Penalty) -- 0/unset uses the documented default (30). Env: LEAF_SOLO_TRUST_PENALTY")
+	flag.IntVar(&cfg.trustChange, "trust-change", envOrInt("LEAF_SOLO_TRUST_CHANGE", 0), "real per-accepted-share probability decrement (see trust.go's TrustConfig.Change) -- 0/unset uses the documented default (1). Env: LEAF_SOLO_TRUST_CHANGE")
+	flag.IntVar(&cfg.trustMin, "trust-min", envOrInt("LEAF_SOLO_TRUST_MIN", 0), "real probability floor, ensuring full validation never stops occurring entirely once ramped in (see trust.go's TrustConfig.Min) -- 0/unset uses the documented default (20). Env: LEAF_SOLO_TRUST_MIN")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_SOLO_ALGO")
 	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_SOLO_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (consulted for -algo=rxt, and for -coin=monero's real RandomX/rx validation -- both share the same real randomx-service-backed RandomXValidator). Env: LEAF_SOLO_RANDOMX_SERVICE_URL")
 
@@ -461,6 +482,18 @@ func main() {
 	// difficulty.
 	server := solo.NewServer(cm, jobManager, node, validators, networkFromString(cfg.network), logger, vardiffCfg)
 	defer server.Shutdown()
+
+	if cfg.trustEnabled {
+		trustCfg := solo.TrustConfig{
+			Enabled:   true,
+			Threshold: cfg.trustThreshold,
+			Penalty:   cfg.trustPenalty,
+			Change:    cfg.trustChange,
+			Min:       cfg.trustMin,
+		}
+		server.EnableTrust(trustCfg)
+		logger.Printf("trusted-miner RandomX-validation skip ENABLED for RXT/RXM (threshold=%d penalty=%d change=%d min=%d -- 0 means the documented default is in effect)", cfg.trustThreshold, cfg.trustPenalty, cfg.trustChange, cfg.trustMin)
+	}
 
 	if cfg.metricsListenAddress != "" {
 		server.EnableMetrics(version, cfg.maxAddressLabels)

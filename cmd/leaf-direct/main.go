@@ -50,6 +50,11 @@ type config struct {
 	nodeGRPCAddress string
 	listenAddress   string
 	payoutAddress   string
+	trustEnabled    bool
+	trustThreshold  int
+	trustPenalty    int
+	trustChange     int
+	trustMin        int
 	network         string
 	coin            string
 	monerodURL      string
@@ -108,6 +113,11 @@ func loadConfig() config {
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_DIRECT_NETWORK", "testnet"), "network tag for share/block records: mainnet|testnet. Env: LEAF_DIRECT_NETWORK")
 	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_DIRECT_COIN", "tari"), "which coin/PoW family this leaf-direct process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_DIRECT_COIN")
 	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_DIRECT_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081). REQUIRED when -coin=monero; ignored for -coin=tari. Env: LEAF_DIRECT_MONEROD_URL")
+	flag.BoolVar(&cfg.trustEnabled, "trust-enabled", envOr("LEAF_DIRECT_TRUST_ENABLED", "false") == "true", "enable the real, legacy-ported probabilistic RandomX-validation-skip mechanism for RXT/RXM shares (see internal/leaflib/solo/trust.go) -- mirrors leaf-solo's identical flag exactly. Disabled by default. Env: LEAF_DIRECT_TRUST_ENABLED (\"true\" to enable)")
+	flag.IntVar(&cfg.trustThreshold, "trust-threshold", envOrInt("LEAF_DIRECT_TRUST_THRESHOLD", 0), "real trust-ramp threshold gate -- 0/unset uses the documented default (10). Env: LEAF_DIRECT_TRUST_THRESHOLD")
+	flag.IntVar(&cfg.trustPenalty, "trust-penalty", envOrInt("LEAF_DIRECT_TRUST_PENALTY", 0), "real trust-ramp penalty gate, re-armed after any rejected share -- 0/unset uses the documented default (30). Env: LEAF_DIRECT_TRUST_PENALTY")
+	flag.IntVar(&cfg.trustChange, "trust-change", envOrInt("LEAF_DIRECT_TRUST_CHANGE", 0), "real per-accepted-share probability decrement -- 0/unset uses the documented default (1). Env: LEAF_DIRECT_TRUST_CHANGE")
+	flag.IntVar(&cfg.trustMin, "trust-min", envOrInt("LEAF_DIRECT_TRUST_MIN", 0), "real probability floor -- 0/unset uses the documented default (20). Env: LEAF_DIRECT_TRUST_MIN")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_DIRECT_ALGO", "sha3x"), "which single mining algorithm this leaf-direct process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_DIRECT_ALGO")
 	flag.StringVar(&cfg.poolType, "pool-type", envOr("LEAF_DIRECT_POOL_TYPE", ""), "real pool payout model stamped onto every share/block forwarded to the backend: pplns|pps|prop|solo. REQUIRED (no safe silent default -- determines real payout accounting semantics). Env: LEAF_DIRECT_POOL_TYPE")
 	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_DIRECT_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (only consulted when -algo=rxt). Env: LEAF_DIRECT_RANDOMX_SERVICE_URL")
@@ -461,6 +471,18 @@ func main() {
 		Algo: algoFromString(cfg.algo), PoolType: poolType,
 	})
 	defer server.Shutdown()
+
+	if cfg.trustEnabled {
+		trustCfg := solo.TrustConfig{
+			Enabled:   true,
+			Threshold: cfg.trustThreshold,
+			Penalty:   cfg.trustPenalty,
+			Change:    cfg.trustChange,
+			Min:       cfg.trustMin,
+		}
+		server.EnableTrust(trustCfg)
+		logger.Printf("trusted-miner RandomX-validation skip ENABLED for RXT/RXM (threshold=%d penalty=%d change=%d min=%d -- 0 means the documented default is in effect)", cfg.trustThreshold, cfg.trustPenalty, cfg.trustChange, cfg.trustMin)
+	}
 
 	if cfg.metricsListenAddress != "" {
 		server.EnableMetrics(version, cfg.maxAddressLabels)

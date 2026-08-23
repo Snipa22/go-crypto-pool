@@ -47,6 +47,13 @@ type Server struct {
 	// (zero fields replaced by sane defaults) once, in NewServer.
 	vardiff VardiffConfig
 
+	// trustConfig gates the real, legacy-ported probabilistic
+	// RandomX-validation-skip mechanism for RXT/RXM shares (see
+	// trust.go). Zero-value TrustConfig{} (Enabled: false) is the
+	// default — every share is always fully validated unless a
+	// caller explicitly opts in via EnableTrust.
+	trustConfig TrustConfig
+
 	mu       sync.RWMutex
 	sessions map[uint64]*Session
 
@@ -120,6 +127,24 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	return m
+}
+
+// EnableTrust opts this server into the real, legacy-ported
+// probabilistic RandomX-validation-skip mechanism for RXT/RXM shares
+// (see trust.go's doc comment for the full reference algorithm and
+// citation). Must be called before serving any connections to take
+// effect for them — sessions capture s.trustConfig once, at
+// newSession time. Calling this is optional; a Server that never
+// calls it always fully validates every share, identical to this
+// mechanism not existing at all.
+func (s *Server) EnableTrust(cfg TrustConfig) {
+	s.trustConfig = cfg.Normalized()
+	// Normalized leaves Enabled untouched by design (see
+	// TrustConfig.Normalized's doc comment) — re-apply the caller's
+	// actual Enabled value explicitly since Normalized's return value
+	// above already preserved it correctly; this call is here only
+	// for clarity that Enabled is a deliberate, unmodified pass-through.
+	s.trustConfig.Enabled = cfg.Enabled
 }
 
 // MetricsHandler returns the Prometheus /metrics HTTP handler if
