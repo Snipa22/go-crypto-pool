@@ -114,11 +114,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Snipa22/go-crypto-pool/internal/backend/addressmap"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/api"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/disburse"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/networkapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/payout"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/statsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
@@ -273,6 +275,89 @@ func (a statsRepositoryAdapter) WorkerShareStatsSince(ctx context.Context, algo,
 		})
 	}
 	return out, nil
+}
+
+// addressMapRepositoryAdapter adapts *db.Repository (whose
+// UpsertAddressMap/GetAddressMap operate on db.AddressMap) to
+// addressmap.Repository (which operates on addressmap.Record),
+// mirroring statsRepositoryAdapter's role above for the SXMR
+// merge-mining XMR-to-Tari address mapping API.
+type addressMapRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a addressMapRepositoryAdapter) Upsert(ctx context.Context, xmrAddress, tariAddress string) error {
+	return a.repo.UpsertAddressMap(ctx, xmrAddress, tariAddress)
+}
+
+func (a addressMapRepositoryAdapter) Get(ctx context.Context, xmrAddress string) (addressmap.Record, error) {
+	m, err := a.repo.GetAddressMap(ctx, xmrAddress)
+	if err != nil {
+		if errors.Is(err, db.ErrAddressMapNotFound) {
+			return addressmap.Record{}, addressmap.ErrNotFound
+		}
+		return addressmap.Record{}, err
+	}
+	return addressmap.Record{
+		XMRAddress:  m.XMRAddress,
+		TariAddress: m.TariAddress,
+		CreatedAt:   m.CreatedAt,
+		UpdatedAt:   m.UpdatedAt,
+	}, nil
+}
+
+// networkAPIRepositoryAdapter adapts *db.Repository (whose
+// ListPools/NetworkStatsSince operate on db.Pool/db.NetworkStats) to
+// networkapi.Repository (which operates on networkapi.PoolRecord/
+// networkapi.NetworkStatsRecord), mirroring statsRepositoryAdapter's
+// role above for the public pool-wide network/topology API.
+type networkAPIRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a networkAPIRepositoryAdapter) ListPools(ctx context.Context, algo, network string) ([]networkapi.PoolRecord, error) {
+	rows, err := a.repo.ListPools(ctx, algo, network)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]networkapi.PoolRecord, 0, len(rows))
+	for _, p := range rows {
+		ports := make([]networkapi.PortRecord, 0, len(p.Ports))
+		for _, pt := range p.Ports {
+			ports = append(ports, networkapi.PortRecord{
+				Port:            pt.Port,
+				Description:     pt.Description,
+				MinDifficulty:   pt.MinDifficulty,
+				MaxDifficulty:   pt.MaxDifficulty,
+				StartDifficulty: pt.StartDifficulty,
+				VariableDiff:    pt.VariableDiff,
+			})
+		}
+		out = append(out, networkapi.PoolRecord{
+			Algo:      p.Algo,
+			Network:   p.Network,
+			PoolType:  p.PoolType,
+			Name:      p.Name,
+			Enabled:   p.Enabled,
+			CreatedAt: p.CreatedAt,
+			Ports:     ports,
+		})
+	}
+	return out, nil
+}
+
+func (a networkAPIRepositoryAdapter) NetworkStatsSince(ctx context.Context, algo, network string, sinceUnix int64) (networkapi.NetworkStatsRecord, error) {
+	s, err := a.repo.NetworkStatsSince(ctx, algo, network, sinceUnix)
+	if err != nil {
+		return networkapi.NetworkStatsRecord{}, err
+	}
+	return networkapi.NetworkStatsRecord{
+		SharesSum:       s.SharesSum,
+		ShareCount:      s.ShareCount,
+		BlocksFound:     s.BlocksFound,
+		LastBlockAt:     s.LastBlockAt,
+		LastBlockHeight: s.LastBlockHeight,
+	}, nil
 }
 
 // unlockerRepositoryAdapter adapts *db.Repository (whose
@@ -877,6 +962,21 @@ func run() error {
 		Metrics: m,
 	})
 
+	// addressMapHandler serves the SXMR merge-mining system's real
+	// XMR-to-Tari address-mapping endpoints (POST/GET
+	// /api/v1/address-map) on the same listener -- see
+	// internal/backend/addressmap's package doc comment for why
+	// this is its own Handler/trust-boundary, independent of both
+	// the ingestion API and the miner stats API above.
+	addressMapHandler := addressmap.NewHandler(addressMapRepositoryAdapter{repo: repo})
+
+	// networkAPIHandler serves the real, read-only pool-wide network/
+	// topology endpoints (GET /api/v1/network/pools,
+	// GET /api/v1/network/stats) -- see internal/backend/networkapi's
+	// package doc comment for how this differs in scope from
+	// statsHandler above (whole-pool vs. single-miner).
+	networkAPIHandler := networkapi.NewHandler(networkAPIRepositoryAdapter{repo: repo})
+
 	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig()
 	if err != nil {
 		return fmt.Errorf("configuring block unlocker: %w", err)
@@ -956,6 +1056,8 @@ func run() error {
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 	statsHandler.RegisterRoutes(mux)
+	addressMapHandler.RegisterRoutes(mux)
+	networkAPIHandler.RegisterRoutes(mux)
 
 	srv := &http.Server{
 		Addr:              listenAddr,
