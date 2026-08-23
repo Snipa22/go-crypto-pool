@@ -32,6 +32,15 @@ See `migrations/0001_initial_schema.up.sql` for the full DDL. Summary:
   that this project's architecture review flagged). `pools`/`ports`
   carry `network` (mainnet/testnet) as a hard requirement.
 
+- **`payouts`** (migration `0002_wallet_disbursements`) — a permanent,
+  unpartitioned audit log of every real on-chain disbursement attempt
+  made by `internal/backend/disburse.Engine` against
+  `internal/backend/wallet.WalletClient`. One row per real Transfer RPC
+  call (covering one or more `balance` rows via `balance_ids`), with a
+  `PENDING -> SENT|FAILED` status lifecycle — see the migration file's
+  own doc comment for exactly why the row is written *before* the real
+  transfer call is attempted.
+
 ## Retention model for `shares`
 
 Retention is "delete all shares of a given algo+pool_type below block
