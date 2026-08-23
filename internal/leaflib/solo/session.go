@@ -515,6 +515,26 @@ func (s *Session) handleSubmit(req Request) {
 		}
 	}
 
+	// REAL ban re-check at submit time, not just login time (Alex's
+	// explicit follow-up instruction: a session can log in before an
+	// address is banned, or the ban flag can be set mid-session by
+	// an operator responding to real-time abuse — login-time-only
+	// enforcement would let an already-connected botnet keep
+	// submitting shares indefinitely after being banned). Checked
+	// against the address ACTUALLY stored on this session
+	// (s.address), not whatever the miner claims now — mirrors
+	// handleLogin's own real enforcement point exactly, just at the
+	// other end of the session's lifetime. Cheap: this runs before
+	// any real PoW validation work, so a banned miner's shares are
+	// rejected as early as the job-ownership/expiry checks above.
+	if s.server.addressFlags != nil {
+		if flags := s.server.addressFlags.Get(s.address.Load().(string)); flags.Banned {
+			s.server.logger.Printf("solo: rejecting submit for now-banned address %s (session %s)", s.address.Load(), s.sessionID)
+			s.writeShareResponse(req.ID, false, "this address is banned from this pool")
+			return
+		}
+	}
+
 	// xn-prefix check happens BEFORE nonce decoding/PoW validation —
 	// ported exactly from the legacy ordering and rejection shape, and
 	// applies to SHA3X and C29 only, NOT RXT (see doc comment above:

@@ -307,6 +307,19 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 	}
 
+	// REAL ban re-check at submit time, not just login time -- see
+	// solo.Session's own identical addition for the full rationale
+	// (a session can log in before an address is banned, or get
+	// banned mid-session; login-time-only enforcement would let an
+	// already-connected botnet keep submitting shares indefinitely).
+	if s.server.addressFlags != nil {
+		if flags := s.server.addressFlags.Get(s.address.Load().(string)); flags.Banned {
+			s.server.logger.Printf("direct: rejecting submit for now-banned address %s (session %s)", s.address.Load(), s.sessionID)
+			s.writeShareResponse(req.ID, false, "this address is banned from this pool")
+			return
+		}
+	}
+
 	// xn-prefix check: applies to SHA3X and C29 only, NOT RXT — RXT's
 	// own real nonce handling (see rxt.go/createTariMiningBlob and the
 	// real Tari Rust source) treats the full 8-byte big-endian nonce
