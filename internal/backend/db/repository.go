@@ -45,6 +45,7 @@ type Block struct {
 	Unlocked   bool
 	Valid      bool
 	Value      *int64
+	PoolID     int32
 }
 
 // Repository provides minimal read/write access to the core schema. It is
@@ -180,13 +181,13 @@ func (r *Repository) InsertBlock(ctx context.Context, b Block) error {
 	const stmt = `
 		INSERT INTO blocks (
 			algo, network, pool_type, hash, height, difficulty, shares,
-			block_timestamp, unlocked, valid, value
+			block_timestamp, unlocked, valid, value, pool_id
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
 		)`
 	_, err := r.pool.Exec(ctx, stmt,
 		b.Algo, b.Network, b.PoolType, b.Hash, b.Height, b.Difficulty, b.Shares,
-		b.Timestamp, b.Unlocked, b.Valid, b.Value,
+		b.Timestamp, b.Unlocked, b.Valid, b.Value, b.PoolID,
 	)
 	if err != nil {
 		return fmt.Errorf("db: inserting block: %w", err)
@@ -281,13 +282,13 @@ func (r *Repository) SetBlockStatus(ctx context.Context, id int64, valid, unlock
 func (r *Repository) GetBlockByID(ctx context.Context, id int64) (Block, error) {
 	const stmt = `
 		SELECT algo, network, pool_type, hash, height, difficulty, shares,
-		       block_timestamp, unlocked, valid, value
+		       block_timestamp, unlocked, valid, value, pool_id
 		FROM blocks
 		WHERE id = $1`
 	var b Block
 	err := r.pool.QueryRow(ctx, stmt, id).Scan(
 		&b.Algo, &b.Network, &b.PoolType, &b.Hash, &b.Height, &b.Difficulty, &b.Shares,
-		&b.Timestamp, &b.Unlocked, &b.Valid, &b.Value,
+		&b.Timestamp, &b.Unlocked, &b.Valid, &b.Value, &b.PoolID,
 	)
 	if err != nil {
 		return Block{}, fmt.Errorf("db: getting block %d: %w", id, err)

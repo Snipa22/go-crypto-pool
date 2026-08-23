@@ -116,6 +116,13 @@ type WorkerShareStatsRecord struct {
 	ShareCount int64
 }
 
+// PoolSourceShareStatsRecord mirrors db.PoolSourceShareStats.
+type PoolSourceShareStatsRecord struct {
+	PoolID     int32
+	SharesSum  int64
+	ShareCount int64
+}
+
 // Repository is the narrow, read-only persistence surface this
 // package's handlers depend on. *db.Repository satisfies this as-is
 // (see internal/backend/db/stats.go); tests inject a fake.
@@ -123,6 +130,7 @@ type Repository interface {
 	MinerBalances(ctx context.Context, paymentAddress, algo, network string, paymentID *string) ([]BalanceRecord, error)
 	ShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (ShareStatsRecord, error)
 	WorkerShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]WorkerShareStatsRecord, error)
+	PoolSourceShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]PoolSourceShareStatsRecord, error)
 }
 
 // StatsMetrics is the narrow metrics surface this package's handlers
@@ -196,6 +204,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/stats/balance", h.handleBalance)
 	mux.HandleFunc("GET /api/v1/stats/hashrate", h.handleHashrate)
 	mux.HandleFunc("GET /api/v1/stats/hashrate/workers", h.handleHashrateWorkers)
+	mux.HandleFunc("GET /api/v1/stats/hashrate/sources", h.handleHashrateSources)
 }
 
 // EstimateHashrateHS applies the standard difficulty*2^32/elapsed-time

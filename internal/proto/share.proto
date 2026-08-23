@@ -116,6 +116,22 @@ message SHA3XProof {
 // backend. Every field the backend needs for accounting/payout is
 // present without decoding raw_proof; raw_proof is optional supporting
 // data for a future secondary/audit validator only.
+//
+// pool_id (below) is this repo's scoped-down analogue of the legacy
+// nodejs-pool stack's /poolInit registration: the legacy pool ran
+// several worker processes that registered themselves at startup and
+// got handed back a numeric pool id, which was then stamped on every
+// share so operators could tell which physical pool-server process
+// produced it. go-crypto-pool has no multi-process cluster
+// coordination at all (confirmed with Alex, 2026-08-23) — there is no
+// runtime registration handshake to reproduce. Instead, pool_id is
+// simply a static, operator-assigned integer every leaf-direct process
+// is configured with at startup (see cmd/leaf-direct's
+// -pool-id/LEAF_DIRECT_POOL_ID) and stamps on every Share/Block it
+// forwards, unconditionally. It answers the same "which pool-server
+// instance produced this row" question the legacy field did, without
+// any of the process-registration machinery that question doesn't
+// need here.
 message Share {
   Algo algo = 1;
   Network network = 2;
@@ -159,4 +175,10 @@ message Block {
   bool valid = 9;
   optional int64 value = 10;
   int64 height = 11; // block_height wasn't in the legacy Block message; added since the backend needs it for the same overflow reasons as Share
+
+  // pool_id mirrors Share.pool_id (see that field's doc comment) —
+  // the same static, operator-assigned pool-server-source identifier,
+  // stamped on a found block's report exactly like it is on every
+  // share.
+  int32 pool_id = 12;
 }

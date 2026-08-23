@@ -157,6 +157,69 @@ type WorkerShareStats struct {
 	ShareCount int64
 }
 
+// PoolSourceShareStats is ShareStatsSince's per-pool-server-source
+// breakdown: same aggregate shape as WorkerShareStats, but grouped by
+// `pool_id` (the static, operator-assigned pool-server-source
+// identifier every leaf-direct process stamps on its own shares — see
+// internal/proto/share.proto's Share.pool_id doc comment for the full
+// "scoped-down /poolInit" rationale) instead of `identifier`. This is
+// the query that actually makes pool_id's real, wired-up value useful
+// for anything: an operator running more than one leaf-direct process
+// against the same backend can see hashrate/share-volume attributed
+// per physical pool-server instance, exactly the question the legacy
+// stack's /poolInit registration existed to answer.
+type PoolSourceShareStats struct {
+	PoolID     int32
+	SharesSum  int64
+	ShareCount int64
+}
+
+// PoolSourceShareStatsSince is WorkerShareStatsSince's pool_id
+// analogue: identical filter/validation rules and identical
+// SharesSum-descending ordering convention (busiest pool-server
+// source first).
+func (r *Repository) PoolSourceShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]PoolSourceShareStats, error) {
+	if err := ValidateAlgo(algo); err != nil {
+		return nil, err
+	}
+	if err := ValidateNetwork(network); err != nil {
+		return nil, err
+	}
+	if paymentAddress == "" {
+		return nil, fmt.Errorf("db: PoolSourceShareStatsSince: payment_address is required")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(`SELECT pool_id, COALESCE(SUM(shares), 0), COUNT(*)
+		FROM shares
+		WHERE algo = $1 AND network = $2 AND payment_address = $3 AND share_timestamp >= $4`)
+	args := []any{algo, network, paymentAddress, sinceUnix}
+	if paymentID != nil {
+		args = append(args, *paymentID)
+		fmt.Fprintf(&sb, " AND COALESCE(payment_id, '') = $%d", len(args))
+	}
+	sb.WriteString(" GROUP BY pool_id ORDER BY 2 DESC, pool_id ASC")
+
+	rows, err := r.pool.Query(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: querying pool-source share stats for %s: %w", paymentAddress, err)
+	}
+	defer rows.Close()
+
+	var out []PoolSourceShareStats
+	for rows.Next() {
+		var p PoolSourceShareStats
+		if err := rows.Scan(&p.PoolID, &p.SharesSum, &p.ShareCount); err != nil {
+			return nil, fmt.Errorf("db: scanning pool-source share stats row: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterating pool-source share stats rows: %w", err)
+	}
+	return out, nil
+}
+
 // WorkerShareStatsSince is ShareStatsSince's per-worker breakdown:
 // same filter/validation rules, but grouped by `identifier` (the
 // worker/rig name carried on every shares row — see migrations'
