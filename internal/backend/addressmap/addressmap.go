@@ -145,6 +145,35 @@ func validateAddress(field, addr string) error {
 	return nil
 }
 
+// validateTariAddress additionally checks a real, cheap structural
+// invariant: length. nodejs-pool-sxmr's own /user/updateTariAddress
+// route (lib/api.js) also checked a "12"/"14" prefix, but that check
+// is MAINNET-specific -- a real Esmeralda testnet address (e.g. the
+// one already in this project's own Vault test fixtures,
+// f2GYDtVpj6yx8ZRPez2fsaU3VBAfVzcYycb3boUqMz1C9cZdJ7CrAkhhYoqRRNJPjwRSKqfd2caRe9jv8ZKwAwDGbvD,
+// 91 chars, starts "f2") uses a genuinely different real network-byte
+// prefix and would be wrongly rejected by that check. Since this
+// backend explicitly supports both MAINNET and TESTNET (see
+// ValidateNetwork), and this package does not have a verified,
+// network-aware table of every real Tari network-byte prefix, only
+// the length invariant (Tari addresses are consistently 90-91 base58
+// chars across networks) is enforced here -- deliberately more
+// permissive than the legacy mainnet-only reference, not a stricter
+// invention. A real, byte-exact prefix table sourced from Tari's own
+// address-encoding source (not guessed) would be a legitimate future
+// tightening, but shipping a wrong restrictive check that silently
+// blocks real testnet addresses is a worse failure mode than this
+// permissive one.
+func validateTariAddress(addr string) error {
+	if err := validateAddress("tari_address", addr); err != nil {
+		return err
+	}
+	if len(addr) < 90 || len(addr) > 200 {
+		return errors.New("tari_address does not look like a valid Tari address (expected roughly 90+ base58 chars)")
+	}
+	return nil
+}
+
 // upsertRequest is the JSON body POST /api/v1/address-map expects.
 type upsertRequest struct {
 	XMRAddress  string `json:"xmr_address"`
@@ -166,7 +195,7 @@ func (h *Handler) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSONErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateAddress("tari_address", req.TariAddress); err != nil {
+	if err := validateTariAddress(req.TariAddress); err != nil {
 		writeJSONErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
