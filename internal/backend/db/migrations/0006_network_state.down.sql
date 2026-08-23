@@ -1,4 +1,4 @@
--- 0005_network_state.down.sql
+-- 0006_network_state.down.sql
 BEGIN;
 DROP TABLE IF EXISTS network_state;
 COMMIT;
