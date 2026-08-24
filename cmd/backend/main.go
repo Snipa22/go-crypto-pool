@@ -1105,6 +1105,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if err := runMigrateCommand(os.Args[2:]); err != nil {
+			log.Fatalf("backend: %v", err)
+		}
+		return
+	}
 
 	if err := run(); err != nil {
 		log.Fatalf("backend: %v", err)
