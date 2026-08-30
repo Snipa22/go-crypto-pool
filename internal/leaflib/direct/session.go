@@ -486,146 +486,180 @@ func (s *Session) handleSubmit(req solo.Request) {
 		return
 	}
 
-	v, err := s.server.validators.Get(job.Algo)
-	if err != nil {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("no validator configured for this leaf's algo %v: %v", job.Algo, err))
-		return
-	}
-
-	// Real, legacy-ported trusted-miner validation skip — mirrors
-	// solo.Session's own identical handleSubmit gating exactly (see
-	// solo/trust.go's doc comment). Only RXT/RXM ever consider a
-	// skip; SHA3X/C29 are always fully validated regardless of
-	// s.trust's state.
-	var valid bool
-	skipped := solo.IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
-	if skipped {
-		valid = true
-	} else {
-		valid, err = v.Validate(context.Background(), share)
-		if err != nil && err != validator.ErrWrongProofType {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+	// PERFORMANCE FIX (Alex, live production incident, 2026-08-30): see
+	// solo/session.go's handleSubmit and solo/asyncvalidation.go's
+	// package doc comment for the full production incident and
+	// rationale — leaf-direct has the EXACT SAME read-loop-blocking bug
+	// leaf-solo did (this method's validator dispatch below also makes a
+	// real, synchronous randomx-service HTTP round-trip for RXT/RXM,
+	// inline, previously blocking Run's scanner.Scan() loop). finishSubmit
+	// captures everything from here to the end of this method so it can
+	// run either INLINE (SHA3X/C29, unchanged) or dispatched to
+	// s.server.randomxPool (RXT/RXM — see the dispatch below), exactly
+	// mirroring solo.Session's own identical split. Response-ordering and
+	// race-safety reasoning is identical too: a real xmrig client matches
+	// responses by their own numeric "id" field, not arrival order (see
+	// solo/session.go's doc comment, verified against xmrig's real
+	// Client.cpp source), and every piece of per-session/per-job mutable
+	// state below (job.MarkNonceUsed already ran above; shareCount/
+	// blockCount/hashesAccumulated are atomic; s.trust has its own
+	// internal mutex; BuildCandidateBlock only reads job fields; mc.Write
+	// is already synchronized onto one writer goroutine) was already
+	// race-safe by construction.
+	finishSubmit := func() {
+		v, err := s.server.validators.Get(job.Algo)
+		if err != nil {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("no validator configured for this leaf's algo %v: %v", job.Algo, err))
 			return
 		}
-	}
-	if !valid {
-		if solo.IsRandomXFamily(job.Algo) {
-			s.trust.RecordOutcome(false)
-		}
-		s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
-		return
-	}
-	if solo.IsRandomXFamily(job.Algo) {
-		s.trust.RecordOutcome(true)
-	}
 
-	s.shareCount.Add(1)
-
-	diff, candidate, err := s.server.node.BuildCandidateBlock(job, nonce, solo.SubmitProof{Cycle: submit.POW, ResultHex: submit.Result})
-	if err != nil {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
-		return
-	}
-
-	// GENUINE DIFFERENCE FROM leaf-solo: every validated share (not
-	// just block-level finds) is forwarded to the real backend over
-	// transport.ShareTransport — this is leaf-direct's whole reason
-	// for existing (see this package's doc comment). Forwarding
-	// happens synchronously here but with a bounded context timeout
-	// so a slow/unreachable backend degrades the miner's wire
-	// response latency rather than the process hanging indefinitely;
-	// a transport failure is logged and does NOT flip an otherwise
-	// cryptographically-valid share into a wire-level rejection (the
-	// miner did real, valid work regardless of whether the backend
-	// happened to be reachable at that instant — mirrors leaf-solo's
-	// own "SubmitBlock error still counts vardiff progress, still
-	// tells the miner their PoW was rejected only for the pool's own
-	// infra reasons" philosophy, generalized to shares).
-	s.forwardShare(share)
-
-	if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
-		s.hashesAccumulated.Add(job.StaticDifficulty)
-		s.writeShareResponse(req.ID, true, "")
-		return
-	}
-
-	// Meets full block difficulty: this is a genuine block find.
-	// Dispatch is coin-aware: for Tari (candidate is a real
-	// *tari_generated.Block), leaf-direct submits in real parallel to
-	// every configured GRPC node (s.server.multiSubmit), with "at
-	// least one acceptance = success" semantics, and best-effort
-	// broadcasts the find over the NATS relay (s.server.relay.Publish)
-	// — see this package's doc comment and multisubmit.go/
-	// internal/leaflib/relay for the full design. For Monero
-	// (candidate is a real nonce-patched blocktemplate_blob []byte —
-	// MoneroNodeClient.BuildCandidateBlock's own contract,
-	// monero_node.go), there is genuinely no multi-node-submit path
-	// yet: MultiNodeSubmitter (multisubmit.go) is Tari-GRPC-specific
-	// (its blockSubmitClient interface is literally
-	// SubmitBlock(*tari_generated.Block)) — a KNOWN, EXPLICITLY
-	// DEFERRED GAP (see this repo's PR description), not silently
-	// papered over. The real, working priority path instead: a single
-	// real submission via this leaf's own configured
-	// s.server.node.SubmitBlock (this leaf's ONE MoneroNodeClient
-	// connection, the same one JobManager already uses as its
-	// template source).
-	var (
-		submitOK     bool
-		blockHashHex string
-	)
-	switch job.Algo {
-	case poolpb.Algo_ALGO_RXM:
-		blob, ok := candidate.([]byte)
-		if !ok {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
-			return
-		}
-		if submitErr := s.server.node.SubmitBlock(context.Background(), candidate); submitErr != nil {
-			submitOK = false
-			s.server.logger.Printf("direct: monero BLOCK SUBMIT FAILED (single-node; multi-node Monero submit is a known, deferred gap) for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, submitErr)
+		// Real, legacy-ported trusted-miner validation skip — mirrors
+		// solo.Session's own identical handleSubmit gating exactly (see
+		// solo/trust.go's doc comment). Only RXT/RXM ever consider a
+		// skip; SHA3X/C29 are always fully validated regardless of
+		// s.trust's state.
+		var valid bool
+		skipped := solo.IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
+		if skipped {
+			valid = true
 		} else {
-			submitOK = true
+			valid, err = v.Validate(context.Background(), share)
+			if err != nil && err != validator.ErrWrongProofType {
+				s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+				return
+			}
 		}
-		sum := sha256.Sum256(blob)
-		blockHashHex = hex.EncodeToString(sum[:])
-	default:
-		block, ok := candidate.(*tari_generated.Block)
-		if !ok {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected candidate type %T", candidate))
+		if !valid {
+			if solo.IsRandomXFamily(job.Algo) {
+				s.trust.RecordOutcome(false)
+			}
+			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
 			return
 		}
-		var results []NodeSubmitResult
-		results, submitOK = s.server.submitBlockDirect(context.Background(), block)
+		if solo.IsRandomXFamily(job.Algo) {
+			s.trust.RecordOutcome(true)
+		}
+
+		s.shareCount.Add(1)
+
+		diff, candidate, err := s.server.node.BuildCandidateBlock(job, nonce, solo.SubmitProof{Cycle: submit.POW, ResultHex: submit.Result})
+		if err != nil {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
+			return
+		}
+
+		// GENUINE DIFFERENCE FROM leaf-solo: every validated share (not
+		// just block-level finds) is forwarded to the real backend over
+		// transport.ShareTransport — this is leaf-direct's whole reason
+		// for existing (see this package's doc comment). Forwarding
+		// happens synchronously here but with a bounded context timeout
+		// so a slow/unreachable backend degrades the miner's wire
+		// response latency rather than the process hanging indefinitely;
+		// a transport failure is logged and does NOT flip an otherwise
+		// cryptographically-valid share into a wire-level rejection (the
+		// miner did real, valid work regardless of whether the backend
+		// happened to be reachable at that instant — mirrors leaf-solo's
+		// own "SubmitBlock error still counts vardiff progress, still
+		// tells the miner their PoW was rejected only for the pool's own
+		// infra reasons" philosophy, generalized to shares).
+		s.forwardShare(share)
+
+		if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
+			s.hashesAccumulated.Add(job.StaticDifficulty)
+			s.writeShareResponse(req.ID, true, "")
+			return
+		}
+
+		// Meets full block difficulty: this is a genuine block find.
+		// Dispatch is coin-aware: for Tari (candidate is a real
+		// *tari_generated.Block), leaf-direct submits in real parallel to
+		// every configured GRPC node (s.server.multiSubmit), with "at
+		// least one acceptance = success" semantics, and best-effort
+		// broadcasts the find over the NATS relay (s.server.relay.Publish)
+		// — see this package's doc comment and multisubmit.go/
+		// internal/leaflib/relay for the full design. For Monero
+		// (candidate is a real nonce-patched blocktemplate_blob []byte —
+		// MoneroNodeClient.BuildCandidateBlock's own contract,
+		// monero_node.go), there is genuinely no multi-node-submit path
+		// yet: MultiNodeSubmitter (multisubmit.go) is Tari-GRPC-specific
+		// (its blockSubmitClient interface is literally
+		// SubmitBlock(*tari_generated.Block)) — a KNOWN, EXPLICITLY
+		// DEFERRED GAP (see this repo's PR description), not silently
+		// papered over. The real, working priority path instead: a single
+		// real submission via this leaf's own configured
+		// s.server.node.SubmitBlock (this leaf's ONE MoneroNodeClient
+		// connection, the same one JobManager already uses as its
+		// template source).
+		var (
+			submitOK     bool
+			blockHashHex string
+		)
+		switch job.Algo {
+		case poolpb.Algo_ALGO_RXM:
+			blob, ok := candidate.([]byte)
+			if !ok {
+				s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
+				return
+			}
+			if submitErr := s.server.node.SubmitBlock(context.Background(), candidate); submitErr != nil {
+				submitOK = false
+				s.server.logger.Printf("direct: monero BLOCK SUBMIT FAILED (single-node; multi-node Monero submit is a known, deferred gap) for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, submitErr)
+			} else {
+				submitOK = true
+			}
+			sum := sha256.Sum256(blob)
+			blockHashHex = hex.EncodeToString(sum[:])
+		default:
+			block, ok := candidate.(*tari_generated.Block)
+			if !ok {
+				s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected candidate type %T", candidate))
+				return
+			}
+			var results []NodeSubmitResult
+			results, submitOK = s.server.submitBlockDirect(context.Background(), block)
+			if !submitOK {
+				s.hashesAccumulated.Add(job.StaticDifficulty)
+				s.server.logger.Printf("direct: BLOCK SUBMIT FAILED at every configured node for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, results)
+				s.server.recordBlock(false)
+				s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: rejected/failed at every configured node (%d configured)", len(results)))
+				return
+			}
+			blockHashHex, _ = blockHash(block)
+		}
+
 		if !submitOK {
 			s.hashesAccumulated.Add(job.StaticDifficulty)
-			s.server.logger.Printf("direct: BLOCK SUBMIT FAILED at every configured node for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, results)
 			s.server.recordBlock(false)
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: rejected/failed at every configured node (%d configured)", len(results)))
+			s.writeShareResponse(req.ID, false, "invalid block: rejected/failed at the configured node")
 			return
 		}
-		blockHashHex, _ = blockHash(block)
+
+		s.blockCount.Add(1)
+		s.server.logger.Printf("direct: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.address.Load(), job.Height, job.ID, diff, blockHashHex)
+		s.server.recordBlock(true)
+		s.hashesAccumulated.Add(job.StaticDifficulty)
+		s.writeShareResponse(req.ID, true, "")
+
+		// Report the found block to the backend too (accounting/
+		// visibility — the backend does not need per-node dispatch detail,
+		// only that a block was found and submitted, see
+		// transport.ShareTransport.SubmitBlock's doc comment).
+		s.forwardBlock(share, job, blockHashHex)
+
+		go s.server.jobManager.InvalidateAll()
 	}
 
-	if !submitOK {
-		s.hashesAccumulated.Add(job.StaticDifficulty)
-		s.server.recordBlock(false)
-		s.writeShareResponse(req.ID, false, "invalid block: rejected/failed at the configured node")
+	// DISPATCH: mirrors solo.Session's own identical dispatch exactly —
+	// only RXT/RXM go through the bounded async pool; SHA3X/C29 keep
+	// running finishSubmit INLINE, synchronously, since their validators
+	// have no network-latency bottleneck to fix.
+	if solo.IsRandomXFamily(job.Algo) {
+		if ok := s.server.randomxPool.Submit(finishSubmit); !ok {
+			s.writeShareResponse(req.ID, false, "pool is shutting down, please reconnect")
+		}
 		return
 	}
-
-	s.blockCount.Add(1)
-	s.server.logger.Printf("direct: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.address.Load(), job.Height, job.ID, diff, blockHashHex)
-	s.server.recordBlock(true)
-	s.hashesAccumulated.Add(job.StaticDifficulty)
-	s.writeShareResponse(req.ID, true, "")
-
-	// Report the found block to the backend too (accounting/
-	// visibility — the backend does not need per-node dispatch detail,
-	// only that a block was found and submitted, see
-	// transport.ShareTransport.SubmitBlock's doc comment).
-	s.forwardBlock(share, job, blockHashHex)
-
-	go s.server.jobManager.InvalidateAll()
+	finishSubmit()
 }
 
 func acceptedAddresses(results []NodeSubmitResult) []string {

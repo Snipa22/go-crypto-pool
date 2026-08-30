@@ -102,6 +102,16 @@ type Server struct {
 	// off so operators who want the existing page unchanged get
 	// exactly that.
 	hideRemoteAddress bool
+
+	// randomxPool is the bounded, server-wide worker pool session.go's
+	// handleSubmit dispatches RandomX-family (RXT/RXM) share validation
+	// onto, so that a real, per-share synchronous randomx-service HTTP
+	// round-trip never blocks Session.Run's read loop -- see
+	// asyncvalidation.go's package doc comment for the full production
+	// incident this fixes and the concurrency-bound justification.
+	// Always non-nil (constructed in NewServer); SHA3X/C29 validation is
+	// entirely unaffected and never touches this pool.
+	randomxPool *AsyncValidationPool
 }
 
 // NewServer constructs a Server. cm must already be configured with the
@@ -130,6 +140,7 @@ func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeC
 		vardiff:          vardiff.Normalized(),
 		sessions:         make(map[uint64]*Session),
 		maxAddressLabels: metrics.DefaultMaxAddressLabels,
+		randomxPool:      NewAsyncValidationPool(AsyncValidationWorkers, AsyncValidationQueueSize),
 	}
 	s.unsubscribe = jobManager.Subscribe(s.invalidateAndRepushJobs)
 	return s
@@ -380,11 +391,16 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficul
 	session.Run(mc.Context())
 }
 
-// Shutdown unsubscribes from job updates. It does not close the
+// Shutdown unsubscribes from job updates and stops this Server's
+// RandomX-family async validation worker pool (asyncValidationPool.Stop --
+// blocks until every in-flight validation finishes). It does not close the
 // ConnectionManager or listener — callers own those lifecycles.
 func (s *Server) Shutdown() {
 	if s.unsubscribe != nil {
 		s.unsubscribe()
+	}
+	if s.randomxPool != nil {
+		s.randomxPool.Stop()
 	}
 }
 

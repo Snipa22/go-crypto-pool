@@ -125,6 +125,15 @@ type Server struct {
 	// identical field exactly — see that doc comment. Defaults to
 	// false; set via SetHideRemoteAddress.
 	hideRemoteAddress bool
+
+	// randomxPool mirrors solo.Server's own identical field exactly —
+	// see solo/asyncvalidation.go's package doc comment for the full
+	// production incident/rationale. leaf-direct has the exact same
+	// read-loop-blocking bug leaf-solo did (its own handleSubmit also
+	// calls validator.RandomXValidator.Validate inline for RXT/RXM), so
+	// it reuses solo's exported AsyncValidationPool rather than
+	// duplicating the type.
+	randomxPool *solo.AsyncValidationPool
 }
 
 // ServerConfig configures a Server.
@@ -218,6 +227,7 @@ func NewServer(cfg ServerConfig) *Server {
 		validators:       cfg.Validators, network: cfg.Network, logger: logger,
 		transport: cfg.Transport, multiSubmit: cfg.MultiSubmit, relay: cfg.Relay, algo: cfg.Algo,
 		poolType: cfg.PoolType, poolID: cfg.PoolID,
+		randomxPool: solo.NewAsyncValidationPool(solo.AsyncValidationWorkers, solo.AsyncValidationQueueSize),
 	}
 	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {
@@ -526,8 +536,10 @@ func unmarshalBlockFromRelay(data []byte) (*tari_generated.Block, error) {
 	return &block, nil
 }
 
-// Shutdown unsubscribes from job updates and the relay, and closes the
-// multi-node submitter's connections. It does not close the
+// Shutdown unsubscribes from job updates and the relay, closes the
+// multi-node submitter's connections, and stops this Server's RandomX-
+// family async validation worker pool (see solo.AsyncValidationPool.Stop --
+// blocks until every in-flight validation finishes). It does not close the
 // ConnectionManager, listener, or transport — callers own those
 // lifecycles.
 func (s *Server) Shutdown() {
@@ -539,5 +551,8 @@ func (s *Server) Shutdown() {
 	}
 	if s.multiSubmit != nil {
 		_ = s.multiSubmit.Close()
+	}
+	if s.randomxPool != nil {
+		s.randomxPool.Stop()
 	}
 }
