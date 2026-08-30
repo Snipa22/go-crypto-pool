@@ -181,25 +181,45 @@ type JobPush struct {
 	Params  JobPayload `json:"params"`
 }
 
+// RPCError is the real object-or-null error shape xmrig's parseResponse
+// requires (error.IsObject() must be true, or error must be absent/null;
+// a bare string is silently treated as "not an error").
+type RPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// ShareResult is the real object shape xmrig's parseResponse requires for
+// result on a submit response (result.IsObject() must be true for
+// handleSubmitResponse to ever be called; a bare bool is silently dropped).
+type ShareResult struct {
+	Status string `json:"status"`
+}
+
 // ShareResponse is the real submit/share response shape
-// (messages.MinerRPCShareResponse in the reference) — Result is a bare
-// BOOLEAN. This is a genuinely different shape from ErrorResponse
-// below (whose Result is a string); real miners parse these
-// differently, so they must not be conflated.
+// (messages.MinerRPCShareResponse in the reference), corrected to the
+// real xmrig-compatible wire shape (see Client.cpp::parseResponse and
+// nodejs-pool/lib/pool.js's sendReply): on accept, Error is literal
+// `null` and Result is an object `{"status":"OK"}`; on reject, Error
+// is an object `{"code":-1,"message":"..."}` and the "result" key is
+// entirely absent from the wire (omitempty). A bare boolean/string
+// pair (the previous shape here) is NOT recognized by real miners.
 type ShareResponse struct {
-	ID      int    `json:"id"`
-	JsonRPC string `json:"jsonrpc"`
-	Error   string `json:"error,omitempty"`
-	Result  bool   `json:"result"`
+	ID      int          `json:"id"`
+	JsonRPC string       `json:"jsonrpc"`
+	Error   *RPCError    `json:"error"`            // NOT omitempty: on accept this must be literal `null`, never omitted (matches nodejs-pool's `error: error ? {...} : null`, which always includes the key)
+	Result  *ShareResult `json:"result,omitempty"` // omitempty IS correct here: on reject the real reference has NO "result" key at all
 }
 
 // ErrorResponse is the real general-purpose response shape
 // (messages.MinerRPCResponse in the reference), used for login errors,
 // unknown methods, keepalive acks, and anything else that is not a
-// share/submit outcome. Result here is a STRING, not a boolean.
+// share/submit outcome. Result here is a STRING, not a boolean (this
+// field is unaffected by the ShareResponse wire-shape bug fix). Error
+// follows the same object-or-null rule as ShareResponse above.
 type ErrorResponse struct {
-	ID      int    `json:"id"`
-	JsonRPC string `json:"jsonrpc"`
-	Error   string `json:"error,omitempty"`
-	Result  string `json:"result"`
+	ID      int       `json:"id"`
+	JsonRPC string    `json:"jsonrpc"`
+	Error   *RPCError `json:"error"` // NOT omitempty — same object-or-null rule as ShareResponse
+	Result  string    `json:"result"`
 }

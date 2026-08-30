@@ -123,7 +123,11 @@ func TestSessionRXTTrustedShareSkipsRealRandomXValidation(t *testing.T) {
 			Result: fakeResult,
 		})})
 		resp := h.recvShareResponse()
-		return resp.Result, resp.Error
+		errMsg = ""
+		if resp.Error != nil {
+			errMsg = resp.Error.Message
+		}
+		return resp.Result != nil, errMsg
 	}
 
 	var accepted bool

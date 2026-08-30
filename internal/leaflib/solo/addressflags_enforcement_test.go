@@ -58,7 +58,7 @@ func TestSessionLogin_RejectsBannedAddress(t *testing.T) {
 
 	var generic struct {
 		Status string          `json:"status"`
-		Error  string          `json:"error"`
+		Error  *RPCError       `json:"error"`
 		Result json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal(raw, &generic); err != nil {
@@ -67,7 +67,7 @@ func TestSessionLogin_RejectsBannedAddress(t *testing.T) {
 	if generic.Status == "OK" {
 		t.Fatalf("expected a banned address's login to be rejected, got status=OK (raw=%s)", raw)
 	}
-	if generic.Error == "" {
+	if generic.Error == nil || generic.Error.Message == "" {
 		t.Errorf("expected a non-empty rejection error message, got none (raw=%s)", raw)
 	}
 }
@@ -112,7 +112,7 @@ func TestSessionSubmit_RejectsAddressBannedMidSession(t *testing.T) {
 		Nonce: xn + "00000000",
 	})})
 	resp := h.recvShareResponse()
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected a submit from a now-mid-session-banned address to be rejected, got accepted")
 	}
 }

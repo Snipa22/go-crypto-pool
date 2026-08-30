@@ -714,12 +714,23 @@ func (s *Session) ownJob(id string) (*solo.Job, bool) {
 }
 
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
-	s.writeJSON(solo.ErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
+	var rpcErr *solo.RPCError
+	if errMsg != "" {
+		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
+	}
+	s.writeJSON(solo.ErrorResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
 }
 
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	s.server.recordShare(accepted)
-	s.writeJSON(solo.ShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
+	var rpcErr *solo.RPCError
+	var result *solo.ShareResult
+	if accepted {
+		result = &solo.ShareResult{Status: "OK"}
+	} else {
+		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
+	}
+	s.writeJSON(solo.ShareResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
 }
 
 func (s *Session) writeJSON(v any) {

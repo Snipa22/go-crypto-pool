@@ -330,8 +330,8 @@ func TestSession_LoginGetJobSubmit_FullFlow(t *testing.T) {
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: jobPush.Params.JobID, Nonce: nonceHexAt(1), Result: claimedHash})
 	c.send(Request{ID: 3, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	shareResp := c.recvShareResponse()
-	if !shareResp.Result {
-		t.Fatalf("expected the submit to be accepted, got error=%q", shareResp.Error)
+	if shareResp.Result == nil {
+		t.Fatalf("expected the submit to be accepted, got error=%v", shareResp.Error)
 	}
 	if h.upstream.callCount() != 0 {
 		t.Errorf("expected NO upstream submit call for a below-block-target share, got %d calls", h.upstream.callCount())
@@ -355,8 +355,8 @@ func TestSession_ShareBelowBlockTarget_CreditedLocallyNotForwarded(t *testing.T)
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(2), Result: claimedHash})
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	resp := c.recvShareResponse()
-	if !resp.Result {
-		t.Fatalf("expected accepted share, got error=%q", resp.Error)
+	if resp.Result == nil {
+		t.Fatalf("expected accepted share, got error=%v", resp.Error)
 	}
 
 	if h.upstream.callCount() != 0 {
@@ -381,8 +381,8 @@ func TestSession_ShareMeetingBlockTarget_ForwardedUpstream(t *testing.T) {
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(3), Result: claimedHash})
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	resp := c.recvShareResponse()
-	if !resp.Result {
-		t.Fatalf("expected accepted block-level find, got error=%q", resp.Error)
+	if resp.Result == nil {
+		t.Fatalf("expected accepted block-level find, got error=%v", resp.Error)
 	}
 	if h.upstream.callCount() != 1 {
 		t.Fatalf("expected exactly one upstream submit call for a genuine block-level find, got %d", h.upstream.callCount())
@@ -405,7 +405,7 @@ func TestSession_CryptographicallyInvalidShare_Rejected(t *testing.T) {
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(4), Result: claimedHash})
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	resp := c.recvShareResponse()
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected a cryptographically invalid share to be rejected")
 	}
 	if h.upstream.callCount() != 0 {
@@ -435,7 +435,7 @@ func TestSession_JobOwnership_CrossSessionSubmitRejected(t *testing.T) {
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginB.Result.ID, JobID: loginA.Result.Job.JobID, Nonce: nonceHexAt(5), Result: claimedHash})
 	cB.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	resp := cB.recvShareResponse()
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected a cross-session job_id submit to be rejected")
 	}
 	if h.upstream.callCount() != 0 {
@@ -452,13 +452,13 @@ func TestSession_DuplicateNonceRejected(t *testing.T) {
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(6), Result: claimedHash})
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	first := c.recvShareResponse()
-	if !first.Result {
-		t.Fatalf("expected first submit to be accepted, got %q", first.Error)
+	if first.Result == nil {
+		t.Fatalf("expected first submit to be accepted, got %v", first.Error)
 	}
 
 	c.send(Request{ID: 3, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	second := c.recvShareResponse()
-	if second.Result {
+	if second.Result != nil {
 		t.Fatal("expected a replayed nonce to be rejected")
 	}
 }
@@ -472,7 +472,7 @@ func TestSession_UnknownJobIDRejected(t *testing.T) {
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: "not-a-real-job-id", Nonce: nonceHexAt(7), Result: claimedHash})
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	resp := c.recvShareResponse()
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected an unknown job_id to be rejected")
 	}
 }
@@ -488,7 +488,7 @@ func TestSession_JobExpiry(t *testing.T) {
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(8), Result: claimedHash})
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	resp := c.recvShareResponse()
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected an expired job's submit to be rejected")
 	}
 }

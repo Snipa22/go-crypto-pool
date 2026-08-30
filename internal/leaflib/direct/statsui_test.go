@@ -29,7 +29,7 @@ func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 		Nonce: directXNPrefixedNonceHex(xn, 12345),
 	})})
 	resp := h.recvShareResponse()
-	if !resp.Result {
+	if resp.Result == nil {
 		t.Fatalf("expected the setup submit to be accepted, got %#v", resp)
 	}
 
@@ -81,7 +81,7 @@ func TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured(t *testing.T) {
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 12345),
 	})})
-	if resp := h.recvShareResponse(); !resp.Result {
+	if resp := h.recvShareResponse(); resp.Result == nil {
 		t.Fatalf("expected the setup submit to be accepted, got %#v", resp)
 	}
 
@@ -230,7 +230,7 @@ func TestServerStats_ReflectsRealBackendTransportHealth(t *testing.T) {
 		Nonce: directXNPrefixedNonceHex(xn, 555),
 	})})
 	resp := h.recvShareResponse()
-	if !resp.Result {
+	if resp.Result == nil {
 		t.Fatalf("expected the setup submit to be accepted, got %#v", resp)
 	}
 	if h.transport.shareCount() != 1 {

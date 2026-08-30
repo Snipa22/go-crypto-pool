@@ -30,8 +30,8 @@ func TestServer_EnableMetrics_ShareDecisionsIncrementOnBothRealCodePaths(t *test
 	claimedHash := hashForDifficulty(500_000)
 	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(2), Result: claimedHash})
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
-	if resp := c.recvShareResponse(); !resp.Result {
-		t.Fatalf("expected accepted share, got error=%q", resp.Error)
+	if resp := c.recvShareResponse(); resp.Result == nil {
+		t.Fatalf("expected accepted share, got error=%v", resp.Error)
 	}
 
 	body := scrapeMetrics(t, h.server)
@@ -48,8 +48,8 @@ func TestServer_EnableMetrics_ShareDecisionsIncrementOnBothRealCodePaths(t *test
 	claimedHash2 := hashForDifficulty(2_000_000)
 	submitParams2, _ := json.Marshal(SubmitRequest{ID: loginResp2.Result.ID, JobID: loginResp2.Result.Job.JobID, Nonce: nonceHexAt(3), Result: claimedHash2})
 	c2.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams2})
-	if resp := c2.recvShareResponse(); !resp.Result {
-		t.Fatalf("expected accepted block-level find, got error=%q", resp.Error)
+	if resp := c2.recvShareResponse(); resp.Result == nil {
+		t.Fatalf("expected accepted block-level find, got error=%v", resp.Error)
 	}
 
 	body = scrapeMetrics(t, h.server)

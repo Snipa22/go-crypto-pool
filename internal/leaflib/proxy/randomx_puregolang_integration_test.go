@@ -103,8 +103,8 @@ func TestSession_RealPureGoRandomXValidator_BlockLevelFind_ForwardedUpstream(t *
 	}
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
 	resp := c.recvShareResponse()
-	if !resp.Result {
-		t.Fatalf("expected the real, correct RandomX proof to be accepted, got error=%q", resp.Error)
+	if resp.Result == nil {
+		t.Fatalf("expected the real, correct RandomX proof to be accepted, got error=%v", resp.Error)
 	}
 	if upstream.callCount() != 1 {
 		t.Fatalf("expected exactly one real upstream submit call for a genuine block-level find, got %d", upstream.callCount())
@@ -121,7 +121,7 @@ func TestSession_RealPureGoRandomXValidator_BlockLevelFind_ForwardedUpstream(t *
 	}
 	c2.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams2})
 	resp2 := c2.recvShareResponse()
-	if resp2.Result {
+	if resp2.Result != nil {
 		t.Fatal("expected a wrong claimed RandomX result to be rejected by the real pure-Go validator, not accepted")
 	}
 	if upstream.callCount() != 1 {

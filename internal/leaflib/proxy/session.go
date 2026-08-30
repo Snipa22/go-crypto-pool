@@ -18,6 +18,7 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/proxy/metrics"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 )
 
 // ShareValidator is the real local-RandomX-re-validation dependency
@@ -417,11 +418,27 @@ func (s *Session) ownJob(id string) (*Job, bool) {
 }
 
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
-	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
+	// NOTE: ErrorResponse here is a type alias (= solo.ErrorResponse,
+	// see protocol.go) — not a separate struct copy — so it picked up
+	// solo's object-or-null error wire-shape fix automatically; this
+	// construction site still needed updating to match (see
+	// fix/shareresponse-error-result-wire-shape).
+	var rpcErr *solo.RPCError
+	if errMsg != "" {
+		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
+	}
+	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
 }
 
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
-	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
+	var rpcErr *solo.RPCError
+	var result *solo.ShareResult
+	if accepted {
+		result = &solo.ShareResult{Status: "OK"}
+	} else {
+		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
+	}
+	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
 }
 
 func (s *Session) writeJSON(v any) {

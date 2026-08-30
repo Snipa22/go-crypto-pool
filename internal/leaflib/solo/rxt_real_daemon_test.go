@@ -203,7 +203,7 @@ func TestSessionRXTSubmitAgainstRealRandomXServiceIsAccepted(t *testing.T) {
 		h.t.Fatalf("unmarshal real RXT submit response: %v", err)
 	}
 
-	if !resp.Result {
-		t.Fatalf("expected a genuinely correct RXT share (real randomx-service-computed hash) to be ACCEPTED, got rejected: %q", resp.Error)
+	if resp.Result == nil || resp.Result.Status != "OK" {
+		t.Fatalf("expected a genuinely correct RXT share (real randomx-service-computed hash) to be ACCEPTED, got rejected: %v", resp.Error)
 	}
 }
