@@ -562,11 +562,11 @@ func TestDirectSessionRXTSubmitWithoutXNPrefixIsNotRejectedByXNCheck(t *testing.
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("test setup bug: expected this submit to fail (unreachable RandomX service), not succeed")
 	}
-	if strings.Contains(resp.Error, "Invalid XNonce") {
-		t.Fatalf("BUG REGRESSION: an RXT submit without the xn prefix was rejected by leaf-direct's xn-prefix check (%q) — RXT must be exempt from it", resp.Error)
+	if resp.Error != nil && strings.Contains(resp.Error.Message, "Invalid XNonce") {
+		t.Fatalf("BUG REGRESSION: an RXT submit without the xn prefix was rejected by leaf-direct's xn-prefix check (%q) — RXT must be exempt from it", resp.Error.Message)
 	}
 	if h.transport.shareCount() != 0 {
 		t.Errorf("a rejected submit must not be forwarded to the backend, got %d forwards", h.transport.shareCount())
@@ -591,11 +591,11 @@ func TestDirectSessionSHA3XSubmitWithoutXNPrefixIsStillRejected(t *testing.T) {
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected a SHA3X submit whose nonce does not start with the session's own xn to be REJECTED")
 	}
-	if !strings.Contains(resp.Error, "Invalid XNonce") {
-		t.Errorf("expected rejection to be the xn-prefix check (\"Invalid XNonce\"), got %q", resp.Error)
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "Invalid XNonce") {
+		t.Errorf("expected rejection to be the xn-prefix check (\"Invalid XNonce\"), got %v", resp.Error)
 	}
 }
 
@@ -621,7 +621,7 @@ func TestDirectSessionSHA3XShareCarriesNonZeroTimestamp(t *testing.T) {
 	resp := h.recvShareResponse()
 	after := time.Now().Unix()
 
-	if !resp.Result {
+	if resp.Result == nil {
 		t.Fatalf("expected the share to be accepted, got %#v", resp)
 	}
 	if h.transport.shareCount() != 1 {
@@ -701,7 +701,7 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 	// to forward one; if PoW rejected the share before any forward,
 	// skip the Timestamp assertion (nothing to check) but require the
 	// rejection reason to be the real validator, not a wiring bug.
-	if resp.Result {
+	if resp.Result != nil {
 		if h.transport.shareCount() != 1 {
 			t.Fatalf("expected exactly 1 share forwarded to the backend transport, got %d", h.transport.shareCount())
 		}
@@ -714,7 +714,7 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 		}
 		return
 	}
-	if resp.Error == "" {
+	if resp.Error == nil {
 		t.Fatal("expected a clear rejection error for the non-solving cycle")
 	}
 }
@@ -780,8 +780,8 @@ func TestDirectSessionRXTShareCarriesNonZeroTimestamp(t *testing.T) {
 	if err := json.Unmarshal(line, &resp); err != nil {
 		h.t.Fatalf("unmarshal real RXT submit response: %v", err)
 	}
-	if !resp.Result {
-		t.Fatalf("expected a genuinely correct RXT share to be ACCEPTED, got rejected: %q", resp.Error)
+	if resp.Result == nil {
+		t.Fatalf("expected a genuinely correct RXT share to be ACCEPTED, got rejected: %v", resp.Error)
 	}
 	if h.transport.shareCount() != 1 {
 		t.Fatalf("expected exactly 1 share forwarded to the backend transport, got %d", h.transport.shareCount())
@@ -874,7 +874,7 @@ func TestDirectSessionGetJobWithoutLoginIsRejected(t *testing.T) {
 	h.send(solo.Request{ID: 5, Method: "getjob"})
 	resp := h.recvErrorResponse()
 
-	if resp.Error == "" {
+	if resp.Error == nil {
 		t.Error("expected getjob before login to be rejected with an error")
 	}
 }
@@ -896,11 +896,11 @@ func TestDirectSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Error != "" {
-		t.Fatalf("unexpected error: %s", resp.Error)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
 	}
-	if !resp.Result {
-		t.Fatalf("expected result=true for an accepted share, got %#v", resp)
+	if resp.Result == nil || resp.Result.Status != "OK" {
+		t.Fatalf("expected result={\"status\":\"OK\"} for an accepted share, got %#v", resp)
 	}
 	if h.submit.calls.Load() != 0 {
 		t.Errorf("MultiSubmit.SubmitBlock should not have been called, got %d calls", h.submit.calls.Load())
@@ -937,11 +937,11 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Error != "" {
-		t.Fatalf("unexpected error: %s", resp.Error)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
 	}
-	if !resp.Result {
-		t.Fatalf("expected result=true for a block-finding share, got %#v", resp)
+	if resp.Result == nil || resp.Result.Status != "OK" {
+		t.Fatalf("expected result={\"status\":\"OK\"} for a block-finding share, got %#v", resp)
 	}
 	if h.submit.calls.Load() != 1 {
 		t.Errorf("expected exactly 1 MultiSubmit.SubmitBlock call, got %d", h.submit.calls.Load())
@@ -1016,7 +1016,7 @@ func TestDirectSessionBlockFindCarriesNonZeroShares(t *testing.T) {
 		Nonce: directXNPrefixedNonceHex(xn, 888),
 	})})
 	resp := h.recvShareResponse()
-	if !resp.Result {
+	if resp.Result == nil {
 		t.Fatalf("expected the block-finding share to be accepted, got %#v", resp)
 	}
 
@@ -1053,11 +1053,11 @@ func TestDirectSessionSubmitCryptographicallyInvalid(t *testing.T) {
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Error == "" {
+	if resp.Error == nil {
 		t.Fatal("expected an error for a share that fails PoW validation")
 	}
-	if resp.Result {
-		t.Fatalf("expected result=false for an invalid share, got %#v", resp)
+	if resp.Result != nil {
+		t.Fatalf("expected result absent for an invalid share, got %#v", resp)
 	}
 	if h.submit.calls.Load() != 0 {
 		t.Errorf("MultiSubmit.SubmitBlock must not be called for an invalid share, got %d calls", h.submit.calls.Load())
@@ -1078,11 +1078,11 @@ func TestDirectSessionSubmitUnknownJobIDIsRejected(t *testing.T) {
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Error == "" {
+	if resp.Error == nil {
 		t.Fatal("expected an error for an unknown job_id")
 	}
-	if resp.Result {
-		t.Error("expected result=false for an unknown job_id")
+	if resp.Result != nil {
+		t.Error("expected result absent for an unknown job_id")
 	}
 }
 
@@ -1101,14 +1101,14 @@ func TestDirectSessionSubmitDuplicateNonceIsRejected(t *testing.T) {
 	}
 
 	first := submit()
-	if !first.Result {
+	if first.Result == nil || first.Result.Status != "OK" {
 		t.Fatalf("expected the first submission of a nonce to be accepted, got %#v", first)
 	}
 	second := submit()
-	if second.Result {
+	if second.Result != nil {
 		t.Fatal("expected a replayed nonce to be rejected")
 	}
-	if second.Error == "" {
+	if second.Error == nil {
 		t.Error("expected an error message on a replayed-nonce rejection")
 	}
 }
@@ -1153,14 +1153,14 @@ func TestDirectSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
 	})})
 	resp := hB.recvShareResponse()
 
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("SECURITY REGRESSION: session B's submit against session A's real job was ACCEPTED — cross-session job submission must be structurally impossible in leaf-direct")
 	}
-	if resp.Error == "" {
+	if resp.Error == nil {
 		t.Fatal("expected a clear rejection error for a cross-session job submission")
 	}
-	if !strings.Contains(resp.Error, "unknown or stale job_id") {
-		t.Errorf("expected rejection to be classed as \"unknown or stale job_id\" (the session-ownership boundary), got %q", resp.Error)
+	if !strings.Contains(resp.Error.Message, "unknown or stale job_id") {
+		t.Errorf("expected rejection to be classed as \"unknown or stale job_id\" (the session-ownership boundary), got %q", resp.Error.Message)
 	}
 	if h.submit.calls.Load() != 0 {
 		t.Errorf("MultiSubmit.SubmitBlock must NOT be called for a cross-session job submission, got %d calls", h.submit.calls.Load())
@@ -1283,11 +1283,11 @@ func TestDirectSessionRXMAccepts4ByteNonce(t *testing.T) {
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("test setup bug: expected this RXM submit to still fail downstream (fake Tari template data, not real Monero data), not succeed")
 	}
-	if strings.Contains(resp.Error, "must be 8 bytes") {
-		t.Fatalf("BUG REGRESSION: a real xmrig-shaped 4-byte RXM nonce (%q) was rejected by the 8-byte length gate (%q) -- RXM must accept a 4-byte nonce", xmrigCaptureNonce, resp.Error)
+	if resp.Error != nil && strings.Contains(resp.Error.Message, "must be 8 bytes") {
+		t.Fatalf("BUG REGRESSION: a real xmrig-shaped 4-byte RXM nonce (%q) was rejected by the 8-byte length gate (%q) -- RXM must accept a 4-byte nonce", xmrigCaptureNonce, resp.Error.Message)
 	}
 }
 
@@ -1306,11 +1306,11 @@ func TestDirectSessionRXMRejectsBadLengthNonce(t *testing.T) {
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected a 3-byte RXM nonce to be rejected")
 	}
-	if !strings.Contains(resp.Error, "4 bytes") {
-		t.Errorf("expected the RXM-specific 4-byte-nonce error, got %q", resp.Error)
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "4 bytes") {
+		t.Errorf("expected the RXM-specific 4-byte-nonce error, got %v", resp.Error)
 	}
 }
 
@@ -1330,11 +1330,11 @@ func TestDirectSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
 	})})
 	resp := h.recvShareResponse()
 
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected a 4-byte SHA3X nonce to be rejected")
 	}
-	if !strings.Contains(resp.Error, "must be 8 bytes") {
-		t.Fatalf("BUG REGRESSION: SHA3X's 8-byte nonce requirement was loosened -- got error %q, want the \"must be 8 bytes\" message", resp.Error)
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "must be 8 bytes") {
+		t.Fatalf("BUG REGRESSION: SHA3X's 8-byte nonce requirement was loosened -- got error %v, want the \"must be 8 bytes\" message", resp.Error)
 	}
 }
 

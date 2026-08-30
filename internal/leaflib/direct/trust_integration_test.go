@@ -107,7 +107,11 @@ func TestDirectSessionRXTTrustedShareSkipsRealRandomXValidation(t *testing.T) {
 			Result: fakeResult,
 		})})
 		resp := h.recvShareResponse()
-		accepted, lastErr = resp.Result, resp.Error
+		accepted = resp.Result != nil
+		lastErr = ""
+		if resp.Error != nil {
+			lastErr = resp.Error.Message
+		}
 		if accepted {
 			break
 		}

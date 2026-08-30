@@ -54,7 +54,7 @@ func TestDirectSessionLogin_RejectsBannedAddress(t *testing.T) {
 
 	var generic struct {
 		Status string          `json:"status"`
-		Error  string          `json:"error"`
+		Error  *solo.RPCError  `json:"error"`
 		Result json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal(raw, &generic); err != nil {
@@ -92,7 +92,7 @@ func TestDirectSessionSubmit_RejectsAddressBannedMidSession(t *testing.T) {
 		Nonce: directXNPrefixedNonceHex(xn, 999),
 	})})
 	resp := h.recvShareResponse()
-	if resp.Result {
+	if resp.Result != nil {
 		t.Fatal("expected a submit from a now-mid-session-banned address to be rejected, got accepted")
 	}
 }

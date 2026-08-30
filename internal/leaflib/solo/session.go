@@ -997,7 +997,11 @@ func (s *Session) ownJob(id string) (*Job, bool) {
 }
 
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
-	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
+	var rpcErr *RPCError
+	if errMsg != "" {
+		rpcErr = &RPCError{Code: -1, Message: errMsg}
+	}
+	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
 }
 
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
@@ -1008,7 +1012,14 @@ func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// branch point exactly once, uniformly labeled by result, without
 	// touching any of the actual accept/reject decision logic above.
 	s.server.recordShare(accepted)
-	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
+	var rpcErr *RPCError
+	var result *ShareResult
+	if accepted {
+		result = &ShareResult{Status: "OK"}
+	} else {
+		rpcErr = &RPCError{Code: -1, Message: errMsg}
+	}
+	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
 }
 
 func (s *Session) writeJSON(v any) {
