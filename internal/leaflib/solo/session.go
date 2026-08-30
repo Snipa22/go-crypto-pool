@@ -553,10 +553,33 @@ func (s *Session) handleSubmit(req Request) {
 		}
 	}
 
+	// Nonce length is algo-conditional: SHA3X/C29/RXT genuinely use
+	// an 8-byte (16 hex char) nonce and keep the strict gate below.
+	// ALGO_RXM (Monero-family RandomX) is DIFFERENT — confirmed from
+	// a real production packet capture against the live public RXM
+	// leaf-solo instance (148.163.90.157:4450): a real xmrig client
+	// sends a genuine 4-byte (8 hex char) nonce, matching Monero's
+	// actual 32-bit block-header nonce field. A blanket 8-byte gate
+	// applied to every algo was rejecting every real RXM submit.
+	// RXM accepts either 4 bytes (the correct, expected width for a
+	// real Monero-family miner) or 8 bytes (lenient tolerance, in
+	// case some other RXM-speaking client zero-pads it) — both are
+	// decoded down to the same low-32-bit uint64 that
+	// MoneroHashingBlobForSubmit actually consumes (it only ever
+	// patches uint32(nonce) into the hashing blob), so accepting
+	// either width is safe and doesn't change block-candidate
+	// behavior for a compliant client.
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
-	if err != nil || len(nonceBytes) != 8 {
-		s.writeShareResponse(req.ID, false, "nonce must be 8 bytes, hex-encoded uint64")
-		return
+	if job.Algo == poolpb.Algo_ALGO_RXM {
+		if err != nil || (len(nonceBytes) != 4 && len(nonceBytes) != 8) {
+			s.writeShareResponse(req.ID, false, "nonce must be 4 bytes for RandomX-family (rx/0) jobs, hex-encoded uint32")
+			return
+		}
+	} else {
+		if err != nil || len(nonceBytes) != 8 {
+			s.writeShareResponse(req.ID, false, "nonce must be 8 bytes, hex-encoded uint64")
+			return
+		}
 	}
 
 	var (
@@ -575,8 +598,15 @@ func (s *Session) handleSubmit(req Request) {
 		// low 32 bits of this uint64 are what actually end up in the
 		// block; a miner must send them little-endian for the wire
 		// nonce to round-trip to the same 4 bytes BuildCandidateBlock
-		// patches in.
-		nonce = binary.LittleEndian.Uint64(nonceBytes)
+		// patches in. A real xmrig client sends exactly these 4
+		// bytes (see doc comment on the length gate above); an
+		// 8-byte submit is decoded the same way for backward
+		// tolerance.
+		if len(nonceBytes) == 4 {
+			nonce = uint64(binary.LittleEndian.Uint32(nonceBytes))
+		} else {
+			nonce = binary.LittleEndian.Uint64(nonceBytes)
+		}
 		if submit.Result == "" {
 			s.writeShareResponse(req.ID, false, "monero (rxm) submit requires a claimed result hash in \"result\"")
 			return

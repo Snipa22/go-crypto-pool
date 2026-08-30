@@ -338,10 +338,25 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 	}
 
+	// Nonce length is algo-conditional -- mirrors solo.Session's own
+	// handleSubmit exactly (see its doc comment for the full
+	// rationale, including the real production packet capture
+	// against 148.163.90.157:4450 showing a real xmrig client
+	// sending a genuine 4-byte nonce for ALGO_RXM). SHA3X/C29/RXT
+	// keep the strict 8-byte gate; RXM accepts 4 bytes (expected) or
+	// 8 bytes (lenient tolerance) -- both decode to the same
+	// low-32-bit value solo.MoneroHashingBlobForSubmit consumes.
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
-	if err != nil || len(nonceBytes) != 8 {
-		s.writeShareResponse(req.ID, false, "nonce must be 8 bytes, hex-encoded uint64")
-		return
+	if job.Algo == poolpb.Algo_ALGO_RXM {
+		if err != nil || (len(nonceBytes) != 4 && len(nonceBytes) != 8) {
+			s.writeShareResponse(req.ID, false, "nonce must be 4 bytes for RandomX-family (rx/0) jobs, hex-encoded uint32")
+			return
+		}
+	} else {
+		if err != nil || len(nonceBytes) != 8 {
+			s.writeShareResponse(req.ID, false, "nonce must be 8 bytes, hex-encoded uint64")
+			return
+		}
 	}
 
 	var (
@@ -354,8 +369,14 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// little-endian nonce convention, same
 		// solo.MoneroHashingBlobForSubmit escape hatch for the real
 		// RandomX verification blob) — see that method's doc comment
-		// for the full rationale.
-		nonce = binary.LittleEndian.Uint64(nonceBytes)
+		// for the full rationale. A real xmrig client sends a
+		// 4-byte nonce; an 8-byte submit is decoded the same way
+		// for backward tolerance.
+		if len(nonceBytes) == 4 {
+			nonce = uint64(binary.LittleEndian.Uint32(nonceBytes))
+		} else {
+			nonce = binary.LittleEndian.Uint64(nonceBytes)
+		}
 		if submit.Result == "" {
 			s.writeShareResponse(req.ID, false, "monero (rxm) submit requires a claimed result hash in \"result\"")
 			return
