@@ -146,6 +146,66 @@ type Session struct {
 	// which vardiff.go's computeRetarget divides by connection-time to
 	// estimate this session's accepted-share rate.
 	hashesAccumulated atomic.Uint64
+
+	// --- BUG FIX (Alex, live production report: "we're sending
+	// duplicate jobs down the wire to RXT"): per-session dedup of the
+	// last job actually delivered to THIS session ---
+	//
+	// lastDeliveredJobID/lastDeliveredDifficulty are updated in
+	// jobPayload below (the single real choke point every job-issuing
+	// call — handleLogin, pushJob's callers handleGetJob/vardiff's
+	// maybeRetarget/server.go's invalidateAndRepushJobs — already goes
+	// through before putting a job on the wire, per jobPayload's own
+	// "SECURITY FIX" doc comment). server.go's invalidateAndRepushJobs
+	// consults these to skip re-sending an unsolicited "job" push that
+	// is identical to what this session was already handed, because
+	// JobManager's cache-invalidation subscription fires on EVERY
+	// periodic RefreshInterval tick (default 30s) AND on tip movement,
+	// not only when this session's own job genuinely changed.
+	//
+	// This ports go-tari-sha3x-solo-stratum's real filter for this
+	// exact class of redundant push: subsystems/poolStratum/miner.go's
+	// checkForNewWork, which runs on a 1s cron but only calls
+	// SendNewJob when `tipData.Metadata.BestBlockHeight >
+	// m.curJob.BlockResult.Block.Header.Height-1` — i.e. only when the
+	// real chain tip has actually advanced past what this specific
+	// miner's current job already reflects. It does NOT push on every
+	// timer tick unconditionally the way this rewrite's
+	// invalidateAndRepushJobs previously did.
+	//
+	// Tracking BOTH fields (not job.ID alone) matters: job.ID is
+	// derived purely from the block hash (see job.go's Job.ID doc
+	// comment) and does not depend on difficulty, but the wire
+	// "target" field (jobPayload's diffToTargetHex(job.StaticDifficulty))
+	// does. A dedup keyed on job.ID alone would silently swallow a
+	// legitimate vardiff-driven difficulty/target update that happens
+	// to share the same job.ID as the last push (JobForXNAtDifficulty
+	// returns the SAME cached Job, unchanged, whenever the underlying
+	// per-xn template hasn't been invalidated — see job.go's
+	// jobForXN/RestampDifficulty doc comments) — a real target update
+	// the miner needs to receive.
+	lastDeliveredJobID      atomic.Value // string
+	lastDeliveredDifficulty atomic.Uint64
+}
+
+// alreadyDelivered reports whether job is identical (same job.ID AND
+// same StaticDifficulty) to the last job actually delivered to this
+// session via jobPayload — see lastDeliveredJobID's doc comment. Used
+// ONLY by server.go's invalidateAndRepushJobs to gate the periodic/
+// tip-triggered UNSOLICITED job push; an explicit miner-initiated
+// getjob request and a genuine vardiff retarget push both still
+// always go through pushJob/jobPayload unconditionally — this dedup
+// is deliberately scoped to the one call site that was actually
+// producing redundant wire traffic.
+func (s *Session) alreadyDelivered(job *Job) bool {
+	if job == nil {
+		return false
+	}
+	lastID, _ := s.lastDeliveredJobID.Load().(string)
+	if lastID == "" || lastID != job.ID {
+		return false
+	}
+	return s.lastDeliveredDifficulty.Load() == job.StaticDifficulty
 }
 
 // defaultSessionJobHistorySize is the default bound on how many of a
@@ -994,6 +1054,12 @@ func (s *Session) pushJob(job *Job) {
 // repushes) without needing a separate recordJob call at each site.
 func (s *Session) jobPayload(job *Job) JobPayload {
 	s.recordJob(job)
+	// Record what was actually delivered, for invalidateAndRepushJobs'
+	// dedup check (see lastDeliveredJobID's doc comment) — every
+	// caller of jobPayload is putting job on the wire to THIS session
+	// right now, so this is the single correct place to update it.
+	s.lastDeliveredJobID.Store(job.ID)
+	s.lastDeliveredDifficulty.Store(job.StaticDifficulty)
 	payload := JobPayload{
 		Algo:   algoWireName(job.Algo),
 		Blob:   hex.EncodeToString(job.Header),

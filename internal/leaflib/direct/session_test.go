@@ -346,8 +346,106 @@ func directCurrentJobIDForXN(t *testing.T, h *directTestHarness, xn string) stri
 	return job.ID
 }
 
+// directRecvJobPush reads and decodes one unsolicited "job" push --
+// mirrors solo package's own recvJobPush helper exactly.
+func (h *directTestHarness) recvJobPush() solo.JobPush {
+	h.t.Helper()
+	var push solo.JobPush
+	if err := json.Unmarshal(h.recvRaw(), &push); err != nil {
+		h.t.Fatalf("unmarshal job push: %v", err)
+	}
+	return push
+}
+
+// directExpectNoJobPush mirrors solo package's own expectNoJobPush --
+// asserts no further wire traffic arrives within a short deadline.
+func directExpectNoJobPush(t *testing.T, h *directTestHarness) {
+	t.Helper()
+	_ = h.client.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	line, err := h.reader.ReadBytes('\n')
+	if err == nil {
+		t.Fatalf("BUG: received an unexpected wire push when none was expected: %s", line)
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected a read timeout (no data), got: %v", err)
+	}
+	_ = h.client.SetReadDeadline(time.Time{})
+}
+
+// directSessionByID looks up the real, live *Session for sessionID on
+// h.server directly, so a test can mutate/inspect internal state
+// (currentDifficulty) that isn't exposed on the wire.
+func directSessionByID(t *testing.T, h *directTestHarness, sessionID string) *Session {
+	t.Helper()
+	h.server.mu.RLock()
+	defer h.server.mu.RUnlock()
+	for _, s := range h.server.sessions {
+		if s.sessionID == sessionID {
+			return s
+		}
+	}
+	t.Fatalf("could not find session %q on server", sessionID)
+	return nil
+}
+
+// TestDirectInvalidateAndRepushJobsSkipsDuplicatePush mirrors
+// solo package's identical regression test exactly -- leaf-direct's
+// invalidateAndRepushJobs (server.go) has the exact same shared-code
+// bug (Alex's live report: "we're sending duplicate jobs down the
+// wire to RXT").
+func TestDirectInvalidateAndRepushJobsSkipsDuplicatePush(t *testing.T) {
+	h := newDirectTestHarness(t, 1000, 1<<62)
+	_, _ = directLogin(t, h, realTariTestAddress("direct-dedup-addr-1"))
+
+	h.server.invalidateAndRepushJobs()
+	directExpectNoJobPush(t, h)
+
+	h.server.invalidateAndRepushJobs()
+	directExpectNoJobPush(t, h)
+}
+
+// TestDirectInvalidateAndRepushJobsStillPushesOnDifficultyChange
+// mirrors solo package's identical regression test exactly.
+func TestDirectInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T) {
+	h := newDirectTestHarness(t, 1000, 1<<62)
+	sessionID, xn := directLogin(t, h, realTariTestAddress("direct-dedup-addr-2"))
+
+	h.server.invalidateAndRepushJobs()
+	directExpectNoJobPush(t, h)
+
+	baselineJobID := directCurrentJobIDForXN(t, h, xn)
+
+	sess := directSessionByID(t, h, sessionID)
+	newDiff := sess.currentDifficulty.Load() * 2
+	sess.currentDifficulty.Store(newDiff)
+	if _, err := h.jm.RestampDifficulty(context.Background(), xn, newDiff); err != nil {
+		t.Fatalf("RestampDifficulty: %v", err)
+	}
+
+	// See solo package's identical test for why this must run in its
+	// own goroutine (net.Pipe's synchronous write/read pairing).
+	go h.server.invalidateAndRepushJobs()
+	push := h.recvJobPush()
+
+	if push.Method != "job" {
+		t.Fatalf("push method = %q, want job", push.Method)
+	}
+	if push.Params.JobID != baselineJobID {
+		t.Fatalf("BUG: job.ID changed across a pure difficulty retarget (got %q, want unchanged %q)", push.Params.JobID, baselineJobID)
+	}
+	wantTarget := diffToTargetHex(newDiff)
+	if push.Params.Target != wantTarget {
+		t.Fatalf("BUG: a real vardiff-driven target update was dropped -- push.Params.Target = %q, want %q", push.Params.Target, wantTarget)
+	}
+
+	h.server.invalidateAndRepushJobs()
+	directExpectNoJobPush(t, h)
+}
+
 func directXNPrefixedNonceHex(xn string, n uint64) string {
 	buf := make([]byte, 8)
+
 	binary.LittleEndian.PutUint64(buf, n)
 	full := hex.EncodeToString(buf)
 	return xn + full[len(xn):]

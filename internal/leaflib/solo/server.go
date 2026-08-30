@@ -289,6 +289,20 @@ func (s *Server) invalidateAndRepushJobs() {
 			s.logger.Printf("solo: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.xn, err)
 			continue
 		}
+		// BUG FIX (Alex, live production report: "we're sending
+		// duplicate jobs down the wire to RXT"): this callback fires
+		// on EVERY periodic RefreshInterval tick (default 30s) AND on
+		// tip movement, regardless of whether THIS session's own job
+		// actually changed. Skip the unsolicited push when it would be
+		// byte-for-byte identical (same job.ID AND same difficulty) to
+		// what this session was already handed — see
+		// Session.alreadyDelivered's doc comment for the real legacy
+		// reference (go-tari-sha3x-solo-stratum's checkForNewWork/
+		// SendNewJob, which only pushes when the tip has genuinely
+		// advanced past the miner's current job) this ports.
+		if sess.alreadyDelivered(job) {
+			continue
+		}
 		sess.pushJob(job)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -1646,4 +1647,139 @@ func currentJobIDForXNRXT(t *testing.T, h *testHarness) string {
 		t.Fatalf("no live session found on server")
 	}
 	return currentJobIDForXN(t, h, xn)
+}
+
+// sessionByID looks up the real, live *Session for sessionID on
+// h.server directly -- like sessionXN, but returns the Session itself
+// so a test can mutate/inspect internal state (currentDifficulty,
+// lastDeliveredJobID) that isn't exposed on the wire.
+func sessionByID(t *testing.T, h *testHarness, sessionID string) *Session {
+	t.Helper()
+	h.server.mu.RLock()
+	defer h.server.mu.RUnlock()
+	for _, s := range h.server.sessions {
+		if s.sessionID == sessionID {
+			return s
+		}
+	}
+	t.Fatalf("could not find session %q on server", sessionID)
+	return nil
+}
+
+// expectNoJobPush asserts that NO further wire traffic arrives within
+// a short deadline -- used to prove invalidateAndRepushJobs' dedup
+// correctly suppressed a would-be-redundant unsolicited "job" push.
+func expectNoJobPush(t *testing.T, h *testHarness) {
+	t.Helper()
+	_ = h.client.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	line, err := h.reader.ReadBytes('\n')
+	if err == nil {
+		t.Fatalf("BUG: received an unexpected wire push when none was expected: %s", line)
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected a read timeout (no data), got: %v", err)
+	}
+	// Reset the deadline so subsequent reads in the same test aren't
+	// affected by this probe's short deadline.
+	_ = h.client.SetReadDeadline(time.Time{})
+}
+
+// TestInvalidateAndRepushJobsSkipsDuplicatePush is the direct
+// regression test for Alex's live production report ("we're sending
+// duplicate jobs down the wire to RXT"): invalidateAndRepushJobs fires
+// on every periodic RefreshInterval tick (and on tip movement)
+// regardless of whether anything actually changed for a given
+// session. Two consecutive invocations against the SAME underlying
+// cached job/template (JobManager's cache was never invalidated
+// between them) must result in AT MOST ONE real "job" push reaching
+// the wire -- the second, genuinely-redundant push must be suppressed.
+func TestInvalidateAndRepushJobsSkipsDuplicatePush(t *testing.T) {
+	h := newTestHarness(t, 1000, 1<<62)
+	sessionID, _ := login(t, h, "dedup-addr-1")
+
+	// First invocation: the per-xn job cache was never invalidated
+	// since login, so JobForXNAtDifficulty returns the SAME cached Job
+	// at the SAME difficulty already recorded by the login response's
+	// own jobPayload call -- this must be recognized as a duplicate
+	// and skipped.
+	h.server.invalidateAndRepushJobs()
+	expectNoJobPush(t, h)
+
+	// Second consecutive invocation, still with nothing having
+	// changed: must ALSO be skipped, proving this isn't a one-shot
+	// fluke of already having a per-session job that happens to match
+	// only right after login.
+	h.server.invalidateAndRepushJobs()
+	expectNoJobPush(t, h)
+
+	_ = sessionID
+}
+
+// TestInvalidateAndRepushJobsStillPushesOnDifficultyChange is the
+// regression guard for the correctness nuance in this fix: job.ID is
+// derived purely from the block hash (job.go's Job.ID) and does NOT
+// depend on difficulty, but the wire "target" field does. A dedup
+// keyed on job.ID alone would incorrectly swallow a legitimate
+// vardiff-driven difficulty/target update sharing the same job.ID as
+// the previous push. This simulates exactly that: a vardiff retarget
+// changes the session's own currentDifficulty between two
+// invalidateAndRepushJobs ticks while the underlying job/template
+// (and therefore job.ID) stays the same -- the push must still be
+// sent, with the new target.
+func TestInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T) {
+	h := newTestHarness(t, 1000, 1<<62)
+	sessionID, xn := login(t, h, "dedup-addr-2")
+
+	// Establish the baseline: same as the pure-dedup test, this first
+	// tick with nothing changed must be suppressed (no write happens,
+	// so this call is safe to run synchronously).
+	h.server.invalidateAndRepushJobs()
+	expectNoJobPush(t, h)
+
+	baselineJobID := currentJobIDForXN(t, h, xn)
+
+	// Simulate a real vardiff retarget between two invalidation ticks:
+	// vardiff.go's maybeRetarget updates currentDifficulty AND calls
+	// JobManager.RestampDifficulty (producing a new *Job with the
+	// SAME ID/Header/BlockHash but a NEW StaticDifficulty, replacing
+	// the cached entry for this xn) -- mutating currentDifficulty
+	// alone would NOT be enough here, since JobForXNAtDifficulty does
+	// not retroactively restamp an already-cached job (see job.go's
+	// doc comment); the cache entry itself must be restamped, exactly
+	// as the real retarget path does.
+	sess := sessionByID(t, h, sessionID)
+	newDiff := sess.currentDifficulty.Load() * 2
+	sess.currentDifficulty.Store(newDiff)
+	if _, err := h.jm.RestampDifficulty(context.Background(), xn, newDiff); err != nil {
+		t.Fatalf("RestampDifficulty: %v", err)
+	}
+
+	// invalidateAndRepushJobs' real push write blocks (net.Pipe is a
+	// synchronous, unbuffered pipe: a server-side Write blocks until
+	// the client reads) until this test's own recvJobPush below
+	// performs that read -- so the call must run in its own
+	// goroutine, exactly like the real production callback does (it
+	// is JobManager's own invalidation-subscriber callback, never
+	// called synchronously from the same goroutine that will read the
+	// resulting wire traffic).
+	go h.server.invalidateAndRepushJobs()
+	push := h.recvJobPush()
+
+	if push.Method != "job" {
+		t.Fatalf("push method = %q, want job", push.Method)
+	}
+	if push.Params.JobID != baselineJobID {
+		t.Fatalf("BUG: job.ID changed across a pure difficulty retarget (got %q, want unchanged %q) -- the underlying template/job.ID must be difficulty-independent", push.Params.JobID, baselineJobID)
+	}
+	wantTarget := diffToTargetHex(newDiff)
+	if push.Params.Target != wantTarget {
+		t.Fatalf("BUG: a real vardiff-driven target update was dropped -- push.Params.Target = %q, want %q (dedup must consider difficulty, not just job.ID)", push.Params.Target, wantTarget)
+	}
+
+	// A third tick with nothing changed since the difficulty-driven
+	// push above must once again be suppressed -- proves the dedup
+	// state was correctly updated to reflect the just-sent push.
+	h.server.invalidateAndRepushJobs()
+	expectNoJobPush(t, h)
 }
