@@ -69,6 +69,50 @@ func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 	}
 }
 
+// TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured mirrors
+// internal/leaflib/solo/statsui_test.go's own test of the same
+// name: SetHideRemoteAddress(true) removes the "Remote address"
+// column entirely; unset (default) still shows it.
+func TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured(t *testing.T) {
+	h := newDirectTestHarness(t, 1, 1<<62)
+	_, xn := directLogin(t, h, realTariTestAddress("hide-remote-addr-test"))
+	jobID := directCurrentJobIDForXN(t, h, xn)
+	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
+		JobID: jobID,
+		Nonce: directXNPrefixedNonceHex(xn, 12345),
+	})})
+	if resp := h.recvShareResponse(); !resp.Result {
+		t.Fatalf("expected the setup submit to be accepted, got %#v", resp)
+	}
+
+	fetch := func() string {
+		srv := httptest.NewServer(h.server.StatsHTMLHandler())
+		defer srv.Close()
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("GET stats page: %v", err)
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, 65536)
+		n, _ := resp.Body.Read(buf)
+		return string(buf[:n])
+	}
+
+	body := fetch()
+	if !strings.Contains(body, "Remote address") {
+		t.Errorf("expected 'Remote address' column by default, got:\n%s", body)
+	}
+
+	h.server.SetHideRemoteAddress(true)
+	body = fetch()
+	if strings.Contains(body, "Remote address") {
+		t.Errorf("expected 'Remote address' column to be absent when hidden, got:\n%s", body)
+	}
+	if !strings.Contains(body, "<html") {
+		t.Errorf("expected the rest of the page to still render normally, got:\n%s", body)
+	}
+}
+
 // TestStatsHTMLHandler_EmptyServerRendersWithoutError confirms the page
 // renders cleanly (no panic, no 500) with zero connected sessions —
 // the "no data yet" case a freshly-started leaf-direct would show.

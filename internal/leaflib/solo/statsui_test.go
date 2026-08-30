@@ -81,6 +81,52 @@ func TestStatsHTMLHandler_EmptyServerRendersWithoutError(t *testing.T) {
 	}
 }
 
+// TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured confirms
+// SetHideRemoteAddress(true) removes both the "Remote address"
+// column header and its per-session value from the rendered page —
+// and that the default (unset) behavior still shows it.
+func TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured(t *testing.T) {
+	h := newTestHarness(t, 1, math.MaxUint64)
+	_, xn := login(t, h, "hide-remote-addr-test")
+	jobID := currentJobIDForXN(t, h, xn)
+	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		JobID: jobID,
+		Nonce: xnPrefixedNonceHex(xn, 12345),
+	})})
+	if resp := h.recvShareResponse(); !resp.Result {
+		t.Fatalf("expected the setup submit to be accepted, got %#v", resp)
+	}
+
+	fetch := func() string {
+		srv := httptest.NewServer(h.server.StatsHTMLHandler())
+		defer srv.Close()
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("GET stats page: %v", err)
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, 65536)
+		n, _ := resp.Body.Read(buf)
+		return string(buf[:n])
+	}
+
+	// Default: shown.
+	body := fetch()
+	if !strings.Contains(body, "Remote address") {
+		t.Errorf("expected 'Remote address' column by default, got:\n%s", body)
+	}
+
+	// Opted in: hidden.
+	h.server.SetHideRemoteAddress(true)
+	body = fetch()
+	if strings.Contains(body, "Remote address") {
+		t.Errorf("expected 'Remote address' column to be absent when hidden, got:\n%s", body)
+	}
+	if !strings.Contains(body, "<html") || !strings.Contains(body, "Active connections") {
+		t.Errorf("expected the rest of the page to still render normally, got:\n%s", body)
+	}
+}
+
 // TestServerStats_ReportsPerSessionAndAddressBreakdown exercises
 // Server.Stats()'s extended shape directly: real per-session data
 // (address, current difficulty) and the per-address breakdown for

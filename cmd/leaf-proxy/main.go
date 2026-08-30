@@ -84,6 +84,11 @@ type config struct {
 	// binary unchanged, just with the LEAF_PROXY_ prefix.
 	metricsListenAddress string
 	maxAddressLabels     int
+
+	// hideRemoteAddress mirrors cmd/leaf-solo's identical flag
+	// exactly (see solo.Server.SetHideRemoteAddress's doc comment
+	// -- proxy.Server has an identical method). Defaults to false.
+	hideRemoteAddress bool
 }
 
 func loadConfig() config {
@@ -128,7 +133,8 @@ func loadConfig() config {
 	flag.DurationVar(&cfg.dialTimeout, "upstream-dial-timeout", envOrDuration("LEAF_PROXY_UPSTREAM_DIAL_TIMEOUT", 10*time.Second), "timeout for dialing the upstream pool. Env: LEAF_PROXY_UPSTREAM_DIAL_TIMEOUT")
 	flag.DurationVar(&cfg.requestTimeout, "upstream-request-timeout", envOrDuration("LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT", 15*time.Second), "timeout for a single upstream request/response round-trip. Env: LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT")
 
-	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_PROXY_METRICS_LISTEN_ADDRESS", ":9601"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the downstream-facing stratum port). Set to empty string to disable. Env: LEAF_PROXY_METRICS_LISTEN_ADDRESS")
+	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_PROXY_METRICS_LISTEN_ADDRESS", "127.0.0.1:9601"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the downstream-facing stratum port). Defaults to loopback-only (127.0.0.1) -- an operator must explicitly set this to a wildcard/public address to expose stats/metrics publicly. Set to empty string to disable. Env: LEAF_PROXY_METRICS_LISTEN_ADDRESS")
+	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOrBool("LEAF_PROXY_HIDE_REMOTE_ADDRESS", false), "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_PROXY_HIDE_REMOTE_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_PROXY_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_PROXY_MAX_ADDRESS_LABELS")
 
 	flag.Parse()
@@ -252,6 +258,7 @@ func main() {
 	// ported from) -- ported unchanged aside from the LEAF_PROXY_
 	// flag/env prefix and leaf-proxy's own metrics.Metrics type.
 	if cfg.metricsListenAddress != "" {
+		server.SetHideRemoteAddress(cfg.hideRemoteAddress)
 		server.EnableMetrics(version, cfg.maxAddressLabels)
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", server.MetricsHandler())

@@ -93,6 +93,11 @@ type config struct {
 	metricsListenAddress string
 	maxAddressLabels     int
 
+	// hideRemoteAddress mirrors cmd/leaf-solo's identical flag
+	// exactly (see solo.Server.SetHideRemoteAddress's doc comment).
+	// Defaults to false.
+	hideRemoteAddress bool
+
 	// backendBaseURL / backendAuth* configure the real
 	// HTTPProtobufTransport this leaf forwards every validated share/
 	// block to — this leaf's whole reason for existing (see this
@@ -162,8 +167,9 @@ func loadConfig() config {
 	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_DIRECT_MAX_CONNECTIONS", 0), "max concurrent miner connections, 0 = unlimited. Env: LEAF_DIRECT_MAX_CONNECTIONS")
 	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", envOrDuration("LEAF_DIRECT_IDLE_TIMEOUT", 2*time.Minute), "rolling per-connection idle timeout. Env: LEAF_DIRECT_IDLE_TIMEOUT")
 
-	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_DIRECT_METRICS_LISTEN_ADDRESS", ":9601"), "HTTP listen address for /metrics. Empty disables it. Env: LEAF_DIRECT_METRICS_LISTEN_ADDRESS")
+	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_DIRECT_METRICS_LISTEN_ADDRESS", "127.0.0.1:9601"), "HTTP listen address for /metrics. Defaults to loopback-only (127.0.0.1) -- an operator must explicitly set this to a wildcard/public address to expose it publicly. Empty disables it. Env: LEAF_DIRECT_METRICS_LISTEN_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_DIRECT_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by metrics (0 = package default). Env: LEAF_DIRECT_MAX_ADDRESS_LABELS")
+	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOr("LEAF_DIRECT_HIDE_REMOTE_ADDRESS", "false") == "true", "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_DIRECT_HIDE_REMOTE_ADDRESS (\"true\" to enable)")
 
 	flag.StringVar(&cfg.backendBaseURL, "backend-base-url", envOr("LEAF_DIRECT_BACKEND_BASE_URL", ""), "real backend base URL every validated share/block is forwarded to over HTTP+Protobuf. REQUIRED. Env: LEAF_DIRECT_BACKEND_BASE_URL")
 	flag.StringVar(&cfg.backendAuthHeader, "backend-auth-header", envOr("LEAF_DIRECT_BACKEND_AUTH_HEADER", ""), "optional shared-secret/bearer auth header name sent with every backend request. Env: LEAF_DIRECT_BACKEND_AUTH_HEADER")
@@ -528,6 +534,7 @@ func main() {
 	logger.Printf("manual ban/forced-minimum-difficulty enforcement ENABLED, polling %s%s every %s", cfg.backendBaseURL, "/api/v1/leaf/address-flags", cfg.addressFlagsPollInterval)
 
 	if cfg.metricsListenAddress != "" {
+		server.SetHideRemoteAddress(cfg.hideRemoteAddress)
 		server.EnableMetrics(version, cfg.maxAddressLabels)
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", server.MetricsHandler())

@@ -90,6 +90,18 @@ type Server struct {
 	// Defaults to metrics.DefaultMaxAddressLabels; overridden by
 	// EnableMetrics when called with a positive value.
 	maxAddressLabels int
+
+	// hideRemoteAddress, when true, tells StatsHTMLHandler to omit
+	// the "Remote address" column (both header and value) from the
+	// rendered stats page entirely -- see SetHideRemoteAddress.
+	// Defaults to false (existing behavior: remote addresses shown)
+	// since this is an opt-in privacy control, not a security-fix
+	// default change -- unlike the metrics-listen-address bind
+	// default, which changed to localhost-only (see
+	// cmd/leaf-solo/main.go), this flag intentionally still defaults
+	// off so operators who want the existing page unchanged get
+	// exactly that.
+	hideRemoteAddress bool
 }
 
 // NewServer constructs a Server. cm must already be configured with the
@@ -141,6 +153,15 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	return m
+}
+
+// SetHideRemoteAddress opts this server's stats HTML page into
+// omitting the "Remote address" column entirely (both header and
+// per-session value) — see the hideRemoteAddress field's doc comment.
+// Safe to call at any point before or after Serve begins accepting
+// connections; StatsHTMLHandler reads it fresh on every request.
+func (s *Server) SetHideRemoteAddress(hide bool) {
+	s.hideRemoteAddress = hide
 }
 
 // EnableTrust opts this server into the real, legacy-ported

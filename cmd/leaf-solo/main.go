@@ -142,6 +142,13 @@ type config struct {
 	metricsListenAddress string
 	maxAddressLabels     int
 
+	// hideRemoteAddress, when true, tells the stats HTML page to
+	// omit the "Remote address" column entirely (see
+	// solo.Server.SetHideRemoteAddress). Defaults to false --
+	// preserves the existing page unless an operator explicitly
+	// opts in.
+	hideRemoteAddress bool
+
 	// addressFlagsFile / addressFlagsPollInterval configure the real,
 	// manual ban/forced-minimum-difficulty enforcement described in
 	// internal/leaflib/addressflags's package doc comment.
@@ -197,8 +204,9 @@ func loadConfig() config {
 	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_SOLO_MAX_CONNECTIONS", 0), "max concurrent miner connections, 0 = unlimited. Env: LEAF_SOLO_MAX_CONNECTIONS")
 	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", envOrDuration("LEAF_SOLO_IDLE_TIMEOUT", 2*time.Minute), "rolling per-connection idle timeout. Env: LEAF_SOLO_IDLE_TIMEOUT")
 
-	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_SOLO_METRICS_LISTEN_ADDRESS", ":9600"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the miner-facing stratum port). Set to empty string to disable. Env: LEAF_SOLO_METRICS_LISTEN_ADDRESS")
+	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_SOLO_METRICS_LISTEN_ADDRESS", "127.0.0.1:9600"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the miner-facing stratum port). Defaults to loopback-only (127.0.0.1) -- an operator must explicitly set this to a wildcard/public address (e.g. :9600 or 0.0.0.0:9600) to expose stats/metrics publicly. Set to empty string to disable. Env: LEAF_SOLO_METRICS_LISTEN_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_SOLO_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_SOLO_MAX_ADDRESS_LABELS")
+	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOr("LEAF_SOLO_HIDE_REMOTE_ADDRESS", "false") == "true", "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments so remote miner IPs are never exposed on a page anyone can load. Disabled by default (existing behavior unchanged). Env: LEAF_SOLO_HIDE_REMOTE_ADDRESS (\"true\" to enable)")
 
 	flag.StringVar(&cfg.addressFlagsFile, "address-flags-file", envOr("LEAF_SOLO_ADDRESS_FLAGS_FILE", ""), "path to a local, operator-maintained JSON file of manually banned/forced-minimum-difficulty payment addresses (see internal/leaflib/addressflags.FileSource's doc comment for the file format). Empty (default) disables the feature entirely -- leaf-solo has no backend to poll instead. Env: LEAF_SOLO_ADDRESS_FLAGS_FILE")
 	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_SOLO_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often -address-flags-file is re-read. Ignored if -address-flags-file is unset. Env: LEAF_SOLO_ADDRESS_FLAGS_POLL_INTERVAL")
@@ -523,6 +531,7 @@ func main() {
 	}
 
 	if cfg.metricsListenAddress != "" {
+		server.SetHideRemoteAddress(cfg.hideRemoteAddress)
 		server.EnableMetrics(version, cfg.maxAddressLabels)
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", server.MetricsHandler())
