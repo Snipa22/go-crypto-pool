@@ -443,6 +443,65 @@ func TestMoneroNodeClient_SubmitBlock_RejectsWrongCandidateType(t *testing.T) {
 	}
 }
 
+// TestMoneroRPCCall_DecodesNumericID mirrors the exact real production
+// bug fixed this session: live journalctl evidence from
+// leaf-solo-rxm.service showed the real monerod submit_block RPC
+// response echoing "id" as a bare JSON NUMBER
+// ("json: cannot unmarshal number into Go struct field
+// moneroRPCResponse.id of type string"), causing every real
+// submit_block call to fail at the top-level struct decode before
+// rpcResp.Error/Result could ever be inspected. This test proves
+// call() now decodes such a response successfully and still
+// correctly surfaces the real *moneroRPCError payload underneath.
+func TestMoneroRPCCall_DecodesNumericID(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/json_rpc", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Real shape observed from monerod's submit_block response:
+		// numeric id, not a quoted string.
+		fmt.Fprint(w, `{"id":0,"jsonrpc":"2.0","error":{"code":-7,"message":"Block not accepted"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewMoneroNodeClient(srv.URL)
+	err := client.call(context.Background(), "submit_block", []string{"deadbeef"}, nil)
+	if err == nil {
+		t.Fatalf("expected an error")
+	}
+	rpcErr, ok := err.(*moneroRPCError)
+	if !ok {
+		t.Fatalf("error is not a *moneroRPCError (got %T: %v) — decode likely failed before reaching the real error payload", err, err)
+	}
+	if rpcErr.Code != -7 || rpcErr.Message != "Block not accepted" {
+		t.Fatalf("rpcErr = %+v, want code=-7 message=\"Block not accepted\"", rpcErr)
+	}
+}
+
+// TestMoneroRPCCall_DecodesStringID is the companion regression guard
+// for TestMoneroRPCCall_DecodesNumericID above: confirms the
+// get_block_template/get_info-style STRING id shape (which worked
+// before this fix) still decodes correctly after switching
+// moneroRPCResponse.ID to json.RawMessage.
+func TestMoneroRPCCall_DecodesStringID(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/json_rpc", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"0","jsonrpc":"2.0","result":{"height":42}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewMoneroNodeClient(srv.URL)
+	var result moneroGetInfoResult
+	if err := client.call(context.Background(), "get_info", nil, &result); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if result.Height != 42 {
+		t.Fatalf("result.Height = %d, want 42", result.Height)
+	}
+}
+
 // TestMoneroRPCCall_SurfacesDaemonError exercises call() against a
 // real (local, httptest) HTTP server returning monerod's real,
 // documented submit_block rejection JSON shape verbatim, confirming
