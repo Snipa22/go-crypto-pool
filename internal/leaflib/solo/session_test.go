@@ -821,10 +821,77 @@ func TestSessionJobHistoryIsBounded(t *testing.T) {
 	}
 }
 
+// TestSessionLoginJobPayloadOmitsXNForRandomXFamilyAlgos is the real
+// wire-shape regression guard for this bug fix: RXT/RXM
+// (RandomX-family) job payloads must NOT carry an "xn" key at all —
+// real RandomX miners (xmrig, graxil) neither expect nor use one, and
+// unconditionally populating JobPayload.XN with the session's
+// extranonce for these algos broke live xmrig connections against the
+// production RXT leaf-solo port. This asserts on the literal raw JSON
+// bytes (not just a decoded Go struct, which would hide the
+// difference between an omitted key and a present-but-empty one)
+// that "xn" is genuinely absent for RXT.
+func TestSessionLoginJobPayloadOmitsXNForRandomXFamilyAlgos(t *testing.T) {
+	h := newRXTTestHarness(t, 1000, 1<<62, "http://127.0.0.1:1") // unreachable; irrelevant to login/job wire shape
+	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realTariTestAddress("addr-rxt-noxn-wire"), Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"rxt"}})})
+	raw := h.recvRaw()
+
+	var asMap map[string]any
+	if err := json.Unmarshal(raw, &asMap); err != nil {
+		t.Fatalf("unmarshal login response as map: %v", err)
+	}
+	result, ok := asMap["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("login response has no result object: %s", raw)
+	}
+	job, ok := result["job"].(map[string]any)
+	if !ok {
+		t.Fatalf("login result has no job object: %s", raw)
+	}
+	if algo, _ := job["algo"].(string); algo != "rxt" {
+		t.Fatalf("job algo = %q, want rxt (sanity check this is really an RXT job): %s", algo, raw)
+	}
+	if _, present := job["xn"]; present {
+		t.Errorf("RXT job payload must not carry an \"xn\" key at all, got raw job JSON: %s", raw)
+	}
+}
+
+// TestSessionLoginJobPayloadStillIncludesXNForSHA3X is
+// TestSessionLoginJobPayloadOmitsXNForRandomXFamilyAlgos's regression
+// counterpart: the RXT/RXM-only fix must not accidentally strip xn
+// from SHA3X (or C29) jobs too, since those algos' real
+// nonce-partitioning convention still depends on it.
+func TestSessionLoginJobPayloadStillIncludesXNForSHA3X(t *testing.T) {
+	h := newTestHarness(t, 1000, 1<<62)
+	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realTariTestAddress("addr-sha3x-xn-wire"), Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
+	raw := h.recvRaw()
+
+	var asMap map[string]any
+	if err := json.Unmarshal(raw, &asMap); err != nil {
+		t.Fatalf("unmarshal login response as map: %v", err)
+	}
+	job := asMap["result"].(map[string]any)["job"].(map[string]any)
+	xnVal, present := job["xn"]
+	if !present {
+		t.Fatalf("SHA3X job payload must still carry an \"xn\" key, got raw job JSON: %s", raw)
+	}
+	if s, _ := xnVal.(string); s == "" {
+		t.Errorf("SHA3X job's xn value must be non-empty, got %q in raw job JSON: %s", xnVal, raw)
+	}
+}
+
 // login performs a real login handshake and returns the session id the
 // server handed back (LoginResult.ID) and the session's own assigned
-// xn (LoginResult.Job.XN), which real submits must echo/prefix
-// respectively.
+// xn.
+//
+// xn is resolved via sessionXN (a direct lookup of the real Session's
+// internal xn field), NOT via the wire LoginResult.Job.XN field:
+// RXT/RXM sessions still carry an internal xn for job bookkeeping
+// (JobForXN et al) even though that xn is deliberately never sent
+// over the wire for those two algos (see jobPayload's doc comment) --
+// reading it off the wire would silently return "" for RXT/RXM
+// harnesses and break every test that needs a real xn to construct
+// xn-prefixed nonces.
 func login(t *testing.T, h *testHarness, address string) (sessionID, xn string) {
 	t.Helper()
 	// address is a short, readable test label; it is deterministically
@@ -836,7 +903,26 @@ func login(t *testing.T, h *testHarness, address string) (sessionID, xn string) 
 	if resp.Result.Status != "OK" {
 		t.Fatalf("login failed: status=%q", resp.Result.Status)
 	}
-	return resp.Result.ID, resp.Result.Job.XN
+	return resp.Result.ID, sessionXN(t, h, resp.Result.ID)
+}
+
+// sessionXN looks up the real, live Session for sessionID on h.server
+// and returns its internal xn field directly -- this is the
+// session-bookkeeping xn (assigned once at connect time, used to key
+// JobForXN and to validate xn-prefixed nonces for SHA3X/C29), which is
+// independent of whether that xn is ever surfaced on the wire for the
+// session's algo (it deliberately is not, for RXT/RXM).
+func sessionXN(t *testing.T, h *testHarness, sessionID string) string {
+	t.Helper()
+	h.server.mu.RLock()
+	defer h.server.mu.RUnlock()
+	for _, s := range h.server.sessions {
+		if s.sessionID == sessionID {
+			return s.xn
+		}
+	}
+	t.Fatalf("could not find session %q on server", sessionID)
+	return ""
 }
 
 // currentJobIDForXN looks up the current job for a given already-issued
