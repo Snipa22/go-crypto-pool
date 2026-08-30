@@ -104,9 +104,29 @@ func (e *moneroRPCError) Error() string {
 // moneroRPCResponse is the generic JSON-RPC 2.0 response envelope;
 // Result is left as json.RawMessage so each call site unmarshals into
 // its own real result type.
+//
+// ID is deliberately json.RawMessage, NOT string. Real production
+// evidence (live journalctl from leaf-solo-rxm.service against a real
+// monerod testnet daemon) confirmed that monerod's submit_block
+// response echoes "id" back as a bare JSON NUMBER, not a string —
+// even though get_block_template/get_info happen to echo it as a
+// string (matching the "0" string this client's own call() sends as
+// its request id). Real-world monerod RPC handling is evidently not
+// internally consistent about the wire type of an echoed id across
+// its own different methods, and JSON-RPC 2.0 itself only requires id
+// to be a string, number, or null — never assume it's always one
+// specific Go type. Hardcoding ID as `string` meant json.Unmarshal
+// failed at the TOP-LEVEL struct decode for every single submit_block
+// response, before rpcResp.Error/rpcResp.Result were ever inspected —
+// masking whether the real daemon actually accepted or rejected the
+// block behind a spurious local decode error instead. Nothing in this
+// package ever reads rpcResp.ID after decode (confirmed by grep), so
+// json.RawMessage is the correct, lowest-risk fix: it accepts any
+// valid JSON id shape (string, number, or null) with zero downstream
+// type-assertion needed.
 type moneroRPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      string          `json:"id"`
+	ID      json.RawMessage `json:"id"`
 	Result  json.RawMessage `json:"result"`
 	Error   *moneroRPCError `json:"error"`
 }
