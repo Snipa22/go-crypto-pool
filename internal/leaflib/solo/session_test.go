@@ -1287,6 +1287,13 @@ const realXMRMainnetAddr = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3Xjrp
 // loginRXM is login's ALGO_RXM counterpart: uses a real Monero
 // address (not a Tari one) and advertises the "rx/0" algo, matching a
 // real xmrig client's login params.
+//
+// xn is resolved via sessionXN (a direct lookup of the real Session's
+// internal xn field), NOT via the wire LoginResult.Job.XN field: RXM
+// sessions still carry an internal xn for job bookkeeping even though
+// it is deliberately never sent over the wire for that algo (see
+// jobPayload's doc comment) -- reading it off the wire would silently
+// return "" and cause callers to look up/submit against the wrong job.
 func loginRXM(t *testing.T, h *testHarness) (sessionID, xn string) {
 	t.Helper()
 	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realXMRMainnetAddr, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"rx/0"}})})
@@ -1294,7 +1301,7 @@ func loginRXM(t *testing.T, h *testHarness) (sessionID, xn string) {
 	if resp.Result.Status != "OK" {
 		t.Fatalf("login failed: status=%q", resp.Result.Status)
 	}
-	return resp.Result.ID, resp.Result.Job.XN
+	return resp.Result.ID, sessionXN(t, h, resp.Result.ID)
 }
 
 func mustJSON(t *testing.T, v any) json.RawMessage {
