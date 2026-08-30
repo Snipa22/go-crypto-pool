@@ -3,6 +3,7 @@ package solo
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -1487,4 +1488,162 @@ func TestAlgoWireNameC29AndSHA3XUnaffected(t *testing.T) {
 	if got := algoWireName(poolpb.Algo_ALGO_SHA3X); got != "sha3x" {
 		t.Fatalf("algoWireName(ALGO_SHA3X) = %q, want %q", got, "sha3x")
 	}
+}
+
+// TestJobPayloadRXTBlobIs76Bytes is a direct regression guard for the
+// live production bug this pass fixes: a real packet capture against
+// 148.163.90.157:4447 (RXT) showed a wire "blob" field of only 64 hex
+// characters (32 bytes, the bare Tari merge-mining hash) — not a
+// minable blob a real RandomX-family client (XMRig) can parse — while
+// the SAME leaf family's working RXM job (148.163.90.157:4450)
+// carried a real 152-hex-char (76-byte) blob. This test logs in on a
+// real RXT-configured JobManager/Session and asserts the wire "blob"
+// is now also 152 hex chars (76 bytes), decoding to the exact
+// createTariMiningBlob layout (3 zero bytes, the real 32-byte mining
+// hash, a zeroed 8-byte nonce-placeholder region, then the
+// pow-algo/data segment) with the nonce-placeholder region entirely
+// zero (nonce=0 placeholder — see rxt.go's rxtXmrigNonceOffset doc
+// comment for why byte offset 39, inside this region, is exactly
+// where a real XMRig client is expected to patch its own nonce).
+func TestJobPayloadRXTBlobIs76Bytes(t *testing.T) {
+	h := newRXTTestHarness(t, 1000, 100000, "http://127.0.0.1:1")
+	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{
+		Login: realTariTestAddress("rxt-blob-shape"), Pass: "x", Agent: "XMRig/6.25.0", Algo: []string{"rx/0"},
+	})})
+	resp := h.recvLoginResponse()
+	if resp.Result.Status != "OK" {
+		t.Fatalf("login failed: status=%q", resp.Result.Status)
+	}
+
+	blobHex := resp.Result.Job.Blob
+	if len(blobHex) != 152 {
+		t.Fatalf("RXT job wire \"blob\" = %d hex chars, want 152 (76 bytes) -- this is the exact live production bug: a bare 32-byte hash (64 hex chars) is not a minable blob a real RandomX client can parse", len(blobHex))
+	}
+	blob, err := hex.DecodeString(blobHex)
+	if err != nil {
+		t.Fatalf("blob is not valid hex: %v", err)
+	}
+	if len(blob) != 76 {
+		t.Fatalf("decoded blob length = %d bytes, want 76", len(blob))
+	}
+
+	if !bytes.Equal(blob[0:3], []byte{0, 0, 0}) {
+		t.Errorf("bytes[0:3] (zero placeholder) = %x, want all-zero", blob[0:3])
+	}
+
+	wantHash := make([]byte, 32) // createTariMiningBlob zero-pads a short/31-byte fixture up to exactly 32 bytes
+	copy(wantHash, []byte("test-merge-mining-hash-32bytes!"))
+	if !bytes.Equal(blob[3:35], wantHash) {
+		t.Errorf("bytes[3:35] (mining hash) = %q, want %q", blob[3:35], wantHash)
+	}
+
+	if !bytes.Equal(blob[35:43], make([]byte, 8)) {
+		t.Errorf("bytes[35:43] (nonce region) = %x, want all-zero (nonce=0 outbound placeholder)", blob[35:43])
+	}
+
+	if blob[43] != rxtPowAlgoByte {
+		t.Errorf("byte[43] (pow_algo) = %d, want %d (rxtPowAlgoByte)", blob[43], rxtPowAlgoByte)
+	}
+	if !bytes.Equal(blob[44:76], make([]byte, 32)) {
+		t.Errorf("bytes[44:76] (pow_data, empty+padded) = %x, want all-zero", blob[44:76])
+	}
+}
+
+// TestJobPayloadSHA3XC29RXMBlobShapeUnaffected is the explicit
+// regression guard the task requires: SHA3X and C29 job blobs must
+// STILL be exactly 32 bytes (64 hex chars, the bare merge-mining
+// hash — genuinely correct for those two algos, unlike RXT), and
+// RXM's job blob must STILL be exactly 76 bytes (152 hex chars,
+// already correct by construction — see monero_node.go) after the
+// RXT-only fix above.
+func TestJobPayloadSHA3XC29RXMBlobShapeUnaffected(t *testing.T) {
+	t.Run("sha3x stays 32 bytes", func(t *testing.T) {
+		h := newTestHarness(t, 1000, 100000)
+		h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realTariTestAddress("sha3x-shape"), Pass: "x", Agent: "XMRig/6.25.0", Algo: []string{"sha3x"}})})
+		resp := h.recvLoginResponse()
+		if resp.Result.Status != "OK" {
+			t.Fatalf("login failed: status=%q", resp.Result.Status)
+		}
+		if len(resp.Result.Job.Blob) != len(hex.EncodeToString([]byte("test-merge-mining-hash-32bytes!"))) {
+			t.Fatalf("SHA3X job blob = %d hex chars, want %d -- REGRESSION from the RXT-only blob fix", len(resp.Result.Job.Blob), len(hex.EncodeToString([]byte("test-merge-mining-hash-32bytes!"))))
+		}
+	})
+
+	t.Run("c29 stays 32 bytes", func(t *testing.T) {
+		h := newC29TestHarness(t, 1000, 100000)
+		h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realTariTestAddress("c29-shape"), Pass: "x", Agent: "XMRig/6.25.0", Algo: []string{"c29"}})})
+		resp := h.recvLoginResponse()
+		if resp.Result.Status != "OK" {
+			t.Fatalf("login failed: status=%q", resp.Result.Status)
+		}
+		if len(resp.Result.Job.Blob) != len(hex.EncodeToString([]byte("test-merge-mining-hash-32bytes!"))) {
+			t.Fatalf("C29 job blob = %d hex chars, want %d -- REGRESSION from the RXT-only blob fix", len(resp.Result.Job.Blob), len(hex.EncodeToString([]byte("test-merge-mining-hash-32bytes!"))))
+		}
+	})
+
+	t.Run("rxm stays 76 bytes", func(t *testing.T) {
+		h := newRXMTestHarness(t, 1000, 100000)
+		h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realXMRMainnetAddr, Pass: "x", Agent: "XMRig/6.25.0", Algo: []string{"rx/0"}})})
+		resp := h.recvLoginResponse()
+		if resp.Result.Status != "OK" {
+			t.Fatalf("login failed: status=%q", resp.Result.Status)
+		}
+		// newRXMTestHarness's fakeNodeClient is Tari-shaped (see its
+		// own doc comment), so job.Header is still the bare 31-byte
+		// (test fixture) mergeMiningHash here -- this asserts RXM's
+		// blob construction path (job.Header used directly) is
+		// UNTOUCHED by the RXT-only fix, not that this particular
+		// fixture is a real Monero blob.
+		if len(resp.Result.Job.Blob) != len(hex.EncodeToString([]byte("test-merge-mining-hash-32bytes!"))) {
+			t.Fatalf("RXM (fixture) job blob = %d hex chars, want %d -- REGRESSION from the RXT-only blob fix (jobPayload's RXT branch guard is no longer algo-exclusive)", len(resp.Result.Job.Blob), len(hex.EncodeToString([]byte("test-merge-mining-hash-32bytes!"))))
+		}
+	})
+}
+
+// TestHandleSubmitRXTNonceLengthAccepts4Bytes is a direct regression
+// guard for the companion submit-side half of this fix: a real
+// XMRig client reports a raw 4-byte nonce (not 8) for RXT, matching
+// its own hardcoded Job::nonceOffset()/nonceSize() default-case
+// behavior for the generic RandomX family (rxt.go's
+// rxtXmrigNonceOffset/rxtXmrigNonceSize) -- so the ALGO_RXT nonce
+// length gate must accept 4 bytes (8 hex chars) and NOT reject it
+// with the old, SHA3X/C29-only "must be 8 bytes" error.
+func TestHandleSubmitRXTNonceLengthAccepts4Bytes(t *testing.T) {
+	h := newRXTTestHarness(t, 1000, 100000, "http://127.0.0.1:1") // deliberately unreachable randomx-service
+	sessionID, _ := login(t, h, "rxt-nonce-len")
+	jobID := currentJobIDForXNRXT(t, h)
+
+	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID: sessionID, JobID: jobID, Nonce: "deadbeef" /* 4 raw bytes, 8 hex chars */, Result: strings.Repeat("ab", 32),
+	})})
+	resp := h.recvShareResponse()
+
+	// The unreachable randomx-service means real PoW validation will
+	// fail downstream -- that's expected and NOT what this test
+	// checks. The observable this test needs is that the length gate
+	// itself did not reject the submit with the old "must be 8 bytes"
+	// message.
+	if strings.Contains(resp.Error, "must be 8 bytes") {
+		t.Fatalf("BUG: a real 4-byte RXT nonce was rejected by the length gate with %q -- RXT must accept the same 4-byte width RXM already does (a real XMRig client never sends 8 bytes for either)", resp.Error)
+	}
+}
+
+// currentJobIDForXNRXT mirrors currentJobIDForXN but resolves xn via
+// sessionXN (RXT's xn is never surfaced on the wire -- see login's own
+// doc comment) using the FIRST live session found; used only by the
+// single-session nonce-length test above, which never needs to
+// disambiguate between multiple sessions.
+func currentJobIDForXNRXT(t *testing.T, h *testHarness) string {
+	t.Helper()
+	h.server.mu.RLock()
+	var xn string
+	for _, s := range h.server.sessions {
+		xn = s.xn
+		break
+	}
+	h.server.mu.RUnlock()
+	if xn == "" {
+		t.Fatalf("no live session found on server")
+	}
+	return currentJobIDForXN(t, h, xn)
 }

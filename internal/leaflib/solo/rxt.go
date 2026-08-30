@@ -31,6 +31,46 @@ const rxtPowAlgoByte byte = 2
 // 33 (pow.to_bytes(), padded) = 76.
 const tariMiningBlobSize = 3 + 32 + 8 + 33
 
+// rxtXmrigNonceOffset/rxtXmrigNonceSize are the REAL, hardcoded byte
+// offset and width a stock, unmodified XMRig client patches its own
+// search nonce into for any generic RandomX-family ("rx/0") job —
+// confirmed from XMRig's actual real source
+// (src/base/net/stratum/Job.cpp's Job::nonceOffset(): the generic
+// `default:` case, used for every RandomX-family algo that isn't
+// KAWPOW/GHOSTRIDER/RX_YADA, returns the fixed constant 39; Job.h's
+// nonceSize() returns 4 for that same default case, and nonce() is
+// typed `uint32_t*`). This is NOT something XMRig reads from a wire
+// field — there is no "nonce_offset"/"reserved_offset" JSON field
+// anywhere in XMRig's real stratum job-parsing code
+// (Client.cpp::parseJob); the offset is purely a compiled-in constant
+// keyed off the algorithm family, matching the real Monero
+// block-header blob convention this same constant was originally
+// derived from. Any pool wanting a stock XMRig binary to correctly
+// locate and patch its own nonce into a job's blob MUST place that
+// nonce at this exact offset — there is no alternative negotiation
+// mechanism to fall back on.
+//
+// For RXT specifically, this lands squarely inside
+// createTariMiningBlob's own 8-byte big-endian nonce field (bytes
+// [35:43) — offset 39 is exactly the midpoint of that field, i.e. its
+// low-order 4 bytes. Sending an outbound blob built with nonce=0
+// leaves bytes [35:39) zero and bytes [39:43) as the placeholder
+// XMRig will overwrite with its own raw 4 search-nonce bytes (native
+// byte order — XMRig hex-encodes and reports back whatever raw bytes
+// physically sit at that memory location, see Client.cpp::submit's
+// `Cvt::toHex(nonce, ..., reinterpret_cast<const uint8_t*>(&result.nonce), sizeof(uint32_t))`,
+// not some reinterpreted/byte-swapped value). Reconstructing the
+// SAME 76 bytes the miner actually hashed for share verification is
+// therefore just: decode the reported 4 raw nonce bytes as a
+// big-endian uint32, zero-extend to uint64, and feed that straight
+// back into createTariMiningBlob (whose own to_be_bytes(nonce) write
+// reproduces bytes [35:39)=0, [39:43)=the same 4 raw bytes,
+// byte-for-byte) — see session.go's handleSubmit ALGO_RXT case.
+const (
+	rxtXmrigNonceOffset = 39
+	rxtXmrigNonceSize   = 4
+)
+
 // createTariMiningBlob ports the real Tari base node's
 // create_tari_mining_blob (base_layer/core/src/proof_of_work/monero_rx/
 // helpers.rs, confirmed from the actual Rust source in this session — NOT

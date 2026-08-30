@@ -342,12 +342,14 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// handleSubmit exactly (see its doc comment for the full
 	// rationale, including the real production packet capture
 	// against 148.163.90.157:4450 showing a real xmrig client
-	// sending a genuine 4-byte nonce for ALGO_RXM). SHA3X/C29/RXT
-	// keep the strict 8-byte gate; RXM accepts 4 bytes (expected) or
-	// 8 bytes (lenient tolerance) -- both decode to the same
-	// low-32-bit value solo.MoneroHashingBlobForSubmit consumes.
+	// sending a genuine 4-byte nonce for ALGO_RXM). RXT FIX: a real
+	// XMRig client also reports a raw 4-byte nonce for RXT (there is
+	// no coin-specific variant on the client side — see
+	// wireutil.go's rxtXmrigNonceOffset doc comment), so RXT now
+	// takes the SAME lenient 4-or-8-byte gate as RXM instead of the
+	// strict 8-byte-only gate SHA3X/C29 keep.
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
-	if job.Algo == poolpb.Algo_ALGO_RXM {
+	if job.Algo == poolpb.Algo_ALGO_RXM || job.Algo == poolpb.Algo_ALGO_RXT {
 		if err != nil || (len(nonceBytes) != 4 && len(nonceBytes) != 8) {
 			s.writeShareResponse(req.ID, false, "nonce must be 4 bytes for RandomX-family (rx/0) jobs, hex-encoded uint32")
 			return
@@ -411,7 +413,22 @@ func (s *Session) handleSubmit(req solo.Request) {
 			}},
 		}
 	case poolpb.Algo_ALGO_RXT:
-		nonce = binary.BigEndian.Uint64(nonceBytes)
+		// NONCE RECONSTRUCTION FIX: mirrors solo.Session's own
+		// ALGO_RXT handling exactly — see solo/session.go's
+		// handleSubmit doc comment on this same fix for the full,
+		// confirmed-from-XMRig's-real-source rationale. A real
+		// unmodified XMRig client reports a raw 4-byte nonce
+		// (rxtXmrigNonceOffset/Size); decode as big-endian uint32,
+		// zero-extended, so createTariMiningBlob's own
+		// to_be_bytes(nonce) write below reproduces byte-for-byte
+		// the same blob region XMRig actually hashed. An 8-byte
+		// submit is still accepted and decoded directly (lenient
+		// tolerance, same as before).
+		if len(nonceBytes) == 4 {
+			nonce = uint64(binary.BigEndian.Uint32(nonceBytes))
+		} else {
+			nonce = binary.BigEndian.Uint64(nonceBytes)
+		}
 		if submit.Result == "" {
 			s.writeShareResponse(req.ID, false, "rxt submit requires a claimed result hash in \"result\"")
 			return
@@ -732,6 +749,18 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 		Height: job.Height,
 		JobID:  job.ID,
 		Target: diffToTargetHex(job.StaticDifficulty),
+	}
+	// RXT-only (bug fix): mirrors solo.Session's own jobPayload fix
+	// exactly — see that file's doc comment on this same fix for the
+	// full rationale (job.Header is a bare 32-byte hash, not a
+	// minable blob; real RandomX clients need the real 76-byte
+	// createTariMiningBlob shape). rxtPowAlgoByte/createTariMiningBlob
+	// are this package's own wireutil.go mirrors of solo's identical
+	// unexported helpers; solo.TariPowDataFromJob is the shared,
+	// exported escape hatch both packages already use.
+	if job.Algo == poolpb.Algo_ALGO_RXT {
+		blob := createTariMiningBlob(job.Header, 0, rxtPowAlgoByte, solo.TariPowDataFromJob(job))
+		payload.Blob = hex.EncodeToString(blob)
 	}
 	// xn nonce-partitioning is a SHA3X/C29 convention only. RXT/RXM
 	// (RandomX-family) miners such as xmrig and graxil neither expect
