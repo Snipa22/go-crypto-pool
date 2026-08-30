@@ -158,6 +158,16 @@ const rxtPowAlgoByte byte = 2
 // tariMiningBlobSize exactly (76 bytes).
 const tariMiningBlobSize = 3 + 32 + 8 + 33
 
+// rxtXmrigNonceOffset/rxtXmrigNonceSize mirror solo/rxt.go's
+// unexported constants of the same name exactly — see that file's doc
+// comment for the full, confirmed-from-XMRig's-real-source rationale
+// (Job::nonceOffset()'s generic RandomX-family default case = 39,
+// Job::nonceSize()'s default case = 4; not a wire-negotiated field).
+const (
+	rxtXmrigNonceOffset = 39
+	rxtXmrigNonceSize   = 4
+)
+
 // createTariMiningBlob mirrors solo/rxt.go's unexported
 // createTariMiningBlob byte-for-byte — see that function's doc comment
 // for the full, confirmed-from-the-real-Rust-source provenance of this

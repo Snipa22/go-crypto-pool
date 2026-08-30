@@ -569,8 +569,17 @@ func (s *Session) handleSubmit(req Request) {
 	// patches uint32(nonce) into the hashing blob), so accepting
 	// either width is safe and doesn't change block-candidate
 	// behavior for a compliant client.
+	// RXT nonce length: FIX — a real, unmodified XMRig client patches
+	// its own search nonce as a raw 4-byte value at a fixed byte
+	// offset (rxt.go's rxtXmrigNonceOffset/rxtXmrigNonceSize, = 39/4
+	// — confirmed from XMRig's actual Job::nonceOffset()/nonceSize()
+	// source, the generic RandomX-family default case) for EVERY
+	// "rx/0" job, RXT included — there is no coin-specific variant on
+	// the client side. RXT must therefore accept the same 4-byte
+	// (lenient: or 8-byte) nonce width ALGO_RXM already does, not the
+	// strict 8-byte gate every other algo keeps.
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
-	if job.Algo == poolpb.Algo_ALGO_RXM {
+	if job.Algo == poolpb.Algo_ALGO_RXM || job.Algo == poolpb.Algo_ALGO_RXT {
 		if err != nil || (len(nonceBytes) != 4 && len(nonceBytes) != 8) {
 			s.writeShareResponse(req.ID, false, "nonce must be 4 bytes for RandomX-family (rx/0) jobs, hex-encoded uint32")
 			return
@@ -662,13 +671,34 @@ func (s *Session) handleSubmit(req Request) {
 		}
 	case poolpb.Algo_ALGO_RXT:
 		// Real RXT (Tari's OWN native RandomX PoW — NOT merge-mining
-		// RXM) submit wire shape: no "pow" field (that's C29-only); the
-		// miner's claimed RandomX result hash rides in the existing
-		// generic "result" field (submit.Result), and the nonce is
-		// encoded BIG-ENDIAN — CONFIRMED from the real Tari Rust source
-		// (create_tari_mining_blob's `header.nonce.to_be_bytes()`),
-		// matching C29's convention, NOT SHA3X's little-endian one.
-		nonce = binary.BigEndian.Uint64(nonceBytes)
+		// RXM) submit wire shape: no "pow" field (that's C29-only);
+		// the miner's claimed RandomX result hash rides in the
+		// existing generic "result" field (submit.Result).
+		//
+		// NONCE RECONSTRUCTION FIX: a real, unmodified XMRig client
+		// does NOT patch/report an 8-byte big-endian value at
+		// createTariMiningBlob's own nonce field start (offset 35)
+		// — it patches a raw 4-byte value at the fixed, hardcoded
+		// offset 39 (rxt.go's rxtXmrigNonceOffset — confirmed from
+		// XMRig's actual Job::nonceOffset() source, the generic
+		// RandomX-family default case) and reports back exactly
+		// those raw bytes, unmodified, as submit.Nonce. Offset 39 is
+		// the low-order 4 bytes of createTariMiningBlob's 8-byte
+		// nonce field [35:43) — decoding the reported 4 raw bytes as
+		// a big-endian uint32 and zero-extending to uint64
+		// reconstructs a nonce value whose to_be_bytes() (via
+		// createTariMiningBlob below) reproduces bytes [35:39)=0,
+		// [39:43)=the SAME 4 raw bytes the miner actually hashed —
+		// i.e. byte-for-byte the same blob XMRig computed its
+		// RandomX hash against. A legacy/lenient 8-byte submit
+		// (e.g. from a hypothetical Tari-native-aware client that
+		// patches the full field per createTariMiningBlob's own
+		// semantic) is still accepted and decoded directly.
+		if len(nonceBytes) == 4 {
+			nonce = uint64(binary.BigEndian.Uint32(nonceBytes))
+		} else {
+			nonce = binary.BigEndian.Uint64(nonceBytes)
+		}
 
 		if submit.Result == "" {
 			s.writeShareResponse(req.ID, false, "rxt submit requires a claimed result hash in \"result\"")
@@ -970,6 +1000,39 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 		Height: job.Height,
 		JobID:  job.ID,
 		Target: diffToTargetHex(job.StaticDifficulty),
+	}
+	// RXT-only (bug fix): job.Header for an ALGO_RXT job is the bare
+	// 32-byte Tari merge-mining hash, NOT a minable blob — real
+	// RandomX-family miner software (XMRig et al.) requires a real,
+	// correctly-shaped 76-byte mining blob to patch its own nonce
+	// into and hash directly (matching Monero's own real client
+	// convention, which ALGO_RXM already correctly satisfies here
+	// via a full pre-built hashing blob in job.Header — see
+	// monero_node.go). Confirmed via a live production packet
+	// capture against 148.163.90.157:4447 (RXT, this leaf) and
+	// :4450 (RXM, same leaf family, working): after the wire "algo"
+	// label was already fixed to "rx/0", XMRig 6.25.0 accepted the
+	// RXT job but produced zero valid shares because its "blob" was
+	// only 64 hex chars (32 bytes) versus RXM's working 152 hex
+	// chars (76 bytes) — the bare hash is not a minable blob a real
+	// RandomX client can parse.
+	//
+	// Built via the SAME real createTariMiningBlob helper
+	// (rxt.go) already used server-side at submit time to
+	// re-verify a miner's claimed nonce, with nonce=0 as a
+	// placeholder: byte offset 39 (rxtXmrigNonceOffset, see its doc
+	// comment) — where a stock XMRig patches its own 4-byte search
+	// nonce for any generic RandomX-family job — falls squarely
+	// inside this blob's own 8-byte nonce field [35:43), so a
+	// nonce=0 placeholder here correctly leaves that exact region
+	// ready for XMRig to overwrite. rxtPowAlgoByte/TariPowDataFromJob
+	// are the same real, already-existing symbols this file's own
+	// handleSubmit ALGO_RXT case already uses to build the
+	// SAME-SHAPED blob for verification — reused here, not
+	// reimplemented.
+	if job.Algo == poolpb.Algo_ALGO_RXT {
+		blob := createTariMiningBlob(job.Header, 0, rxtPowAlgoByte, TariPowDataFromJob(job))
+		payload.Blob = hex.EncodeToString(blob)
 	}
 	// xn nonce-partitioning is a SHA3X/C29 convention only. RXT/RXM
 	// (RandomX-family) miners such as xmrig and graxil neither expect
