@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/nodeGRPC"
@@ -191,21 +192,60 @@ func MoneroHashingBlobForSubmit(job *Job, nonce uint64) ([]byte, error) {
 
 // GRPCNodeClient is the production NodeClient, backed by
 // go-tari-grpc-lib/v3's nodeGRPC package against a real Tari base node.
-type GRPCNodeClient struct{}
+type GRPCNodeClient struct {
+	// coinbaseExtraTag is this instance's configured coinbase-extra
+	// ownership tag (see NewGRPCNodeClient's doc comment and
+	// MaxCoinbaseExtraTagLen/NormalizeCoinbaseExtraTag below for the
+	// real safety bound). Runtime-configurable per-process (was
+	// formerly a single hardcoded package-level "GCPOOL-SOLO"
+	// constant) so cmd/leaf-solo can set it to a per-algo default
+	// (e.g. "supportxtm-sha3x") or an explicit operator override —
+	// see cmd/leaf-solo/main.go's -coinbase-extra-tag flag.
+	coinbaseExtraTag []byte
+}
 
 // NewGRPCNodeClient dials address (host:port) via nodeGRPC.InitNodeGRPC
 // and returns a ready-to-use GRPCNodeClient. nodeGRPC's connection is a
 // package-level singleton (see doc comment on NodeClient), so only one
-// GRPCNodeClient should be constructed per process.
-func NewGRPCNodeClient(address string) *GRPCNodeClient {
+// GRPCNodeClient should be constructed per process. coinbaseExtraTag is
+// already-normalized (see NormalizeCoinbaseExtraTag) and is appended to
+// every fetched block template's coinbase-extra field ahead of the
+// per-xn random nonce (see GetBlockTemplate).
+func NewGRPCNodeClient(address string, coinbaseExtraTag []byte) *GRPCNodeClient {
 	nodeGRPC.InitNodeGRPC(address)
-	return &GRPCNodeClient{}
+	return &GRPCNodeClient{coinbaseExtraTag: coinbaseExtraTag}
 }
 
-// poolCoinbaseExtraTag identifies go-crypto-pool leaf-solo in the
-// coinbase extra field, analogous to the legacy pool's "WUF"-bracketed
-// squad-identifier scheme in blockTemplate.go's GetBlockSha3.
-var poolCoinbaseExtraTag = []byte("GCPOOL-SOLO")
+// MaxCoinbaseExtraTagLen is the real safety bound for a user-configured
+// coinbase-extra ownership tag. Tari's actual consensus constant
+// coinbase_output_features_extra_max_length is 256 bytes across every
+// network (confirmed in tari-project/tari's
+// base_layer/transaction_components/src/consensus/consensus_constants.rs
+// — every Consensus::*() constructor, mainnet/nextnet/esmeralda/igor/
+// localnet, sets this field to 256). GetBlockTemplate additionally
+// appends an 8-byte per-xn random nonce INTO THE SAME coinbase_extra
+// field alongside the tag (see nonceBuf below), so the tag itself must
+// leave headroom for that: 256 - 8 = 248.
+const MaxCoinbaseExtraTagLen = 256 - 8
+
+// NormalizeCoinbaseExtraTag validates/sanitizes a user-supplied
+// coinbase-extra tag string: an empty/whitespace-only tag falls back to
+// fallback (the caller's computed per-algo default), and anything over
+// MaxCoinbaseExtraTagLen bytes is truncated — this leaf never silently
+// submits a block template whose coinbase_extra would exceed the real
+// base node's consensus-enforced max length (which would get the whole
+// template/block rejected).
+func NormalizeCoinbaseExtraTag(tag, fallback string) []byte {
+	t := tag
+	if strings.TrimSpace(t) == "" {
+		t = fallback
+	}
+	b := []byte(t)
+	if len(b) > MaxCoinbaseExtraTagLen {
+		b = b[:MaxCoinbaseExtraTagLen]
+	}
+	return b
+}
 
 // tariPowAlgo maps this codebase's poolpb.Algo onto the real
 // tari_generated.PowAlgo_PowAlgos wire value GetNewBlockTemplateWithCoinbases
@@ -271,11 +311,7 @@ func (c *GRPCNodeClient) GetBlockTemplate(_ context.Context, payoutAddress strin
 		return nil, err
 	}
 
-	nonceBuf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(nonceBuf, rand.Uint64())
-	coinbaseExtra := make([]byte, 0, len(poolCoinbaseExtraTag)+len(nonceBuf))
-	coinbaseExtra = append(coinbaseExtra, poolCoinbaseExtraTag...)
-	coinbaseExtra = append(coinbaseExtra, nonceBuf...)
+	coinbaseExtra := c.buildCoinbaseExtra()
 
 	coinbases := []*tari_generated.NewBlockCoinbase{
 		{
@@ -295,6 +331,22 @@ func (c *GRPCNodeClient) GetBlockTemplate(_ context.Context, payoutAddress strin
 		return nil, err
 	}
 	return tariJobFromResult(result, algo)
+}
+
+// buildCoinbaseExtra combines this instance's configured
+// coinbaseExtraTag with a fresh, cryptographically-independent random
+// 8-byte per-xn nonce buffer into the exact []byte GetBlockTemplate
+// submits as CoinbaseExtra (see that method's doc comment for the full
+// per-xn randomization rationale). Factored out of GetBlockTemplate so
+// tests can exercise the exact tag-inclusion logic without a real GRPC
+// connection (see node_test.go).
+func (c *GRPCNodeClient) buildCoinbaseExtra() []byte {
+	nonceBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(nonceBuf, rand.Uint64())
+	coinbaseExtra := make([]byte, 0, len(c.coinbaseExtraTag)+len(nonceBuf))
+	coinbaseExtra = append(coinbaseExtra, c.coinbaseExtraTag...)
+	coinbaseExtra = append(coinbaseExtra, nonceBuf...)
+	return coinbaseExtra
 }
 
 // tariJobFromResult builds a coin-agnostic *Job from a real Tari

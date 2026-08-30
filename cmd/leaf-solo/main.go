@@ -125,6 +125,20 @@ type config struct {
 	// pass was tested against (http://127.0.0.1:39093).
 	randomXServiceURL string
 
+	// coinbaseExtraTag is -coinbase-extra-tag / LEAF_SOLO_COINBASE_EXTRA_TAG:
+	// an explicit operator override for the coinbase-extra ownership
+	// tag appended to every fetched Tari block template (see
+	// internal/leaflib/solo/node.go's GRPCNodeClient.coinbaseExtraTag).
+	// Left empty (the default), resolveCoinbaseExtraTag computes a
+	// per-algo default instead ("supportxtm-sha3x"/"supportxtm-c29"/
+	// "supportxtm-rxt"/"supportxtm-rxm") from whichever algo/coin this
+	// process is actually configured for (see resolveAlgo/isMoneroCoin)
+	// — a single blended tag across every algo/process defeats
+	// per-algo on-chain attribution, which is the whole point of this
+	// flag existing. When set, this value is used VERBATIM, overriding
+	// the per-algo default entirely.
+	coinbaseExtraTag string
+
 	startingDifficulty uint64
 	portsRaw           string
 	minDifficulty      uint64
@@ -170,6 +184,7 @@ func loadConfig() config {
 	flag.IntVar(&cfg.trustMin, "trust-min", envOrInt("LEAF_SOLO_TRUST_MIN", 0), "real probability floor, ensuring full validation never stops occurring entirely once ramped in (see trust.go's TrustConfig.Min) -- 0/unset uses the documented default (20). Env: LEAF_SOLO_TRUST_MIN")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_SOLO_ALGO")
 	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_SOLO_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (consulted for -algo=rxt, and for -coin=monero's real RandomX/rx validation -- both share the same real randomx-service-backed RandomXValidator). Env: LEAF_SOLO_RANDOMX_SERVICE_URL")
+	flag.StringVar(&cfg.coinbaseExtraTag, "coinbase-extra-tag", envOr("LEAF_SOLO_COINBASE_EXTRA_TAG", ""), "coinbase-extra ownership tag appended to every fetched Tari block template (identifies this leaf's found blocks on-chain). Left unset (the default), a per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 / supportxtm-rxt / supportxtm-rxm, based on -algo/-coin -- see resolveCoinbaseExtraTag. When set, this value is used verbatim, overriding the per-algo default. Truncated to solo.MaxCoinbaseExtraTagLen bytes if longer. Env: LEAF_SOLO_COINBASE_EXTRA_TAG")
 
 	// LEAF_SOLO_STARTING_DIFFICULTY replaces the old, now-removed
 	// LEAF_SOLO_DIFFICULTY (which used to be THE only difficulty any
@@ -394,6 +409,48 @@ func resolveAlgo(cfg config) poolpb.Algo {
 	return algoFromString(cfg.algo)
 }
 
+// algoTagSuffix derives the "supportxtm-<suffix>" default's per-algo
+// suffix from resolveAlgo's real, already-normalized poolpb.Algo for
+// this process (reusing that exact resolution logic rather than a
+// second, separate/hardcoded mapping) -- "rxm" is handled specially
+// since resolveAlgo maps EVERY -coin=monero configuration to
+// ALGO_RXM regardless of -algo, and that mapping is exactly what
+// distinguishes it from Tari's own native RXT.
+func algoTagSuffix(cfg config) string {
+	switch resolveAlgo(cfg) {
+	case poolpb.Algo_ALGO_C29:
+		return "c29"
+	case poolpb.Algo_ALGO_RXT:
+		return "rxt"
+	case poolpb.Algo_ALGO_RXM:
+		return "rxm"
+	default:
+		return "sha3x"
+	}
+}
+
+// defaultCoinbaseExtraTag computes this leaf-solo instance's default
+// coinbase-extra ownership tag: "supportxtm-<algo>", derived from
+// whichever algo/coin this process is actually configured to serve
+// (see algoTagSuffix/resolveAlgo) -- NOT one single blended constant
+// across every algo, since per-algo on-chain attribution is the whole
+// point (see resolveCoinbaseExtraTag).
+func defaultCoinbaseExtraTag(cfg config) string {
+	return "supportxtm-" + algoTagSuffix(cfg)
+}
+
+// resolveCoinbaseExtraTag is what main actually calls to get the real
+// coinbase-extra tag this leaf-solo process uses: cfg.coinbaseExtraTag
+// (-coinbase-extra-tag / LEAF_SOLO_COINBASE_EXTRA_TAG) verbatim if the
+// operator explicitly set it, else defaultCoinbaseExtraTag(cfg)'s
+// per-algo default.
+func resolveCoinbaseExtraTag(cfg config) string {
+	if strings.TrimSpace(cfg.coinbaseExtraTag) != "" {
+		return cfg.coinbaseExtraTag
+	}
+	return defaultCoinbaseExtraTag(cfg)
+}
+
 func main() {
 	cfg := loadConfig()
 	logger := log.New(os.Stdout, "leaf-solo: ", log.LstdFlags|log.Lmicroseconds)
@@ -426,6 +483,17 @@ func main() {
 	logger.Printf("vardiff bounds [%d, %d], target time %ds, retarget interval %s", cfg.minDifficulty, cfg.maxDifficulty, cfg.vardiffTargetTime, cfg.vardiffInterval)
 	logger.Printf("job max age (security: per-job expiry independent of tip invalidation): %s", cfg.jobMaxAge)
 
+	// coinbaseExtraTag is resolved from -coinbase-extra-tag/
+	// LEAF_SOLO_COINBASE_EXTRA_TAG if explicitly set, else a per-algo
+	// default ("supportxtm-<algo>") computed from whichever algo/coin
+	// this process is actually configured for -- see
+	// resolveCoinbaseExtraTag. Logged unconditionally so a freshly
+	// deployed/reconfigured leaf-solo's actual on-chain attribution
+	// tag is directly verifiable from its own startup logs.
+	coinbaseExtraTagStr := resolveCoinbaseExtraTag(cfg)
+	coinbaseExtraTag := solo.NormalizeCoinbaseExtraTag(coinbaseExtraTagStr, defaultCoinbaseExtraTag(cfg))
+	logger.Printf("coinbase-extra tag: %q (%d bytes)", string(coinbaseExtraTag), len(coinbaseExtraTag))
+
 	// Real coin-conditional NodeClient construction: both
 	// implementations satisfy the exact same coin-agnostic
 	// solo.NodeClient interface (node.go), so everything downstream
@@ -437,7 +505,7 @@ func main() {
 		node = solo.NewMoneroNodeClient(cfg.monerodURL)
 	} else {
 		logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
-		node = solo.NewGRPCNodeClient(cfg.nodeGRPCAddress)
+		node = solo.NewGRPCNodeClient(cfg.nodeGRPCAddress, coinbaseExtraTag)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

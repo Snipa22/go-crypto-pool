@@ -40,3 +40,56 @@ func TestPoolTypeFromString(t *testing.T) {
 		}
 	}
 }
+
+// TestDefaultCoinbaseExtraTagPerAlgo mirrors leaf-solo's own identical
+// test -- confirms leaf-direct's defaultCoinbaseExtraTag computes the
+// same per-algo "supportxtm-<algo>" pattern.
+func TestDefaultCoinbaseExtraTagPerAlgo(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  config
+		want string
+	}{
+		{"sha3x default (empty algo)", config{coin: "tari", algo: ""}, "supportxtm-sha3x"},
+		{"sha3x explicit", config{coin: "tari", algo: "sha3x"}, "supportxtm-sha3x"},
+		{"c29", config{coin: "tari", algo: "c29"}, "supportxtm-c29"},
+		{"rxt", config{coin: "tari", algo: "rxt"}, "supportxtm-rxt"},
+		{"rxm via -coin=monero", config{coin: "monero"}, "supportxtm-rxm"},
+		{"rxm via -coin=monero, -algo ignored", config{coin: "monero", algo: "c29"}, "supportxtm-rxm"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := defaultCoinbaseExtraTag(tc.cfg); got != tc.want {
+				t.Errorf("defaultCoinbaseExtraTag(%+v) = %q, want %q", tc.cfg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveCoinbaseExtraTagExplicitOverrideWins mirrors leaf-solo's
+// own identical test.
+func TestResolveCoinbaseExtraTagExplicitOverrideWins(t *testing.T) {
+	cfg := config{coin: "tari", algo: "c29", coinbaseExtraTag: "MY-CUSTOM-TAG"}
+	if got := resolveCoinbaseExtraTag(cfg); got != "MY-CUSTOM-TAG" {
+		t.Errorf("resolveCoinbaseExtraTag = %q, want explicit override %q", got, "MY-CUSTOM-TAG")
+	}
+}
+
+// TestResolveCoinbaseExtraTagFallsBackToPerAlgoDefaultWhenUnset
+// mirrors leaf-solo's own identical test.
+func TestResolveCoinbaseExtraTagFallsBackToPerAlgoDefaultWhenUnset(t *testing.T) {
+	cases := []struct {
+		cfg  config
+		want string
+	}{
+		{config{coin: "tari", algo: "sha3x"}, "supportxtm-sha3x"},
+		{config{coin: "tari", algo: "c29"}, "supportxtm-c29"},
+		{config{coin: "tari", algo: "rxt"}, "supportxtm-rxt"},
+		{config{coin: "monero"}, "supportxtm-rxm"},
+	}
+	for _, tc := range cases {
+		if got := resolveCoinbaseExtraTag(tc.cfg); got != tc.want {
+			t.Errorf("resolveCoinbaseExtraTag(%+v) = %q, want %q", tc.cfg, got, tc.want)
+		}
+	}
+}
