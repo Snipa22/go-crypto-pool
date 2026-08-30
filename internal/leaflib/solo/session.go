@@ -818,129 +818,221 @@ func (s *Session) handleSubmit(req Request) {
 		return
 	}
 
-	v, err := s.server.validators.Get(job.Algo)
-	if err != nil {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("no validator configured for this leaf's algo %v: %v", job.Algo, err))
-		return
-	}
-
-	// Real, legacy-ported trusted-miner validation skip (see
-	// trust.go) — only ever considered for RXT/RXM, the two
-	// RandomX-family algos where full validation is a real,
-	// service-backed RandomX hash genuinely expensive to compute at
-	// scale; SHA3X/C29 are cheap local computation with no analogous
-	// mechanism in the reference and are always fully validated
-	// regardless of s.trust. ShouldSkipValidation itself already
-	// returns false for a nil/disabled s.trust, so this is safe to
-	// call unconditionally.
-	var valid bool
-	skipped := IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
-	if skipped {
-		// Trusted share: the miner's own claimed result is taken on
-		// faith, no real RandomX hash is computed — ported exactly
-		// from the reference's `hash = new Buffer(resultHash, 'hex')`
-		// branch (see trust.go's doc comment). This is, by
-		// definition, "valid" for the purpose of crediting the share;
-		// RecordOutcome below is still called with the real,
-		// eventual accept/reject outcome once BuildCandidateBlock's
-		// own difficulty check runs against the miner's claimed
-		// result, exactly like the reference calls handleMinerData
-		// unconditionally regardless of which processShare branch
-		// ran.
-		valid = true
-	} else {
-		valid, err = v.Validate(context.Background(), share)
-		if err != nil && err != validator.ErrWrongProofType {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+	// PERFORMANCE FIX (Alex, live production incident, 2026-08-30): the
+	// rest of this method — real validator dispatch, accept/reject
+	// bookkeeping, block-candidate construction/submission, and the
+	// wire response — used to run inline, right here, in Session.Run's
+	// read loop. For SHA3X/C29 (validator.SHA3XValidator/C29Validator)
+	// that is a cheap, in-process CPU hash and stays exactly that way
+	// below. For ALGO_RXT/ALGO_RXM, validator.RandomXValidator.Validate
+	// makes a REAL, SYNCHRONOUS HTTP round-trip to an external
+	// randomx-service daemon for every submitted share — confirmed via a
+	// live timing test at ~4ms+ per call even under light load. Running
+	// that inline blocked scanner.Scan() from ever reading the miner's
+	// NEXT submitted line until this one's HTTP round-trip finished, so
+	// the pool could only drain one RandomX-family share per connection
+	// every ~4ms+, sequentially — far slower than a real miner submits.
+	// CONFIRMED VIA REAL WIRE CAPTURE against the live public RXM leaf
+	// (148.163.90.157:4450): a real xmrig client's own submit request ids
+	// climbed into the thousands (id:8454, id:8458, ...) while the pool's
+	// most recently WRITTEN response was still echoing id:6127 — a
+	// growing, unbounded backlog that eventually caused a client-side
+	// write failure and full miner disconnect, recurring roughly every
+	// ~30s under sustained real load.
+	//
+	// finishSubmit captures everything from here to the end of this
+	// method in one closure so it can be run either INLINE (SHA3X/C29,
+	// unchanged behavior) or dispatched to asyncvalidation.go's bounded,
+	// server-wide worker pool (RXT/RXM — see the dispatch below).
+	//
+	// RESPONSE-ORDERING NOTE (verified against the real xmrig source,
+	// github.com/xmrig/xmrig, src/base/net/stratum/Client.cpp): a real
+	// xmrig client matches a submit's response to its own request purely
+	// by the numeric JSON "id" field — `Client::submit` stores each
+	// outgoing submit's sequence id in `m_results[m_sequence]` (a real
+	// id-keyed map) BEFORE sending, and `Client::send(id, callback)`
+	// stores any registered callback in `m_callbacks` keyed the same
+	// way; `parseResponse(int64_t id, ...)` looks the id up in those maps
+	// to dispatch the response — there is no ordering assumption anywhere
+	// in that path. Concurrent RandomX-family validations therefore do
+	// NOT need to be serialized back into submission order before being
+	// written to the wire: each finishSubmit closure calls
+	// writeShareResponse(req.ID, ...) with ITS OWN captured req.ID
+	// regardless of when it happens to complete relative to any other
+	// in-flight submit on the same session, and mc.Write (connection.go)
+	// already guarantees no interleaving/corruption between concurrent
+	// writers — the response for a later-submitted-but-faster-to-validate
+	// share is allowed to reach the wire before an earlier submit's
+	// still-pending response, and a real xmrig client resolves that
+	// correctly by id, not arrival order. (See
+	// TestSessionRandomXConcurrentSubmitsRespondByOwnID in
+	// session_async_randomx_test.go, which asserts exactly this.)
+	//
+	// RACE-SAFETY NOTE: every piece of per-session/per-job mutable state
+	// finishSubmit touches is already safe under genuine concurrent
+	// execution from multiple in-flight validations for the SAME
+	// session, independently of this dispatch change: job.MarkNonceUsed
+	// (above, always run synchronously in the read loop, before
+	// dispatch — its own nonceMu makes it safe regardless) already ran;
+	// s.shareCount/s.blockCount/s.hashesAccumulated are atomic.Uint64;
+	// s.trust (MinerTrust) documents itself as "safe for concurrent use"
+	// and has its own internal mutex; s.server.node.BuildCandidateBlock
+	// only READS job fields and returns a fresh proto.Clone'd candidate
+	// (node.go/monero_node.go — never mutates the shared job template);
+	// s.mc.Write is already synchronized onto the connection's single
+	// writer goroutine (connection.go). Nothing here needed a NEW lock —
+	// it was already race-safe by construction, just previously
+	// single-threaded by the caller.
+	finishSubmit := func() {
+		v, err := s.server.validators.Get(job.Algo)
+		if err != nil {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("no validator configured for this leaf's algo %v: %v", job.Algo, err))
 			return
 		}
-	}
-	if !valid {
-		if IsRandomXFamily(job.Algo) {
-			s.trust.RecordOutcome(false)
+
+		// Real, legacy-ported trusted-miner validation skip (see
+		// trust.go) — only ever considered for RXT/RXM, the two
+		// RandomX-family algos where full validation is a real,
+		// service-backed RandomX hash genuinely expensive to compute at
+		// scale; SHA3X/C29 are cheap local computation with no analogous
+		// mechanism in the reference and are always fully validated
+		// regardless of s.trust. ShouldSkipValidation itself already
+		// returns false for a nil/disabled s.trust, so this is safe to
+		// call unconditionally.
+		var valid bool
+		skipped := IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
+		if skipped {
+			// Trusted share: the miner's own claimed result is taken on
+			// faith, no real RandomX hash is computed — ported exactly
+			// from the reference's `hash = new Buffer(resultHash, 'hex')`
+			// branch (see trust.go's doc comment). This is, by
+			// definition, "valid" for the purpose of crediting the share;
+			// RecordOutcome below is still called with the real,
+			// eventual accept/reject outcome once BuildCandidateBlock's
+			// own difficulty check runs against the miner's claimed
+			// result, exactly like the reference calls handleMinerData
+			// unconditionally regardless of which processShare branch
+			// ran.
+			valid = true
+		} else {
+			valid, err = v.Validate(context.Background(), share)
+			if err != nil && err != validator.ErrWrongProofType {
+				s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+				return
+			}
 		}
-		s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
-		return
-	}
-	if IsRandomXFamily(job.Algo) {
-		s.trust.RecordOutcome(true)
-	}
+		if !valid {
+			if IsRandomXFamily(job.Algo) {
+				s.trust.RecordOutcome(false)
+			}
+			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
+			return
+		}
+		if IsRandomXFamily(job.Algo) {
+			s.trust.RecordOutcome(true)
+		}
 
-	// Valid share (met the configured static share difficulty). This is
-	// local diagnostic/hashrate-estimation signal only — solo mode has
-	// no share table and no backend to forward it to.
-	s.shareCount.Add(1)
+		// Valid share (met the configured static share difficulty). This is
+		// local diagnostic/hashrate-estimation signal only — solo mode has
+		// no share table and no backend to forward it to.
+		s.shareCount.Add(1)
 
-	diff, candidate, err := s.server.node.BuildCandidateBlock(job, nonce, SubmitProof{Cycle: submit.POW, ResultHex: submit.Result})
-	if err != nil {
-		// Infrastructure-only failure deriving the real difficulty of
-		// an already-validated share (e.g. a zero C29 hash — see
-		// validator.C29Difficulty's doc comment); this is not the
-		// miner's fault, but there is nothing sound to compare
-		// against job.NetworkTargetDifficulty, so reject rather than
-		// silently mis-accept/mis-reject a block find.
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
-		return
-	}
+		diff, candidate, err := s.server.node.BuildCandidateBlock(job, nonce, SubmitProof{Cycle: submit.POW, ResultHex: submit.Result})
+		if err != nil {
+			// Infrastructure-only failure deriving the real difficulty of
+			// an already-validated share (e.g. a zero C29 hash — see
+			// validator.C29Difficulty's doc comment); this is not the
+			// miner's fault, but there is nothing sound to compare
+			// against job.NetworkTargetDifficulty, so reject rather than
+			// silently mis-accept/mis-reject a block find.
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
+			return
+		}
 
-	if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
-		// Accepted share, below block difficulty: this is the
-		// vardiff accept-history signal (ported exactly from
-		// go-tari-sha3x-solo-stratum's SubmitJob, `m.hashes +=
-		// job.Target` at the "valid, non-block" accept point — see
-		// vardiff.go's doc comment). job.StaticDifficulty is THIS
-		// job's stamped difficulty, i.e. this session's current
-		// vardiff value at the moment this share was accepted.
+		if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
+			// Accepted share, below block difficulty: this is the
+			// vardiff accept-history signal (ported exactly from
+			// go-tari-sha3x-solo-stratum's SubmitJob, `m.hashes +=
+			// job.Target` at the "valid, non-block" accept point — see
+			// vardiff.go's doc comment). job.StaticDifficulty is THIS
+			// job's stamped difficulty, i.e. this session's current
+			// vardiff value at the moment this share was accepted.
+			s.hashesAccumulated.Add(job.StaticDifficulty)
+			s.writeShareResponse(req.ID, true, "")
+			return
+		}
+
+		// Meets full block difficulty: submit the real, already-constructed
+		// candidate block (see NodeClient.BuildCandidateBlock above) for
+		// real. Mirrors go-tari-sha3x-solo-stratum's SubmitJob
+		// (subsystems/poolStratum/miner.go, ~line 493) and
+		// go-tari-c29-solo-stratum's equivalent.
+		err = s.server.node.SubmitBlock(context.Background(), candidate)
+		if err != nil {
+			// Ported exactly from the reference (miner.go's SubmitJob,
+			// SubmitBlock-error branch): the reference still increments
+			// m.hashes here even though the wire response to the miner
+			// is a rejection (their proof was cryptographically valid,
+			// but the pool/node-level submission failed — that's not the
+			// miner's fault to see as an accept, so mirror the
+			// reference's choice byte-for-byte on both the wire response
+			// AND the vardiff accounting, rather than "fixing" either).
+			s.hashesAccumulated.Add(job.StaticDifficulty)
+			s.server.logger.Printf("solo: SubmitBlock failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
+			// Real block ATTEMPT that failed at the node-submission
+			// level — a genuinely different event from an ordinary
+			// rejected share (the PoW was valid; distinguish it on
+			// leaf_blocks_total, not leaf_shares_total).
+			s.server.recordBlock(false)
+			// Ported exactly from the reference (miner.go's SubmitJob,
+			// SubmitBlock-error branch): the wire response to the miner is
+			// still a rejection (their proof was cryptographically valid,
+			// but the pool/node-level submission failed — that is not the
+			// miner's fault to see as an accept, so mirror the reference's
+			// choice here byte-for-byte rather than "fixing" it).
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: %v", err))
+			return
+		}
+
+		s.blockCount.Add(1)
+		s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
+		s.server.recordBlock(true)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.writeShareResponse(req.ID, true, "")
-		return
+
+		// A block was found; every cached per-xn template is now stale
+		// (built against a tip that no longer exists). Invalidate the
+		// whole cache (this also fires JobManager's subscribers, which
+		// triggers Server.invalidateAndRepushJobs to regenerate+push fresh
+		// jobs to every connected session) rather than waiting out the
+		// tip-poll interval.
+		go s.server.jobManager.InvalidateAll()
 	}
 
-	// Meets full block difficulty: submit the real, already-constructed
-	// candidate block (see NodeClient.BuildCandidateBlock above) for
-	// real. Mirrors go-tari-sha3x-solo-stratum's SubmitJob
-	// (subsystems/poolStratum/miner.go, ~line 493) and
-	// go-tari-c29-solo-stratum's equivalent.
-	err = s.server.node.SubmitBlock(context.Background(), candidate)
-	if err != nil {
-		// Ported exactly from the reference (miner.go's SubmitJob,
-		// SubmitBlock-error branch): the reference still increments
-		// m.hashes here even though the wire response to the miner
-		// is a rejection (their proof was cryptographically valid,
-		// but the pool/node-level submission failed — that's not the
-		// miner's fault to see as an accept, so mirror the
-		// reference's choice byte-for-byte on both the wire response
-		// AND the vardiff accounting, rather than "fixing" either).
-		s.hashesAccumulated.Add(job.StaticDifficulty)
-		s.server.logger.Printf("solo: SubmitBlock failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
-		// Real block ATTEMPT that failed at the node-submission
-		// level — a genuinely different event from an ordinary
-		// rejected share (the PoW was valid; distinguish it on
-		// leaf_blocks_total, not leaf_shares_total).
-		s.server.recordBlock(false)
-		// Ported exactly from the reference (miner.go's SubmitJob,
-		// SubmitBlock-error branch): the wire response to the miner is
-		// still a rejection (their proof was cryptographically valid,
-		// but the pool/node-level submission failed — that is not the
-		// miner's fault to see as an accept, so mirror the reference's
-		// choice here byte-for-byte rather than "fixing" it).
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: %v", err))
+	// DISPATCH: only RXT/RXM (the two algos whose validator makes a real
+	// network round-trip — see asyncvalidation.go's doc comment) go
+	// through the bounded async pool. SHA3X/C29 keep running finishSubmit
+	// INLINE, synchronously, in the read loop exactly as before this
+	// fix — a deliberate choice, not an oversight: their validators
+	// (SHA3XValidator/C29Validator) are cheap in-process CPU hashes with
+	// no analogous network-latency bottleneck, so there is no throughput
+	// problem to fix for them, and keeping their code path completely
+	// unchanged eliminates any regression risk to already-working
+	// behavior for a benefit (a handful of microseconds of dispatch
+	// overhead) that doesn't exist for them.
+	if IsRandomXFamily(job.Algo) {
+		if ok := s.server.randomxPool.Submit(finishSubmit); !ok {
+			// Pool already stopped (server shutting down) — respond
+			// with a real rejection rather than leaving this submit
+			// unanswered (task constraint: "no orphaned unresolved
+			// submits"). This is not a cryptographic rejection of the
+			// miner's share; a reconnect against a fresh instance will
+			// process it normally.
+			s.writeShareResponse(req.ID, false, "pool is shutting down, please reconnect")
+		}
 		return
 	}
-
-	s.blockCount.Add(1)
-	s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
-	s.server.recordBlock(true)
-	s.hashesAccumulated.Add(job.StaticDifficulty)
-	s.writeShareResponse(req.ID, true, "")
-
-	// A block was found; every cached per-xn template is now stale
-	// (built against a tip that no longer exists). Invalidate the
-	// whole cache (this also fires JobManager's subscribers, which
-	// triggers Server.invalidateAndRepushJobs to regenerate+push fresh
-	// jobs to every connected session) rather than waiting out the
-	// tip-poll interval.
-	go s.server.jobManager.InvalidateAll()
+	finishSubmit()
 }
 
 // recordJob records job into this session's own bounded job history
