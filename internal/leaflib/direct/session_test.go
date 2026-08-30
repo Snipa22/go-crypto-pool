@@ -295,6 +295,20 @@ func (h *directTestHarness) recvShareResponse() solo.ShareResponse {
 	return resp
 }
 
+// recvLegacyShareResponse decodes a submit response using the
+// pre-PR-#56 bare-bool/bare-string LegacyShareResponse shape — used by
+// C29 test harnesses only, mirroring solo package's own
+// recvLegacyShareResponse test helper (see that helper's doc comment
+// for the confirmed regression this preserves against).
+func (h *directTestHarness) recvLegacyShareResponse() solo.LegacyShareResponse {
+	h.t.Helper()
+	var resp solo.LegacyShareResponse
+	if err := json.Unmarshal(h.recvRaw(), &resp); err != nil {
+		h.t.Fatalf("unmarshal legacy share response: %v", err)
+	}
+	return resp
+}
+
 func (h *directTestHarness) recvErrorResponse() solo.ErrorResponse {
 	h.t.Helper()
 	var resp solo.ErrorResponse
@@ -688,7 +702,7 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 		Nonce: directXNPrefixedNonceHexBigEndian(xn, 222),
 		POW:   cycle,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 	after := time.Now().Unix()
 
 	// The all-zero cycle will fail real PoW verification -- expected.
@@ -701,7 +715,7 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 	// to forward one; if PoW rejected the share before any forward,
 	// skip the Timestamp assertion (nothing to check) but require the
 	// rejection reason to be the real validator, not a wiring bug.
-	if resp.Result != nil {
+	if resp.Result {
 		if h.transport.shareCount() != 1 {
 			t.Fatalf("expected exactly 1 share forwarded to the backend transport, got %d", h.transport.shareCount())
 		}
@@ -714,7 +728,7 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 		}
 		return
 	}
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected a clear rejection error for the non-solving cycle")
 	}
 }

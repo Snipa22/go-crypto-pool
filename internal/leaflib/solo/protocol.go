@@ -204,6 +204,19 @@ type ShareResult struct {
 // is an object `{"code":-1,"message":"..."}` and the "result" key is
 // entirely absent from the wire (omitempty). A bare boolean/string
 // pair (the previous shape here) is NOT recognized by real miners.
+//
+// ALGO-SCOPED: this shape is for SHA3X/RXT/RXM ONLY (the real
+// xmrig-class client family — confirmed working, per Alex: "Lolminer
+// is working with sha3x fine"). C29's own real ecosystem client
+// (lolMiner/graxil29 against go-tari-c29-solo-stratum's actual wire
+// dialect) does NOT tolerate this shape — confirmed via a real
+// production regression: lolMiner's own diagnostic
+// "Received a defect stratum message: conversion of data to type 'b'
+// failed" (lolMiner's error for a missing/wrong-shaped boolean field)
+// appeared on the live C29 port immediately after this shape was
+// introduced, and Alex confirmed "it was working fine before the
+// changes". C29 uses LegacyShareResponse below instead — see
+// session.go's writeShareResponse for the algo dispatch.
 type ShareResponse struct {
 	ID      int          `json:"id"`
 	JsonRPC string       `json:"jsonrpc"`
@@ -217,9 +230,56 @@ type ShareResponse struct {
 // share/submit outcome. Result here is a STRING, not a boolean (this
 // field is unaffected by the ShareResponse wire-shape bug fix). Error
 // follows the same object-or-null rule as ShareResponse above.
+//
+// ALGO-SCOPED: same SHA3X/RXT/RXM-only scoping as ShareResponse above
+// — see that type's doc comment. C29 uses LegacyErrorResponse below.
 type ErrorResponse struct {
 	ID      int       `json:"id"`
 	JsonRPC string    `json:"jsonrpc"`
 	Error   *RPCError `json:"error"` // NOT omitempty — same object-or-null rule as ShareResponse
 	Result  string    `json:"result"`
+}
+
+// LegacyShareResponse is the pre-PR-#56 submit/share response shape,
+// preserved verbatim for ALGO_C29. Restored EXACTLY from this repo's
+// own git history immediately prior to PR #56 (commit 0c01157, the
+// direct parent of b3c8716 "fix(leaflib): send real object-shaped
+// error/result in JSON-RPC submit responses") — NOT reconstructed from
+// memory. This shape matches C29's own real, actual ecosystem client
+// dialect: go-tari-c29-solo-stratum's messages.MinerRPCShareResponse
+// (github.com/Snipa22/go-tari-c29-solo-stratum,
+// subsystems/messages/minerStructs.go) field-for-field:
+//
+//	type MinerRPCShareResponse struct {
+//		ID      int    `json:"id"`
+//		JsonRPC string `json:"jsonrpc"`
+//		Error   string `json:"error,omitempty"`
+//		Result  bool   `json:"result"`
+//	}
+//
+// Result is a bare BOOLEAN (not an object) and Error is a bare STRING
+// (not an object/null) — the genuinely different, older wire dialect
+// lolMiner/graxil29-class C29 GPU miners require. See ShareResponse's
+// doc comment above for the regression this fixes.
+type LegacyShareResponse struct {
+	ID      int    `json:"id"`
+	JsonRPC string `json:"jsonrpc"`
+	Error   string `json:"error,omitempty"`
+	Result  bool   `json:"result"`
+}
+
+// LegacyErrorResponse is the pre-PR-#56 general-purpose response
+// shape, preserved verbatim for ALGO_C29 — same provenance and
+// rationale as LegacyShareResponse above. Matches
+// go-tari-c29-solo-stratum's messages.MinerRPCResponse exactly (bare
+// string Error, bare string Result — Result here was never a boolean,
+// on either dialect, so only Error's shape actually differs by algo in
+// practice; this type is kept for exact wire-format parity with the
+// real C29 reference implementation and so the C29 path never touches
+// the SHA3X/RXT/RXM-only *RPCError type at all).
+type LegacyErrorResponse struct {
+	ID      int    `json:"id"`
+	JsonRPC string `json:"jsonrpc"`
+	Error   string `json:"error,omitempty"`
+	Result  string `json:"result"`
 }
