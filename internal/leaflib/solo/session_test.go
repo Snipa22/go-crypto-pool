@@ -294,6 +294,21 @@ func (h *testHarness) recvShareResponse() ShareResponse {
 	return resp
 }
 
+// recvLegacyShareResponse decodes a submit response using the
+// pre-PR-#56 bare-bool/bare-string LegacyShareResponse shape — used by
+// C29 test harnesses only, since ALGO_C29 sessions now genuinely emit
+// this different wire shape (see session.go's writeShareResponse and
+// protocol.go's LegacyShareResponse doc comment for the confirmed
+// regression this preserves against).
+func (h *testHarness) recvLegacyShareResponse() LegacyShareResponse {
+	h.t.Helper()
+	var resp LegacyShareResponse
+	if err := json.Unmarshal(h.recvRaw(), &resp); err != nil {
+		h.t.Fatalf("unmarshal legacy share response: %v", err)
+	}
+	return resp
+}
+
 func (h *testHarness) recvErrorResponse() ErrorResponse {
 	h.t.Helper()
 	var resp ErrorResponse
@@ -1051,12 +1066,12 @@ func TestSessionC29SubmitWithCorrectlyShapedCycleIsRejectedByRealValidator(t *te
 		Nonce: xnPrefixedNonceHex(xn, 1),
 		POW:   cycle,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a non-solving (all-zero) C29 cycle to be rejected by the real cuckoo.Verify call")
 	}
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected a clear rejection error")
 	}
 	if h.node.submitCalls.Load() != 0 {
@@ -1081,12 +1096,12 @@ func TestSessionC29SubmitWrongCycleLengthIsRejected(t *testing.T) {
 		Nonce: xnPrefixedNonceHex(xn, 1),
 		POW:   shortCycle,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a wrong-length pow array to be rejected")
 	}
-	if resp.Error == nil || !strings.Contains(resp.Error.Message, "42") {
+	if resp.Error == "" || !strings.Contains(resp.Error, "42") {
 		t.Errorf("expected the rejection error to mention the required edge count, got %v", resp.Error)
 	}
 }
@@ -1136,7 +1151,7 @@ func TestSessionC29NonceByteOrderIsBigEndianNotLittleEndian(t *testing.T) {
 		Nonce: nonceHex,
 		POW:   cycle,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
 	// The all-zero cycle will still fail real PoW verification (it's
 	// not a genuine solved cycle) — that's expected and fine. What
@@ -1144,11 +1159,11 @@ func TestSessionC29NonceByteOrderIsBigEndianNotLittleEndian(t *testing.T) {
 	// for a nonce-FORMAT reason (which would indicate the byte-order
 	// handling broke decoding entirely) — the real validator was
 	// reached and is what produced the rejection.
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected the non-solving cycle to still be rejected")
 	}
-	if resp.Error != nil && (strings.Contains(resp.Error.Message, "must be 8 bytes") || strings.Contains(resp.Error.Message, "hex") && strings.Contains(resp.Error.Message, "invalid")) {
-		t.Fatalf("submit was rejected for a NONCE FORMAT reason (%q), not real PoW validation — byte-order handling may be broken", resp.Error.Message)
+	if resp.Error != "" && (strings.Contains(resp.Error, "must be 8 bytes") || strings.Contains(resp.Error, "hex") && strings.Contains(resp.Error, "invalid")) {
+		t.Fatalf("submit was rejected for a NONCE FORMAT reason (%q), not real PoW validation — byte-order handling may be broken", resp.Error)
 	}
 }
 
@@ -1217,12 +1232,12 @@ func TestSessionC29SubmitWithoutXNPrefixIsRejected(t *testing.T) {
 		Nonce: badNonce,
 		POW:   cycle,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a C29 submit whose nonce does not start with the session's own xn to be REJECTED")
 	}
-	if resp.Error == nil || !strings.Contains(resp.Error.Message, "Invalid XNonce") {
+	if resp.Error == "" || !strings.Contains(resp.Error, "Invalid XNonce") {
 		t.Errorf("expected rejection to be the xn-prefix check (\"Invalid XNonce\"), got %v", resp.Error)
 	}
 }
@@ -1447,12 +1462,12 @@ func TestSessionC29StillRejects4ByteNonce(t *testing.T) {
 		Nonce: shortNonce,
 		POW:   make([]uint64, 42),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a 4-byte C29 nonce to be rejected")
 	}
-	if resp.Error == nil || !strings.Contains(resp.Error.Message, "must be 8 bytes") {
+	if resp.Error == "" || !strings.Contains(resp.Error, "must be 8 bytes") {
 		t.Fatalf("BUG REGRESSION: C29's 8-byte nonce requirement was loosened -- got error %v, want the \"must be 8 bytes\" message", resp.Error)
 	}
 }

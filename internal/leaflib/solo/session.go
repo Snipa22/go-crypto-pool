@@ -996,7 +996,18 @@ func (s *Session) ownJob(id string) (*Job, bool) {
 	return job, ok
 }
 
+// writeGeneralResponse dispatches on this session's configured algo:
+// ALGO_C29 gets the real, genuinely different bare-string LegacyErrorResponse
+// wire shape (matching go-tari-c29-solo-stratum's own MinerRPCResponse — see
+// protocol.go's LegacyErrorResponse doc comment for the confirmed
+// regression this avoids), while every other algo (SHA3X/RXT/RXM, all
+// confirmed working xmrig-class clients) keeps the object/null
+// ErrorResponse shape from the PR #56 xmrig-compatibility fix.
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
+	if s.server.jobManager.Algo() == poolpb.Algo_ALGO_C29 {
+		s.writeJSON(LegacyErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
+		return
+	}
 	var rpcErr *RPCError
 	if errMsg != "" {
 		rpcErr = &RPCError{Code: -1, Message: errMsg}
@@ -1004,6 +1015,12 @@ func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
 }
 
+// writeShareResponse dispatches on this session's configured algo, same
+// rationale as writeGeneralResponse above: ALGO_C29 gets the real bare-bool
+// LegacyShareResponse shape lolMiner/graxil29 actually require on the wire
+// (matching go-tari-c29-solo-stratum's MinerRPCShareResponse exactly — see
+// protocol.go's LegacyShareResponse doc comment), while SHA3X/RXT/RXM keep
+// the confirmed-working object/null ShareResponse shape from PR #56.
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// Every submit outcome (share or block, accepted or rejected)
 	// flows through this single response-writing helper, so hooking
@@ -1012,6 +1029,10 @@ func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// branch point exactly once, uniformly labeled by result, without
 	// touching any of the actual accept/reject decision logic above.
 	s.server.recordShare(accepted)
+	if s.server.jobManager.Algo() == poolpb.Algo_ALGO_C29 {
+		s.writeJSON(LegacyShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
+		return
+	}
 	var rpcErr *RPCError
 	var result *ShareResult
 	if accepted {

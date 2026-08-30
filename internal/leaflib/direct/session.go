@@ -734,7 +734,16 @@ func (s *Session) ownJob(id string) (*solo.Job, bool) {
 	return job, ok
 }
 
+// writeGeneralResponse dispatches on this session's configured algo, mirroring
+// solo.Session's own writeGeneralResponse exactly (see that function's doc
+// comment for the full rationale): ALGO_C29 gets solo.LegacyErrorResponse's
+// real bare-string wire shape, every other algo keeps the PR #56 object/null
+// solo.ErrorResponse shape.
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
+	if s.server.algo == poolpb.Algo_ALGO_C29 {
+		s.writeJSON(solo.LegacyErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
+		return
+	}
 	var rpcErr *solo.RPCError
 	if errMsg != "" {
 		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
@@ -742,8 +751,18 @@ func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 	s.writeJSON(solo.ErrorResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
 }
 
+// writeShareResponse dispatches on this session's configured algo, mirroring
+// solo.Session's own writeShareResponse exactly: ALGO_C29 gets
+// solo.LegacyShareResponse's real bare-bool wire shape (the shape
+// lolMiner/graxil29 actually require — see protocol.go's LegacyShareResponse
+// doc comment in the solo package), every other algo keeps the confirmed-
+// working object/null solo.ShareResponse shape from PR #56.
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	s.server.recordShare(accepted)
+	if s.server.algo == poolpb.Algo_ALGO_C29 {
+		s.writeJSON(solo.LegacyShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
+		return
+	}
 	var rpcErr *solo.RPCError
 	var result *solo.ShareResult
 	if accepted {
