@@ -304,6 +304,14 @@ func (h *directTestHarness) recvErrorResponse() solo.ErrorResponse {
 	return resp
 }
 
+// directLogin performs a real login handshake and returns the
+// session id the server handed back and the session's own assigned
+// xn, resolved via directSessionXN (a direct lookup of the real
+// Session's internal xn field) rather than the wire
+// LoginResult.Job.XN field -- RXT/RXM sessions still carry an
+// internal xn for job bookkeeping even though it is deliberately
+// never sent over the wire for those two algos (see jobPayload's doc
+// comment in session.go).
 func directLogin(t *testing.T, h *directTestHarness, address string) (sessionID, xn string) {
 	t.Helper()
 	h.send(solo.Request{ID: 1, Method: "login", Params: mustDirectJSON(t, solo.LoginRequest{Login: address, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
@@ -311,7 +319,22 @@ func directLogin(t *testing.T, h *directTestHarness, address string) (sessionID,
 	if resp.Result.Status != "OK" {
 		t.Fatalf("login failed: status=%q", resp.Result.Status)
 	}
-	return resp.Result.ID, resp.Result.Job.XN
+	return resp.Result.ID, directSessionXN(t, h, resp.Result.ID)
+}
+
+// directSessionXN looks up the real, live Session for sessionID on
+// h.server and returns its internal xn field directly.
+func directSessionXN(t *testing.T, h *directTestHarness, sessionID string) string {
+	t.Helper()
+	h.server.mu.RLock()
+	defer h.server.mu.RUnlock()
+	for _, s := range h.server.sessions {
+		if s.sessionID == sessionID {
+			return s.xn
+		}
+	}
+	t.Fatalf("could not find session %q on server", sessionID)
+	return ""
 }
 
 func directCurrentJobIDForXN(t *testing.T, h *directTestHarness, xn string) string {

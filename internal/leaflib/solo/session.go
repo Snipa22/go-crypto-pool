@@ -940,7 +940,15 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 		Height: job.Height,
 		JobID:  job.ID,
 		Target: diffToTargetHex(job.StaticDifficulty),
-		XN:     s.xn,
+	}
+	// xn nonce-partitioning is a SHA3X/C29 convention only. RXT/RXM
+	// (RandomX-family) miners such as xmrig and graxil neither expect
+	// nor use an "xn" field on their jobs, so it must be left as the
+	// Go zero value (empty string) here — JobPayload.XN's
+	// `json:"xn,omitempty"` tag then omits the field from the wire
+	// JSON entirely for those two algos, rather than sending `"xn":""`.
+	if job.Algo != poolpb.Algo_ALGO_RXT && job.Algo != poolpb.Algo_ALGO_RXM {
+		payload.XN = s.xn
 	}
 	// RXT-only: surface the real RandomX seed/key (job.go's Job.VmKey,
 	// taken directly from GetNewBlockResult.VmKey) as the wire
