@@ -81,14 +81,14 @@ const statsPageHTML = `<!DOCTYPE html>
   <h2>Connected sessions</h2>
   {{if .Stats.Sessions}}
   <table>
-    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Agent</th><th>Remote address</th><th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Blocks</th></tr>
+    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Agent</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Blocks</th></tr>
     {{range .Stats.Sessions}}
     <tr>
       <td>{{.SessionID}}</td>
       <td>{{if .Address}}{{.Address}}{{else}}<span class="empty">(not logged in)</span>{{end}}</td>
       <td>{{.Worker}}</td>
       <td>{{if .Agent}}{{.Agent}}{{else}}<span class="empty">(unknown)</span>{{end}}</td>
-      <td>{{.RemoteAddr}}</td>
+      {{if not $.HideRemoteAddress}}<td>{{.RemoteAddr}}</td>{{end}}
       <td>{{formatTime .ConnectedAt}}</td>
       <td>{{connDuration .ConnectedAt}}</td>
       <td>{{.CurrentDifficulty}}</td>
@@ -111,6 +111,15 @@ type statsPageData struct {
 	Stats            Stats
 	MaxAddressLabels int
 	AddressCapped    bool
+	// HideRemoteAddress, when true, omits the "Remote address"
+	// column (both header and per-session value) from the rendered
+	// stats page entirely -- set from Server.hideRemoteAddress (see
+	// SetHideRemoteAddress) so public-facing deployments can avoid
+	// exposing remote miner IPs on a page anyone can load. Rendering
+	// nothing at all is deliberately preferred over rendering an
+	// empty value: a header with no data looks like a bug, not a
+	// privacy control.
+	HideRemoteAddress bool
 }
 
 // formatHashrate renders a hashes/second estimate (see
@@ -138,10 +147,11 @@ func (s *Server) StatsHTMLHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		st := s.Stats()
 		data := statsPageData{
-			GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
-			Stats:            st,
-			MaxAddressLabels: s.maxAddressLabels,
-			AddressCapped:    len(st.MinersByAddress) > 0 && st.MinersByAddress[len(st.MinersByAddress)-1].Address == "other",
+			GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+			Stats:             st,
+			MaxAddressLabels:  s.maxAddressLabels,
+			AddressCapped:     len(st.MinersByAddress) > 0 && st.MinersByAddress[len(st.MinersByAddress)-1].Address == "other",
+			HideRemoteAddress: s.hideRemoteAddress,
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := statsPageTemplate.Execute(w, data); err != nil {

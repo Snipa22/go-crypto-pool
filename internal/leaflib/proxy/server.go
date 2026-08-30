@@ -79,6 +79,11 @@ type Server struct {
 	// UpstreamReconnectsTotal counter (prometheus.Counter has no
 	// Set method).
 	lastReconnectCount atomic.Uint64
+
+	// hideRemoteAddress mirrors internal/leaflib/solo/server.go's
+	// identical field exactly — see that doc comment. Defaults to
+	// false; set via SetHideRemoteAddress.
+	hideRemoteAddress bool
 }
 
 // NewServer constructs a Server. cm must already be configured with
@@ -130,6 +135,12 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	return m
+}
+
+// SetHideRemoteAddress mirrors internal/leaflib/solo/server.go's
+// identical method exactly — see that doc comment.
+func (s *Server) SetHideRemoteAddress(hide bool) {
+	s.hideRemoteAddress = hide
 }
 
 // MetricsHandler returns the Prometheus /metrics HTTP handler if

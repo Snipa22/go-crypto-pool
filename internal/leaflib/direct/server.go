@@ -120,6 +120,11 @@ type Server struct {
 	transportErrorTotal atomic.Uint64
 	lastTransportKind   atomic.Value // string
 	lastTransportAt     atomic.Value // time.Time
+
+	// hideRemoteAddress mirrors internal/leaflib/solo/server.go's
+	// identical field exactly — see that doc comment. Defaults to
+	// false; set via SetHideRemoteAddress.
+	hideRemoteAddress bool
 }
 
 // ServerConfig configures a Server.
@@ -241,6 +246,12 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetr
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	return m
+}
+
+// SetHideRemoteAddress mirrors internal/leaflib/solo/server.go's
+// identical method exactly — see that doc comment.
+func (s *Server) SetHideRemoteAddress(hide bool) {
+	s.hideRemoteAddress = hide
 }
 
 // EnableTrust opts this server into the real, legacy-ported

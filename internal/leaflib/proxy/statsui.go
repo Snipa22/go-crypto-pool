@@ -82,13 +82,13 @@ const statsPageHTML = `<!DOCTYPE html>
   <h2>Connected sessions</h2>
   {{if .Stats.Sessions}}
   <table>
-    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Remote address</th><th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Shares</th><th>Upstream-forwarded</th></tr>
+    <tr><th>Session ID</th><th>Address</th><th>Worker</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Shares</th><th>Upstream-forwarded</th></tr>
     {{range .Stats.Sessions}}
     <tr>
       <td>{{.SessionID}}</td>
       <td>{{if .Address}}{{.Address}}{{else}}<span class="empty">(not logged in)</span>{{end}}</td>
       <td>{{.Worker}}</td>
-      <td>{{.RemoteAddr}}</td>
+      {{if not $.HideRemoteAddress}}<td>{{.RemoteAddr}}</td>{{end}}
       <td>{{formatTime .ConnectedAt}}</td>
       <td>{{connDuration .ConnectedAt}}</td>
       <td>{{.CurrentDifficulty}}</td>
@@ -110,6 +110,9 @@ type statsPageData struct {
 	Stats            Stats
 	MaxAddressLabels int
 	AddressCapped    bool
+	// HideRemoteAddress mirrors internal/leaflib/solo/statsui.go's
+	// identical field exactly — see that doc comment.
+	HideRemoteAddress bool
 }
 
 // StatsHTMLHandler serves the basic stats UI page described above,
@@ -120,10 +123,11 @@ func (s *Server) StatsHTMLHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		st := s.Stats()
 		data := statsPageData{
-			GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
-			Stats:            st,
-			MaxAddressLabels: s.maxAddressLabels,
-			AddressCapped:    len(st.MinersByAddress) > 0 && st.MinersByAddress[len(st.MinersByAddress)-1].Address == "other",
+			GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+			Stats:             st,
+			MaxAddressLabels:  s.maxAddressLabels,
+			AddressCapped:     len(st.MinersByAddress) > 0 && st.MinersByAddress[len(st.MinersByAddress)-1].Address == "other",
+			HideRemoteAddress: s.hideRemoteAddress,
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := statsPageTemplate.Execute(w, data); err != nil {
