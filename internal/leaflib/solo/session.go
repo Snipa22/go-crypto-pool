@@ -1006,7 +1006,25 @@ func algoWireName(algo poolpb.Algo) string {
 	case poolpb.Algo_ALGO_C29:
 		return "c29"
 	case poolpb.Algo_ALGO_RXT:
-		return "rxt"
+		// RXT (Tari's own "RandomXT") is algorithmically plain
+		// RandomX under the hood — same hash function as Monero's
+		// rx/0, just with Tari's own block/nonce/blob layout. Real
+		// RandomX-family miners (XMRig et al.) have no concept of an
+		// algorithm called "rxt": they only dispatch on their own
+		// fixed algo-name set (rx/0, rx/wow, ...), exactly the set
+		// they advertise in their own login "algo" capability array.
+		// Confirmed live in production: XMRig 6.25.0 against the RXT
+		// leaf-solo port reported real ~90kh/s hashrate but zero
+		// accepted shares because the job was labeled "rxt", a string
+		// absent from XMRig's own algo dispatch table (its login
+		// advertised rx/0, rx/wow, etc., never rxt). "RandomXT" is a
+		// Tari-protocol-internal name and must never leak onto the
+		// miner-facing wire — exactly the same principle already
+		// applied to ALGO_RXM below. NOT "rxt" — that's this repo's
+		// own internal poolpb.Algo protobuf enum name (and the
+		// operator-facing -algo=rxt CLI flag value), neither of which
+		// changes; only this wire label does.
+		return "rx/0"
 	case poolpb.Algo_ALGO_RXM:
 		// "rx/0" is the real wire algo string a real Monero-family
 		// miner (XMRig et al.) actually expects/recognizes — confirmed

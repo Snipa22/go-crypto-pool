@@ -904,8 +904,12 @@ func TestSessionLoginJobPayloadOmitsXNForRandomXFamilyAlgos(t *testing.T) {
 	if !ok {
 		t.Fatalf("login result has no job object: %s", raw)
 	}
-	if algo, _ := job["algo"].(string); algo != "rxt" {
-		t.Fatalf("job algo = %q, want rxt (sanity check this is really an RXT job): %s", algo, raw)
+	// Wire label is "rx/0", not "rxt" — RXT is plain RandomX under the
+	// hood and real RandomX miners (XMRig et al.) have no concept of an
+	// algo named "rxt"; only this repo's internal poolpb.Algo enum name
+	// and the -algo=rxt CLI flag value stay "rxt".
+	if algo, _ := job["algo"].(string); algo != "rx/0" {
+		t.Fatalf("job algo = %q, want rx/0 (sanity check this is really an RXT job on the correct miner-facing wire label): %s", algo, raw)
 	}
 	if _, present := job["xn"]; present {
 		t.Errorf("RXT job payload must not carry an \"xn\" key at all, got raw job JSON: %s", raw)
@@ -1441,5 +1445,39 @@ func TestSessionC29StillRejects4ByteNonce(t *testing.T) {
 	}
 	if !strings.Contains(resp.Error, "must be 8 bytes") {
 		t.Fatalf("BUG REGRESSION: C29's 8-byte nonce requirement was loosened -- got error %q, want the \"must be 8 bytes\" message", resp.Error)
+	}
+}
+
+// TestAlgoWireNameRXTMapsToRX0 is a direct regression guard for the
+// live production bug: RXT jobs must be labeled "rx/0" on the wire,
+// exactly like RXM, NOT the internal poolpb.Algo enum name "rxt".
+// Real RandomX-family miners (XMRig et al.) have no concept of an
+// algorithm called "rxt" in their own algo dispatch table — confirmed
+// live against XMRig 6.25.0, whose login "algo" capability array
+// contained "rx/0" but never "rxt", against production leaf-solo-rxt
+// (port 4447): the miner reported real ~90kh/s hashrate but produced
+// zero accepted shares because the job's algo label was unrecognized.
+func TestAlgoWireNameRXTMapsToRX0(t *testing.T) {
+	if got := algoWireName(poolpb.Algo_ALGO_RXT); got != "rx/0" {
+		t.Fatalf("algoWireName(ALGO_RXT) = %q, want %q (RXT is plain RandomX under the hood; the miner-facing wire label must match RXM's, not the internal enum name)", got, "rx/0")
+	}
+}
+
+// TestAlgoWireNameRXMStillMapsToRX0 guards against regressing the
+// already-correct RXM mapping while fixing RXT above.
+func TestAlgoWireNameRXMStillMapsToRX0(t *testing.T) {
+	if got := algoWireName(poolpb.Algo_ALGO_RXM); got != "rx/0" {
+		t.Fatalf("algoWireName(ALGO_RXM) = %q, want %q", got, "rx/0")
+	}
+}
+
+// TestAlgoWireNameC29AndSHA3XUnaffected guards the other wire labels
+// against any regression from the RXT fix above.
+func TestAlgoWireNameC29AndSHA3XUnaffected(t *testing.T) {
+	if got := algoWireName(poolpb.Algo_ALGO_C29); got != "c29" {
+		t.Fatalf("algoWireName(ALGO_C29) = %q, want %q", got, "c29")
+	}
+	if got := algoWireName(poolpb.Algo_ALGO_SHA3X); got != "sha3x" {
+		t.Fatalf("algoWireName(ALGO_SHA3X) = %q, want %q", got, "sha3x")
 	}
 }

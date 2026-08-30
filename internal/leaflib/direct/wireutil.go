@@ -77,7 +77,12 @@ func algoWireName(algo poolpb.Algo) string {
 	case poolpb.Algo_ALGO_C29:
 		return "c29"
 	case poolpb.Algo_ALGO_RXT:
-		return "rxt"
+		// RXT is plain RandomX under the hood (same hash as rx/0,
+		// Tari's own block/nonce/blob layout); real RandomX miners
+		// have no concept of an algo named "rxt" — mirrors solo's own
+		// algoWireName fix. NOT "rxt" — that's the internal
+		// poolpb.Algo enum name / -algo=rxt CLI flag value, unchanged.
+		return "rx/0"
 	case poolpb.Algo_ALGO_RXM:
 		// "rx/0" is the real wire algo string a real Monero-family
 		// miner actually expects — mirrors solo's own algoWireName and
