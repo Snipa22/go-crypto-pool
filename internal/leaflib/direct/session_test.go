@@ -1231,3 +1231,21 @@ func TestDirectSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
 		t.Fatalf("BUG REGRESSION: SHA3X's 8-byte nonce requirement was loosened -- got error %q, want the \"must be 8 bytes\" message", resp.Error)
 	}
 }
+
+// TestAlgoWireNameRXTMapsToRX0 mirrors solo's own regression guard:
+// RXT jobs must be labeled "rx/0" on the wire, exactly like RXM, NOT
+// the internal poolpb.Algo enum name "rxt" — real RandomX-family
+// miners (XMRig et al.) have no concept of an algorithm called "rxt".
+func TestAlgoWireNameRXTMapsToRX0(t *testing.T) {
+	if got := algoWireName(poolpb.Algo_ALGO_RXT); got != "rx/0" {
+		t.Fatalf("algoWireName(ALGO_RXT) = %q, want %q", got, "rx/0")
+	}
+}
+
+// TestAlgoWireNameRXMStillMapsToRX0 guards against regressing the
+// already-correct RXM mapping while fixing RXT above.
+func TestAlgoWireNameRXMStillMapsToRX0(t *testing.T) {
+	if got := algoWireName(poolpb.Algo_ALGO_RXM); got != "rx/0" {
+		t.Fatalf("algoWireName(ALGO_RXM) = %q, want %q", got, "rx/0")
+	}
+}
