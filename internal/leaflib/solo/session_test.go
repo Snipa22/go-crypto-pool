@@ -143,6 +143,62 @@ func newRXTTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64, rando
 	return h
 }
 
+// newRXMTestHarness is newC29TestHarness's ALGO_RXM counterpart, used
+// ONLY to exercise handleSubmit's algo-conditional nonce-length gate
+// (the regression fix below) — NOT full Monero PoW verification.
+// fakeNodeClient's GetBlockTemplate is Tari-shaped (tariJobFromResult)
+// and knows nothing about Monero; it still happily returns a *Job
+// whose Algo field is whatever poolpb.Algo the caller (JobManager,
+// configured here with Algo_ALGO_RXM) passed in, with TemplateData
+// left as the raw Tari result rather than a real *moneroTemplateData.
+// That's fine for THIS test's purpose: handleSubmit's length gate
+// switches on job.Algo alone, before any TemplateData type assertion,
+// so a submit that clears the gate still deterministically fails
+// downstream at MoneroHashingBlobForSubmit's own type assertion
+// (solo/node.go) with a distinct, non-"8 bytes" error — which is
+// exactly the observable this test needs: proof the gate itself did
+// not reject the submit.
+func newRXMTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *testHarness {
+	t.Helper()
+	node := &fakeNodeClient{
+		height:           42,
+		targetDifficulty: networkTargetDiff,
+		mergeMiningHash:  []byte("test-merge-mining-hash-32bytes!"),
+		blockHashSeed:    []byte("test-block-hash-seed-32-bytes!!"),
+	}
+	jm := NewJobManager(JobManagerConfig{
+		Node:             node,
+		PayoutAddress:    "solo-test-address",
+		StaticDifficulty: staticDiff,
+		Algo:             poolpb.Algo_ALGO_RXM,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 2 * time.Second})
+	registry := validator.Registry{}
+	server := NewServer(cm, jm, node, registry, poolpb.Network_NETWORK_TESTNET, nil, VardiffConfig{})
+
+	serverConn, clientConn := net.Pipe()
+	go server.handleConn(ctx, serverConn, staticDiff)
+
+	h := &testHarness{
+		t:      t,
+		server: server,
+		cm:     cm,
+		jm:     jm,
+		node:   node,
+		client: clientConn,
+		reader: bufio.NewReader(clientConn),
+		writer: bufio.NewWriter(clientConn),
+		cancel: cancel,
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = clientConn.Close()
+	})
+	return h
+}
+
 // newTestHarnessWithJobMaxAge is newTestHarness plus an explicit
 // JobManagerConfig.JobMaxAge override (0 keeps NewJobManager's own
 // default of 6 minutes), used by the real per-job expiry tests below.
@@ -1129,6 +1185,28 @@ func flipFirstHexNibble(s string) string {
 	return "0" + s[1:]
 }
 
+// realXMRMainnetAddr is the real, well-known Monero project donation
+// address -- a genuine mainnet standard address whose base58/checksum
+// has been independently verified for years by the Monero ecosystem
+// (same fixture as internal/backend/addressmap/addressmap_test.go's
+// own realXMRMainnetAddr), used here so the RXM-focused nonce-length
+// gate tests below can pass handleLogin's real, coin-aware Monero
+// address validation (address.go's validateMoneroLoginAddress).
+const realXMRMainnetAddr = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
+
+// loginRXM is login's ALGO_RXM counterpart: uses a real Monero
+// address (not a Tari one) and advertises the "rx/0" algo, matching a
+// real xmrig client's login params.
+func loginRXM(t *testing.T, h *testHarness) (sessionID, xn string) {
+	t.Helper()
+	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: realXMRMainnetAddr, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"rx/0"}})})
+	resp := h.recvLoginResponse()
+	if resp.Result.Status != "OK" {
+		t.Fatalf("login failed: status=%q", resp.Result.Status)
+	}
+	return resp.Result.ID, resp.Result.Job.XN
+}
+
 func mustJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	buf, err := json.Marshal(v)
@@ -1136,4 +1214,146 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 		t.Fatalf("marshal: %v", err)
 	}
 	return buf
+}
+
+// --- nonce-length gate regression tests (bug fix: the nonce-length
+// check was an unconditional "must be exactly 8 bytes" gate applied
+// to EVERY algo, rejecting every real ALGO_RXM submit -- a real
+// production packet capture against the live public RXM leaf-solo
+// instance (148.163.90.157:4450) showed a real xmrig client's
+// genuine 4-byte nonce ("818d1a00", matching Monero's real 32-bit
+// block-header nonce field) being rejected with "nonce must be 8
+// bytes, hex-encoded uint64" purely because of this blanket check.
+// RXM must now accept a 4-byte nonce; SHA3X/C29/RXT must still
+// require exactly 8 bytes, unchanged. ---
+
+// TestSessionRXMAccepts4ByteNonce is the core regression test for the
+// fix: submitting the EXACT nonce from the real production packet
+// capture above ("818d1a00", 4 bytes) for an ALGO_RXM job must NOT be
+// rejected by the "nonce must be 8 bytes" gate. The submit still
+// fails further downstream (this harness's fakeNodeClient builds a
+// Tari-shaped job, not a real *moneroTemplateData, so
+// MoneroHashingBlobForSubmit's own type assertion fails) -- that's
+// expected and is not what this test asserts. The test's ONLY
+// assertion is that the rejection reason is NOT the 8-byte gate.
+func TestSessionRXMAccepts4ByteNonce(t *testing.T) {
+	h := newRXMTestHarness(t, 1, 1<<62)
+	sessionID, xn := loginRXM(t, h)
+	jobID := currentJobIDForXN(t, h, xn)
+
+	const xmrigCaptureNonce = "818d1a00" // real capture: 4 bytes, 8 hex chars
+	h.send(Request{ID: 70, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:     sessionID,
+		JobID:  jobID,
+		Nonce:  xmrigCaptureNonce,
+		Result: strings.Repeat("00", 32), // placeholder claimed result hash
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("test setup bug: expected this RXM submit to still fail downstream (fake Tari template data, not real Monero data), not succeed")
+	}
+	if strings.Contains(resp.Error, "must be 8 bytes") {
+		t.Fatalf("BUG REGRESSION: a real xmrig-shaped 4-byte RXM nonce (%q) was rejected by the 8-byte length gate (%q) -- RXM must accept a 4-byte nonce", xmrigCaptureNonce, resp.Error)
+	}
+}
+
+// TestSessionRXMAccepts8ByteNonceToo confirms the fix's lenient
+// 8-byte tolerance branch for RXM still works (some other
+// RXM-speaking client could zero-pad to 8 bytes) -- same
+// "not the 8-byte gate" assertion as above, just with an 8-byte
+// nonce this time.
+func TestSessionRXMAccepts8ByteNonceToo(t *testing.T) {
+	h := newRXMTestHarness(t, 1, 1<<62)
+	sessionID, xn := loginRXM(t, h)
+	jobID := currentJobIDForXN(t, h, xn)
+
+	h.send(Request{ID: 71, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:     sessionID,
+		JobID:  jobID,
+		Nonce:  "00000000818d1a00",
+		Result: strings.Repeat("00", 32),
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("test setup bug: expected this RXM submit to still fail downstream, not succeed")
+	}
+	if strings.Contains(resp.Error, "must be 8 bytes") || strings.Contains(resp.Error, "must be 4 bytes") {
+		t.Fatalf("an 8-byte RXM nonce was rejected by the length gate (%q) -- RXM should tolerate 8 bytes too", resp.Error)
+	}
+}
+
+// TestSessionRXMRejectsBadLengthNonce confirms RXM's length gate
+// still rejects a genuinely wrong-length nonce (neither 4 nor 8
+// bytes) -- proving the fix didn't just remove the gate entirely.
+func TestSessionRXMRejectsBadLengthNonce(t *testing.T) {
+	h := newRXMTestHarness(t, 1, 1<<62)
+	sessionID, xn := loginRXM(t, h)
+	jobID := currentJobIDForXN(t, h, xn)
+
+	h.send(Request{ID: 72, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:     sessionID,
+		JobID:  jobID,
+		Nonce:  "aabbcc", // 3 bytes -- neither valid width
+		Result: strings.Repeat("00", 32),
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a 3-byte RXM nonce to be rejected")
+	}
+	if !strings.Contains(resp.Error, "4 bytes") {
+		t.Errorf("expected the RXM-specific 4-byte-nonce error, got %q", resp.Error)
+	}
+}
+
+// TestSessionSHA3XStillRejects4ByteNonce and
+// TestSessionC29StillRejects4ByteNonce are the regression guards for
+// the OTHER side of this fix: making the length gate lenient for RXM
+// must NOT have accidentally loosened it for SHA3X/C29, which
+// genuinely require exactly 8 bytes.
+func TestSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
+	h := newTestHarness(t, 1, 1<<62)
+	sessionID, xn := login(t, h, "addr-sha3x-4byte")
+	jobID := currentJobIDForXN(t, h, xn)
+
+	// A 4-byte (8 hex char) nonce, xn-prefixed so the xn check
+	// (which runs first) doesn't mask the length-gate result.
+	shortNonce := xn + strings.Repeat("0", 8-len(xn))
+	h.send(Request{ID: 73, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:    sessionID,
+		JobID: jobID,
+		Nonce: shortNonce,
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a 4-byte SHA3X nonce to be rejected")
+	}
+	if !strings.Contains(resp.Error, "must be 8 bytes") {
+		t.Fatalf("BUG REGRESSION: SHA3X's 8-byte nonce requirement was loosened -- got error %q, want the \"must be 8 bytes\" message", resp.Error)
+	}
+}
+
+func TestSessionC29StillRejects4ByteNonce(t *testing.T) {
+	h := newC29TestHarness(t, 1, 1)
+	sessionID, xn := login(t, h, "addr-c29-4byte")
+	jobID := currentJobIDForXN(t, h, xn)
+
+	shortNonce := xn + strings.Repeat("0", 8-len(xn))
+	h.send(Request{ID: 74, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		ID:    sessionID,
+		JobID: jobID,
+		Nonce: shortNonce,
+		POW:   make([]uint64, 42),
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a 4-byte C29 nonce to be rejected")
+	}
+	if !strings.Contains(resp.Error, "must be 8 bytes") {
+		t.Fatalf("BUG REGRESSION: C29's 8-byte nonce requirement was loosened -- got error %q, want the \"must be 8 bytes\" message", resp.Error)
+	}
 }

@@ -1048,3 +1048,163 @@ func TestDirectSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
 		t.Errorf("a cross-session-rejected submit must not be forwarded to the backend, got %d forwards", h.transport.shareCount())
 	}
 }
+
+// --- nonce-length gate regression tests (bug fix: mirrors
+// solo/session_test.go's own regression tests exactly -- see that
+// file's doc comment for the full rationale and the real production
+// packet capture against 148.163.90.157:4450 that surfaced this bug.
+// leaf-direct's handleSubmit had the identical unconditional 8-byte
+// nonce-length gate as leaf-solo's. ---
+
+// realDirectXMRMainnetAddr is the same real Monero mainnet donation
+// address used by solo/session_test.go's realXMRMainnetAddr, needed
+// here so these RXM-focused tests can pass directLogin-equivalent
+// real, coin-aware Monero address validation.
+const realDirectXMRMainnetAddr = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
+
+// directLoginRXM is directLogin's ALGO_RXM counterpart: uses a real
+// Monero address and advertises "rx/0", matching a real xmrig login.
+func directLoginRXM(t *testing.T, h *directTestHarness) (sessionID, xn string) {
+	t.Helper()
+	h.send(solo.Request{ID: 1, Method: "login", Params: mustDirectJSON(t, solo.LoginRequest{Login: realDirectXMRMainnetAddr, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"rx/0"}})})
+	resp := h.recvLoginResponse()
+	if resp.Result.Status != "OK" {
+		t.Fatalf("login failed: status=%q", resp.Result.Status)
+	}
+	return resp.Result.ID, resp.Result.Job.XN
+}
+
+// newDirectRXMTestHarness is newDirectRXTTestHarness's ALGO_RXM
+// counterpart, used ONLY to exercise handleSubmit's algo-conditional
+// nonce-length gate -- NOT full Monero PoW verification. Mirrors
+// solo/session_test.go's own newRXMTestHarness: fakeDirectNodeClient
+// is Tari-shaped and knows nothing about Monero, but the resulting
+// Job's Algo field is still whatever poolpb.Algo the JobManager was
+// configured with (ALGO_RXM here), which is all the length gate
+// switches on.
+func newDirectRXMTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64) *directTestHarness {
+	t.Helper()
+	node := &fakeDirectNodeClient{
+		height:          42,
+		mergeMiningHash: []byte("direct-test-merge-mining-hash-3"),
+	}
+	node.targetDifficulty = networkTargetDiff
+	jm := solo.NewJobManager(solo.JobManagerConfig{
+		Node:             node,
+		PayoutAddress:    "direct-test-address",
+		StaticDifficulty: staticDiff,
+		Algo:             poolpb.Algo_ALGO_RXM,
+	})
+
+	registry := validator.Registry{}
+
+	tr := &fakeShareTransport{}
+	sub := &fakeAcceptingBlockClient{}
+	multi := newMultiNodeSubmitterForTest(map[string]blockSubmitClient{"fake-node:18102": sub}, log.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 2 * time.Second})
+
+	server := NewServer(ServerConfig{
+		ConnectionManager: cm,
+		JobManager:        jm,
+		Node:              node,
+		Validators:        registry,
+		Network:           poolpb.Network_NETWORK_TESTNET,
+		Transport:         tr,
+		MultiSubmit:       multi,
+		Algo:              poolpb.Algo_ALGO_RXM,
+		PoolType:          poolpb.PoolType_POOL_TYPE_SOLO,
+		PoolID:            42,
+	})
+
+	serverConn, clientConn := net.Pipe()
+	go server.handleConn(ctx, serverConn, staticDiff)
+
+	h := &directTestHarness{
+		t: t, server: server, jm: jm, node: node, transport: tr, submit: sub,
+		client: clientConn,
+		reader: bufio.NewReader(clientConn),
+		writer: bufio.NewWriter(clientConn),
+		cancel: cancel,
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = clientConn.Close()
+	})
+	return h
+}
+
+// TestDirectSessionRXMAccepts4ByteNonce is the direct-package
+// counterpart of solo/session_test.go's TestSessionRXMAccepts4ByteNonce:
+// the EXACT nonce from the real production packet capture
+// ("818d1a00", 4 bytes) must NOT be rejected by the "nonce must be 8
+// bytes" gate for an ALGO_RXM job.
+func TestDirectSessionRXMAccepts4ByteNonce(t *testing.T) {
+	h := newDirectRXMTestHarness(t, 1, 1<<62)
+	sessionID, xn := directLoginRXM(t, h)
+	jobID := directCurrentJobIDForXN(t, h, xn)
+
+	const xmrigCaptureNonce = "818d1a00" // real capture: 4 bytes, 8 hex chars
+	h.send(solo.Request{ID: 70, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
+		ID:     sessionID,
+		JobID:  jobID,
+		Nonce:  xmrigCaptureNonce,
+		Result: strings.Repeat("00", 32),
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("test setup bug: expected this RXM submit to still fail downstream (fake Tari template data, not real Monero data), not succeed")
+	}
+	if strings.Contains(resp.Error, "must be 8 bytes") {
+		t.Fatalf("BUG REGRESSION: a real xmrig-shaped 4-byte RXM nonce (%q) was rejected by the 8-byte length gate (%q) -- RXM must accept a 4-byte nonce", xmrigCaptureNonce, resp.Error)
+	}
+}
+
+// TestDirectSessionRXMRejectsBadLengthNonce confirms RXM's length
+// gate still rejects a genuinely wrong-length nonce.
+func TestDirectSessionRXMRejectsBadLengthNonce(t *testing.T) {
+	h := newDirectRXMTestHarness(t, 1, 1<<62)
+	sessionID, xn := directLoginRXM(t, h)
+	jobID := directCurrentJobIDForXN(t, h, xn)
+
+	h.send(solo.Request{ID: 71, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
+		ID:     sessionID,
+		JobID:  jobID,
+		Nonce:  "aabbcc", // 3 bytes -- neither valid width
+		Result: strings.Repeat("00", 32),
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a 3-byte RXM nonce to be rejected")
+	}
+	if !strings.Contains(resp.Error, "4 bytes") {
+		t.Errorf("expected the RXM-specific 4-byte-nonce error, got %q", resp.Error)
+	}
+}
+
+// TestDirectSessionSHA3XStillRejects4ByteNonce is the regression
+// guard for the other side of this fix: SHA3X must still require
+// exactly 8 bytes.
+func TestDirectSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
+	h := newDirectTestHarness(t, 1, 1<<62)
+	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-direct-sha3x-4byte"))
+	jobID := directCurrentJobIDForXN(t, h, xn)
+
+	shortNonce := xn + strings.Repeat("0", 8-len(xn))
+	h.send(solo.Request{ID: 72, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
+		ID:    sessionID,
+		JobID: jobID,
+		Nonce: shortNonce,
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result {
+		t.Fatal("expected a 4-byte SHA3X nonce to be rejected")
+	}
+	if !strings.Contains(resp.Error, "must be 8 bytes") {
+		t.Fatalf("BUG REGRESSION: SHA3X's 8-byte nonce requirement was loosened -- got error %q, want the \"must be 8 bytes\" message", resp.Error)
+	}
+}
