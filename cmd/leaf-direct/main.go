@@ -76,6 +76,15 @@ type config struct {
 
 	randomXServiceURL string
 
+	// coinbaseExtraTag mirrors leaf-solo's own cfg.coinbaseExtraTag
+	// exactly -- -coinbase-extra-tag / LEAF_DIRECT_COINBASE_EXTRA_TAG,
+	// an explicit operator override for the coinbase-extra ownership
+	// tag appended to every fetched Tari block template. Left empty
+	// (the default), resolveCoinbaseExtraTag computes a per-algo
+	// default ("supportxtm-sha3x"/"supportxtm-c29"/"supportxtm-rxt"/
+	// "supportxtm-rxm") instead -- see that function's doc comment.
+	coinbaseExtraTag string
+
 	startingDifficulty uint64
 	portsRaw           string
 	minDifficulty      uint64
@@ -152,6 +161,7 @@ func loadConfig() config {
 	flag.StringVar(&cfg.poolType, "pool-type", envOr("LEAF_DIRECT_POOL_TYPE", ""), "real pool payout model stamped onto every share/block forwarded to the backend: pplns|pps|prop|solo. REQUIRED (no safe silent default -- determines real payout accounting semantics). Env: LEAF_DIRECT_POOL_TYPE")
 	flag.IntVar(&cfg.poolID, "pool-id", envOrInt("LEAF_DIRECT_POOL_ID", 0), "real, static, operator-assigned pool-server-source identifier stamped onto every share/block forwarded to the backend (see internal/proto/share.proto's Share.pool_id doc comment). REQUIRED, must be > 0 (no safe silent default -- see this flag's own field doc comment on config.poolID for why 0/unset is not a safe fallback). Env: LEAF_DIRECT_POOL_ID")
 	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_DIRECT_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (only consulted when -algo=rxt). Env: LEAF_DIRECT_RANDOMX_SERVICE_URL")
+	flag.StringVar(&cfg.coinbaseExtraTag, "coinbase-extra-tag", envOr("LEAF_DIRECT_COINBASE_EXTRA_TAG", ""), "coinbase-extra ownership tag appended to every fetched Tari block template (identifies this leaf's found blocks on-chain). Left unset (the default), a per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 / supportxtm-rxt / supportxtm-rxm, based on -algo/-coin -- see resolveCoinbaseExtraTag. When set, this value is used verbatim, overriding the per-algo default. Truncated to solo.MaxCoinbaseExtraTagLen bytes if longer. Env: LEAF_DIRECT_COINBASE_EXTRA_TAG")
 
 	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_DIRECT_STARTING_DIFFICULTY", 10000), "starting share difficulty for a newly-connected session. Env: LEAF_DIRECT_STARTING_DIFFICULTY")
 	flag.StringVar(&cfg.portsRaw, "ports", envOr("LEAF_DIRECT_PORTS", ""), "comma-separated list of address:difficulty[:desc] port tiers. When unset, -listen-address/-starting-difficulty are used as a single implicit tier. Env: LEAF_DIRECT_PORTS")
@@ -312,6 +322,36 @@ func resolveAlgo(cfg config) poolpb.Algo {
 	return algoFromString(cfg.algo)
 }
 
+// algoTagSuffix mirrors leaf-solo's own algoTagSuffix exactly -- see
+// that function's doc comment.
+func algoTagSuffix(cfg config) string {
+	switch resolveAlgo(cfg) {
+	case poolpb.Algo_ALGO_C29:
+		return "c29"
+	case poolpb.Algo_ALGO_RXT:
+		return "rxt"
+	case poolpb.Algo_ALGO_RXM:
+		return "rxm"
+	default:
+		return "sha3x"
+	}
+}
+
+// defaultCoinbaseExtraTag mirrors leaf-solo's own
+// defaultCoinbaseExtraTag exactly -- see that function's doc comment.
+func defaultCoinbaseExtraTag(cfg config) string {
+	return "supportxtm-" + algoTagSuffix(cfg)
+}
+
+// resolveCoinbaseExtraTag mirrors leaf-solo's own
+// resolveCoinbaseExtraTag exactly -- see that function's doc comment.
+func resolveCoinbaseExtraTag(cfg config) string {
+	if strings.TrimSpace(cfg.coinbaseExtraTag) != "" {
+		return cfg.coinbaseExtraTag
+	}
+	return defaultCoinbaseExtraTag(cfg)
+}
+
 // poolTypeFromString parses the real string convention mirrored from
 // internal/backend/api/api.go's own (private, unexported) poolTypeString
 // reverse-mapping (PPLNS/PPS/PROP/SOLO), accepted here case-insensitively
@@ -403,6 +443,15 @@ func main() {
 	}
 	logger.Printf("vardiff bounds [%d, %d], target time %ds, retarget interval %s", cfg.minDifficulty, cfg.maxDifficulty, cfg.vardiffTargetTime, cfg.vardiffInterval)
 
+	// coinbaseExtraTag mirrors leaf-solo's own resolution exactly --
+	// see cmd/leaf-solo/main.go's identical block for the full
+	// rationale. Logged unconditionally so a freshly deployed/
+	// reconfigured leaf-direct's actual on-chain attribution tag is
+	// directly verifiable from its own startup logs.
+	coinbaseExtraTagStr := resolveCoinbaseExtraTag(cfg)
+	coinbaseExtraTag := solo.NormalizeCoinbaseExtraTag(coinbaseExtraTagStr, defaultCoinbaseExtraTag(cfg))
+	logger.Printf("coinbase-extra tag: %q (%d bytes)", string(coinbaseExtraTag), len(coinbaseExtraTag))
+
 	// Real coin-conditional NodeClient construction. For -coin=tari
 	// (default), this is direct.NewNodeClient's own real
 	// per-call-injectable GRPC client (unchanged). For -coin=monero,
@@ -417,7 +466,7 @@ func main() {
 		node = solo.NewMoneroNodeClient(cfg.monerodURL)
 	} else {
 		logger.Printf("connecting to primary Tari base node GRPC at %s", cfg.nodeGRPCAddress)
-		tariNode, err := direct.NewNodeClient(cfg.nodeGRPCAddress)
+		tariNode, err := direct.NewNodeClient(cfg.nodeGRPCAddress, coinbaseExtraTag)
 		if err != nil {
 			logger.Fatalf("failed to construct primary node client for %s: %v", cfg.nodeGRPCAddress, err)
 		}

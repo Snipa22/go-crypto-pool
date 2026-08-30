@@ -27,6 +27,14 @@ import (
 // just because leaf-solo historically did.
 type NodeClient struct {
 	client *tarilib.Client
+
+	// coinbaseExtraTag is this instance's configured coinbase-extra
+	// ownership tag, leaf-direct's own counterpart to
+	// solo/node.go's GRPCNodeClient.coinbaseExtraTag — see that
+	// field's doc comment. Runtime-configurable (was formerly a
+	// single hardcoded package-level "GCPOOL-DIRECT" constant) —
+	// see cmd/leaf-direct/main.go's -coinbase-extra-tag flag.
+	coinbaseExtraTag []byte
 }
 
 // NewNodeClient dials address (host:port) via tarilib.NewClient and
@@ -34,13 +42,16 @@ type NodeClient struct {
 // this holds its own independent connection — constructing more than
 // one of these (e.g. for template source + a distinct GRPC relay
 // consumer node) is fully safe, unlike the singleton API leaf-solo
-// uses.
-func NewNodeClient(address string) (*NodeClient, error) {
+// uses. coinbaseExtraTag is already-normalized (see
+// solo.NormalizeCoinbaseExtraTag) and is appended to every fetched
+// block template's coinbase-extra field ahead of the per-xn random
+// nonce (see GetBlockTemplate).
+func NewNodeClient(address string, coinbaseExtraTag []byte) (*NodeClient, error) {
 	c, err := tarilib.NewClient(address)
 	if err != nil {
 		return nil, err
 	}
-	return &NodeClient{client: c}, nil
+	return &NodeClient{client: c, coinbaseExtraTag: coinbaseExtraTag}, nil
 }
 
 // tariPowAlgo mirrors solo/node.go's own unexported tariPowAlgo exactly
@@ -59,11 +70,6 @@ func tariPowAlgo(algo poolpb.Algo) tari_generated.PowAlgo_PowAlgos {
 	}
 }
 
-// poolCoinbaseExtraTag identifies go-crypto-pool leaf-direct in the
-// coinbase extra field, leaf-direct's own counterpart to
-// solo/node.go's poolCoinbaseExtraTag.
-var poolCoinbaseExtraTag = []byte("GCPOOL-DIRECT")
-
 // GetBlockTemplate implements solo.NodeClient. Mirrors
 // solo.GRPCNodeClient.GetBlockTemplate's real coinbase-extra
 // randomization exactly (see that method's doc comment for the full
@@ -75,10 +81,7 @@ var poolCoinbaseExtraTag = []byte("GCPOOL-DIRECT")
 // comment), not a coin-typed result JobManager would need to parse
 // itself.
 func (c *NodeClient) GetBlockTemplate(_ context.Context, payoutAddress string, algo poolpb.Algo) (*solo.Job, error) {
-	nonceBuf := randomNonceBuf()
-	coinbaseExtra := make([]byte, 0, len(poolCoinbaseExtraTag)+len(nonceBuf))
-	coinbaseExtra = append(coinbaseExtra, poolCoinbaseExtraTag...)
-	coinbaseExtra = append(coinbaseExtra, nonceBuf...)
+	coinbaseExtra := c.buildCoinbaseExtra()
 
 	coinbases := []*tari_generated.NewBlockCoinbase{
 		{
@@ -98,6 +101,20 @@ func (c *NodeClient) GetBlockTemplate(_ context.Context, payoutAddress string, a
 		return nil, err
 	}
 	return tariJobFromResult(result, algo)
+}
+
+// buildCoinbaseExtra combines this instance's configured
+// coinbaseExtraTag with a fresh per-xn random nonce buffer into the
+// exact []byte GetBlockTemplate submits as CoinbaseExtra — leaf-direct's
+// own counterpart to solo.GRPCNodeClient.buildCoinbaseExtra. Factored
+// out so tests can exercise the exact tag-inclusion logic without a
+// real GRPC connection (see node_test.go).
+func (c *NodeClient) buildCoinbaseExtra() []byte {
+	nonceBuf := randomNonceBuf()
+	coinbaseExtra := make([]byte, 0, len(c.coinbaseExtraTag)+len(nonceBuf))
+	coinbaseExtra = append(coinbaseExtra, c.coinbaseExtraTag...)
+	coinbaseExtra = append(coinbaseExtra, nonceBuf...)
+	return coinbaseExtra
 }
 
 // tariJobFromResult mirrors solo/node.go's own unexported
