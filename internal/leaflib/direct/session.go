@@ -91,6 +91,27 @@ type Session struct {
 	// see that field's doc comment.
 	forcedMinDifficulty atomic.Uint64
 	hashesAccumulated   atomic.Uint64
+
+	// lastDeliveredJobID/lastDeliveredDifficulty mirror solo.Session's
+	// own identical fields exactly -- see that type's doc comment for
+	// the full rationale (BUG FIX: Alex's live "duplicate jobs down
+	// the wire" report). Updated in jobPayload below; consulted by
+	// server.go's invalidateAndRepushJobs via alreadyDelivered.
+	lastDeliveredJobID      atomic.Value // string
+	lastDeliveredDifficulty atomic.Uint64
+}
+
+// alreadyDelivered mirrors solo.Session's own identical method exactly
+// -- see that method's doc comment.
+func (s *Session) alreadyDelivered(job *solo.Job) bool {
+	if job == nil {
+		return false
+	}
+	lastID, _ := s.lastDeliveredJobID.Load().(string)
+	if lastID == "" || lastID != job.ID {
+		return false
+	}
+	return s.lastDeliveredDifficulty.Load() == job.StaticDifficulty
 }
 
 func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64) *Session {
@@ -743,6 +764,11 @@ func (s *Session) pushJob(job *solo.Job) {
 
 func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	s.recordJob(job)
+	// Record what was actually delivered, mirroring
+	// solo.Session.jobPayload's identical bookkeeping -- see
+	// lastDeliveredJobID's doc comment.
+	s.lastDeliveredJobID.Store(job.ID)
+	s.lastDeliveredDifficulty.Store(job.StaticDifficulty)
 	payload := solo.JobPayload{
 		Algo:   algoWireName(job.Algo),
 		Blob:   hex.EncodeToString(job.Header),

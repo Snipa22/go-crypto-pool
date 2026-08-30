@@ -365,6 +365,14 @@ func (s *Server) invalidateAndRepushJobs() {
 			s.logger.Printf("direct: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.xn, err)
 			continue
 		}
+		// BUG FIX (Alex, live production report: "we're sending
+		// duplicate jobs down the wire to RXT") -- mirrors
+		// solo.Server.invalidateAndRepushJobs' identical fix exactly;
+		// see that function's doc comment and Session.alreadyDelivered
+		// for the real legacy reference this ports.
+		if sess.alreadyDelivered(job) {
+			continue
+		}
 		sess.pushJob(job)
 	}
 }
