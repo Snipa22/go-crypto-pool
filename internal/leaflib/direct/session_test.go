@@ -1087,6 +1087,14 @@ const realDirectXMRMainnetAddr = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXf
 
 // directLoginRXM is directLogin's ALGO_RXM counterpart: uses a real
 // Monero address and advertises "rx/0", matching a real xmrig login.
+//
+// xn is resolved via directSessionXN (a direct lookup of the real
+// Session's internal xn field), NOT via the wire LoginResult.Job.XN
+// field: RXM sessions still carry an internal xn for job bookkeeping
+// even though it is deliberately never sent over the wire for that
+// algo (see jobPayload's doc comment in session.go) -- reading it off
+// the wire would silently return "" and cause callers to look
+// up/submit against the wrong job.
 func directLoginRXM(t *testing.T, h *directTestHarness) (sessionID, xn string) {
 	t.Helper()
 	h.send(solo.Request{ID: 1, Method: "login", Params: mustDirectJSON(t, solo.LoginRequest{Login: realDirectXMRMainnetAddr, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"rx/0"}})})
@@ -1094,7 +1102,7 @@ func directLoginRXM(t *testing.T, h *directTestHarness) (sessionID, xn string) {
 	if resp.Result.Status != "OK" {
 		t.Fatalf("login failed: status=%q", resp.Result.Status)
 	}
-	return resp.Result.ID, resp.Result.Job.XN
+	return resp.Result.ID, directSessionXN(t, h, resp.Result.ID)
 }
 
 // newDirectRXMTestHarness is newDirectRXTTestHarness's ALGO_RXM
