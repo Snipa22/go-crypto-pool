@@ -35,6 +35,7 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/direct"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
@@ -141,9 +142,16 @@ type config struct {
 	// internal/leaflib/relay.
 	relayNATSURL string
 	relaySubject string
+
+	// configFile is the optional path to a TOML file providing
+	// defaults for any flag above that the operator did not set
+	// explicitly via CLI flag or environment variable. See
+	// leaf-direct.example.toml and internal/leaflib/cfgfile for the
+	// exact precedence rule (flag > env > file > hardcoded default).
+	configFile string
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
 	cfg := config{}
 
 	flag.StringVar(&cfg.nodeGRPCAddress, "node-grpc-address", envOr("LEAF_NODE_GRPC_ADDRESS", ""), "Tari base node GRPC address (host:port); also the primary template-source AND is always included in the multi-node submit set. REQUIRED when -coin=tari (the default); ignored for -coin=monero. Env: LEAF_NODE_GRPC_ADDRESS")
@@ -193,8 +201,166 @@ func loadConfig() config {
 	flag.StringVar(&cfg.relayNATSURL, "relay-nats-url", envOr("LEAF_DIRECT_RELAY_NATS_URL", ""), "NATS server URL for the best-effort found-block relay broadcast/resubmit mechanism. Empty (default) fully disables the relay -- a complete no-op, never required. Env: LEAF_DIRECT_RELAY_NATS_URL")
 	flag.StringVar(&cfg.relaySubject, "relay-subject", envOr("LEAF_DIRECT_RELAY_SUBJECT", ""), "NATS subject for the relay (empty = relay package default). Env: LEAF_DIRECT_RELAY_SUBJECT")
 
+	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_DIRECT_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-direct.example.toml. Env: LEAF_DIRECT_CONFIG_FILE")
+
 	flag.Parse()
-	return cfg
+
+	if err := applyConfigFile(&cfg); err != nil {
+		return cfg, err
+	}
+
+	return cfg, nil
+}
+
+// fileConfig mirrors config field-for-field (excluding configFile
+// itself) with pointer types so an absent TOML key decodes to nil and
+// is left untouched by the cfgfile.ApplyXxx helpers below. Durations
+// are represented in the TOML file as a plain integer number of
+// seconds (go-toml/v2 does not natively decode into time.Duration)
+// and converted with time.Duration(v) * time.Second when applied.
+type fileConfig struct {
+	NodeGRPCAddress *string `toml:"node_grpc_address"`
+	ListenAddress   *string `toml:"listen_address"`
+	PayoutAddress   *string `toml:"payout_address"`
+	Network         *string `toml:"network"`
+	Coin            *string `toml:"coin"`
+	MonerodURL      *string `toml:"monerod_url"`
+
+	TrustEnabled   *bool `toml:"trust_enabled"`
+	TrustThreshold *int  `toml:"trust_threshold"`
+	TrustPenalty   *int  `toml:"trust_penalty"`
+	TrustChange    *int  `toml:"trust_change"`
+	TrustMin       *int  `toml:"trust_min"`
+
+	Algo              *string `toml:"algo"`
+	PoolType          *string `toml:"pool_type"`
+	PoolID            *int    `toml:"pool_id"`
+	RandomXServiceURL *string `toml:"randomx_service_url"`
+	CoinbaseExtraTag  *string `toml:"coinbase_extra_tag"`
+
+	StartingDifficulty     *uint64 `toml:"starting_difficulty"`
+	PortsRaw               *string `toml:"ports"`
+	MinDifficulty          *uint64 `toml:"min_difficulty"`
+	MaxDifficulty          *uint64 `toml:"max_difficulty"`
+	VardiffTargetTime      *int    `toml:"vardiff_target_time_seconds"`
+	VardiffIntervalSeconds *int    `toml:"vardiff_retarget_interval_seconds"`
+
+	RefreshIntervalSeconds *int `toml:"refresh_interval_seconds"`
+	TipPollIntervalSeconds *int `toml:"tip_poll_interval_seconds"`
+	JobMaxAgeSeconds       *int `toml:"job_max_age_seconds"`
+
+	MaxConnections     *int `toml:"max_connections"`
+	IdleTimeoutSeconds *int `toml:"idle_timeout_seconds"`
+
+	MetricsListenAddress *string `toml:"metrics_listen_address"`
+	MaxAddressLabels     *int    `toml:"max_address_labels"`
+	HideRemoteAddress    *bool   `toml:"hide_remote_address"`
+
+	BackendBaseURL             *string `toml:"backend_base_url"`
+	BackendAuthHeader          *string `toml:"backend_auth_header"`
+	BackendAuthValue           *string `toml:"backend_auth_value"`
+	BackendShareTimeoutSeconds *int    `toml:"backend_share_timeout_seconds"`
+	BackendBlockTimeoutSeconds *int    `toml:"backend_block_timeout_seconds"`
+
+	AddressFlagsPollIntervalSeconds *int `toml:"address_flags_poll_interval_seconds"`
+
+	SubmitNodesRaw *string `toml:"submit_nodes"`
+
+	RelayNATSURL *string `toml:"relay_nats_url"`
+	RelaySubject *string `toml:"relay_subject"`
+}
+
+// applyConfigFile merges cfg.configFile (if set) into cfg, honoring
+// the flag > env > file > hardcoded-default precedence rule owned by
+// internal/leaflib/cfgfile. It is a no-op when cfg.configFile == "".
+func applyConfigFile(cfg *config) error {
+	if cfg.configFile == "" {
+		return nil
+	}
+
+	visited := cfgfile.VisitedFlags(flag.CommandLine)
+
+	var fc fileConfig
+	if err := cfgfile.Decode(cfg.configFile, &fc); err != nil {
+		return fmt.Errorf("leaf-direct: loading -config %s: %w", cfg.configFile, err)
+	}
+
+	cfgfile.ApplyString(&cfg.nodeGRPCAddress, fc.NodeGRPCAddress, visited, "node-grpc-address", "LEAF_NODE_GRPC_ADDRESS")
+	cfgfile.ApplyString(&cfg.listenAddress, fc.ListenAddress, visited, "listen-address", "LEAF_DIRECT_LISTEN_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutAddress, fc.PayoutAddress, visited, "payout-address", "LEAF_DIRECT_PAYOUT_ADDRESS")
+	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "LEAF_DIRECT_NETWORK")
+	cfgfile.ApplyString(&cfg.coin, fc.Coin, visited, "coin", "LEAF_DIRECT_COIN")
+	cfgfile.ApplyString(&cfg.monerodURL, fc.MonerodURL, visited, "monerod-url", "LEAF_DIRECT_MONEROD_URL")
+
+	cfgfile.ApplyBool(&cfg.trustEnabled, fc.TrustEnabled, visited, "trust-enabled", "LEAF_DIRECT_TRUST_ENABLED")
+	cfgfile.ApplyInt(&cfg.trustThreshold, fc.TrustThreshold, visited, "trust-threshold", "LEAF_DIRECT_TRUST_THRESHOLD")
+	cfgfile.ApplyInt(&cfg.trustPenalty, fc.TrustPenalty, visited, "trust-penalty", "LEAF_DIRECT_TRUST_PENALTY")
+	cfgfile.ApplyInt(&cfg.trustChange, fc.TrustChange, visited, "trust-change", "LEAF_DIRECT_TRUST_CHANGE")
+	cfgfile.ApplyInt(&cfg.trustMin, fc.TrustMin, visited, "trust-min", "LEAF_DIRECT_TRUST_MIN")
+
+	cfgfile.ApplyString(&cfg.algo, fc.Algo, visited, "algo", "LEAF_DIRECT_ALGO")
+	cfgfile.ApplyString(&cfg.poolType, fc.PoolType, visited, "pool-type", "LEAF_DIRECT_POOL_TYPE")
+	cfgfile.ApplyInt(&cfg.poolID, fc.PoolID, visited, "pool-id", "LEAF_DIRECT_POOL_ID")
+	cfgfile.ApplyString(&cfg.randomXServiceURL, fc.RandomXServiceURL, visited, "randomx-service-url", "LEAF_DIRECT_RANDOMX_SERVICE_URL")
+	cfgfile.ApplyString(&cfg.coinbaseExtraTag, fc.CoinbaseExtraTag, visited, "coinbase-extra-tag", "LEAF_DIRECT_COINBASE_EXTRA_TAG")
+
+	cfgfile.ApplyUint64(&cfg.startingDifficulty, fc.StartingDifficulty, visited, "starting-difficulty", "LEAF_DIRECT_STARTING_DIFFICULTY")
+	cfgfile.ApplyString(&cfg.portsRaw, fc.PortsRaw, visited, "ports", "LEAF_DIRECT_PORTS")
+	cfgfile.ApplyUint64(&cfg.minDifficulty, fc.MinDifficulty, visited, "min-difficulty", "LEAF_DIRECT_MIN_DIFFICULTY")
+	cfgfile.ApplyUint64(&cfg.maxDifficulty, fc.MaxDifficulty, visited, "max-difficulty", "LEAF_DIRECT_MAX_DIFFICULTY")
+	cfgfile.ApplyInt(&cfg.vardiffTargetTime, fc.VardiffTargetTime, visited, "vardiff-target-time", "LEAF_DIRECT_VARDIFF_TARGET_TIME")
+
+	if fc.VardiffIntervalSeconds != nil {
+		d := time.Duration(*fc.VardiffIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.vardiffInterval, &d, visited, "vardiff-retarget-interval", "LEAF_DIRECT_VARDIFF_RETARGET_INTERVAL")
+	}
+
+	if fc.RefreshIntervalSeconds != nil {
+		d := time.Duration(*fc.RefreshIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.refreshInterval, &d, visited, "refresh-interval", "LEAF_DIRECT_REFRESH_INTERVAL")
+	}
+	if fc.TipPollIntervalSeconds != nil {
+		d := time.Duration(*fc.TipPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.tipPollInterval, &d, visited, "tip-poll-interval", "LEAF_DIRECT_TIP_POLL_INTERVAL")
+	}
+	if fc.JobMaxAgeSeconds != nil {
+		d := time.Duration(*fc.JobMaxAgeSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.jobMaxAge, &d, visited, "job-max-age", "LEAF_DIRECT_JOB_MAX_AGE")
+	}
+
+	cfgfile.ApplyInt(&cfg.maxConnections, fc.MaxConnections, visited, "max-connections", "LEAF_DIRECT_MAX_CONNECTIONS")
+	if fc.IdleTimeoutSeconds != nil {
+		d := time.Duration(*fc.IdleTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.idleTimeout, &d, visited, "idle-timeout", "LEAF_DIRECT_IDLE_TIMEOUT")
+	}
+
+	cfgfile.ApplyString(&cfg.metricsListenAddress, fc.MetricsListenAddress, visited, "metrics-listen-address", "LEAF_DIRECT_METRICS_LISTEN_ADDRESS")
+	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_DIRECT_MAX_ADDRESS_LABELS")
+	cfgfile.ApplyBool(&cfg.hideRemoteAddress, fc.HideRemoteAddress, visited, "hide-remote-address", "LEAF_DIRECT_HIDE_REMOTE_ADDRESS")
+
+	cfgfile.ApplyString(&cfg.backendBaseURL, fc.BackendBaseURL, visited, "backend-base-url", "LEAF_DIRECT_BACKEND_BASE_URL")
+	cfgfile.ApplyString(&cfg.backendAuthHeader, fc.BackendAuthHeader, visited, "backend-auth-header", "LEAF_DIRECT_BACKEND_AUTH_HEADER")
+	cfgfile.ApplyString(&cfg.backendAuthValue, fc.BackendAuthValue, visited, "backend-auth-value", "LEAF_DIRECT_BACKEND_AUTH_VALUE")
+	if fc.BackendShareTimeoutSeconds != nil {
+		d := time.Duration(*fc.BackendShareTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.backendShareTimeout, &d, visited, "backend-share-timeout", "LEAF_DIRECT_BACKEND_SHARE_TIMEOUT")
+	}
+	if fc.BackendBlockTimeoutSeconds != nil {
+		d := time.Duration(*fc.BackendBlockTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.backendBlockTimeout, &d, visited, "backend-block-timeout", "LEAF_DIRECT_BACKEND_BLOCK_TIMEOUT")
+	}
+
+	if fc.AddressFlagsPollIntervalSeconds != nil {
+		d := time.Duration(*fc.AddressFlagsPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.addressFlagsPollInterval, &d, visited, "address-flags-poll-interval", "LEAF_DIRECT_ADDRESS_FLAGS_POLL_INTERVAL")
+	}
+
+	cfgfile.ApplyString(&cfg.submitNodesRaw, fc.SubmitNodesRaw, visited, "submit-nodes", "LEAF_DIRECT_SUBMIT_NODES")
+
+	cfgfile.ApplyString(&cfg.relayNATSURL, fc.RelayNATSURL, visited, "relay-nats-url", "LEAF_DIRECT_RELAY_NATS_URL")
+	cfgfile.ApplyString(&cfg.relaySubject, fc.RelaySubject, visited, "relay-subject", "LEAF_DIRECT_RELAY_SUBJECT")
+
+	return nil
 }
 
 func resolvePorts(cfg config) ([]solo.PortConfig, error) {
@@ -400,7 +566,10 @@ func resolveSubmitNodes(primary, raw string) []string {
 }
 
 func main() {
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("leaf-direct: %v", err)
+	}
 	logger := log.New(os.Stdout, "leaf-direct: ", log.LstdFlags|log.Lmicroseconds)
 
 	if isMoneroCoin(cfg.coin) {

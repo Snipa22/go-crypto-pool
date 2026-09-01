@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/proxy"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 )
@@ -89,9 +90,16 @@ type config struct {
 	// exactly (see solo.Server.SetHideRemoteAddress's doc comment
 	// -- proxy.Server has an identical method). Defaults to false.
 	hideRemoteAddress bool
+
+	// configFile is the optional path to a TOML file providing
+	// defaults for any flag above that the operator did not set
+	// explicitly via CLI flag or environment variable. See
+	// leaf-proxy.example.toml and internal/leaflib/cfgfile for the
+	// exact precedence rule (flag > env > file > hardcoded default).
+	configFile string
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
 	cfg := config{}
 
 	flag.StringVar(&cfg.upstreamHost, "upstream-host", envOr("LEAF_PROXY_UPSTREAM_HOST", "pool.supportxmr.com"), "real upstream Monero-family pool hostname. Env: LEAF_PROXY_UPSTREAM_HOST")
@@ -137,8 +145,109 @@ func loadConfig() config {
 	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOrBool("LEAF_PROXY_HIDE_REMOTE_ADDRESS", false), "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_PROXY_HIDE_REMOTE_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_PROXY_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_PROXY_MAX_ADDRESS_LABELS")
 
+	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_PROXY_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-proxy.example.toml. Env: LEAF_PROXY_CONFIG_FILE")
+
 	flag.Parse()
-	return cfg
+
+	if err := applyConfigFile(&cfg); err != nil {
+		return cfg, err
+	}
+
+	return cfg, nil
+}
+
+// fileConfig mirrors config field-for-field (excluding configFile
+// itself) with pointer types so an absent TOML key decodes to nil and
+// is left untouched by the cfgfile.ApplyXxx helpers below. Durations
+// are represented in the TOML file as a plain integer number of
+// seconds (go-toml/v2 does not natively decode into time.Duration)
+// and converted with time.Duration(v) * time.Second when applied.
+type fileConfig struct {
+	UpstreamHost     *string `toml:"upstream_host"`
+	UpstreamPort     *int    `toml:"upstream_port"`
+	UpstreamTLS      *bool   `toml:"upstream_tls"`
+	UpstreamInsecure *bool   `toml:"upstream_tls_insecure_skip_verify"`
+	UpstreamLogin    *string `toml:"upstream_login"`
+	UpstreamPass     *string `toml:"upstream_pass"`
+	UpstreamAgent    *string `toml:"upstream_agent"`
+
+	ListenAddress          *string `toml:"listen_address"`
+	StartingDifficulty     *uint64 `toml:"starting_difficulty"`
+	MinDifficulty          *uint64 `toml:"min_difficulty"`
+	MaxDifficulty          *uint64 `toml:"max_difficulty"`
+	VardiffTargetTime      *int    `toml:"vardiff_target_time_seconds"`
+	VardiffIntervalSeconds *int    `toml:"vardiff_retarget_interval_seconds"`
+	JobMaxAgeSeconds       *int    `toml:"job_max_age_seconds"`
+
+	MaxConnections     *int `toml:"max_connections"`
+	IdleTimeoutSeconds *int `toml:"idle_timeout_seconds"`
+
+	DialTimeoutSeconds    *int `toml:"upstream_dial_timeout_seconds"`
+	RequestTimeoutSeconds *int `toml:"upstream_request_timeout_seconds"`
+
+	MetricsListenAddress *string `toml:"metrics_listen_address"`
+	MaxAddressLabels     *int    `toml:"max_address_labels"`
+	HideRemoteAddress    *bool   `toml:"hide_remote_address"`
+}
+
+// applyConfigFile merges cfg.configFile (if set) into cfg, honoring
+// the flag > env > file > hardcoded-default precedence rule owned by
+// internal/leaflib/cfgfile. It is a no-op when cfg.configFile == "".
+func applyConfigFile(cfg *config) error {
+	if cfg.configFile == "" {
+		return nil
+	}
+
+	visited := cfgfile.VisitedFlags(flag.CommandLine)
+
+	var fc fileConfig
+	if err := cfgfile.Decode(cfg.configFile, &fc); err != nil {
+		return fmt.Errorf("leaf-proxy: loading -config %s: %w", cfg.configFile, err)
+	}
+
+	cfgfile.ApplyString(&cfg.upstreamHost, fc.UpstreamHost, visited, "upstream-host", "LEAF_PROXY_UPSTREAM_HOST")
+	cfgfile.ApplyInt(&cfg.upstreamPort, fc.UpstreamPort, visited, "upstream-port", "LEAF_PROXY_UPSTREAM_PORT")
+	cfgfile.ApplyBool(&cfg.upstreamTLS, fc.UpstreamTLS, visited, "upstream-tls", "LEAF_PROXY_UPSTREAM_TLS")
+	cfgfile.ApplyBool(&cfg.upstreamInsecure, fc.UpstreamInsecure, visited, "upstream-tls-insecure-skip-verify", "LEAF_PROXY_UPSTREAM_TLS_INSECURE_SKIP_VERIFY")
+	cfgfile.ApplyString(&cfg.upstreamLogin, fc.UpstreamLogin, visited, "upstream-login", "LEAF_PROXY_UPSTREAM_LOGIN")
+	cfgfile.ApplyString(&cfg.upstreamPass, fc.UpstreamPass, visited, "upstream-pass", "LEAF_PROXY_UPSTREAM_PASS")
+	cfgfile.ApplyString(&cfg.upstreamAgent, fc.UpstreamAgent, visited, "upstream-agent", "LEAF_PROXY_UPSTREAM_AGENT")
+
+	cfgfile.ApplyString(&cfg.listenAddress, fc.ListenAddress, visited, "listen-address", "LEAF_PROXY_LISTEN_ADDRESS")
+	cfgfile.ApplyUint64(&cfg.startingDifficulty, fc.StartingDifficulty, visited, "starting-difficulty", "LEAF_PROXY_STARTING_DIFFICULTY")
+	cfgfile.ApplyUint64(&cfg.minDifficulty, fc.MinDifficulty, visited, "min-difficulty", "LEAF_PROXY_MIN_DIFFICULTY")
+	cfgfile.ApplyUint64(&cfg.maxDifficulty, fc.MaxDifficulty, visited, "max-difficulty", "LEAF_PROXY_MAX_DIFFICULTY")
+	cfgfile.ApplyInt(&cfg.vardiffTargetTime, fc.VardiffTargetTime, visited, "vardiff-target-time", "LEAF_PROXY_VARDIFF_TARGET_TIME")
+
+	if fc.VardiffIntervalSeconds != nil {
+		d := time.Duration(*fc.VardiffIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.vardiffInterval, &d, visited, "vardiff-retarget-interval", "LEAF_PROXY_VARDIFF_RETARGET_INTERVAL")
+	}
+	if fc.JobMaxAgeSeconds != nil {
+		d := time.Duration(*fc.JobMaxAgeSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.jobMaxAge, &d, visited, "job-max-age", "LEAF_PROXY_JOB_MAX_AGE")
+	}
+
+	cfgfile.ApplyInt(&cfg.maxConnections, fc.MaxConnections, visited, "max-connections", "LEAF_PROXY_MAX_CONNECTIONS")
+	if fc.IdleTimeoutSeconds != nil {
+		d := time.Duration(*fc.IdleTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.idleTimeout, &d, visited, "idle-timeout", "LEAF_PROXY_IDLE_TIMEOUT")
+	}
+
+	if fc.DialTimeoutSeconds != nil {
+		d := time.Duration(*fc.DialTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.dialTimeout, &d, visited, "upstream-dial-timeout", "LEAF_PROXY_UPSTREAM_DIAL_TIMEOUT")
+	}
+	if fc.RequestTimeoutSeconds != nil {
+		d := time.Duration(*fc.RequestTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.requestTimeout, &d, visited, "upstream-request-timeout", "LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT")
+	}
+
+	cfgfile.ApplyString(&cfg.metricsListenAddress, fc.MetricsListenAddress, visited, "metrics-listen-address", "LEAF_PROXY_METRICS_LISTEN_ADDRESS")
+	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_PROXY_MAX_ADDRESS_LABELS")
+	cfgfile.ApplyBool(&cfg.hideRemoteAddress, fc.HideRemoteAddress, visited, "hide-remote-address", "LEAF_PROXY_HIDE_REMOTE_ADDRESS")
+
+	return nil
 }
 
 func envOr(key, def string) string {
@@ -185,7 +294,10 @@ func envOrDuration(key string, def time.Duration) time.Duration {
 }
 
 func main() {
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("leaf-proxy: %v", err)
+	}
 	logger := log.New(os.Stdout, "leaf-proxy: ", log.LstdFlags|log.Lmicroseconds)
 
 	if cfg.upstreamLogin == "" {

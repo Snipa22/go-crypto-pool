@@ -1,0 +1,85 @@
+# leaf-proxy example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point leaf-proxy at a
+# copy of this file (with real values) via -config <path> or
+# LEAF_PROXY_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var >
+# this file > the hardcoded default shown below.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "30s"), since go-toml/v2 does not natively decode into time.Duration.
+
+# Real upstream Monero-family pool hostname. (default: "pool.supportxmr.com")
+upstream_host = "pool.supportxmr.com"
+
+# Real upstream pool stratum port (SupportXMR: 3333 low-diff, 5555 medium-diff,
+# 7777 high-diff, 9000 TLS). (default: 7777)
+upstream_port = 7777
+
+# Dial the upstream pool over TLS. (default: false)
+upstream_tls = false
+
+# Skip TLS certificate verification for the upstream pool (testing only).
+# (default: false)
+upstream_tls_insecure_skip_verify = false
+
+# Real XMR payout address to log in to the upstream pool with. (default: "")
+upstream_login = ""
+
+# Real upstream pool worker identifier/password. (default: "go-crypto-pool-leaf-proxy")
+upstream_pass = "go-crypto-pool-leaf-proxy"
+
+# Advanced-mining-client agent string sent on upstream login -- MUST contain the
+# literal substring "xmr-node-proxy" for pools using this detection convention
+# to grant the reserved_offset/client_nonce_offset extension.
+# (default: "xmr-node-proxy/go-crypto-pool-<version>")
+upstream_agent = "xmr-node-proxy/go-crypto-pool-dev"
+
+# Downstream miner-facing TCP listen address. (default: ":5555")
+listen_address = ":5555"
+
+# Starting downstream share difficulty; vardiff adjusts it from here.
+# (default: 10000)
+starting_difficulty = 10000
+
+# Absolute floor vardiff will never retarget below. (default: 100)
+min_difficulty = 100
+
+# Absolute ceiling vardiff will never retarget above. (default: 1000000000)
+max_difficulty = 1000000000
+
+# Seconds between shares vardiff aims for. (default: 30)
+vardiff_target_time_seconds = 30
+
+# How often each downstream session's own vardiff retarget timer fires, in
+# seconds. (default: 60)
+vardiff_retarget_interval_seconds = 60
+
+# Real per-job expiry threshold, in seconds; a submit against an older job is
+# rejected. (default: 360)
+job_max_age_seconds = 360
+
+# Max concurrent downstream miner connections, 0 = unlimited. (default: 0)
+max_connections = 0
+
+# Rolling per-downstream-connection idle timeout, in seconds. (default: 120)
+idle_timeout_seconds = 120
+
+# Timeout for dialing the upstream pool, in seconds. (default: 10)
+upstream_dial_timeout_seconds = 10
+
+# Timeout for a single upstream request/response round-trip, in seconds.
+# (default: 15)
+upstream_request_timeout_seconds = 15
+
+# HTTP listen address for /metrics (Prometheus) and the stats page. Separate
+# from listen_address (the downstream-facing stratum port). Defaults to
+# loopback-only; set to an empty string to disable.
+# (default: "127.0.0.1:9601")
+metrics_listen_address = "127.0.0.1:9601"
+
+# Cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address
+# and the stats page's per-address breakdown (0 = package default). (default: 0)
+max_address_labels = 0
+
+# Omit the "Remote address" column from the stats HTML page entirely --
+# recommended for public-facing deployments. (default: false)
+hide_remote_address = false

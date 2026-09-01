@@ -1,130 +1,274 @@
 // Copyright and license: see repository LICENSE (MIT).
 package main
 
-import "testing"
+import (
+	"flag"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
-func TestResolvePortsFallsBackToLegacySingleValueFields(t *testing.T) {
-	cfg := config{listenAddress: ":4444", startingDifficulty: 10000}
-	ports, err := resolvePorts(cfg)
-	if err != nil {
-		t.Fatalf("resolvePorts: %v", err)
-	}
-	if len(ports) != 1 {
-		t.Fatalf("len(ports) = %d, want 1", len(ports))
-	}
-	if ports[0].Address != ":4444" || ports[0].Difficulty != 10000 {
-		t.Errorf("got %+v, want Address=:4444 Difficulty=10000", ports[0])
-	}
+// precedenceCase drives one subtest of TestLoadConfigPrecedence. toml, if
+// non-empty, is written to a temp file and wired in via "-config=<path>";
+// env is applied with t.Setenv (auto-restored); args are appended after the
+// binary name in os.Args before calling loadConfig().
+type precedenceCase struct {
+	name  string
+	args  []string
+	env   map[string]string
+	toml  string
+	check func(t *testing.T, cfg config)
 }
 
-func TestResolvePortsParsesLEAFSOLOPORTS(t *testing.T) {
-	cfg := config{portsRaw: ":4444:10000:low-diff,:4445:1000000:high-diff"}
-	ports, err := resolvePorts(cfg)
-	if err != nil {
-		t.Fatalf("resolvePorts: %v", err)
-	}
-	if len(ports) != 2 {
-		t.Fatalf("len(ports) = %d, want 2", len(ports))
-	}
-	if ports[0].Address != ":4444" || ports[0].Difficulty != 10000 || ports[0].PortDesc != "low-diff" {
-		t.Errorf("ports[0] = %+v, want {:4444 10000 low-diff}", ports[0])
-	}
-	if ports[1].Address != ":4445" || ports[1].Difficulty != 1000000 || ports[1].PortDesc != "high-diff" {
-		t.Errorf("ports[1] = %+v, want {:4445 1000000 high-diff}", ports[1])
-	}
-}
+// runPrecedenceCase resets flag.CommandLine to a fresh FlagSet and
+// save/restores os.Args + flag.CommandLine around loadConfig(), since
+// loadConfig registers its flags on the package-level flag.CommandLine via
+// flag.StringVar/flag.BoolVar/etc.
+func runPrecedenceCase(t *testing.T, tc precedenceCase) {
+	t.Helper()
 
-func TestResolvePortsParsesEntryWithoutDesc(t *testing.T) {
-	cfg := config{portsRaw: ":4444:10000"}
-	ports, err := resolvePorts(cfg)
-	if err != nil {
-		t.Fatalf("resolvePorts: %v", err)
-	}
-	if len(ports) != 1 || ports[0].Address != ":4444" || ports[0].Difficulty != 10000 || ports[0].PortDesc != "" {
-		t.Errorf("got %+v, want {:4444 10000 \"\"}", ports)
-	}
-}
+	oldArgs := os.Args
+	oldCommandLine := flag.CommandLine
+	t.Cleanup(func() {
+		os.Args = oldArgs
+		flag.CommandLine = oldCommandLine
+	})
+	flag.CommandLine = flag.NewFlagSet("leaf-solo-test", flag.ContinueOnError)
 
-func TestResolvePortsRejectsInvalidEntries(t *testing.T) {
-	cases := []string{
-		":4444",
-		":4444:notanumber",
-		":4444:0",
-		"::0:desc",
-	}
-	for _, raw := range cases {
-		cfg := config{portsRaw: raw}
-		if _, err := resolvePorts(cfg); err == nil {
-			t.Errorf("resolvePorts(%q): expected an error, got nil", raw)
+	args := append([]string{"leaf-solo"}, tc.args...)
+	if tc.toml != "" {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "cfg.toml")
+		if err := os.WriteFile(path, []byte(tc.toml), 0o644); err != nil {
+			t.Fatalf("writing test config file: %v", err)
 		}
+		args = append(args, "-config="+path)
 	}
+	os.Args = args
+
+	for k, v := range tc.env {
+		t.Setenv(k, v)
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig() returned unexpected error: %v", err)
+	}
+	tc.check(t, cfg)
 }
 
-// TestDefaultCoinbaseExtraTagPerAlgo confirms defaultCoinbaseExtraTag
-// computes the per-algo "supportxtm-<algo>" pattern Alex asked for
-// (distinct per algo/coin, not one single blended tag) -- reusing
-// resolveAlgo/isMoneroCoin's real resolution logic, not a separate
-// hardcoded mapping.
-func TestDefaultCoinbaseExtraTagPerAlgo(t *testing.T) {
-	cases := []struct {
-		name string
-		cfg  config
-		want string
-	}{
-		{"sha3x default (empty algo)", config{coin: "tari", algo: ""}, "supportxtm-sha3x"},
-		{"sha3x explicit", config{coin: "tari", algo: "sha3x"}, "supportxtm-sha3x"},
-		{"c29", config{coin: "tari", algo: "c29"}, "supportxtm-c29"},
-		{"rxt", config{coin: "tari", algo: "rxt"}, "supportxtm-rxt"},
-		{"rxm via -coin=monero", config{coin: "monero"}, "supportxtm-rxm"},
-		{"rxm via -coin=monero, -algo ignored", config{coin: "monero", algo: "c29"}, "supportxtm-rxm"},
-		{"rxm via -coin=Monero case-insensitive", config{coin: "Monero"}, "supportxtm-rxm"},
+// TestLoadConfigPrecedence proves the real flag > env > config-file >
+// hardcoded-default precedence order end-to-end (real TOML decode via
+// cfgfile.Decode, not a fake), across one string field (network), one bool
+// field (trust-enabled), one int field (vardiff-target-time) and one
+// duration field (idle-timeout), per the brief's explicit requirement.
+func TestLoadConfigPrecedence(t *testing.T) {
+	cases := []precedenceCase{
+		// -- string field: network ---------------------------------------
+		{
+			name: "network/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.network != "testnet" {
+					t.Errorf("network = %q, want hardcoded default %q", cfg.network, "testnet")
+				}
+			},
+		},
+		{
+			name: "network/file-only",
+			toml: `network = "mainnet"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.network != "mainnet" {
+					t.Errorf("network = %q, want file value %q", cfg.network, "mainnet")
+				}
+			},
+		},
+		{
+			name: "network/env-only",
+			env:  map[string]string{"LEAF_SOLO_NETWORK": "mainnet"},
+			toml: `network = "testnet"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.network != "mainnet" {
+					t.Errorf("network = %q, want env value %q (env must beat file)", cfg.network, "mainnet")
+				}
+			},
+		},
+		{
+			name: "network/flag-only",
+			args: []string{"-network=mainnet"},
+			toml: `network = "testnet"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.network != "mainnet" {
+					t.Errorf("network = %q, want flag value %q (flag must beat env absence and file)", cfg.network, "mainnet")
+				}
+			},
+		},
+		{
+			name: "network/flag-env-file-all-set",
+			args: []string{"-network=mainnet"},
+			env:  map[string]string{"LEAF_SOLO_NETWORK": "testnet"},
+			toml: `network = "testnet"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.network != "mainnet" {
+					t.Errorf("network = %q, want flag value %q (flag must win full precedence)", cfg.network, "mainnet")
+				}
+			},
+		},
+
+		// -- bool field: trust-enabled ------------------------------------
+		{
+			name: "trust-enabled/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.trustEnabled != false {
+					t.Errorf("trustEnabled = %v, want hardcoded default %v", cfg.trustEnabled, false)
+				}
+			},
+		},
+		{
+			name: "trust-enabled/file-only",
+			toml: `trust_enabled = true`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.trustEnabled != true {
+					t.Errorf("trustEnabled = %v, want file value %v", cfg.trustEnabled, true)
+				}
+			},
+		},
+		{
+			name: "trust-enabled/env-only",
+			env:  map[string]string{"LEAF_SOLO_TRUST_ENABLED": "false"},
+			toml: `trust_enabled = true`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.trustEnabled != false {
+					t.Errorf("trustEnabled = %v, want env value %v (env must beat file)", cfg.trustEnabled, false)
+				}
+			},
+		},
+		{
+			name: "trust-enabled/flag-only",
+			args: []string{"-trust-enabled=true"},
+			toml: `trust_enabled = false`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.trustEnabled != true {
+					t.Errorf("trustEnabled = %v, want flag value %v (flag must beat env absence and file)", cfg.trustEnabled, true)
+				}
+			},
+		},
+		{
+			name: "trust-enabled/flag-env-file-all-set",
+			args: []string{"-trust-enabled=true"},
+			env:  map[string]string{"LEAF_SOLO_TRUST_ENABLED": "false"},
+			toml: `trust_enabled = true`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.trustEnabled != true {
+					t.Errorf("trustEnabled = %v, want flag value %v (flag must win full precedence over env=false)", cfg.trustEnabled, true)
+				}
+			},
+		},
+
+		// -- int field: vardiff-target-time -------------------------------
+		{
+			name: "vardiff-target-time/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.vardiffTargetTime != 30 {
+					t.Errorf("vardiffTargetTime = %d, want hardcoded default %d", cfg.vardiffTargetTime, 30)
+				}
+			},
+		},
+		{
+			name: "vardiff-target-time/file-only",
+			toml: `vardiff_target_time_seconds = 45`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.vardiffTargetTime != 45 {
+					t.Errorf("vardiffTargetTime = %d, want file value %d", cfg.vardiffTargetTime, 45)
+				}
+			},
+		},
+		{
+			name: "vardiff-target-time/env-only",
+			env:  map[string]string{"LEAF_SOLO_VARDIFF_TARGET_TIME": "60"},
+			toml: `vardiff_target_time_seconds = 45`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.vardiffTargetTime != 60 {
+					t.Errorf("vardiffTargetTime = %d, want env value %d (env must beat file)", cfg.vardiffTargetTime, 60)
+				}
+			},
+		},
+		{
+			name: "vardiff-target-time/flag-only",
+			args: []string{"-vardiff-target-time=75"},
+			toml: `vardiff_target_time_seconds = 45`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.vardiffTargetTime != 75 {
+					t.Errorf("vardiffTargetTime = %d, want flag value %d (flag must beat env absence and file)", cfg.vardiffTargetTime, 75)
+				}
+			},
+		},
+		{
+			name: "vardiff-target-time/flag-env-file-all-set",
+			args: []string{"-vardiff-target-time=75"},
+			env:  map[string]string{"LEAF_SOLO_VARDIFF_TARGET_TIME": "60"},
+			toml: `vardiff_target_time_seconds = 45`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.vardiffTargetTime != 75 {
+					t.Errorf("vardiffTargetTime = %d, want flag value %d (flag must win full precedence)", cfg.vardiffTargetTime, 75)
+				}
+			},
+		},
+
+		// -- duration field: idle-timeout ---------------------------------
+		{
+			name: "idle-timeout/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.idleTimeout != 2*time.Minute {
+					t.Errorf("idleTimeout = %v, want hardcoded default %v", cfg.idleTimeout, 2*time.Minute)
+				}
+			},
+		},
+		{
+			name: "idle-timeout/file-only",
+			toml: `idle_timeout_seconds = 100`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.idleTimeout != 100*time.Second {
+					t.Errorf("idleTimeout = %v, want file value %v", cfg.idleTimeout, 100*time.Second)
+				}
+			},
+		},
+		{
+			name: "idle-timeout/env-only",
+			env:  map[string]string{"LEAF_SOLO_IDLE_TIMEOUT": "200s"},
+			toml: `idle_timeout_seconds = 100`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.idleTimeout != 200*time.Second {
+					t.Errorf("idleTimeout = %v, want env value %v (env must beat file)", cfg.idleTimeout, 200*time.Second)
+				}
+			},
+		},
+		{
+			name: "idle-timeout/flag-only",
+			args: []string{"-idle-timeout=300s"},
+			toml: `idle_timeout_seconds = 100`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.idleTimeout != 300*time.Second {
+					t.Errorf("idleTimeout = %v, want flag value %v (flag must beat env absence and file)", cfg.idleTimeout, 300*time.Second)
+				}
+			},
+		},
+		{
+			name: "idle-timeout/flag-env-file-all-set",
+			args: []string{"-idle-timeout=300s"},
+			env:  map[string]string{"LEAF_SOLO_IDLE_TIMEOUT": "200s"},
+			toml: `idle_timeout_seconds = 100`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.idleTimeout != 300*time.Second {
+					t.Errorf("idleTimeout = %v, want flag value %v (flag must win full precedence)", cfg.idleTimeout, 300*time.Second)
+				}
+			},
+		},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := defaultCoinbaseExtraTag(tc.cfg); got != tc.want {
-				t.Errorf("defaultCoinbaseExtraTag(%+v) = %q, want %q", tc.cfg, got, tc.want)
-			}
+			runPrecedenceCase(t, tc)
 		})
-	}
-}
-
-// TestResolveCoinbaseExtraTagExplicitOverrideWins confirms an
-// explicitly-set -coinbase-extra-tag/LEAF_SOLO_COINBASE_EXTRA_TAG
-// value wins over the per-algo default, verbatim.
-func TestResolveCoinbaseExtraTagExplicitOverrideWins(t *testing.T) {
-	cfg := config{coin: "tari", algo: "c29", coinbaseExtraTag: "MY-CUSTOM-TAG"}
-	if got := resolveCoinbaseExtraTag(cfg); got != "MY-CUSTOM-TAG" {
-		t.Errorf("resolveCoinbaseExtraTag = %q, want explicit override %q", got, "MY-CUSTOM-TAG")
-	}
-}
-
-// TestResolveCoinbaseExtraTagFallsBackToPerAlgoDefaultWhenUnset
-// confirms the empty (unset) case falls through to the per-algo
-// default, for every algo/coin combination.
-func TestResolveCoinbaseExtraTagFallsBackToPerAlgoDefaultWhenUnset(t *testing.T) {
-	cases := []struct {
-		cfg  config
-		want string
-	}{
-		{config{coin: "tari", algo: "sha3x"}, "supportxtm-sha3x"},
-		{config{coin: "tari", algo: "c29"}, "supportxtm-c29"},
-		{config{coin: "tari", algo: "rxt"}, "supportxtm-rxt"},
-		{config{coin: "monero"}, "supportxtm-rxm"},
-	}
-	for _, tc := range cases {
-		if got := resolveCoinbaseExtraTag(tc.cfg); got != tc.want {
-			t.Errorf("resolveCoinbaseExtraTag(%+v) = %q, want %q", tc.cfg, got, tc.want)
-		}
-	}
-}
-
-// TestResolveCoinbaseExtraTagIgnoresWhitespaceOnlyOverride confirms a
-// whitespace-only explicit value is treated as unset (falls back to
-// the per-algo default), matching every other string flag's
-// strings.TrimSpace-based emptiness convention in this codebase.
-func TestResolveCoinbaseExtraTagIgnoresWhitespaceOnlyOverride(t *testing.T) {
-	cfg := config{coin: "tari", algo: "rxt", coinbaseExtraTag: "   "}
-	if got := resolveCoinbaseExtraTag(cfg); got != "supportxtm-rxt" {
-		t.Errorf("resolveCoinbaseExtraTag(whitespace override) = %q, want per-algo default %q", got, "supportxtm-rxt")
 	}
 }

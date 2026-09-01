@@ -7,10 +7,12 @@ require (
 	github.com/Snipa22/go-tari-grpc-lib/v3 v3.2.0
 	github.com/Snipa22/go-tari-lib v1.3.0
 	github.com/Snipa22/go-xmr-lib v0.2.5
+	github.com/gtank/ristretto255 v0.2.0
 	github.com/holiman/uint256 v1.3.2
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/nats-io/nats-server/v2 v2.14.5
 	github.com/nats-io/nats.go v1.53.1
+	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/prometheus/client_golang v1.24.1
 	github.com/snipa22/powkit v0.0.4
 	go.uber.org/goleak v1.3.0
@@ -26,7 +28,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dchest/blake2b v1.0.0 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
-	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect

@@ -1,0 +1,149 @@
+# backend example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point backend at a
+# copy of this file (with real values) via -config <path> or
+# BACKEND_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var >
+# this file > the hardcoded default shown below. Only the default (no
+# subcommand) run() path honors -config -- the block/retention/address/migrate
+# CLI subcommands are unaffected.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "30s"), since go-toml/v2 does not natively decode into time.Duration.
+
+# (required) Postgres DSN, e.g.
+# "postgres://user:pass@host:5432/db?sslmode=disable". No default -- startup
+# fails fast if this is missing.
+db_dsn = ""
+
+# HTTP listen address. (default: ":8080")
+listen_addr = ":8080"
+
+# Shared-secret auth header name to require on /api/v1/share and
+# /api/v1/block, e.g. "Authorization". Must be set together with
+# auth_header_value, or not at all -- both empty means no auth check is
+# performed. (default: "")
+auth_header_name = ""
+
+# Expected value for auth_header_name above. (default: "")
+auth_header_value = ""
+
+# (required) the network this backend is configured for. Accepts "mainnet" or
+# "testnet" (case-insensitive). No default -- startup fails fast if this is
+# missing or does not parse to a valid network.
+network = ""
+
+# host:port of a real Tari base node's GRPC endpoint. When set, the block
+# unlocker polls every pending ALGO_RXT/ALGO_C29/ALGO_SHA3X block against it
+# to detect maturity/orphaning. When unset, those algos' blocks are simply
+# never auto-unlocked. (default: "")
+tari_grpc_addr = ""
+
+# base URL of a real monerod JSON-RPC endpoint (e.g. "http://127.0.0.1:18081").
+# When set, the unlocker polls every pending ALGO_RXM block against it. Same
+# opt-in behavior as tari_grpc_addr above. (default: "")
+monero_rpc_addr = ""
+
+# How often the unlocker re-checks pending blocks, in seconds. Only consulted
+# if at least one of tari_grpc_addr/monero_rpc_addr is set. (default: 60)
+unlocker_poll_interval_seconds = 60
+
+# Confirmations required before a Tari-family block (RXT/C29/SHA3X) is marked
+# unlocked/payable. A PLACEHOLDER, operationally-tunable value, not a Tari
+# protocol constant. (default: 60)
+unlocker_tari_maturity = 60
+
+# Confirmations required before an RXM block is marked unlocked/payable,
+# mirroring Monero's own CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW. (default: 60)
+unlocker_monero_maturity = 60
+
+# How often the network-state poller re-checks the real upstream chain(s)
+# configured via tari_grpc_addr/monero_rpc_addr, in seconds. (default: 60)
+network_poller_poll_interval_seconds = 60
+
+# Pool operator fee-collection payment address. When set, every block the
+# unlocker marks matured also triggers a real payout cycle for that block,
+# crediting miner balances. When unset, blocks still mature/unlock correctly,
+# they are simply never auto-paid out. (default: "")
+payout_fee_address = ""
+
+# Coin developer donation address. (default: "")
+payout_coin_dev_address = ""
+
+# Pool software developer donation address. (default: "")
+payout_pool_dev_address = ""
+
+# PPS pool-type operator fee percentage (0-100). (default: 0)
+payout_pps_fee_percent = 0
+
+# PPLNS pool-type operator fee percentage (0-100). (default: 0)
+payout_pplns_fee_percent = 0
+
+# Solo pool-type operator fee percentage (0-100). (default: 0)
+payout_solo_fee_percent = 0
+
+# Donation split percentage (0-100) of each fee cut routed to
+# payout_coin_dev_address. (default: 0)
+payout_dev_donation_percent = 0
+
+# Donation split percentage (0-100) of each fee cut routed to
+# payout_pool_dev_address. (default: 0)
+payout_pool_dev_donation_percent = 0
+
+# PPLNS window multiplier. A placeholder, operator-tunable value -- see
+# payout.Config's doc comment. (default: 2)
+payout_pplns_share_multi = 2
+
+# How often the retention job re-evaluates every target, in seconds. Only
+# consulted if at least one retention window is configured. (default: 3600)
+retention_poll_interval_seconds = 3600
+
+# The DEFAULT retention window, in block-height units, applied to every
+# (algo, pool_type) combination that does not have a more specific override.
+# 0 (or unset) means no default. (default: 0)
+#
+# NOTE: the per-combination override
+# GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS (e.g.
+# GCPOOL_RETENTION_RXT_PPLNS_BLOCKS) remains ENV-VAR-ONLY and is deliberately
+# not represented in this file -- its key name is only known at runtime
+# (db.ValidAlgos x db.ValidPoolTypes), so it cannot become a static TOML key.
+retention_blocks = 0
+
+# Base URL of a real monero-wallet-rpc endpoint (e.g.
+# "http://127.0.0.1:18083"). When set, accrued pending_balance is periodically
+# paid out via a real on-chain transfer. (default: "")
+monero_wallet_rpc_addr = ""
+
+# HTTP Digest auth username matching whatever --rpc-login the real
+# monero-wallet-rpc process was started with. (default: "")
+monero_wallet_rpc_user = ""
+
+# HTTP Digest auth password matching monero_wallet_rpc_user above.
+# (default: "")
+monero_wallet_rpc_password = ""
+
+# Minimum pending_balance (atomic units) required before a miner is paid out
+# at all. Shared by both the Monero and Tari disbursement engines.
+# (default: 0)
+disburse_min_payout_atomic = 0
+
+# Cap on destinations per real Transfer call, for the Monero disbursement
+# engine only (the Tari engine hardcodes 1 -- see buildTariDisburseEngine's
+# doc comment). (default: 15)
+disburse_max_destinations_per_batch = 15
+
+# How often the disbursement engine(s) run a cycle, in seconds. Shared by both
+# the Monero and Tari disbursement engines. (default: 600)
+disburse_poll_interval_seconds = 600
+
+# Address (host:port) of a real Tari console/base wallet GRPC endpoint. When
+# set, enables the Tari payout disbursement engine. (default: "")
+tari_wallet_grpc_addr = ""
+
+# Default fee_per_gram for a Transfer whose Priority is zero. 0 (or unset)
+# leaves wallet.NewTariWalletGRPC's own package default in effect.
+# (default: 0)
+tari_wallet_fee_per_gram = 0
+
+# How often the wallet-stats poller calls GetBalance on every configured
+# wallet, in seconds. Only consulted if at least one wallet RPC is
+# configured. (default: 60)
+wallet_stats_poll_interval_seconds = 60
