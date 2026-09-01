@@ -3,8 +3,13 @@
 // the HTTP+Protobuf share/block ingestion API (internal/backend/api),
 // and serves it.
 //
-// Configuration is via environment variables (no flags/config file yet
-// — this is the first runnable pass, not the final ops story):
+// Configuration is via flags, environment variables, or an optional
+// TOML config file (see -config / backend.example.toml and
+// internal/leaflib/cfgfile for the exact flag > env > file > default
+// precedence rule) -- every setting below is available as both a
+// flag (its env var name lowercased, with underscores replaced by
+// hyphens and the GCPOOL_ prefix stripped, e.g. GCPOOL_DB_DSN ->
+// -db-dsn) and the environment variable documented below:
 //
 //	GCPOOL_DB_DSN            (required) Postgres DSN, e.g.
 //	                         "postgres://user:pass@host:5432/db?sslmode=disable"
@@ -103,6 +108,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -130,6 +136,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/statsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -157,6 +164,303 @@ const (
 // -ldflags "-X main.Version=...", e.g. from a CI-set git tag/commit;
 // defaults to "dev" for local/unreleased builds.
 var Version = "dev"
+
+// config holds every backend setting that was previously read
+// directly via os.Getenv scattered across run() and the various
+// buildXxxConfig/buildXxxEngine helpers below -- see this file's
+// package doc comment for the full env-var-by-env-var writeup, and
+// loadConfig for how each field is populated (flag > env > TOML file
+// > hardcoded default). The one deliberate exception is the dynamic
+// per-(algo,pool_type) GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS
+// override consumed inside buildRetentionConfig's own db.ValidAlgos/
+// db.ValidPoolTypes loop -- those cannot become static flags/fields
+// since their names are only known at runtime, so that inner loop's
+// os.Getenv call is intentionally left as-is.
+type config struct {
+	dbDSN           string
+	listenAddr      string
+	authHeaderName  string
+	authHeaderValue string
+	network         string
+
+	tariGRPCAddr  string
+	moneroRPCAddr string
+
+	unlockerPollInterval   time.Duration
+	unlockerTariMaturity   int64
+	unlockerMoneroMaturity int64
+
+	networkPollerPollInterval time.Duration
+
+	payoutFeeAddress             string
+	payoutCoinDevAddress         string
+	payoutPoolDevAddress         string
+	payoutPPSFeePercent          float64
+	payoutPPLNSFeePercent        float64
+	payoutSoloFeePercent         float64
+	payoutDevDonationPercent     float64
+	payoutPoolDevDonationPercent float64
+	payoutPPLNSShareMulti        float64
+
+	retentionPollInterval time.Duration
+	retentionBlocks       int64
+
+	moneroWalletRPCAddr     string
+	moneroWalletRPCUser     string
+	moneroWalletRPCPassword string
+
+	disburseMinPayoutAtomic         int64
+	disburseMaxDestinationsPerBatch int
+	disbursePollInterval            time.Duration
+
+	tariWalletGRPCAddr   string
+	tariWalletFeePerGram uint64
+
+	walletStatsPollInterval time.Duration
+
+	// configFile is the optional path to a TOML file providing
+	// defaults for any flag above that the operator did not set
+	// explicitly via CLI flag or environment variable. See
+	// backend.example.toml and internal/leaflib/cfgfile for the
+	// exact precedence rule (flag > env > file > hardcoded default).
+	configFile string
+}
+
+// loadConfig registers one flag per config field (mirroring the
+// GCPOOL_* env var of the same name -- see this file's package doc
+// comment), parses flag.CommandLine, and then merges in an optional
+// -config TOML file per the flag > env > file > hardcoded-default
+// precedence rule owned by internal/leaflib/cfgfile. Only the default
+// (no-subcommand) run() path calls this -- the block/retention/
+// address/migrate CLI subcommands parse their own, separate flag
+// sets in their own files and never call loadConfig.
+func loadConfig() (config, error) {
+	cfg := config{}
+
+	flag.StringVar(&cfg.dbDSN, "db-dsn", envOr("GCPOOL_DB_DSN", ""), "(required) Postgres DSN, e.g. \"postgres://user:pass@host:5432/db?sslmode=disable\". Env: GCPOOL_DB_DSN")
+	flag.StringVar(&cfg.listenAddr, "listen-addr", envOr("GCPOOL_LISTEN_ADDR", defaultListenAddr), "HTTP listen address. Env: GCPOOL_LISTEN_ADDR")
+	flag.StringVar(&cfg.authHeaderName, "auth-header-name", envOr("GCPOOL_AUTH_HEADER_NAME", ""), "shared-secret auth header name to require on /api/v1/share and /api/v1/block, e.g. \"Authorization\". Must be set together with -auth-header-value, or not at all -- both empty means no auth check is performed. Env: GCPOOL_AUTH_HEADER_NAME")
+	flag.StringVar(&cfg.authHeaderValue, "auth-header-value", envOr("GCPOOL_AUTH_HEADER_VALUE", ""), "expected value for -auth-header-name above. Env: GCPOOL_AUTH_HEADER_VALUE")
+	flag.StringVar(&cfg.network, "network", envOr("GCPOOL_NETWORK", ""), "(required) the network this backend is configured for. Accepts \"mainnet\" or \"testnet\" (case-insensitive). There is no default -- startup fails fast if this is missing or does not parse to a valid network. Env: GCPOOL_NETWORK")
+
+	flag.StringVar(&cfg.tariGRPCAddr, "tari-grpc-addr", envOr("GCPOOL_TARI_GRPC_ADDR", ""), "host:port of a real Tari base node's GRPC endpoint. When set, the block unlocker polls every pending ALGO_RXT/ALGO_C29/ALGO_SHA3X block against it to detect maturity/orphaning. When unset, those algos' blocks are simply never auto-unlocked. Env: GCPOOL_TARI_GRPC_ADDR")
+	flag.StringVar(&cfg.moneroRPCAddr, "monero-rpc-addr", envOr("GCPOOL_MONERO_RPC_ADDR", ""), "base URL of a real monerod JSON-RPC endpoint (e.g. \"http://127.0.0.1:18081\"). When set, the unlocker polls every pending ALGO_RXM block against it. Same opt-in behavior as -tari-grpc-addr above. Env: GCPOOL_MONERO_RPC_ADDR")
+
+	flag.DurationVar(&cfg.unlockerPollInterval, "unlocker-poll-interval", envOrDuration("GCPOOL_UNLOCKER_POLL_INTERVAL", defaultUnlockerPollInterval), "how often the unlocker re-checks pending blocks. Only consulted if at least one of -tari-grpc-addr/-monero-rpc-addr is set. Env: GCPOOL_UNLOCKER_POLL_INTERVAL")
+	flag.Int64Var(&cfg.unlockerTariMaturity, "unlocker-tari-maturity", envOrInt64("GCPOOL_UNLOCKER_TARI_MATURITY", defaultTariMaturity), "confirmations required before a Tari-family block (RXT/C29/SHA3X) is marked unlocked/payable. A PLACEHOLDER, operationally-tunable value, not a Tari protocol constant. Env: GCPOOL_UNLOCKER_TARI_MATURITY")
+	flag.Int64Var(&cfg.unlockerMoneroMaturity, "unlocker-monero-maturity", envOrInt64("GCPOOL_UNLOCKER_MONERO_MATURITY", defaultMoneroMaturity), "confirmations required before an RXM block is marked unlocked/payable, mirroring Monero's own CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW. Env: GCPOOL_UNLOCKER_MONERO_MATURITY")
+
+	flag.DurationVar(&cfg.networkPollerPollInterval, "network-poller-poll-interval", envOrDuration("GCPOOL_NETWORK_POLLER_POLL_INTERVAL", defaultNetworkPollerInterval), "how often the network-state poller re-checks the real upstream chain(s) configured via -tari-grpc-addr/-monero-rpc-addr. Env: GCPOOL_NETWORK_POLLER_POLL_INTERVAL")
+
+	flag.StringVar(&cfg.payoutFeeAddress, "payout-fee-address", envOr("GCPOOL_PAYOUT_FEE_ADDRESS", ""), "pool operator fee-collection payment address. When set, every block the unlocker marks matured also triggers a real payout cycle for that block, crediting miner balances. When unset, blocks still mature/unlock correctly, they are simply never auto-paid out. Env: GCPOOL_PAYOUT_FEE_ADDRESS")
+	flag.StringVar(&cfg.payoutCoinDevAddress, "payout-coin-dev-address", envOr("GCPOOL_PAYOUT_COIN_DEV_ADDRESS", ""), "coin developer donation address. Env: GCPOOL_PAYOUT_COIN_DEV_ADDRESS")
+	flag.StringVar(&cfg.payoutPoolDevAddress, "payout-pool-dev-address", envOr("GCPOOL_PAYOUT_POOL_DEV_ADDRESS", ""), "pool software developer donation address. Env: GCPOOL_PAYOUT_POOL_DEV_ADDRESS")
+	flag.Float64Var(&cfg.payoutPPSFeePercent, "payout-pps-fee-percent", envOrFloat64("GCPOOL_PAYOUT_PPS_FEE_PERCENT", 0), "PPS pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_PPS_FEE_PERCENT")
+	flag.Float64Var(&cfg.payoutPPLNSFeePercent, "payout-pplns-fee-percent", envOrFloat64("GCPOOL_PAYOUT_PPLNS_FEE_PERCENT", 0), "PPLNS pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_PPLNS_FEE_PERCENT")
+	flag.Float64Var(&cfg.payoutSoloFeePercent, "payout-solo-fee-percent", envOrFloat64("GCPOOL_PAYOUT_SOLO_FEE_PERCENT", 0), "Solo pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_SOLO_FEE_PERCENT")
+	flag.Float64Var(&cfg.payoutDevDonationPercent, "payout-dev-donation-percent", envOrFloat64("GCPOOL_PAYOUT_DEV_DONATION_PERCENT", 0), "donation split percentage (0-100) of each fee cut routed to -payout-coin-dev-address. Env: GCPOOL_PAYOUT_DEV_DONATION_PERCENT")
+	flag.Float64Var(&cfg.payoutPoolDevDonationPercent, "payout-pool-dev-donation-percent", envOrFloat64("GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT", 0), "donation split percentage (0-100) of each fee cut routed to -payout-pool-dev-address. Env: GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT")
+	flag.Float64Var(&cfg.payoutPPLNSShareMulti, "payout-pplns-share-multi", envOrFloat64("GCPOOL_PAYOUT_PPLNS_SHARE_MULTI", defaultPPLNSShareMulti), "PPLNS window multiplier. A placeholder, operator-tunable value -- see payout.Config's doc comment. Env: GCPOOL_PAYOUT_PPLNS_SHARE_MULTI")
+
+	flag.DurationVar(&cfg.retentionPollInterval, "retention-poll-interval", envOrDuration("GCPOOL_RETENTION_POLL_INTERVAL", defaultRetentionPollInterval), "how often the retention job re-evaluates every target. Only consulted if at least one retention window is configured. Env: GCPOOL_RETENTION_POLL_INTERVAL")
+	flag.Int64Var(&cfg.retentionBlocks, "retention-blocks", envOrInt64("GCPOOL_RETENTION_BLOCKS", 0), "the DEFAULT retention window, in block-height units, applied to every (algo, pool_type) combination in db.ValidAlgos x db.ValidPoolTypes that does not have a more specific GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS override (env-var-only, not a flag -- see this file's package doc comment). 0 (or unset) means no default. Env: GCPOOL_RETENTION_BLOCKS")
+
+	flag.StringVar(&cfg.moneroWalletRPCAddr, "monero-wallet-rpc-addr", envOr("GCPOOL_MONERO_WALLET_RPC_ADDR", ""), "base URL of a real monero-wallet-rpc endpoint (e.g. \"http://127.0.0.1:18083\"). When set, accrued pending_balance is periodically paid out via a real on-chain transfer. Env: GCPOOL_MONERO_WALLET_RPC_ADDR")
+	flag.StringVar(&cfg.moneroWalletRPCUser, "monero-wallet-rpc-user", envOr("GCPOOL_MONERO_WALLET_RPC_USER", ""), "HTTP Digest auth username matching whatever --rpc-login the real monero-wallet-rpc process was started with. Env: GCPOOL_MONERO_WALLET_RPC_USER")
+	flag.StringVar(&cfg.moneroWalletRPCPassword, "monero-wallet-rpc-password", envOr("GCPOOL_MONERO_WALLET_RPC_PASSWORD", ""), "HTTP Digest auth password matching -monero-wallet-rpc-user above. Env: GCPOOL_MONERO_WALLET_RPC_PASSWORD")
+	flag.Int64Var(&cfg.disburseMinPayoutAtomic, "disburse-min-payout-atomic", envOrInt64("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC", 0), "minimum pending_balance (atomic units) required before a miner is paid out at all. Shared by both the Monero and Tari disbursement engines. Env: GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC")
+	flag.IntVar(&cfg.disburseMaxDestinationsPerBatch, "disburse-max-destinations-per-batch", envOrInt("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH", defaultDisburseMaxDestinationsPerBatch), "cap on destinations per real Transfer call, for the Monero disbursement engine only (the Tari engine hardcodes 1, see buildTariDisburseEngine's doc comment). Env: GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH")
+	flag.DurationVar(&cfg.disbursePollInterval, "disburse-poll-interval", envOrDuration("GCPOOL_DISBURSE_POLL_INTERVAL", defaultDisbursePollInterval), "how often the disbursement engine(s) run a cycle. Shared by both the Monero and Tari disbursement engines. Env: GCPOOL_DISBURSE_POLL_INTERVAL")
+
+	flag.StringVar(&cfg.tariWalletGRPCAddr, "tari-wallet-grpc-addr", envOr("GCPOOL_TARI_WALLET_GRPC_ADDR", ""), "address (host:port) of a real Tari console/base wallet GRPC endpoint. When set, enables the Tari payout disbursement engine. Env: GCPOOL_TARI_WALLET_GRPC_ADDR")
+	flag.Uint64Var(&cfg.tariWalletFeePerGram, "tari-wallet-fee-per-gram", envOrUint64("GCPOOL_TARI_WALLET_FEE_PER_GRAM", 0), "default fee_per_gram for a Transfer whose Priority is zero. 0 (or unset) leaves wallet.NewTariWalletGRPC's own package default in effect. Env: GCPOOL_TARI_WALLET_FEE_PER_GRAM")
+
+	flag.DurationVar(&cfg.walletStatsPollInterval, "wallet-stats-poll-interval", envOrDuration("GCPOOL_WALLET_STATS_POLL_INTERVAL", defaultWalletStatsPollInterval), "how often the wallet-stats poller calls GetBalance on every configured wallet. Only consulted if at least one wallet RPC is configured. Env: GCPOOL_WALLET_STATS_POLL_INTERVAL")
+
+	flag.StringVar(&cfg.configFile, "config", envOr("BACKEND_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below not explicitly set via CLI flag or environment variable. See backend.example.toml. Env: BACKEND_CONFIG_FILE")
+
+	flag.Parse()
+
+	if err := applyConfigFile(&cfg); err != nil {
+		return cfg, err
+	}
+
+	return cfg, nil
+}
+
+// fileConfig mirrors config field-for-field (excluding configFile
+// itself) with pointer types so an absent TOML key decodes to nil and
+// is left untouched by the cfgfile.ApplyXxx helpers below. Durations
+// are represented in the TOML file as a plain integer number of
+// seconds (go-toml/v2 does not natively decode into time.Duration)
+// and converted with time.Duration(v) * time.Second when applied.
+type fileConfig struct {
+	DBDSN           *string `toml:"db_dsn"`
+	ListenAddr      *string `toml:"listen_addr"`
+	AuthHeaderName  *string `toml:"auth_header_name"`
+	AuthHeaderValue *string `toml:"auth_header_value"`
+	Network         *string `toml:"network"`
+
+	TariGRPCAddr  *string `toml:"tari_grpc_addr"`
+	MoneroRPCAddr *string `toml:"monero_rpc_addr"`
+
+	UnlockerPollIntervalSeconds *int   `toml:"unlocker_poll_interval_seconds"`
+	UnlockerTariMaturity        *int64 `toml:"unlocker_tari_maturity"`
+	UnlockerMoneroMaturity      *int64 `toml:"unlocker_monero_maturity"`
+
+	NetworkPollerPollIntervalSeconds *int `toml:"network_poller_poll_interval_seconds"`
+
+	PayoutFeeAddress             *string  `toml:"payout_fee_address"`
+	PayoutCoinDevAddress         *string  `toml:"payout_coin_dev_address"`
+	PayoutPoolDevAddress         *string  `toml:"payout_pool_dev_address"`
+	PayoutPPSFeePercent          *float64 `toml:"payout_pps_fee_percent"`
+	PayoutPPLNSFeePercent        *float64 `toml:"payout_pplns_fee_percent"`
+	PayoutSoloFeePercent         *float64 `toml:"payout_solo_fee_percent"`
+	PayoutDevDonationPercent     *float64 `toml:"payout_dev_donation_percent"`
+	PayoutPoolDevDonationPercent *float64 `toml:"payout_pool_dev_donation_percent"`
+	PayoutPPLNSShareMulti        *float64 `toml:"payout_pplns_share_multi"`
+
+	RetentionPollIntervalSeconds *int   `toml:"retention_poll_interval_seconds"`
+	RetentionBlocks              *int64 `toml:"retention_blocks"`
+
+	MoneroWalletRPCAddr     *string `toml:"monero_wallet_rpc_addr"`
+	MoneroWalletRPCUser     *string `toml:"monero_wallet_rpc_user"`
+	MoneroWalletRPCPassword *string `toml:"monero_wallet_rpc_password"`
+
+	DisburseMinPayoutAtomic         *int64 `toml:"disburse_min_payout_atomic"`
+	DisburseMaxDestinationsPerBatch *int   `toml:"disburse_max_destinations_per_batch"`
+	DisbursePollIntervalSeconds     *int   `toml:"disburse_poll_interval_seconds"`
+
+	TariWalletGRPCAddr   *string `toml:"tari_wallet_grpc_addr"`
+	TariWalletFeePerGram *uint64 `toml:"tari_wallet_fee_per_gram"`
+
+	WalletStatsPollIntervalSeconds *int `toml:"wallet_stats_poll_interval_seconds"`
+}
+
+// applyConfigFile merges cfg.configFile (if set) into cfg, honoring
+// the flag > env > file > hardcoded-default precedence rule owned by
+// internal/leaflib/cfgfile. It is a no-op when cfg.configFile == "".
+func applyConfigFile(cfg *config) error {
+	if cfg.configFile == "" {
+		return nil
+	}
+
+	visited := cfgfile.VisitedFlags(flag.CommandLine)
+
+	var fc fileConfig
+	if err := cfgfile.Decode(cfg.configFile, &fc); err != nil {
+		return fmt.Errorf("backend: loading -config %s: %w", cfg.configFile, err)
+	}
+
+	cfgfile.ApplyString(&cfg.dbDSN, fc.DBDSN, visited, "db-dsn", "GCPOOL_DB_DSN")
+	cfgfile.ApplyString(&cfg.listenAddr, fc.ListenAddr, visited, "listen-addr", "GCPOOL_LISTEN_ADDR")
+	cfgfile.ApplyString(&cfg.authHeaderName, fc.AuthHeaderName, visited, "auth-header-name", "GCPOOL_AUTH_HEADER_NAME")
+	cfgfile.ApplyString(&cfg.authHeaderValue, fc.AuthHeaderValue, visited, "auth-header-value", "GCPOOL_AUTH_HEADER_VALUE")
+	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "GCPOOL_NETWORK")
+
+	cfgfile.ApplyString(&cfg.tariGRPCAddr, fc.TariGRPCAddr, visited, "tari-grpc-addr", "GCPOOL_TARI_GRPC_ADDR")
+	cfgfile.ApplyString(&cfg.moneroRPCAddr, fc.MoneroRPCAddr, visited, "monero-rpc-addr", "GCPOOL_MONERO_RPC_ADDR")
+
+	if fc.UnlockerPollIntervalSeconds != nil {
+		d := time.Duration(*fc.UnlockerPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.unlockerPollInterval, &d, visited, "unlocker-poll-interval", "GCPOOL_UNLOCKER_POLL_INTERVAL")
+	}
+	cfgfile.ApplyInt64(&cfg.unlockerTariMaturity, fc.UnlockerTariMaturity, visited, "unlocker-tari-maturity", "GCPOOL_UNLOCKER_TARI_MATURITY")
+	cfgfile.ApplyInt64(&cfg.unlockerMoneroMaturity, fc.UnlockerMoneroMaturity, visited, "unlocker-monero-maturity", "GCPOOL_UNLOCKER_MONERO_MATURITY")
+
+	if fc.NetworkPollerPollIntervalSeconds != nil {
+		d := time.Duration(*fc.NetworkPollerPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.networkPollerPollInterval, &d, visited, "network-poller-poll-interval", "GCPOOL_NETWORK_POLLER_POLL_INTERVAL")
+	}
+
+	cfgfile.ApplyString(&cfg.payoutFeeAddress, fc.PayoutFeeAddress, visited, "payout-fee-address", "GCPOOL_PAYOUT_FEE_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutCoinDevAddress, fc.PayoutCoinDevAddress, visited, "payout-coin-dev-address", "GCPOOL_PAYOUT_COIN_DEV_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutPoolDevAddress, fc.PayoutPoolDevAddress, visited, "payout-pool-dev-address", "GCPOOL_PAYOUT_POOL_DEV_ADDRESS")
+	cfgfile.ApplyFloat64(&cfg.payoutPPSFeePercent, fc.PayoutPPSFeePercent, visited, "payout-pps-fee-percent", "GCPOOL_PAYOUT_PPS_FEE_PERCENT")
+	cfgfile.ApplyFloat64(&cfg.payoutPPLNSFeePercent, fc.PayoutPPLNSFeePercent, visited, "payout-pplns-fee-percent", "GCPOOL_PAYOUT_PPLNS_FEE_PERCENT")
+	cfgfile.ApplyFloat64(&cfg.payoutSoloFeePercent, fc.PayoutSoloFeePercent, visited, "payout-solo-fee-percent", "GCPOOL_PAYOUT_SOLO_FEE_PERCENT")
+	cfgfile.ApplyFloat64(&cfg.payoutDevDonationPercent, fc.PayoutDevDonationPercent, visited, "payout-dev-donation-percent", "GCPOOL_PAYOUT_DEV_DONATION_PERCENT")
+	cfgfile.ApplyFloat64(&cfg.payoutPoolDevDonationPercent, fc.PayoutPoolDevDonationPercent, visited, "payout-pool-dev-donation-percent", "GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT")
+	cfgfile.ApplyFloat64(&cfg.payoutPPLNSShareMulti, fc.PayoutPPLNSShareMulti, visited, "payout-pplns-share-multi", "GCPOOL_PAYOUT_PPLNS_SHARE_MULTI")
+
+	if fc.RetentionPollIntervalSeconds != nil {
+		d := time.Duration(*fc.RetentionPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.retentionPollInterval, &d, visited, "retention-poll-interval", "GCPOOL_RETENTION_POLL_INTERVAL")
+	}
+	cfgfile.ApplyInt64(&cfg.retentionBlocks, fc.RetentionBlocks, visited, "retention-blocks", "GCPOOL_RETENTION_BLOCKS")
+
+	cfgfile.ApplyString(&cfg.moneroWalletRPCAddr, fc.MoneroWalletRPCAddr, visited, "monero-wallet-rpc-addr", "GCPOOL_MONERO_WALLET_RPC_ADDR")
+	cfgfile.ApplyString(&cfg.moneroWalletRPCUser, fc.MoneroWalletRPCUser, visited, "monero-wallet-rpc-user", "GCPOOL_MONERO_WALLET_RPC_USER")
+	cfgfile.ApplyString(&cfg.moneroWalletRPCPassword, fc.MoneroWalletRPCPassword, visited, "monero-wallet-rpc-password", "GCPOOL_MONERO_WALLET_RPC_PASSWORD")
+	cfgfile.ApplyInt64(&cfg.disburseMinPayoutAtomic, fc.DisburseMinPayoutAtomic, visited, "disburse-min-payout-atomic", "GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC")
+	cfgfile.ApplyInt(&cfg.disburseMaxDestinationsPerBatch, fc.DisburseMaxDestinationsPerBatch, visited, "disburse-max-destinations-per-batch", "GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH")
+	if fc.DisbursePollIntervalSeconds != nil {
+		d := time.Duration(*fc.DisbursePollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.disbursePollInterval, &d, visited, "disburse-poll-interval", "GCPOOL_DISBURSE_POLL_INTERVAL")
+	}
+
+	cfgfile.ApplyString(&cfg.tariWalletGRPCAddr, fc.TariWalletGRPCAddr, visited, "tari-wallet-grpc-addr", "GCPOOL_TARI_WALLET_GRPC_ADDR")
+	cfgfile.ApplyUint64(&cfg.tariWalletFeePerGram, fc.TariWalletFeePerGram, visited, "tari-wallet-fee-per-gram", "GCPOOL_TARI_WALLET_FEE_PER_GRAM")
+
+	if fc.WalletStatsPollIntervalSeconds != nil {
+		d := time.Duration(*fc.WalletStatsPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.walletStatsPollInterval, &d, visited, "wallet-stats-poll-interval", "GCPOOL_WALLET_STATS_POLL_INTERVAL")
+	}
+
+	return nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envOrInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envOrInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envOrUint64(key string, def uint64) uint64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envOrDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+func envOrFloat64(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
 
 // parseNetwork parses the GCPOOL_NETWORK environment variable value
 // into a poolpb.Network. Only "mainnet" and "testnet" (case-insensitive)
@@ -615,54 +919,31 @@ func (t payoutTrigger) TriggerPayout(ctx context.Context, b unlocker.Block) erro
 // RXM is Monero).
 var tariAlgos = []string{"RXT", "C29", "SHA3X"}
 
-// buildUnlockerConfig reads the GCPOOL_TARI_GRPC_ADDR/
-// GCPOOL_MONERO_RPC_ADDR/GCPOOL_UNLOCKER_* environment variables (see
-// this file's package doc comment) and returns a ready-to-use
+// buildUnlockerConfig reads cfg's tariGRPCAddr/moneroRPCAddr/
+// unlocker* fields (see this file's package doc comment for the
+// underlying GCPOOL_TARI_GRPC_ADDR/GCPOOL_MONERO_RPC_ADDR/
+// GCPOOL_UNLOCKER_* env vars) and returns a ready-to-use
 // unlocker.Config plus whether any verifier was actually configured
 // (ok == false means the caller should not start the unlocker at all
 // — see run()).
-func buildUnlockerConfig() (cfg unlocker.Config, ok bool, err error) {
-	cfg.Coins = map[string]unlocker.CoinConfig{}
+func buildUnlockerConfig(cfg config) (out unlocker.Config, ok bool, err error) {
+	out.Coins = map[string]unlocker.CoinConfig{}
+	out.PollInterval = cfg.unlockerPollInterval
 
-	pollInterval := defaultUnlockerPollInterval
-	if raw := os.Getenv("GCPOOL_UNLOCKER_POLL_INTERVAL"); raw != "" {
-		pollInterval, err = time.ParseDuration(raw)
-		if err != nil {
-			return cfg, false, fmt.Errorf("GCPOOL_UNLOCKER_POLL_INTERVAL: %w", err)
-		}
-	}
-	cfg.PollInterval = pollInterval
-
-	if addr := os.Getenv("GCPOOL_TARI_GRPC_ADDR"); addr != "" {
-		maturity := defaultTariMaturity
-		if raw := os.Getenv("GCPOOL_UNLOCKER_TARI_MATURITY"); raw != "" {
-			m, parseErr := strconv.ParseInt(raw, 10, 64)
-			if parseErr != nil {
-				return cfg, false, fmt.Errorf("GCPOOL_UNLOCKER_TARI_MATURITY: %w", parseErr)
-			}
-			maturity = m
-		}
-		verifier := chain.NewTariVerifier(addr)
+	if cfg.tariGRPCAddr != "" {
+		verifier := chain.NewTariVerifier(cfg.tariGRPCAddr)
 		for _, algo := range tariAlgos {
-			cfg.Coins[algo] = unlocker.CoinConfig{Verifier: verifier, MaturityDepth: maturity}
+			out.Coins[algo] = unlocker.CoinConfig{Verifier: verifier, MaturityDepth: cfg.unlockerTariMaturity}
 		}
 		ok = true
 	}
 
-	if addr := os.Getenv("GCPOOL_MONERO_RPC_ADDR"); addr != "" {
-		maturity := defaultMoneroMaturity
-		if raw := os.Getenv("GCPOOL_UNLOCKER_MONERO_MATURITY"); raw != "" {
-			m, parseErr := strconv.ParseInt(raw, 10, 64)
-			if parseErr != nil {
-				return cfg, false, fmt.Errorf("GCPOOL_UNLOCKER_MONERO_MATURITY: %w", parseErr)
-			}
-			maturity = m
-		}
-		cfg.Coins["RXM"] = unlocker.CoinConfig{Verifier: chain.NewMoneroVerifier(addr), MaturityDepth: maturity}
+	if cfg.moneroRPCAddr != "" {
+		out.Coins["RXM"] = unlocker.CoinConfig{Verifier: chain.NewMoneroVerifier(cfg.moneroRPCAddr), MaturityDepth: cfg.unlockerMoneroMaturity}
 		ok = true
 	}
 
-	return cfg, ok, nil
+	return out, ok, nil
 }
 
 // sortedKeys returns m's keys sorted, purely for deterministic,
@@ -677,37 +958,30 @@ func sortedKeys(m map[string]unlocker.CoinConfig) []string {
 	return keys
 }
 
-// buildNetworkPollerConfig reads the same GCPOOL_TARI_GRPC_ADDR/
-// GCPOOL_MONERO_RPC_ADDR environment variables buildUnlockerConfig
-// consumes (see this file's package doc comment) plus the poller-
-// specific GCPOOL_NETWORK_POLLER_POLL_INTERVAL, and returns a
-// ready-to-use networkpoller.Config plus whether any real upstream
-// Source was actually configured (ok == false means the caller
-// should not start the poller at all -- mirrors buildUnlockerConfig's
-// own opt-in story exactly).
+// buildNetworkPollerConfig reads the same cfg.tariGRPCAddr/
+// cfg.moneroRPCAddr fields buildUnlockerConfig consumes (see this
+// file's package doc comment) plus the poller-specific
+// cfg.networkPollerPollInterval, and returns a ready-to-use
+// networkpoller.Config plus whether any real upstream Source was
+// actually configured (ok == false means the caller should not start
+// the poller at all -- mirrors buildUnlockerConfig's own opt-in
+// story exactly).
 //
 // Deliberately does NOT call nodeGRPC.InitNodeGRPC itself: when
-// GCPOOL_TARI_GRPC_ADDR is set, buildUnlockerConfig's own
+// cfg.tariGRPCAddr is set, buildUnlockerConfig's own
 // chain.NewTariVerifier call already does so exactly once (see
 // networkpoller.TariNetworkSource's doc comment for why only one
 // InitNodeGRPC call's worth of address should be live per process),
 // and run() below only calls this function after buildUnlockerConfig
 // has already run.
-func buildNetworkPollerConfig(network poolpb.Network, m *metrics.Metrics) (cfg networkpoller.Config, ok bool, err error) {
-	pollInterval := defaultNetworkPollerInterval
-	if raw := os.Getenv("GCPOOL_NETWORK_POLLER_POLL_INTERVAL"); raw != "" {
-		pollInterval, err = time.ParseDuration(raw)
-		if err != nil {
-			return cfg, false, fmt.Errorf("GCPOOL_NETWORK_POLLER_POLL_INTERVAL: %w", err)
-		}
-	}
-	cfg.PollInterval = pollInterval
-	cfg.Metrics = m
+func buildNetworkPollerConfig(cfg config, network poolpb.Network, m *metrics.Metrics) (out networkpoller.Config, ok bool, err error) {
+	out.PollInterval = cfg.networkPollerPollInterval
+	out.Metrics = m
 
 	netStr := networkDBString(network)
 
-	if os.Getenv("GCPOOL_TARI_GRPC_ADDR") != "" {
-		cfg.Targets = append(cfg.Targets,
+	if cfg.tariGRPCAddr != "" {
+		out.Targets = append(out.Targets,
 			networkpoller.Target{Algo: "RXT", Network: netStr, Source: networkpoller.NewTariNetworkSource(networkpoller.TariAlgoRandomX)},
 			networkpoller.Target{Algo: "C29", Network: netStr, Source: networkpoller.NewTariNetworkSource(networkpoller.TariAlgoCuckaroo)},
 			networkpoller.Target{Algo: "SHA3X", Network: netStr, Source: networkpoller.NewTariNetworkSource(networkpoller.TariAlgoSHA3X)},
@@ -715,37 +989,23 @@ func buildNetworkPollerConfig(network poolpb.Network, m *metrics.Metrics) (cfg n
 		ok = true
 	}
 
-	if addr := os.Getenv("GCPOOL_MONERO_RPC_ADDR"); addr != "" {
-		cfg.Targets = append(cfg.Targets, networkpoller.Target{Algo: "RXM", Network: netStr, Source: networkpoller.NewMoneroNetworkSource(addr)})
+	if cfg.moneroRPCAddr != "" {
+		out.Targets = append(out.Targets, networkpoller.Target{Algo: "RXM", Network: netStr, Source: networkpoller.NewMoneroNetworkSource(cfg.moneroRPCAddr)})
 		ok = true
 	}
 
-	return cfg, ok, nil
+	return out, ok, nil
 }
 
-// parsePercentEnv parses an optional percentage (0-100) environment
-// variable, returning def if raw is unset/empty. Mirrors
-// buildUnlockerConfig's *ParseInt-then-error-wrap style for its own
-// numeric env vars.
-func parsePercentEnv(name, raw string, def float64) (float64, error) {
-	if raw == "" {
-		return def, nil
-	}
-	v, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %w", name, err)
-	}
-	return v, nil
-}
-
-// buildPayoutCalculator reads the GCPOOL_PAYOUT_* environment
-// variables and returns a ready-to-use *payout.Calculator plus
-// whether payout calculation should actually be wired into the
-// unlocker's matured-block trigger (ok == false when
-// GCPOOL_PAYOUT_FEE_ADDRESS is unset — a deployment that hasn't
-// configured a fee address yet gets correct chain-maturity tracking
-// out of the unlocker alone, exactly mirroring buildUnlockerConfig's
-// own opt-in story for GCPOOL_TARI_GRPC_ADDR/GCPOOL_MONERO_RPC_ADDR).
+// buildPayoutCalculator reads cfg's payout* fields (see this file's
+// package doc comment for the underlying GCPOOL_PAYOUT_* env vars)
+// and returns a ready-to-use *payout.Calculator plus whether payout
+// calculation should actually be wired into the unlocker's
+// matured-block trigger (ok == false when cfg.payoutFeeAddress is
+// unset — a deployment that hasn't configured a fee address yet gets
+// correct chain-maturity tracking out of the unlocker alone, exactly
+// mirroring buildUnlockerConfig's own opt-in story for
+// cfg.tariGRPCAddr/cfg.moneroRPCAddr).
 //
 //	GCPOOL_PAYOUT_FEE_ADDRESS       (required to enable payout) pool
 //	                                operator fee-collection address.
@@ -764,44 +1024,25 @@ func parsePercentEnv(name, raw string, def float64) (float64, error) {
 //	                                Default 2 (a placeholder, operator-
 //	                                tunable value — see payout.Config's
 //	                                doc comment).
-func buildPayoutCalculator(repo *db.Repository, m *metrics.Metrics) (calc *payout.Calculator, ok bool, err error) {
-	feeAddress := os.Getenv("GCPOOL_PAYOUT_FEE_ADDRESS")
-	if feeAddress == "" {
+func buildPayoutCalculator(cfg config, repo *db.Repository, m *metrics.Metrics) (calc *payout.Calculator, ok bool, err error) {
+	if cfg.payoutFeeAddress == "" {
 		return nil, false, nil
 	}
 
-	cfg := payout.Config{
-		FeeAddress:      feeAddress,
-		CoinDevAddress:  os.Getenv("GCPOOL_PAYOUT_COIN_DEV_ADDRESS"),
-		PoolDevAddress:  os.Getenv("GCPOOL_PAYOUT_POOL_DEV_ADDRESS"),
-		PPLNSShareMulti: defaultPPLNSShareMulti,
-		Metrics:         m,
+	pcfg := payout.Config{
+		FeeAddress:             cfg.payoutFeeAddress,
+		CoinDevAddress:         cfg.payoutCoinDevAddress,
+		PoolDevAddress:         cfg.payoutPoolDevAddress,
+		PPSFeePercent:          cfg.payoutPPSFeePercent,
+		PPLNSFeePercent:        cfg.payoutPPLNSFeePercent,
+		SoloFeePercent:         cfg.payoutSoloFeePercent,
+		DevDonationPercent:     cfg.payoutDevDonationPercent,
+		PoolDevDonationPercent: cfg.payoutPoolDevDonationPercent,
+		PPLNSShareMulti:        cfg.payoutPPLNSShareMulti,
+		Metrics:                m,
 	}
 
-	if cfg.PPSFeePercent, err = parsePercentEnv("GCPOOL_PAYOUT_PPS_FEE_PERCENT", os.Getenv("GCPOOL_PAYOUT_PPS_FEE_PERCENT"), 0); err != nil {
-		return nil, false, err
-	}
-	if cfg.PPLNSFeePercent, err = parsePercentEnv("GCPOOL_PAYOUT_PPLNS_FEE_PERCENT", os.Getenv("GCPOOL_PAYOUT_PPLNS_FEE_PERCENT"), 0); err != nil {
-		return nil, false, err
-	}
-	if cfg.SoloFeePercent, err = parsePercentEnv("GCPOOL_PAYOUT_SOLO_FEE_PERCENT", os.Getenv("GCPOOL_PAYOUT_SOLO_FEE_PERCENT"), 0); err != nil {
-		return nil, false, err
-	}
-	if cfg.DevDonationPercent, err = parsePercentEnv("GCPOOL_PAYOUT_DEV_DONATION_PERCENT", os.Getenv("GCPOOL_PAYOUT_DEV_DONATION_PERCENT"), 0); err != nil {
-		return nil, false, err
-	}
-	if cfg.PoolDevDonationPercent, err = parsePercentEnv("GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT", os.Getenv("GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT"), 0); err != nil {
-		return nil, false, err
-	}
-	if raw := os.Getenv("GCPOOL_PAYOUT_PPLNS_SHARE_MULTI"); raw != "" {
-		v, parseErr := strconv.ParseFloat(raw, 64)
-		if parseErr != nil {
-			return nil, false, fmt.Errorf("GCPOOL_PAYOUT_PPLNS_SHARE_MULTI: %w", parseErr)
-		}
-		cfg.PPLNSShareMulti = v
-	}
-
-	return payout.New(payoutRepositoryAdapter{repo: repo}, cfg), true, nil
+	return payout.New(payoutRepositoryAdapter{repo: repo}, pcfg), true, nil
 }
 
 const defaultPPLNSShareMulti = 2
@@ -817,14 +1058,15 @@ const defaultPPLNSShareMulti = 2
 // order of HeightPartitionBucketSize blocks at a time.
 const defaultRetentionPollInterval = 1 * time.Hour
 
-// buildRetentionConfig reads the GCPOOL_RETENTION_* environment
-// variables and returns a ready-to-use retention.Config plus whether
-// the retention job should actually be started (ok == false when
-// no retention window was configured at all — a deployment that
-// hasn't set any GCPOOL_RETENTION_* variable keeps every share
-// forever, exactly like today, mirroring buildUnlockerConfig/
-// buildDisburseEngine's "config knob absent -> feature disabled"
-// convention).
+// buildRetentionConfig reads cfg.retentionPollInterval/
+// cfg.retentionBlocks (see this file's package doc comment for the
+// underlying GCPOOL_RETENTION_* env vars) and returns a ready-to-use
+// retention.Config plus whether the retention job should actually be
+// started (ok == false when no retention window was configured at
+// all — a deployment that hasn't set any GCPOOL_RETENTION_* variable
+// keeps every share forever, exactly like today, mirroring
+// buildUnlockerConfig/buildDisburseEngine's "config knob absent ->
+// feature disabled" convention).
 //
 //	GCPOOL_RETENTION_POLL_INTERVAL          (optional) how often the
 //	                                         retention job re-evaluates
@@ -842,13 +1084,19 @@ const defaultRetentionPollInterval = 1 * time.Hour
 //	                                         x db.ValidPoolTypes that
 //	                                         does not have a more
 //	                                         specific override below.
-//	                                         Unset means "no default" —
-//	                                         a combination with neither
-//	                                         this nor its own override
-//	                                         set is never touched by the
-//	                                         retention job.
+//	                                         Unset (or <=0) means "no
+//	                                         default" — a combination
+//	                                         with neither this nor its
+//	                                         own override set to a
+//	                                         positive value is never
+//	                                         touched by the retention
+//	                                         job.
 //	GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS
-//	                                         (optional) per-combination
+//	                                         (optional, env-var-only --
+//	                                         not a flag, since the name
+//	                                         is only known at runtime;
+//	                                         see this file's package
+//	                                         doc comment) per-combination
 //	                                         override of the retention
 //	                                         window above, e.g.
 //	                                         GCPOOL_RETENTION_RXT_PPLNS_BLOCKS.
@@ -861,49 +1109,31 @@ const defaultRetentionPollInterval = 1 * time.Hour
 //	                                         combination even when
 //	                                         GCPOOL_RETENTION_BLOCKS is
 //	                                         set for everything else.
-func buildRetentionConfig() (cfg retention.Config, ok bool, err error) {
-	pollInterval := defaultRetentionPollInterval
-	if raw := os.Getenv("GCPOOL_RETENTION_POLL_INTERVAL"); raw != "" {
-		pollInterval, err = time.ParseDuration(raw)
-		if err != nil {
-			return cfg, false, fmt.Errorf("GCPOOL_RETENTION_POLL_INTERVAL: %w", err)
-		}
-	}
-	cfg.PollInterval = pollInterval
+func buildRetentionConfig(cfg config) (out retention.Config, ok bool, err error) {
+	out.PollInterval = cfg.retentionPollInterval
 
-	defaultBlocksSet := false
-	var defaultBlocks int64
-	if raw := os.Getenv("GCPOOL_RETENTION_BLOCKS"); raw != "" {
-		v, parseErr := strconv.ParseInt(raw, 10, 64)
-		if parseErr != nil {
-			return cfg, false, fmt.Errorf("GCPOOL_RETENTION_BLOCKS: %w", parseErr)
-		}
-		defaultBlocks = v
-		defaultBlocksSet = true
-	}
+	defaultBlocks := cfg.retentionBlocks
 
 	for _, algo := range db.ValidAlgos {
 		for _, poolType := range db.ValidPoolTypes {
 			blocks := defaultBlocks
-			set := defaultBlocksSet
 			envName := fmt.Sprintf("GCPOOL_RETENTION_%s_%s_BLOCKS", algo, poolType)
 			if raw := os.Getenv(envName); raw != "" {
 				v, parseErr := strconv.ParseInt(raw, 10, 64)
 				if parseErr != nil {
-					return cfg, false, fmt.Errorf("%s: %w", envName, parseErr)
+					return out, false, fmt.Errorf("%s: %w", envName, parseErr)
 				}
 				blocks = v
-				set = true
 			}
-			if !set || blocks <= 0 {
+			if blocks <= 0 {
 				continue
 			}
-			cfg.Targets = append(cfg.Targets, retention.Target{Algo: algo, PoolType: poolType, RetentionBlocks: blocks})
+			out.Targets = append(out.Targets, retention.Target{Algo: algo, PoolType: poolType, RetentionBlocks: blocks})
 			ok = true
 		}
 	}
 
-	return cfg, ok, nil
+	return out, ok, nil
 }
 
 // defaultDisbursePollInterval/defaultDisburseMaxDestinationsPerBatch
@@ -916,11 +1146,12 @@ const (
 	defaultDisburseMaxDestinationsPerBatch = 15
 )
 
-// buildDisburseEngine reads the GCPOOL_MONERO_WALLET_RPC_* /
-// GCPOOL_DISBURSE_* environment variables and returns a ready-to-use
-// *disburse.Engine plus whether the real payout-disbursement loop
-// should actually be started (ok == false when
-// GCPOOL_MONERO_WALLET_RPC_ADDR is unset — a deployment that hasn't
+// buildDisburseEngine reads cfg's moneroWalletRPC*/disburse* fields
+// (see this file's package doc comment for the underlying
+// GCPOOL_MONERO_WALLET_RPC_*/GCPOOL_DISBURSE_* env vars) and returns
+// a ready-to-use *disburse.Engine plus whether the real
+// payout-disbursement loop should actually be started (ok == false
+// when cfg.moneroWalletRPCAddr is unset — a deployment that hasn't
 // configured a wallet RPC endpoint yet still gets correct payout
 // CALCULATION (crediting pending_balance, via buildPayoutCalculator
 // above), it simply never auto-disburses those balances on-chain).
@@ -949,50 +1180,25 @@ const (
 //	                                  disbursement engine runs a cycle,
 //	                                  as a time.ParseDuration string.
 //	                                  Default "10m".
-func buildDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
-	addr := os.Getenv("GCPOOL_MONERO_WALLET_RPC_ADDR")
-	if addr == "" {
+func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
+	if cfg.moneroWalletRPCAddr == "" {
 		return nil, nil, 0, false, nil
 	}
 
 	var opts []wallet.Option
-	user := os.Getenv("GCPOOL_MONERO_WALLET_RPC_USER")
-	pass := os.Getenv("GCPOOL_MONERO_WALLET_RPC_PASSWORD")
-	if user != "" || pass != "" {
-		opts = append(opts, wallet.WithDigestAuth(user, pass))
+	if cfg.moneroWalletRPCUser != "" || cfg.moneroWalletRPCPassword != "" {
+		opts = append(opts, wallet.WithDigestAuth(cfg.moneroWalletRPCUser, cfg.moneroWalletRPCPassword))
 	}
-	walletClient = wallet.NewMoneroWalletRPC(addr, opts...)
+	walletClient = wallet.NewMoneroWalletRPC(cfg.moneroWalletRPCAddr, opts...)
 
-	cfg := disburse.Config{
+	dcfg := disburse.Config{
 		Wallet:                  walletClient,
-		MaxDestinationsPerBatch: defaultDisburseMaxDestinationsPerBatch,
+		MaxDestinationsPerBatch: cfg.disburseMaxDestinationsPerBatch,
+		MinPayoutAtomic:         cfg.disburseMinPayoutAtomic,
 		Metrics:                 m,
 	}
-	if raw := os.Getenv("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC"); raw != "" {
-		v, parseErr := strconv.ParseInt(raw, 10, 64)
-		if parseErr != nil {
-			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC: %w", parseErr)
-		}
-		cfg.MinPayoutAtomic = v
-	}
-	if raw := os.Getenv("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH"); raw != "" {
-		v, parseErr := strconv.Atoi(raw)
-		if parseErr != nil {
-			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH: %w", parseErr)
-		}
-		cfg.MaxDestinationsPerBatch = v
-	}
 
-	interval = defaultDisbursePollInterval
-	if raw := os.Getenv("GCPOOL_DISBURSE_POLL_INTERVAL"); raw != "" {
-		v, parseErr := time.ParseDuration(raw)
-		if parseErr != nil {
-			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_POLL_INTERVAL: %w", parseErr)
-		}
-		interval = v
-	}
-
-	return disburse.New(disburseRepositoryAdapter{repo: repo}, cfg), walletClient, interval, true, nil
+	return disburse.New(disburseRepositoryAdapter{repo: repo}, dcfg), walletClient, cfg.disbursePollInterval, true, nil
 }
 
 // buildTariDisburseEngine is buildDisburseEngine's Tari counterpart.
@@ -1032,48 +1238,28 @@ func buildDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disbu
 //	                                  deployment would want a
 //	                                  different minimum payout or poll
 //	                                  cadence per coin.
-func buildTariDisburseEngine(repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
-	addr := os.Getenv("GCPOOL_TARI_WALLET_GRPC_ADDR")
-	if addr == "" {
+func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
+	if cfg.tariWalletGRPCAddr == "" {
 		return nil, nil, 0, false, nil
 	}
 
 	var opts []wallet.TariOption
-	if raw := os.Getenv("GCPOOL_TARI_WALLET_FEE_PER_GRAM"); raw != "" {
-		v, parseErr := strconv.ParseUint(raw, 10, 64)
-		if parseErr != nil {
-			return nil, nil, 0, false, fmt.Errorf("GCPOOL_TARI_WALLET_FEE_PER_GRAM: %w", parseErr)
-		}
-		opts = append(opts, wallet.WithFeePerGram(v))
+	if cfg.tariWalletFeePerGram != 0 {
+		opts = append(opts, wallet.WithFeePerGram(cfg.tariWalletFeePerGram))
 	}
-	walletClient = wallet.NewTariWalletGRPC(addr, opts...)
+	walletClient = wallet.NewTariWalletGRPC(cfg.tariWalletGRPCAddr, opts...)
 
-	cfg := disburse.Config{
+	dcfg := disburse.Config{
 		Wallet: walletClient,
 		// Hardcoded, not env-var-configurable -- see this function's
 		// own doc comment for why 1 is the only safe value for Tari
 		// today.
 		MaxDestinationsPerBatch: 1,
+		MinPayoutAtomic:         cfg.disburseMinPayoutAtomic,
 		Metrics:                 m,
 	}
-	if raw := os.Getenv("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC"); raw != "" {
-		v, parseErr := strconv.ParseInt(raw, 10, 64)
-		if parseErr != nil {
-			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC: %w", parseErr)
-		}
-		cfg.MinPayoutAtomic = v
-	}
 
-	interval = defaultDisbursePollInterval
-	if raw := os.Getenv("GCPOOL_DISBURSE_POLL_INTERVAL"); raw != "" {
-		v, parseErr := time.ParseDuration(raw)
-		if parseErr != nil {
-			return nil, nil, 0, false, fmt.Errorf("GCPOOL_DISBURSE_POLL_INTERVAL: %w", parseErr)
-		}
-		interval = v
-	}
-
-	return disburse.New(disburseRepositoryAdapter{repo: repo}, cfg), walletClient, interval, true, nil
+	return disburse.New(disburseRepositoryAdapter{repo: repo}, dcfg), walletClient, cfg.disbursePollInterval, true, nil
 }
 
 // main runs the backend server by default (no args, or any args not
@@ -1112,7 +1298,12 @@ func main() {
 		return
 	}
 
-	if err := run(); err != nil {
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("backend: %v", err)
+	}
+
+	if err := run(cfg); err != nil {
 		log.Fatalf("backend: %v", err)
 	}
 }
@@ -1203,21 +1394,17 @@ func runWalletStatsPoller(ctx context.Context, m *metrics.Metrics, targets []wal
 	}
 }
 
-func run() error {
-	dsn := os.Getenv("GCPOOL_DB_DSN")
-	if dsn == "" {
-		return errors.New("GCPOOL_DB_DSN environment variable is required")
+func run(cfg config) error {
+	if cfg.dbDSN == "" {
+		return errors.New("GCPOOL_DB_DSN (or -db-dsn) is required")
 	}
 
-	listenAddr := os.Getenv("GCPOOL_LISTEN_ADDR")
+	listenAddr := cfg.listenAddr
 	if listenAddr == "" {
 		listenAddr = defaultListenAddr
 	}
 
-	authHeaderName := os.Getenv("GCPOOL_AUTH_HEADER_NAME")
-	authHeaderValue := os.Getenv("GCPOOL_AUTH_HEADER_VALUE")
-
-	network, err := parseNetwork(os.Getenv("GCPOOL_NETWORK"))
+	network, err := parseNetwork(cfg.network)
 	if err != nil {
 		return err
 	}
@@ -1225,7 +1412,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := db.Open(ctx, db.Config{DSN: dsn})
+	pool, err := db.Open(ctx, db.Config{DSN: cfg.dbDSN})
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
@@ -1241,8 +1428,8 @@ func run() error {
 	// listener just for the backend's internal poll loops.
 	m := metrics.New(Version)
 	handler := api.NewHandler(repositoryAdapter{repo: repo}, api.Config{
-		AuthHeaderName:  authHeaderName,
-		AuthHeaderValue: authHeaderValue,
+		AuthHeaderName:  cfg.authHeaderName,
+		AuthHeaderValue: cfg.authHeaderValue,
 		Network:         network,
 		Version:         Version,
 		Metrics:         m,
@@ -1286,13 +1473,13 @@ func run() error {
 	// this endpoint.
 	leafFlagsHandler := leafflagsapi.NewHandler(leafFlagsRepositoryAdapter{repo: repo})
 
-	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig()
+	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("configuring block unlocker: %w", err)
 	}
 	unlockerCfg.Metrics = m
 
-	payoutCalc, payoutEnabled, err := buildPayoutCalculator(repo, m)
+	payoutCalc, payoutEnabled, err := buildPayoutCalculator(cfg, repo, m)
 	if err != nil {
 		return fmt.Errorf("configuring payout calculator: %w", err)
 	}
@@ -1317,7 +1504,7 @@ func run() error {
 	// above, since that call is what performs this process' one
 	// real nodeGRPC.InitNodeGRPC call for GCPOOL_TARI_GRPC_ADDR (see
 	// buildNetworkPollerConfig's own doc comment).
-	networkPollerCfg, networkPollerEnabled, err := buildNetworkPollerConfig(network, m)
+	networkPollerCfg, networkPollerEnabled, err := buildNetworkPollerConfig(cfg, network, m)
 	if err != nil {
 		return fmt.Errorf("configuring network-state poller: %w", err)
 	}
@@ -1329,7 +1516,7 @@ func run() error {
 		log.Print("backend: network-state poller disabled (neither GCPOOL_TARI_GRPC_ADDR nor GCPOOL_MONERO_RPC_ADDR is set); network_state stays empty and networkapi's Network* stats fields simply read back as nil")
 	}
 
-	retentionCfg, retentionEnabled, err := buildRetentionConfig()
+	retentionCfg, retentionEnabled, err := buildRetentionConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("configuring share retention/cleanup: %w", err)
 	}
@@ -1342,7 +1529,7 @@ func run() error {
 		log.Print("backend: share retention/cleanup disabled (no GCPOOL_RETENTION_BLOCKS or GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS set); shares accumulate forever until an operator configures a retention window")
 	}
 
-	disburseEngine, moneroWalletClient, disburseInterval, disburseEnabled, err := buildDisburseEngine(repo, m)
+	disburseEngine, moneroWalletClient, disburseInterval, disburseEnabled, err := buildDisburseEngine(cfg, repo, m)
 	if err != nil {
 		return fmt.Errorf("configuring payout disbursement engine: %w", err)
 	}
@@ -1354,7 +1541,7 @@ func run() error {
 		log.Print("backend: payout disbursement engine disabled (GCPOOL_MONERO_WALLET_RPC_ADDR not set); pending_balance will still accrue, it just won't be auto-paid out on-chain")
 	}
 
-	tariDisburseEngine, tariWalletClient, tariDisburseInterval, tariDisburseEnabled, err := buildTariDisburseEngine(repo, m)
+	tariDisburseEngine, tariWalletClient, tariDisburseInterval, tariDisburseEnabled, err := buildTariDisburseEngine(cfg, repo, m)
 	if err != nil {
 		return fmt.Errorf("configuring Tari payout disbursement engine: %w", err)
 	}
@@ -1379,14 +1566,7 @@ func run() error {
 		}
 	}
 	if len(walletStatsTargets) > 0 {
-		walletStatsInterval := defaultWalletStatsPollInterval
-		if raw := os.Getenv("GCPOOL_WALLET_STATS_POLL_INTERVAL"); raw != "" {
-			v, parseErr := time.ParseDuration(raw)
-			if parseErr != nil {
-				return fmt.Errorf("GCPOOL_WALLET_STATS_POLL_INTERVAL: %w", parseErr)
-			}
-			walletStatsInterval = v
-		}
+		walletStatsInterval := cfg.walletStatsPollInterval
 		log.Printf("backend: wallet-stats poller enabled, polling every %s for %d target(s)", walletStatsInterval, len(walletStatsTargets))
 		go runWalletStatsPoller(ctx, m, walletStatsTargets, walletStatsInterval)
 	} else {

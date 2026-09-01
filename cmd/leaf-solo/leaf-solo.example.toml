@@ -1,0 +1,138 @@
+# leaf-solo example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point leaf-solo at a
+# copy of this file (with real values) via -config <path> or
+# LEAF_SOLO_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var >
+# this file > the hardcoded default shown below.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "30s"), since go-toml/v2 does not natively decode into time.Duration.
+
+# Tari base node GRPC address (host:port). REQUIRED when -coin=tari (the
+# default); ignored for -coin=monero. (default: "")
+node_grpc_address = ""
+
+# Miner-facing TCP listen address. (default: ":4444")
+listen_address = ":4444"
+
+# Solo payout address; found-block coinbase rewards go here. (default: "")
+payout_address = ""
+
+# Network tag for share/diagnostic records: mainnet|testnet. (default: "testnet")
+network = "testnet"
+
+# Which coin/PoW family this leaf-solo process serves: tari (default,
+# unchanged behavior) or monero (real MoneroNodeClient against a real monerod
+# JSON-RPC daemon -- see monerod_url). (default: "tari")
+coin = "tari"
+
+# Real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081), no
+# trailing slash or /json_rpc suffix required. REQUIRED when -coin=monero;
+# ignored for -coin=tari. (default: "")
+monerod_url = ""
+
+# Enable the real, legacy-ported probabilistic RandomX-validation-skip
+# mechanism for RXT/RXM shares. Disabled by default -- every share is always
+# fully, cryptographically validated. Has no effect for SHA3X/C29.
+# (default: false)
+trust_enabled = false
+
+# Real trust-ramp threshold gate -- 0/unset uses the documented default (10).
+# (default: 0)
+trust_threshold = 0
+
+# Real trust-ramp penalty gate, re-armed after any rejected share -- 0/unset
+# uses the documented default (30). (default: 0)
+trust_penalty = 0
+
+# Real per-accepted-share probability decrement -- 0/unset uses the
+# documented default (1). (default: 0)
+trust_change = 0
+
+# Real probability floor, ensuring full validation never stops occurring
+# entirely once ramped in -- 0/unset uses the documented default (20).
+# (default: 0)
+trust_min = 0
+
+# Which single mining algorithm this leaf-solo process serves: sha3x
+# (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/
+# plain RandomX) when -coin=monero. (default: "sha3x")
+algo = "sha3x"
+
+# RandomX-verification HTTP daemon address (consulted for -algo=rxt, and for
+# -coin=monero's real RandomX/rx validation -- both share the same real
+# randomx-service-backed RandomXValidator).
+# (default: "http://127.0.0.1:39093")
+randomx_service_url = "http://127.0.0.1:39093"
+
+# Coinbase-extra ownership tag appended to every fetched Tari block template
+# (identifies this leaf's found blocks on-chain). Left unset (the default), a
+# per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 /
+# supportxtm-rxt / supportxtm-rxm. (default: "")
+coinbase_extra_tag = ""
+
+# Starting share difficulty for a newly-connected session; vardiff adjusts it
+# from here based on that session's own accept history. (default: 10000)
+starting_difficulty = 10000
+
+# Comma-separated list of address:difficulty[:desc] port tiers, e.g.
+# ":4444:10000:low-diff,:4445:1000000:high-diff". When set, this REPLACES
+# listen_address/starting_difficulty entirely (they are ignored). When unset
+# (the default), listen_address/starting_difficulty are used as a single
+# implicit port tier. (default: "")
+ports = ""
+
+# Absolute floor vardiff will never retarget below. (default: 100)
+min_difficulty = 100
+
+# Absolute ceiling vardiff will never retarget above. (default: 1000000000)
+max_difficulty = 1000000000
+
+# Seconds between shares vardiff aims for. (default: 30)
+vardiff_target_time_seconds = 30
+
+# How often each session's own vardiff retarget timer fires (also the
+# minimum connection age before a session's first retarget), in seconds.
+# (default: 60)
+vardiff_retarget_interval_seconds = 60
+
+# Unconditional block-template refresh interval, in seconds. (default: 30)
+refresh_interval_seconds = 30
+
+# Chain-tip poll interval (forces an immediate refresh on tip movement), in
+# seconds. (default: 5)
+tip_poll_interval_seconds = 5
+
+# Real per-job expiry threshold, independent of tip-invalidation; a submit
+# against an older job is rejected as expired, in seconds. (default: 360)
+job_max_age_seconds = 360
+
+# Max concurrent miner connections, 0 = unlimited. (default: 0)
+max_connections = 0
+
+# Rolling per-connection idle timeout, in seconds. (default: 120)
+idle_timeout_seconds = 120
+
+# HTTP listen address for /metrics (Prometheus) and the stats page. Separate
+# from listen_address (the miner-facing stratum port). Defaults to
+# loopback-only; set to an empty string to disable.
+# (default: "127.0.0.1:9600")
+metrics_listen_address = "127.0.0.1:9600"
+
+# Cap on distinct payment-address labels tracked by leaf_miners_by_address
+# and the stats page's per-address breakdown (0 = package default).
+# (default: 0)
+max_address_labels = 0
+
+# Omit the "Remote address" column from the stats HTML page entirely --
+# recommended for public-facing deployments so remote miner IPs are never
+# exposed on a page anyone can load. (default: false)
+hide_remote_address = false
+
+# Path to a local, operator-maintained JSON file of manually banned/
+# forced-minimum-difficulty payment addresses. Empty (default) disables the
+# feature entirely -- leaf-solo has no backend to poll instead. (default: "")
+address_flags_file = ""
+
+# How often address_flags_file is re-read. Ignored if address_flags_file is
+# unset, in seconds. (default: 30)
+address_flags_poll_interval_seconds = 30

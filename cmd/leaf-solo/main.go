@@ -53,6 +53,7 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -173,9 +174,16 @@ type config struct {
 	// maintained JSON file is the only real Source available to it.
 	addressFlagsFile         string
 	addressFlagsPollInterval time.Duration
+
+	// configFile is the optional path to a TOML file providing
+	// defaults for any flag above that the operator did not set
+	// explicitly via CLI flag or environment variable. See
+	// leaf-solo.example.toml and internal/leaflib/cfgfile for the
+	// exact precedence rule (flag > env > file > hardcoded default).
+	configFile string
 }
 
-func loadConfig() config {
+func loadConfig() (config, error) {
 	cfg := config{}
 
 	flag.StringVar(&cfg.nodeGRPCAddress, "node-grpc-address", envOr("LEAF_NODE_GRPC_ADDRESS", ""), "Tari base node GRPC address (host:port). REQUIRED when -coin=tari (the default); ignored for -coin=monero. Env: LEAF_NODE_GRPC_ADDRESS")
@@ -226,8 +234,147 @@ func loadConfig() config {
 	flag.StringVar(&cfg.addressFlagsFile, "address-flags-file", envOr("LEAF_SOLO_ADDRESS_FLAGS_FILE", ""), "path to a local, operator-maintained JSON file of manually banned/forced-minimum-difficulty payment addresses (see internal/leaflib/addressflags.FileSource's doc comment for the file format). Empty (default) disables the feature entirely -- leaf-solo has no backend to poll instead. Env: LEAF_SOLO_ADDRESS_FLAGS_FILE")
 	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_SOLO_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often -address-flags-file is re-read. Ignored if -address-flags-file is unset. Env: LEAF_SOLO_ADDRESS_FLAGS_POLL_INTERVAL")
 
+	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_SOLO_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-solo.example.toml. Env: LEAF_SOLO_CONFIG_FILE")
+
 	flag.Parse()
-	return cfg
+
+	if err := applyConfigFile(&cfg); err != nil {
+		return cfg, err
+	}
+
+	return cfg, nil
+}
+
+// fileConfig mirrors config field-for-field (excluding configFile
+// itself) with pointer types so an absent TOML key decodes to nil and
+// is left untouched by the cfgfile.ApplyXxx helpers below. Durations
+// are represented in the TOML file as a plain integer number of
+// seconds (go-toml/v2 does not natively decode into time.Duration)
+// and converted with time.Duration(v) * time.Second when applied.
+type fileConfig struct {
+	NodeGRPCAddress *string `toml:"node_grpc_address"`
+	ListenAddress   *string `toml:"listen_address"`
+	PayoutAddress   *string `toml:"payout_address"`
+	Network         *string `toml:"network"`
+	Coin            *string `toml:"coin"`
+	MonerodURL      *string `toml:"monerod_url"`
+
+	TrustEnabled   *bool `toml:"trust_enabled"`
+	TrustThreshold *int  `toml:"trust_threshold"`
+	TrustPenalty   *int  `toml:"trust_penalty"`
+	TrustChange    *int  `toml:"trust_change"`
+	TrustMin       *int  `toml:"trust_min"`
+
+	Algo              *string `toml:"algo"`
+	RandomXServiceURL *string `toml:"randomx_service_url"`
+	CoinbaseExtraTag  *string `toml:"coinbase_extra_tag"`
+
+	StartingDifficulty     *uint64 `toml:"starting_difficulty"`
+	PortsRaw               *string `toml:"ports"`
+	MinDifficulty          *uint64 `toml:"min_difficulty"`
+	MaxDifficulty          *uint64 `toml:"max_difficulty"`
+	VardiffTargetTime      *int    `toml:"vardiff_target_time_seconds"`
+	VardiffIntervalSeconds *int    `toml:"vardiff_retarget_interval_seconds"`
+
+	RefreshIntervalSeconds *int `toml:"refresh_interval_seconds"`
+	TipPollIntervalSeconds *int `toml:"tip_poll_interval_seconds"`
+	JobMaxAgeSeconds       *int `toml:"job_max_age_seconds"`
+
+	MaxConnections     *int `toml:"max_connections"`
+	IdleTimeoutSeconds *int `toml:"idle_timeout_seconds"`
+
+	MetricsListenAddress *string `toml:"metrics_listen_address"`
+	MaxAddressLabels     *int    `toml:"max_address_labels"`
+	HideRemoteAddress    *bool   `toml:"hide_remote_address"`
+
+	AddressFlagsFile                *string `toml:"address_flags_file"`
+	AddressFlagsPollIntervalSeconds *int    `toml:"address_flags_poll_interval_seconds"`
+}
+
+// applyConfigFile merges cfg.configFile (if set) into cfg, honoring
+// the flag > env > file > hardcoded-default precedence rule owned by
+// internal/leaflib/cfgfile. It is a no-op when cfg.configFile == "".
+func applyConfigFile(cfg *config) error {
+	if cfg.configFile == "" {
+		return nil
+	}
+
+	visited := cfgfile.VisitedFlags(flag.CommandLine)
+
+	var fc fileConfig
+	if err := cfgfile.Decode(cfg.configFile, &fc); err != nil {
+		return fmt.Errorf("leaf-solo: loading -config %s: %w", cfg.configFile, err)
+	}
+
+	cfgfile.ApplyString(&cfg.nodeGRPCAddress, fc.NodeGRPCAddress, visited, "node-grpc-address", "LEAF_NODE_GRPC_ADDRESS")
+	cfgfile.ApplyString(&cfg.listenAddress, fc.ListenAddress, visited, "listen-address", "LEAF_SOLO_LISTEN_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutAddress, fc.PayoutAddress, visited, "payout-address", "LEAF_SOLO_PAYOUT_ADDRESS")
+	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "LEAF_SOLO_NETWORK")
+	cfgfile.ApplyString(&cfg.coin, fc.Coin, visited, "coin", "LEAF_SOLO_COIN")
+	cfgfile.ApplyString(&cfg.monerodURL, fc.MonerodURL, visited, "monerod-url", "LEAF_SOLO_MONEROD_URL")
+
+	cfgfile.ApplyBool(&cfg.trustEnabled, fc.TrustEnabled, visited, "trust-enabled", "LEAF_SOLO_TRUST_ENABLED")
+	cfgfile.ApplyInt(&cfg.trustThreshold, fc.TrustThreshold, visited, "trust-threshold", "LEAF_SOLO_TRUST_THRESHOLD")
+	cfgfile.ApplyInt(&cfg.trustPenalty, fc.TrustPenalty, visited, "trust-penalty", "LEAF_SOLO_TRUST_PENALTY")
+	cfgfile.ApplyInt(&cfg.trustChange, fc.TrustChange, visited, "trust-change", "LEAF_SOLO_TRUST_CHANGE")
+	cfgfile.ApplyInt(&cfg.trustMin, fc.TrustMin, visited, "trust-min", "LEAF_SOLO_TRUST_MIN")
+
+	cfgfile.ApplyString(&cfg.algo, fc.Algo, visited, "algo", "LEAF_SOLO_ALGO")
+	cfgfile.ApplyString(&cfg.randomXServiceURL, fc.RandomXServiceURL, visited, "randomx-service-url", "LEAF_SOLO_RANDOMX_SERVICE_URL")
+	cfgfile.ApplyString(&cfg.coinbaseExtraTag, fc.CoinbaseExtraTag, visited, "coinbase-extra-tag", "LEAF_SOLO_COINBASE_EXTRA_TAG")
+
+	// startingDifficulty is a special case: the flag is fed by
+	// envOrUint64Fallback with TWO env var names
+	// (LEAF_SOLO_STARTING_DIFFICULTY primary, legacy LEAF_SOLO_DIFFICULTY
+	// fallback) -- a config-file value must not override an explicit
+	// setting of EITHER one, so we build the Source manually (ORing in
+	// the legacy env var) instead of calling cfgfile.ApplyUint64 directly.
+	startingDifficultySrc := cfgfile.FieldSource(visited, "starting-difficulty", "LEAF_SOLO_STARTING_DIFFICULTY")
+	startingDifficultySrc.ExplicitEnv = startingDifficultySrc.ExplicitEnv || os.Getenv("LEAF_SOLO_DIFFICULTY") != ""
+	if fc.StartingDifficulty != nil && cfgfile.ShouldApplyFile(startingDifficultySrc) {
+		cfg.startingDifficulty = *fc.StartingDifficulty
+	}
+
+	cfgfile.ApplyString(&cfg.portsRaw, fc.PortsRaw, visited, "ports", "LEAF_SOLO_PORTS")
+	cfgfile.ApplyUint64(&cfg.minDifficulty, fc.MinDifficulty, visited, "min-difficulty", "LEAF_SOLO_MIN_DIFFICULTY")
+	cfgfile.ApplyUint64(&cfg.maxDifficulty, fc.MaxDifficulty, visited, "max-difficulty", "LEAF_SOLO_MAX_DIFFICULTY")
+	cfgfile.ApplyInt(&cfg.vardiffTargetTime, fc.VardiffTargetTime, visited, "vardiff-target-time", "LEAF_SOLO_VARDIFF_TARGET_TIME")
+
+	if fc.VardiffIntervalSeconds != nil {
+		d := time.Duration(*fc.VardiffIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.vardiffInterval, &d, visited, "vardiff-retarget-interval", "LEAF_SOLO_VARDIFF_RETARGET_INTERVAL")
+	}
+
+	if fc.RefreshIntervalSeconds != nil {
+		d := time.Duration(*fc.RefreshIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.refreshInterval, &d, visited, "refresh-interval", "LEAF_SOLO_REFRESH_INTERVAL")
+	}
+	if fc.TipPollIntervalSeconds != nil {
+		d := time.Duration(*fc.TipPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.tipPollInterval, &d, visited, "tip-poll-interval", "LEAF_SOLO_TIP_POLL_INTERVAL")
+	}
+	if fc.JobMaxAgeSeconds != nil {
+		d := time.Duration(*fc.JobMaxAgeSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.jobMaxAge, &d, visited, "job-max-age", "LEAF_SOLO_JOB_MAX_AGE")
+	}
+
+	cfgfile.ApplyInt(&cfg.maxConnections, fc.MaxConnections, visited, "max-connections", "LEAF_SOLO_MAX_CONNECTIONS")
+	if fc.IdleTimeoutSeconds != nil {
+		d := time.Duration(*fc.IdleTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.idleTimeout, &d, visited, "idle-timeout", "LEAF_SOLO_IDLE_TIMEOUT")
+	}
+
+	cfgfile.ApplyString(&cfg.metricsListenAddress, fc.MetricsListenAddress, visited, "metrics-listen-address", "LEAF_SOLO_METRICS_LISTEN_ADDRESS")
+	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_SOLO_MAX_ADDRESS_LABELS")
+	cfgfile.ApplyBool(&cfg.hideRemoteAddress, fc.HideRemoteAddress, visited, "hide-remote-address", "LEAF_SOLO_HIDE_REMOTE_ADDRESS")
+
+	cfgfile.ApplyString(&cfg.addressFlagsFile, fc.AddressFlagsFile, visited, "address-flags-file", "LEAF_SOLO_ADDRESS_FLAGS_FILE")
+	if fc.AddressFlagsPollIntervalSeconds != nil {
+		d := time.Duration(*fc.AddressFlagsPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.addressFlagsPollInterval, &d, visited, "address-flags-poll-interval", "LEAF_SOLO_ADDRESS_FLAGS_POLL_INTERVAL")
+	}
+
+	return nil
 }
 
 // resolvePorts turns cfg's port configuration into a concrete list of
@@ -460,7 +607,10 @@ func resolveCoinbaseExtraTag(cfg config) string {
 }
 
 func main() {
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("leaf-solo: %v", err)
+	}
 	logger := log.New(os.Stdout, "leaf-solo: ", log.LstdFlags|log.Lmicroseconds)
 
 	if isMoneroCoin(cfg.coin) {

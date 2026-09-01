@@ -98,7 +98,17 @@ func runRetentionRun(args []string) error {
 		return errors.New("retention run: no DSN: pass -dsn or set GCPOOL_DB_DSN")
 	}
 
-	cfg, enabled, err := buildRetentionConfig()
+	// This subcommand deliberately does not go through loadConfig()/
+	// -config (see BRIEF_05_backend.md's scope carve-out for CLI
+	// subcommands) -- it builds just the two fields
+	// buildRetentionConfig actually needs directly from the same
+	// GCPOOL_RETENTION_POLL_INTERVAL/GCPOOL_RETENTION_BLOCKS env vars
+	// the scheduled job itself reads via loadConfig, preserving this
+	// command's existing env-var-only behavior unchanged.
+	retentionCfg, enabled, err := buildRetentionConfig(config{
+		retentionPollInterval: envOrDuration("GCPOOL_RETENTION_POLL_INTERVAL", defaultRetentionPollInterval),
+		retentionBlocks:       envOrInt64("GCPOOL_RETENTION_BLOCKS", 0),
+	})
 	if err != nil {
 		return fmt.Errorf("retention run: %w", err)
 	}
@@ -107,7 +117,7 @@ func runRetentionRun(args []string) error {
 	}
 	if *algo != "" {
 		var narrowed []retention.Target
-		for _, t := range cfg.Targets {
+		for _, t := range retentionCfg.Targets {
 			if t.Algo == *algo && t.PoolType == *poolType {
 				narrowed = append(narrowed, t)
 			}
@@ -115,7 +125,7 @@ func runRetentionRun(args []string) error {
 		if len(narrowed) == 0 {
 			return fmt.Errorf("retention run: no configured retention window for %s/%s", *algo, *poolType)
 		}
-		cfg.Targets = narrowed
+		retentionCfg.Targets = narrowed
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), retentionCLITimeout)
@@ -131,7 +141,7 @@ func runRetentionRun(args []string) error {
 	if !*yes {
 		log.Print("retention run: -yes not set, dry run only -- listing what each target would drop")
 		var wouldDrop, errs int
-		for _, t := range cfg.Targets {
+		for _, t := range retentionCfg.Targets {
 			partitions, err := repo.ListHeightPartitions(ctx, t.Algo, t.PoolType)
 			if err != nil {
 				log.Printf("retention run: %s/%s: listing partitions: %v", t.Algo, t.PoolType, err)
@@ -159,10 +169,10 @@ func runRetentionRun(args []string) error {
 				t.Algo, t.PoolType, frontier, t.RetentionBlocks, cutoff, len(partitions), len(partitions), len(candidates), candidates)
 			wouldDrop += len(candidates)
 		}
-		return fmt.Errorf("retention run: dry run only: would drop %d partition(s) across %d target(s), %d list error(s) (pass -yes to apply)", wouldDrop, len(cfg.Targets), errs)
+		return fmt.Errorf("retention run: dry run only: would drop %d partition(s) across %d target(s), %d list error(s) (pass -yes to apply)", wouldDrop, len(retentionCfg.Targets), errs)
 	}
 
-	runner := retention.New(repo, cfg)
+	runner := retention.New(repo, retentionCfg)
 	result := runner.RunOnce(ctx)
 	for _, tr := range result.Targets {
 		if tr.Err != nil {

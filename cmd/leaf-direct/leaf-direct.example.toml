@@ -1,0 +1,163 @@
+# leaf-direct example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point leaf-direct at
+# a copy of this file (with real values) via -config <path> or
+# LEAF_DIRECT_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var
+# > this file > the hardcoded default shown below.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "30s"), since go-toml/v2 does not natively decode into time.Duration.
+
+# Tari base node GRPC address (host:port); also the primary template-source
+# AND is always included in the multi-node submit set. REQUIRED when
+# -coin=tari (the default); ignored for -coin=monero. (default: "")
+node_grpc_address = ""
+
+# Miner-facing TCP listen address. (default: ":4444")
+listen_address = ":4444"
+
+# Pool payout/coinbase address for fetched block templates. (default: "")
+payout_address = ""
+
+# Network tag for share/block records: mainnet|testnet. (default: "testnet")
+network = "testnet"
+
+# Which coin/PoW family this leaf-direct process serves: tari (default,
+# unchanged behavior) or monero (real MoneroNodeClient against a real monerod
+# JSON-RPC daemon -- see monerod_url). (default: "tari")
+coin = "tari"
+
+# Real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081). REQUIRED
+# when -coin=monero; ignored for -coin=tari. (default: "")
+monerod_url = ""
+
+# Enable the real, legacy-ported probabilistic RandomX-validation-skip
+# mechanism for RXT/RXM shares. Disabled by default. (default: false)
+trust_enabled = false
+
+# Real trust-ramp threshold gate -- 0/unset uses the documented default (10).
+# (default: 0)
+trust_threshold = 0
+
+# Real trust-ramp penalty gate, re-armed after any rejected share -- 0/unset
+# uses the documented default (30). (default: 0)
+trust_penalty = 0
+
+# Real per-accepted-share probability decrement -- 0/unset uses the
+# documented default (1). (default: 0)
+trust_change = 0
+
+# Real probability floor -- 0/unset uses the documented default (20).
+# (default: 0)
+trust_min = 0
+
+# Which single mining algorithm this leaf-direct process serves: sha3x
+# (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/
+# plain RandomX) when -coin=monero. (default: "sha3x")
+algo = "sha3x"
+
+# Real pool payout model stamped onto every share/block forwarded to the
+# backend: pplns|pps|prop|solo. REQUIRED (no safe silent default -- determines
+# real payout accounting semantics). (default: "")
+pool_type = ""
+
+# Real, static, operator-assigned pool-server-source identifier stamped onto
+# every share/block forwarded to the backend. REQUIRED, must be > 0 (no safe
+# silent default). (default: 0)
+pool_id = 0
+
+# RandomX-verification HTTP daemon address (only consulted when -algo=rxt).
+# (default: "http://127.0.0.1:39093")
+randomx_service_url = "http://127.0.0.1:39093"
+
+# Coinbase-extra ownership tag appended to every fetched Tari block template
+# (identifies this leaf's found blocks on-chain). Left unset (the default), a
+# per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 /
+# supportxtm-rxt / supportxtm-rxm, based on algo/coin. When set, this value is
+# used verbatim, overriding the per-algo default. (default: "")
+coinbase_extra_tag = ""
+
+# Starting share difficulty for a newly-connected session. (default: 10000)
+starting_difficulty = 10000
+
+# Comma-separated list of address:difficulty[:desc] port tiers. When unset,
+# listen_address/starting_difficulty are used as a single implicit tier.
+# (default: "")
+ports = ""
+
+# Absolute floor vardiff will never retarget below. (default: 100)
+min_difficulty = 100
+
+# Absolute ceiling vardiff will never retarget above. (default: 1000000000)
+max_difficulty = 1000000000
+
+# Seconds between shares vardiff aims for. (default: 30)
+vardiff_target_time_seconds = 30
+
+# How often each session's own vardiff retarget timer fires, in seconds.
+# (default: 60)
+vardiff_retarget_interval_seconds = 60
+
+# Unconditional block-template refresh interval, in seconds. (default: 30)
+refresh_interval_seconds = 30
+
+# Chain-tip poll interval, in seconds. (default: 5)
+tip_poll_interval_seconds = 5
+
+# Real per-job expiry threshold, independent of tip-invalidation, in seconds.
+# (default: 360)
+job_max_age_seconds = 360
+
+# Max concurrent miner connections, 0 = unlimited. (default: 0)
+max_connections = 0
+
+# Rolling per-connection idle timeout, in seconds. (default: 120)
+idle_timeout_seconds = 120
+
+# HTTP listen address for /metrics. Defaults to loopback-only (127.0.0.1); an
+# operator must explicitly set this to a wildcard/public address to expose it
+# publicly. Empty disables it. (default: "127.0.0.1:9601")
+metrics_listen_address = "127.0.0.1:9601"
+
+# Cap on distinct payment-address labels tracked by metrics (0 = package
+# default). (default: 0)
+max_address_labels = 0
+
+# Omit the "Remote address" column from the stats HTML page entirely --
+# recommended for public-facing deployments. (default: false)
+hide_remote_address = false
+
+# Real backend base URL every validated share/block is forwarded to over
+# HTTP+Protobuf. REQUIRED. (default: "")
+backend_base_url = ""
+
+# Optional shared-secret/bearer auth header name sent with every backend
+# request. (default: "")
+backend_auth_header = ""
+
+# Value for backend_auth_header. (default: "")
+backend_auth_value = ""
+
+# Per-call timeout forwarding a share to the backend, in seconds.
+# (default: 5)
+backend_share_timeout_seconds = 5
+
+# Per-call timeout reporting a found block to the backend, in seconds.
+# (default: 10)
+backend_block_timeout_seconds = 10
+
+# How often the backend's GET /api/v1/leaf/address-flags endpoint is polled
+# for manual ban/forced-minimum-difficulty state, in seconds. (default: 30)
+address_flags_poll_interval_seconds = 30
+
+# Comma-separated list of ADDITIONAL Tari base node GRPC addresses (beyond
+# node_grpc_address, which is always included) to submit a genuine block find
+# to, in real parallel. (default: "")
+submit_nodes = ""
+
+# NATS server URL for the best-effort found-block relay broadcast/resubmit
+# mechanism. Empty (default) fully disables the relay -- a complete no-op,
+# never required. (default: "")
+relay_nats_url = ""
+
+# NATS subject for the relay (empty = relay package default). (default: "")
+relay_subject = ""
