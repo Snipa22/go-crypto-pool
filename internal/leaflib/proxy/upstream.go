@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-xmr-lib/support"
 )
 
 // UpstreamClient is leaf-proxy's real STRATUM CLIENT to an upstream
@@ -111,16 +112,33 @@ type UpstreamConfig struct {
 	Pass  string
 
 	// Agent is the mining-client identifier string sent on login.
-	// This MUST NOT contain the literal substring "xmr-node-proxy" —
-	// live-confirmed against pool.supportxmr.com this session, that
-	// substring (present in the legacy reference's own literal
-	// "xmr-node-proxy/0.0.3") is what a real pool's agent-string
-	// sniffing (nodejs-pool-sxmr's lib/pool.js:
+	// Historically (PR #60, the stopgap this real fix supersedes)
+	// this MUST NOT have contained the literal substring
+	// "xmr-node-proxy" -- live-confirmed against
+	// pool.supportxmr.com, that substring (present in the legacy
+	// reference's own literal "xmr-node-proxy/0.0.3") is what a real
+	// pool's agent-string sniffing (nodejs-pool-sxmr's lib/pool.js:
 	// `agent.includes("xmr-node-proxy")`) uses to grant the
-	// "advanced xmr-node-proxy client" protocol extension — which
+	// "advanced xmr-node-proxy client" protocol extension, which
 	// replaces the ordinary, correctly-sized "blob" job field with a
-	// raw, untrimmed, arbitrarily-large blocktemplate_blob this leaf
-	// has no convert_blob-style reduction step for (see applyJob).
+	// raw, untrimmed, arbitrarily-large blocktemplate_blob.
+	//
+	// NOW THAT applyJob has a real, correct
+	// blocktemplate_blob->hashing-blob conversion path (see applyJob's
+	// doc comment: support.ParseBlockFromTemplateBlob +
+	// support.GetBlockHashingBlob), the agent-string avoidance above
+	// is no longer the ONLY safety mechanism against that dialect --
+	// real conversion now makes it safe even if a pool grants the
+	// advanced dialect regardless of what agent string this leaf
+	// sends. This field's DEFAULT value is deliberately left as PR
+	// #60 set it anyway (defense-in-depth / least surprise: there is
+	// no clear reason to now deliberately court the advanced dialect
+	// by default when the ordinary "blob" dialect is simpler and
+	// already fully supported) -- an operator who explicitly wants
+	// the advanced dialect (e.g. to exercise reserved_offset/
+	// worker-nonce partitioning against a pool that only publishes
+	// it under that dialect) can still opt in by setting this flag to
+	// an agent string containing "xmr-node-proxy" themselves.
 	// Defaults to "go-crypto-pool-leaf-proxy/<version>" — see
 	// cmd/leaf-proxy/main.go.
 	Agent string
@@ -455,6 +473,109 @@ func (uc *UpstreamClient) SubmitShare(ctx context.Context, jobID, nonceHex, resu
 	return true, nil
 }
 
+// convertTemplateBlobTimeout bounds how long
+// convertTemplateBlobToHashingBlob will wait for
+// support.ParseBlockFromTemplateBlob + support.GetBlockHashingBlob to
+// complete before giving up and returning an error -- see that
+// function's doc comment for WHY a timeout, not just a recover, is
+// required. A real, well-formed block template (even a large one,
+// hundreds of transactions) parses in low-single-digit milliseconds;
+// this is a generous multiple of that to avoid any risk of a false
+// timeout on a genuinely slow-but-legitimate call, while still
+// bounding the damage from the known hang described below to a few
+// seconds per malformed input rather than forever.
+const convertTemplateBlobTimeout = 2 * time.Second
+
+// convertTemplateBlobToHashingBlob wraps
+// support.ParseBlockFromTemplateBlob + support.GetBlockHashingBlob
+// with BOTH a panic-recovery net AND a hard wall-clock timeout,
+// converting a raw hex blocktemplate_blob straight into the real,
+// correctly-sized RandomX hashing blob (or a normal error). This is
+// used both by applyJob (converting an upstream pool's
+// freshly-received raw blob) and by template.go's
+// WorkerTemplate.BlobForWorker (re-deriving the hashing blob after
+// patching a worker-nonce into a raw blob's coinbase tx_extra field).
+//
+// GENUINE, CONFIRMED go-xmr-lib v0.2.5 BUG (found and verified this
+// pass, not guessed): serialization.ConstructTXExtra's switch
+// statement over a tx_extra tag byte
+// (go-xmr-lib@v0.2.5/support/serialization/transaction.go:200-215)
+// has NO default case, and none of its four cases (0x00/0x01/0x02/
+// 0x03) advance the `mutable` slice when the byte doesn't match one
+// of them -- so ANY tx_extra region byte that isn't exactly one of
+// those four values causes ParseBlockFromTemplateBlob to spin
+// forever in an infinite loop (NOT a panic -- confirmed via a
+// throwaway reproduction: `for range 1800 sequential garbage bytes`
+// hangs indefinitely; `go test -timeout` is the only thing that ever
+// terminates it). This is a strictly worse failure mode than a panic
+// (recover() cannot help at all), and is highly likely to trigger on
+// ANY sufficiently large arbitrary/malformed/adversarial
+// blocktemplate_blob, since roughly 252/256 possible tag byte values
+// are unhandled. This was NOT fixed in the vendored dependency itself
+// per this repo's own conventions (don't silently patch a third-party
+// module as a workaround for one caller's problem) -- instead, this
+// function bounds the damage with the hard timeout above: on timeout,
+// it returns a normal error (leaving the existing good WorkerTemplate
+// untouched, exactly like any other conversion failure) rather than
+// blocking its caller (and, transitively, this leaf's ability to
+// process new upstream jobs) forever. The spawned goroutine itself
+// CANNOT be forcibly cancelled (Go has no such primitive) and will
+// keep spinning/leaking in the background consuming one CPU core for
+// the lifetime of the process if this bug is ever actually triggered
+// by a live pool -- this is a real, known, accepted limitation of
+// this mitigation, not a complete fix. The proper fix is upstream, in
+// go-xmr-lib itself (add a default case to that switch that returns
+// an error) -- flagging this explicitly here and in this task's final
+// summary rather than guessing at (or silently carrying) a deeper fix
+// within this repo.
+//
+// The recover (for the SEPARATE, panic-based failure modes) is a
+// SAFETY NET on top of the above, not a substitute for checking real
+// error returns: ParseBlockFromTemplateBlob does validate several
+// length invariants via real error returns (serialization.ReadUint
+// on a too-short buffer), and this function still checks and
+// propagates those normally. But some of its OTHER fields (e.g. a
+// corrupt/truncated tx_extra length prefix, or a tx-hash count field
+// that claims far more 32-byte hashes than remain in the buffer) are
+// consumed via direct slicing (blobInBytes[0:val]) rather than a
+// bounds-checked read, which panics with a runtime
+// slice-bounds-out-of-range error on sufficiently malformed/truncated
+// input instead of returning a normal error or hanging. A malformed
+// upstream blocktemplate_blob must never be allowed to crash this
+// leaf's entire process merely because one upstream pool (or a
+// downstream worker-nonce patch landing on an unexpected byte)
+// produced bad bytes -- this recovers from that failure mode and
+// reports it as an ordinary error instead.
+func convertTemplateBlobToHashingBlob(blobHex string) ([]byte, error) {
+	type outcome struct {
+		blob []byte
+		err  error
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		var out outcome
+		defer func() {
+			if r := recover(); r != nil {
+				out = outcome{nil, fmt.Errorf("proxy: recovered from a panic while parsing/converting a blocktemplate_blob (malformed or truncated input): %v", r)}
+			}
+			ch <- out
+		}()
+		parsedBlock, perr := support.ParseBlockFromTemplateBlob(blobHex)
+		if perr != nil {
+			out = outcome{nil, perr}
+			return
+		}
+		hashingBlob, perr := support.GetBlockHashingBlob(parsedBlock)
+		out = outcome{hashingBlob, perr}
+	}()
+	select {
+	case out := <-ch:
+		return out.blob, out.err
+	case <-time.After(convertTemplateBlobTimeout):
+		return nil, fmt.Errorf("proxy: parsing/converting a blocktemplate_blob did not complete within %s -- likely triggered the known go-xmr-lib v0.2.5 ConstructTXExtra infinite-loop bug on malformed tx_extra data (see this function's doc comment); giving up and treating this as a failed conversion rather than blocking forever", convertTemplateBlobTimeout)
+	}
+}
+
 // applyJob converts an UpstreamJobPayload into a *WorkerTemplate,
 // decodes its hex fields, and stores/broadcasts it. Mirrors the
 // reference's handleNewBlockTemplate (proxy.js ~line 706-727):
@@ -462,29 +583,71 @@ func (uc *UpstreamClient) SubmitShare(ctx context.Context, jobID, nonceHex, resu
 // followed by broadcasting a freshly-derived per-worker job to every
 // connected miner.
 //
-// job.BlocktemplateBlob is NEVER used as the outbound miner-facing
-// blob source, even as a fallback — live-confirmed against
-// pool.supportxmr.com this session, that field is the raw, untrimmed,
-// arbitrarily-large (varies with mempool tx count) Monero block
-// template a pool sends ONLY to a client it has recognized (via
-// agent-string sniffing — see cmd/leaf-proxy/main.go's -upstream-agent
-// doc comment) as an "advanced xmr-node-proxy client", and this
-// codebase has no convert_blob-style reduction step to turn it into a
-// real, fixed-size RandomX hashing blob. job.Blob is the ONLY field
-// that is ever a real, correctly-sized RandomX hashing blob on this
-// leaf's supported pools. If job.Blob is empty (e.g. misconfiguration
-// still causing the pool to grant the advanced-client dialect), this
-// refuses to store/broadcast a WorkerTemplate at all, rather than
-// risk forwarding an invalid or oversized blob downstream — see
-// template.go's WorkerTemplate.Blob doc comment.
+// job.BlocktemplateBlob is now the real, correctly-handled conversion
+// path -- per repo maintainer Alex's explicit feedback on PR #60's
+// stopgap ("That means we're not properly re-encoding the blob... The
+// raw blob needs to be passed through the encoder to convert it to a
+// minable blob... There's a helper for that in the library."), a raw
+// blocktemplate_blob is no longer refused: it is run through
+// github.com/Snipa22/go-xmr-lib/support's
+// ParseBlockFromTemplateBlob (parses the raw hex blob into a
+// serialization.Block) followed by GetBlockHashingBlob (serializes
+// just BlockHeader + merkle-root-of-tx-hashes + tx-count-varint --
+// the correctly-sized, ~76-byte RandomX hashing blob real miners
+// need; this is the Go port of cryptonote_format_utils.cpp's
+// get_block_hashing_blob). job.Blob, when present, is still preferred
+// over job.BlocktemplateBlob -- some pools (e.g. pool.supportxmr.com,
+// for an ordinary, non-advanced-client login) publish it directly
+// already correctly sized, requiring no conversion at all. Priority
+// order, mirroring the reference's own "prefer the already-usable
+// field" behavior:
+//
+//   - job.Blob != "": decode it directly as the outbound hashing
+//     blob (unchanged from before this fix). The resulting
+//     WorkerTemplate.RawBlob is nil -- there is no full raw template
+//     to patch worker-nonces into in this case, see template.go's
+//     WorkerTemplate.RawBlob doc comment.
+//   - job.Blob == "" && job.BlocktemplateBlob != "": the real
+//     conversion path described above. On a parse/conversion error
+//     (e.g. genuinely malformed or truncated input), this logs a
+//     clear message and returns WITHOUT touching the currently-stored
+//     template -- mirroring the pre-fix behavior of leaving the
+//     existing good template untouched on bad input, rather than
+//     risk storing/broadcasting a broken one. The resulting
+//     WorkerTemplate.RawBlob is the raw decoded bytes, and
+//     ReservedOffset/ClientNonceOffset become meaningful again (see
+//     WorkerTemplate.BlobForWorker).
+//   - both empty: refuses to store/broadcast a WorkerTemplate at
+//     all, exactly as before this fix -- there is no usable blob at
+//     all in this case.
 func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
-	if job.Blob == "" {
-		uc.logger.Printf("proxy: upstream job carried no usable RandomX hashing blob (blob field empty) — refusing to apply; check -upstream-agent is not identifying this leaf as an advanced xmr-node-proxy client")
-		return
-	}
-	blob, err := hex.DecodeString(job.Blob)
-	if err != nil {
-		uc.logger.Printf("proxy: upstream job carried an unparseable blob, ignoring: %v", err)
+	var (
+		blob    []byte
+		rawBlob []byte
+	)
+	switch {
+	case job.Blob != "":
+		decoded, err := hex.DecodeString(job.Blob)
+		if err != nil {
+			uc.logger.Printf("proxy: upstream job carried an unparseable blob, ignoring: %v", err)
+			return
+		}
+		blob = decoded
+	case job.BlocktemplateBlob != "":
+		decoded, err := hex.DecodeString(job.BlocktemplateBlob)
+		if err != nil {
+			uc.logger.Printf("proxy: upstream job carried an unparseable blocktemplate_blob, ignoring: %v", err)
+			return
+		}
+		hashingBlob, err := convertTemplateBlobToHashingBlob(job.BlocktemplateBlob)
+		if err != nil {
+			uc.logger.Printf("proxy: upstream job's blocktemplate_blob failed to convert to a real RandomX hashing blob (the pool may have sent malformed or truncated data), ignoring: %v", err)
+			return
+		}
+		blob = hashingBlob
+		rawBlob = decoded
+	default:
+		uc.logger.Printf("proxy: upstream job carried no usable blob at all (both blob and blocktemplate_blob empty) — refusing to apply")
 		return
 	}
 	seed, _ := hex.DecodeString(job.SeedHash)
@@ -520,6 +683,7 @@ func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
 
 	t := &WorkerTemplate{
 		Blob:              blob,
+		RawBlob:           rawBlob,
 		ReservedOffset:    reservedOffset,
 		ClientNonceOffset: clientNonceOffset,
 		SeedHash:          seed,
