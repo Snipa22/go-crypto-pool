@@ -48,10 +48,32 @@ import (
 // codebase; leaf-proxy always falls back to writing at reservedOffset
 // in that case, exactly like the legacy "solo" branch above.)
 type WorkerTemplate struct {
-	// Blob is the real, hex-decoded blocktemplate_blob the upstream
-	// pool published for this job (before any worker-nonce has been
-	// written into it).
+	// Blob is the real, correctly-sized RandomX hashing blob for this
+	// job (before any worker-nonce has been written into it) — either
+	// the pool's own already-correctly-sized "blob" field, decoded
+	// directly (ordinary-client dialect), or, when this template was
+	// derived from a raw blocktemplate_blob (advanced-client dialect),
+	// the result of running that raw blob through
+	// support.ParseBlockFromTemplateBlob +
+	// support.GetBlockHashingBlob (see RawBlob below and
+	// upstream.go's applyJob).
 	Blob []byte
+
+	// RawBlob is the full, untrimmed raw blocktemplate_blob bytes for
+	// this template, present ONLY when this template was derived via
+	// the real blocktemplate_blob->hashing-blob conversion path
+	// (applyJob's BlocktemplateBlob branch); nil when the upstream
+	// pool published an already-correctly-sized "blob" field directly
+	// (ordinary-client dialect) -- in that case there is no full raw
+	// template to patch worker-nonces into, so worker-nonce
+	// partitioning falls back to writing directly into the (small)
+	// hashing blob copy, exactly as before this change. See
+	// BlobForWorker for how RawBlob, when present, changes the
+	// worker-nonce-patch strategy (patch the FULL raw blob, then
+	// RE-DERIVE the hashing blob, because a coinbase-tx-affecting
+	// patch changes the merkle root, which is baked into the hashing
+	// blob).
+	RawBlob []byte
 
 	// ReservedOffset is the real, standard GetBlockTemplate
 	// reserved_offset field — published by a Monero-family DAEMON's
@@ -133,15 +155,38 @@ func (t *WorkerTemplate) workerNonceOffset() int {
 // reject rather than silently corrupt/truncate the blob.
 var ErrOffsetOutOfRange = fmt.Errorf("proxy: worker-nonce offset is out of range for this template's blob")
 
-// BlobForWorker returns a FRESH COPY of Blob with workerNonce written,
-// BIG-ENDIAN, as 4 raw bytes, at workerNonceOffset() — ported exactly
-// from the legacy nextBlob's `buffer.writeUInt32BE(nonce, offset)`
-// (Node's Buffer.writeUInt32BE is big-endian). The input template's
-// own Blob is never mutated (mirrors processShare's own
+// BlobForWorker returns a FRESH per-worker hashing blob with
+// workerNonce written, BIG-ENDIAN, as 4 raw bytes, at
+// workerNonceOffset() — ported exactly from the legacy nextBlob's
+// `buffer.writeUInt32BE(nonce, offset)` (Node's Buffer.writeUInt32BE
+// is big-endian). The input template's own Blob/RawBlob are never
+// mutated (mirrors processShare's own
 // `let template = new Buffer(...); blockTemplate.buffer.copy(template)`
 // defensive-copy pattern), so concurrent downstream sessions each
 // requesting a job against the same WorkerTemplate never race on a
 // shared buffer.
+//
+// Two distinct strategies, depending on whether RawBlob is present:
+//
+//   - t.RawBlob != nil (this template was derived via the real
+//     blocktemplate_blob->hashing-blob conversion path — see
+//     upstream.go's applyJob): the worker-nonce offset is meaningful
+//     against the FULL raw blob (reserved_offset/client_nonce_offset
+//     both refer to byte positions within the coinbase transaction's
+//     tx_extra field, which only exists in the full raw blob — the
+//     reduced hashing blob doesn't even contain the coinbase tx's raw
+//     bytes, only a merkle hash derived from it). So: copy RawBlob,
+//     bounds-check, patch the 4 bytes into the COPY, hex-encode it,
+//     re-parse it with support.ParseBlockFromTemplateBlob, and
+//     RE-DERIVE the hashing blob with support.GetBlockHashingBlob
+//     (changing the coinbase tx bytes changes the merkle root, which
+//     is part of the hashing blob, so the old Blob value is stale
+//     the moment RawBlob is patched). That freshly re-derived hashing
+//     blob is what's returned — never the raw blob itself.
+//   - t.RawBlob == nil (the upstream pool published an
+//     already-correctly-sized "blob" field directly — ordinary-client
+//     dialect): keep the exact existing behavior, patching directly
+//     into a copy of Blob.
 //
 // If workerNonceOffset() is -1 (neither ClientNonceOffset nor
 // ReservedOffset was published by the upstream — the REAL, confirmed
@@ -161,6 +206,41 @@ var ErrOffsetOutOfRange = fmt.Errorf("proxy: worker-nonce offset is out of range
 // data corruption.
 func (t *WorkerTemplate) BlobForWorker(workerNonce uint32) ([]byte, error) {
 	offset := t.workerNonceOffset()
+
+	// The real conversion path only applies when there is BOTH a raw
+	// blob to patch AND an offset to patch it at -- if RawBlob is nil
+	// (ordinary-client dialect) OR offset is -1 (upstream published
+	// neither ReservedOffset nor ClientNonceOffset, RawBlob or not),
+	// there is nothing to patch into the raw blob, so this falls
+	// through to the exact pre-existing Blob-only behavior below,
+	// which already returns an unmodified copy of Blob when offset is
+	// -1 -- Blob already holds the correct (unpatched) hashing blob
+	// derived from RawBlob at applyJob time in that case, so no
+	// re-parse/re-derive is needed.
+	if t.RawBlob != nil && offset >= 0 {
+		if offset+4 > len(t.RawBlob) {
+			return nil, fmt.Errorf("%w: offset=%d blob_len=%d", ErrOffsetOutOfRange, offset, len(t.RawBlob))
+		}
+		rawOut := make([]byte, len(t.RawBlob))
+		copy(rawOut, t.RawBlob)
+		binary.BigEndian.PutUint32(rawOut[offset:offset+4], workerNonce)
+
+		// convertTemplateBlobToHashingBlob (upstream.go) re-parses
+		// the patched raw blob and re-derives the hashing blob via
+		// support.ParseBlockFromTemplateBlob +
+		// support.GetBlockHashingBlob, wrapped in a panic-recovery
+		// net -- see that function's doc comment for why the
+		// recovery is needed even though the pre-patch RawBlob was
+		// already validated by applyJob (a worker-nonce patch
+		// landing on an unexpected byte, e.g. a pool-misreported
+		// offset, must not be able to crash this process either).
+		hashingBlob, err := convertTemplateBlobToHashingBlob(hex.EncodeToString(rawOut))
+		if err != nil {
+			return nil, fmt.Errorf("proxy: re-deriving hashing blob from worker-nonce-patched raw blocktemplate_blob: %w", err)
+		}
+		return hashingBlob, nil
+	}
+
 	out := make([]byte, len(t.Blob))
 	copy(out, t.Blob)
 	if offset < 0 {
