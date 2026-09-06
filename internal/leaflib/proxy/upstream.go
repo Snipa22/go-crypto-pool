@@ -110,14 +110,19 @@ type UpstreamConfig struct {
 	Login string
 	Pass  string
 
-	// Agent is the real "advanced mining client" identifier string
-	// sent on login — this is literally what the legacy reference
-	// used (`xmr-node-proxy/0.0.3`) and, on pools that implement the
-	// extension, is how a pool recognizes an aggregating proxy client
-	// and grants it the worker_offset/client_nonce_offset extranonce
-	// partitioning fields (see protocol.go's UpstreamJobPayload doc
-	// comment). Defaults to "go-crypto-pool-leaf-proxy/<version>" —
-	// see cmd/leaf-proxy/main.go.
+	// Agent is the mining-client identifier string sent on login.
+	// This MUST NOT contain the literal substring "xmr-node-proxy" —
+	// live-confirmed against pool.supportxmr.com this session, that
+	// substring (present in the legacy reference's own literal
+	// "xmr-node-proxy/0.0.3") is what a real pool's agent-string
+	// sniffing (nodejs-pool-sxmr's lib/pool.js:
+	// `agent.includes("xmr-node-proxy")`) uses to grant the
+	// "advanced xmr-node-proxy client" protocol extension — which
+	// replaces the ordinary, correctly-sized "blob" job field with a
+	// raw, untrimmed, arbitrarily-large blocktemplate_blob this leaf
+	// has no convert_blob-style reduction step for (see applyJob).
+	// Defaults to "go-crypto-pool-leaf-proxy/<version>" — see
+	// cmd/leaf-proxy/main.go.
 	Agent string
 
 	DialTimeout    time.Duration
@@ -456,12 +461,28 @@ func (uc *UpstreamClient) SubmitShare(ctx context.Context, jobID, nonceHex, resu
 // `pool.activeBlocktemplate = new pool.coinFuncs.MasterBlockTemplate(blockTemplate)`
 // followed by broadcasting a freshly-derived per-worker job to every
 // connected miner.
+//
+// job.BlocktemplateBlob is NEVER used as the outbound miner-facing
+// blob source, even as a fallback — live-confirmed against
+// pool.supportxmr.com this session, that field is the raw, untrimmed,
+// arbitrarily-large (varies with mempool tx count) Monero block
+// template a pool sends ONLY to a client it has recognized (via
+// agent-string sniffing — see cmd/leaf-proxy/main.go's -upstream-agent
+// doc comment) as an "advanced xmr-node-proxy client", and this
+// codebase has no convert_blob-style reduction step to turn it into a
+// real, fixed-size RandomX hashing blob. job.Blob is the ONLY field
+// that is ever a real, correctly-sized RandomX hashing blob on this
+// leaf's supported pools. If job.Blob is empty (e.g. misconfiguration
+// still causing the pool to grant the advanced-client dialect), this
+// refuses to store/broadcast a WorkerTemplate at all, rather than
+// risk forwarding an invalid or oversized blob downstream — see
+// template.go's WorkerTemplate.Blob doc comment.
 func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
-	blobHex := job.BlocktemplateBlob
-	if blobHex == "" {
-		blobHex = job.Blob
+	if job.Blob == "" {
+		uc.logger.Printf("proxy: upstream job carried no usable RandomX hashing blob (blob field empty) — refusing to apply; check -upstream-agent is not identifying this leaf as an advanced xmr-node-proxy client")
+		return
 	}
-	blob, err := hex.DecodeString(blobHex)
+	blob, err := hex.DecodeString(job.Blob)
 	if err != nil {
 		uc.logger.Printf("proxy: upstream job carried an unparseable blob, ignoring: %v", err)
 		return

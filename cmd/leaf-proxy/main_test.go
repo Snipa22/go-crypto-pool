@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -271,4 +272,28 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			runPrecedenceCase(t, tc)
 		})
 	}
+}
+
+// TestLoadConfig_DefaultUpstreamAgentDoesNotIdentifyAsXMRNodeProxy is
+// required test 3 from the brief: the default -upstream-agent /
+// LEAF_PROXY_UPSTREAM_AGENT value must NOT contain the literal
+// substring "xmr-node-proxy" -- live-confirmed against
+// pool.supportxmr.com that substring is exactly what flips the pool
+// into its incompatible "advanced xmr-node-proxy client" dialect
+// (raw, untrimmed blocktemplate_blob instead of the ordinary,
+// correctly-sized blob field), which is what caused leaf-proxy to
+// relay an oversized blob to downstream xmrig miners (login error
+// code: 4).
+func TestLoadConfig_DefaultUpstreamAgentDoesNotIdentifyAsXMRNodeProxy(t *testing.T) {
+	runPrecedenceCase(t, precedenceCase{
+		name: "upstream-agent/default-does-not-contain-xmr-node-proxy",
+		check: func(t *testing.T, cfg config) {
+			if strings.Contains(cfg.upstreamAgent, "xmr-node-proxy") {
+				t.Errorf("default upstreamAgent = %q, must NOT contain the substring %q (see this test's doc comment)", cfg.upstreamAgent, "xmr-node-proxy")
+			}
+			if cfg.upstreamAgent == "" {
+				t.Error("default upstreamAgent must not be empty")
+			}
+		},
+	})
 }
