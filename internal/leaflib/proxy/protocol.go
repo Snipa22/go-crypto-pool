@@ -65,9 +65,20 @@ type (
 // unsolicited "job" method push (handleNewBlockTemplate) — all three
 // carry an object with these same keys in the real protocol.
 type UpstreamJobPayload struct {
-	JobID             string `json:"job_id,omitempty"`
+	JobID string `json:"job_id,omitempty"`
+	// BlocktemplateBlob is decoded/kept ONLY for visibility/logging/
+	// tests -- it must NEVER feed the outbound miner-facing blob path.
+	// Live-confirmed against pool.supportxmr.com this session: this
+	// field is the raw, untrimmed, arbitrarily-large (varies with
+	// mempool tx count -- observed 552-1800+ bytes) real Monero block
+	// template, sent ONLY when the pool has recognized this leaf's
+	// login agent string as an "advanced xmr-node-proxy client" (see
+	// cmd/leaf-proxy/main.go's -upstream-agent doc comment); it is
+	// NEVER a valid, fixed-size RandomX hashing blob, and this
+	// codebase has no convert_blob-style reduction step to make it
+	// one. See upstream.go's applyJob for the enforcement point.
 	BlocktemplateBlob string `json:"blocktemplate_blob,omitempty"`
-	Blob              string `json:"blob,omitempty"` // some pools (e.g. pool.supportxmr.com) key the same field as "blob" instead of "blocktemplate_blob" -- see UpstreamJobPayload doc comment
+	Blob              string `json:"blob,omitempty"` // the ONLY field applyJob uses as the outbound miner-facing blob source -- some pools (e.g. pool.supportxmr.com, for an ordinary, non-advanced-client login) key it "blob" instead of "blocktemplate_blob"; already the correct, fixed-size RandomX hashing blob (76 bytes/152 hex chars observed) -- see UpstreamJobPayload doc comment
 	Difficulty        uint64 `json:"difficulty"`
 	Height            uint64 `json:"height"`
 	ReservedOffset    *int   `json:"reserved_offset,omitempty"`     // pointer: distinguishes "genuinely offset 0" from "not published at all" -- CONFIRMED not published by pool.supportxmr.com's real job responses (see this pass's live smoke test capture)

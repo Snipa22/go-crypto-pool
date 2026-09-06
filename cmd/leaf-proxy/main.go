@@ -108,24 +108,31 @@ func loadConfig() (config, error) {
 	flag.BoolVar(&cfg.upstreamInsecure, "upstream-tls-insecure-skip-verify", envOrBool("LEAF_PROXY_UPSTREAM_TLS_INSECURE_SKIP_VERIFY", false), "skip TLS certificate verification for the upstream pool (testing only). Env: LEAF_PROXY_UPSTREAM_TLS_INSECURE_SKIP_VERIFY")
 	flag.StringVar(&cfg.upstreamLogin, "upstream-login", envOr("LEAF_PROXY_UPSTREAM_LOGIN", ""), "real XMR payout address to log in to the upstream pool with. Env: LEAF_PROXY_UPSTREAM_LOGIN")
 	flag.StringVar(&cfg.upstreamPass, "upstream-pass", envOr("LEAF_PROXY_UPSTREAM_PASS", "go-crypto-pool-leaf-proxy"), "real upstream pool worker identifier/password. Env: LEAF_PROXY_UPSTREAM_PASS")
-	// Default agent string deliberately contains the literal substring
-	// "xmr-node-proxy" -- confirmed from the real pool-server source
-	// (nodejs-pool-sxmr's lib/pool.js: `if (agent &&
+	// Default agent string deliberately does NOT contain the literal
+	// substring "xmr-node-proxy". Confirmed from the real pool-server
+	// source (nodejs-pool-sxmr's lib/pool.js: `if (agent &&
 	// agent.includes("xmr-node-proxy")) { this.proxy = true; }`, a
-	// plain substring check, not an exact-version match) this is what
-	// actually gates a real pool granting the advanced-client
-	// reserved_offset/client_nonce_offset extension. Confirmed live
-	// against pool.supportxmr.com: the exact legacy string
-	// "xmr-node-proxy/0.0.3" gets reserved_offset=171,
-	// client_nonce_offset_present=true; a string that does NOT contain
-	// this substring gets neither (reserved_offset=-1) -- the pool
-	// falls back to treating the connection as an ordinary,
-	// non-advanced client, and leaf-proxy's own WorkerTemplate
-	// correctly degrades to an unmodified-blob fallback in that case
-	// (see internal/leaflib/proxy/template.go), but that fallback is
-	// no longer the expected default path now that the real substring
-	// is included here.
-	flag.StringVar(&cfg.upstreamAgent, "upstream-agent", envOr("LEAF_PROXY_UPSTREAM_AGENT", fmt.Sprintf("xmr-node-proxy/go-crypto-pool-%s", version)), "advanced-mining-client agent string sent on upstream login -- MUST contain the literal substring \"xmr-node-proxy\" for pools using this real, confirmed detection convention (nodejs-pool-sxmr's lib/pool.js) to grant the reserved_offset/client_nonce_offset worker-partitioning extension. Env: LEAF_PROXY_UPSTREAM_AGENT")
+	// plain substring check, not an exact-version match), that
+	// substring is what gates a real pool granting the "advanced
+	// xmr-node-proxy client" protocol extension. Live-confirmed
+	// against pool.supportxmr.com this session: an agent string
+	// containing that substring (e.g. the legacy "xmr-node-proxy/0.0.3")
+	// flips the pool into publishing ONLY a raw, untrimmed
+	// blocktemplate_blob field (arbitrarily large, varying with
+	// mempool tx count -- NEVER a valid RandomX hashing blob, and this
+	// codebase has no convert_blob-style reduction step for it), with
+	// no ordinary "blob" field at all -- this is what previously
+	// caused leaf-proxy to relay an oversized blob to downstream
+	// xmrig miners (login error code: 4). An agent string that does
+	// NOT contain the substring gets the ordinary, correctly-sized
+	// "blob" field instead (76 bytes/152 hex chars observed), which is
+	// what this leaf actually needs since it has no advanced-client
+	// blob-reduction support. Keep this configurable -- an operator
+	// pointing at a pool that genuinely requires the extension (and
+	// where convert_blob support is added later) can still opt back in
+	// via this flag/env var -- but the DEFAULT must stay a plain,
+	// ordinary-client identifier.
+	flag.StringVar(&cfg.upstreamAgent, "upstream-agent", envOr("LEAF_PROXY_UPSTREAM_AGENT", "go-crypto-pool-leaf-proxy/1.0"), "mining-client agent string sent on upstream login -- MUST NOT contain the literal substring \"xmr-node-proxy\" (see this flag's doc comment) unless this codebase gains real convert_blob-style blocktemplate_blob reduction support; that substring opts this leaf into a pool's advanced-client protocol dialect this leaf cannot safely consume yet. Env: LEAF_PROXY_UPSTREAM_AGENT")
 
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_PROXY_LISTEN_ADDRESS", ":5555"), "downstream miner-facing TCP listen address. Env: LEAF_PROXY_LISTEN_ADDRESS")
 	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_PROXY_STARTING_DIFFICULTY", 10000), "starting downstream share difficulty; vardiff adjusts it from here. Env: LEAF_PROXY_STARTING_DIFFICULTY")
