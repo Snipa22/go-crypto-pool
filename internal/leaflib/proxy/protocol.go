@@ -173,3 +173,19 @@ type UpstreamLoginParams struct {
 	Pass  string `json:"pass"`
 	Agent string `json:"agent"`
 }
+
+// UpstreamKeepaliveParams is the real "keepalived" request's params
+// shape sent TO the upstream pool (proxy.js's Pool.sendData, ~line
+// 240-258): once logged in, `params.id = this.id` injects the
+// pool-assigned session id into the params of EVERY subsequent
+// sendData call, including keepalived (and submit -- see
+// UpstreamSubmitParams; login itself predates having an id, see
+// UpstreamLoginParams). Before a session id is known (should not
+// happen in practice -- upstream.go's sendKeepalive is only ever
+// wired up after a successful login has already populated
+// uc.sessionID), an empty params object is sent instead, matching
+// sendData's own `if (typeof params === 'undefined') params = {};`
+// fallback.
+type UpstreamKeepaliveParams struct {
+	ID string `json:"id,omitempty"`
+}

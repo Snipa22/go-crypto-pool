@@ -37,6 +37,18 @@ import (
 // callers. Also not ported: the legacy's cluster/worker multi-process
 // fan-out (this Go process handles every downstream connection in one
 // process via goroutines, same model as leaf-solo).
+//
+// PORTED (this pass): the reference's 30-second `keepalived`
+// heartbeat (proxy.js ~line 672: `setInterval(pool.heartbeat,
+// 30000)`, installed right after a successful login). Real pools
+// (confirmed against pool.supportxmr.com) enforce their own
+// server-side idle-connection timeout well under this leaf's local
+// IdleTimeout/2m default, silently tearing down an otherwise-healthy
+// socket with a clean read-EOF during quiet periods between jobs;
+// without this heartbeat that surfaces as constant, unnecessary
+// reconnect churn (see heartbeatLoop/sendKeepalive below, and
+// dialAndLogin/readLoop's doc comments for how a heartbeat goroutine
+// is started/stopped exactly once per connection generation).
 type UpstreamClient struct {
 	cfg    UpstreamConfig
 	logger *log.Logger
@@ -53,7 +65,17 @@ type UpstreamClient struct {
 	// (re)connect (dialAndLogin, which replaces both after a fresh
 	// dial+login) and Close (which reads both to tear them down) —
 	// both can run concurrently in practice via reconnectLoop racing
-	// an operator-triggered Close.
+	// an operator-triggered Close. ALSO guards the closed/heartbeatWG
+	// hand-off below (dialAndLogin's "is this client already
+	// closing, should I even bother starting a heartbeat" check, and
+	// Close's own close(uc.closed)) for the same reason: without a
+	// shared lock serializing "check closed, then Add" against
+	// "close(closed), then Wait", heartbeatWG.Add could race with
+	// heartbeatWG.Wait in the narrow window where a reconnect's
+	// login finishes concurrently with an operator Close — a real
+	// sync.WaitGroup contract violation ("Add ... must happen before
+	// Wait"), not just a benign race. Locking cmMu around both sides
+	// of that decision makes them strictly ordered instead.
 	cmMu sync.Mutex
 	cm   *leaflib.ConnectionManager
 	mc   *leaflib.ManagedConnection
@@ -73,6 +95,16 @@ type UpstreamClient struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+
+	// heartbeatWG tracks every heartbeatLoop goroutine ever started
+	// (one per connection generation that successfully logged in --
+	// see dialAndLogin) so Close can genuinely wait for all of them
+	// to exit before returning, rather than merely signalling them
+	// to stop and trusting they will promptly. This is what makes
+	// "no heartbeat goroutine outlives Close()" a real, synchronized
+	// guarantee instead of a race — see cmMu's doc comment above for
+	// how Add/Wait are kept from racing with each other.
+	heartbeatWG sync.WaitGroup
 
 	// connected/reconnects back UpstreamHealth (see server.go's
 	// UpstreamHealth interface doc comment): connected reflects
@@ -165,6 +197,17 @@ func (cfg UpstreamConfig) normalized() UpstreamConfig {
 	return out
 }
 
+// upstreamHeartbeatInterval is how often heartbeatLoop sends a
+// keepalived request to the upstream pool once logged in --
+// hardcoded to exactly match the reference's
+// `setInterval(pool.heartbeat, 30000)` (proxy.js ~line 672), an
+// empirically-tuned value, not something this leaf should re-guess
+// or expose as an operator-configurable UpstreamConfig field/flag. A
+// `var`, not a `const`, purely so a test in this package can lower
+// it via a t.Cleanup save/restore for fast, deterministic testing;
+// production always runs with this exact 30s value.
+var upstreamHeartbeatInterval = 30 * time.Second
+
 // NewUpstreamClient constructs an UpstreamClient. Call Connect to
 // actually dial and log in.
 func NewUpstreamClient(cfg UpstreamConfig, logger *log.Logger) *UpstreamClient {
@@ -211,15 +254,37 @@ func (uc *UpstreamClient) Connect(ctx context.Context) error {
 // after uc.mc is assigned (under cmMu) and BEFORE login() is called,
 // rather than by callers after dialAndLogin returns. To avoid a
 // duplicate/uncoordinated readLoop goroutine when THIS login attempt
-// itself fails (dialAndLogin closes mc/cm below, which makes this
-// same readLoop's scanner terminate too), readLoop is told via
-// loggedIn whether login for this exact connection ever actually
-// succeeded: if not, it exits quietly instead of invoking
+// itself fails (dialAndLogin closes mc/cm on login failure, which is
+// what makes this same readLoop's scanner terminate too), readLoop is
+// told via loggedIn whether login for this exact connection ever
+// actually succeeded: if not, it exits quietly instead of invoking
 // reconnectLoop itself — that failure is already being surfaced as
 // this function's own return value, to whichever caller (Connect, or
 // reconnectLoop's own retry-with-backoff loop) is driving this
 // attempt, so a second, independent reconnectLoop invocation from
 // inside readLoop would be a real duplicate.
+//
+// stopHeartbeat is this connection generation's own heartbeat-stop
+// channel, created here (unconditionally, alongside loggedIn, before
+// readLoop is even started) and handed to readLoop so it can close it
+// exactly once when this generation's scanner loop ends, for ANY
+// reason (see readLoop's doc comment). The heartbeatLoop goroutine
+// itself is only actually started below, after loggedIn.Store(true)
+// — i.e. only once login has genuinely succeeded — so a login
+// failure never starts a heartbeat in the first place; readLoop
+// still closes stopHeartbeat in that case too, which is harmless
+// (nothing is listening on it yet) and keeps readLoop as the single,
+// unconditional owner of the close call rather than needing a second
+// "was it actually started" flag threaded through as well. See the
+// caveat above ManagedConnection.Context (connection.go) for why this
+// is a fresh plain channel per generation rather than something
+// derived from mc.Context().
+//
+// The heartbeat is started only under cmMu, after re-checking
+// uc.closed — see cmMu's doc comment above for why: this is what
+// keeps heartbeatWG.Add (here) from ever racing with
+// heartbeatWG.Wait (Close) when a reconnect's login happens to
+// finish concurrently with an operator-triggered Close.
 func (uc *UpstreamClient) dialAndLogin(ctx context.Context) error {
 	addr := fmt.Sprintf("%s:%d", uc.cfg.Host, uc.cfg.Port)
 	dialer := &net.Dialer{Timeout: uc.cfg.DialTimeout}
@@ -251,7 +316,8 @@ func (uc *UpstreamClient) dialAndLogin(ctx context.Context) error {
 	uc.cmMu.Unlock()
 
 	loggedIn := &atomic.Bool{}
-	go uc.readLoop(mc, loggedIn)
+	stopHeartbeat := make(chan struct{})
+	go uc.readLoop(mc, loggedIn, stopHeartbeat)
 
 	if _, err := uc.login(ctx); err != nil {
 		_ = mc.Close("upstream login failed")
@@ -259,6 +325,24 @@ func (uc *UpstreamClient) dialAndLogin(ctx context.Context) error {
 		return err
 	}
 	loggedIn.Store(true)
+
+	uc.cmMu.Lock()
+	select {
+	case <-uc.closed:
+		// The client was explicitly Closed while this login was
+		// in flight -- Close has already (or is about to)
+		// tear this connection down and call heartbeatWG.Wait;
+		// starting a heartbeat now would both be pointless and
+		// risk the Add-after-Wait misuse cmMu's doc comment
+		// describes. Skip it; login itself genuinely succeeded,
+		// so this is still not an error.
+		uc.cmMu.Unlock()
+		return nil
+	default:
+	}
+	uc.heartbeatWG.Add(1)
+	uc.cmMu.Unlock()
+	go uc.heartbeatLoop(stopHeartbeat)
 	return nil
 }
 
@@ -313,21 +397,31 @@ func (uc *UpstreamClient) Connected() bool { return uc.connected.Load() }
 // Connect is NOT counted) — implements server.go's UpstreamHealth.
 func (uc *UpstreamClient) ReconnectCount() uint64 { return uc.reconnects.Load() }
 
-// Close tears down the upstream connection.
+// Close tears down the upstream connection. Also waits (via
+// heartbeatWG) for every heartbeatLoop goroutine ever started to
+// have genuinely exited before returning — not just signalled to
+// stop — so callers (and this package's own goroutine-leak
+// regression test) can rely on "Close returned" meaning "no
+// heartbeat ticker is still running", not merely "one was asked to
+// stop". uc.closed is closed under cmMu (matching dialAndLogin's own
+// cmMu-guarded check before Add) specifically so that check-then-Add
+// there can never race with this close-then-Wait — see cmMu's doc
+// comment for the full reasoning.
 func (uc *UpstreamClient) Close() error {
 	var err error
 	uc.closeOnce.Do(func() {
-		close(uc.closed)
-		uc.connected.Store(false)
 		uc.cmMu.Lock()
+		close(uc.closed)
 		mc, cm := uc.mc, uc.cm
 		uc.cmMu.Unlock()
+		uc.connected.Store(false)
 		if mc != nil {
 			err = mc.Close("upstream client closed")
 		}
 		if cm != nil {
 			cm.Shutdown()
 		}
+		uc.heartbeatWG.Wait()
 	})
 	return err
 }
@@ -471,6 +565,90 @@ func (uc *UpstreamClient) SubmitShare(ctx context.Context, jobID, nonceHex, resu
 		return false, fmt.Errorf("proxy: upstream pool rejected submit: %s", resp.Error.Message)
 	}
 	return true, nil
+}
+
+// sendKeepalive sends a real "keepalived" request to the upstream
+// pool through the existing send/nextID plumbing -- ported from the
+// reference's Pool.heartbeat/sendData (proxy.js ~line 235-258):
+// `this.heartbeat = function(){ if (this.keepAlive){
+// this.sendData('keepalived'); } }`. Params mirror sendData's own
+// post-login `params.id = this.id` injection (see
+// UpstreamKeepaliveParams's doc comment) -- {"id": uc.sessionID} once
+// one is known, or an empty params object otherwise.
+//
+// A successful keepalived response IS a real, correlated
+// request/response round-trip through uc.send/uc.pending (it gets a
+// real id via the same nextID sequence as login/submit, and IS
+// looked up there) -- but the reference's handlePoolMessage
+// (proxy.js ~line 675-704) has no `case 'keepalived'` at all, so a
+// successful result is silently discarded there. Mirroring that: any
+// non-nil error from uc.send here (a response timeout, a write
+// failure, or an upstream error response) is logged and otherwise
+// ignored -- never propagated as fatal, never used to trigger a
+// reconnect from this call. Genuine connection death is already
+// detected independently by readLoop's own scanner loop terminating
+// and handing off to reconnectLoop; a slow/failed keepalive response
+// by itself is not evidence of that and must not be overfit into
+// meaning it is.
+func (uc *UpstreamClient) sendKeepalive(ctx context.Context) error {
+	var params json.RawMessage
+	if uc.sessionID != "" {
+		p, err := json.Marshal(UpstreamKeepaliveParams{ID: uc.sessionID})
+		if err != nil {
+			uc.logger.Printf("proxy: upstream keepalive failed: %v", err)
+			return err
+		}
+		params = p
+	} else {
+		params = json.RawMessage("{}")
+	}
+	req := Request{ID: uc.nextID(), JsonRPC: "2.0", Method: "keepalived", Params: params}
+	if _, err := uc.send(ctx, req); err != nil {
+		uc.logger.Printf("proxy: upstream keepalive failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+// heartbeatLoop is the goroutine body started by dialAndLogin
+// immediately after a successful login (loggedIn.Store(true)) --
+// ported from the reference's on-connect handler installing
+// `setInterval(pool.heartbeat, 30000)` right after `pool.login()`
+// (proxy.js ~line 672). It fires sendKeepalive every
+// upstreamHeartbeatInterval (a bounded uc.cfg.RequestTimeout context
+// per call, so one slow/hung keepalive can't stall the ticker
+// indefinitely) until stop is closed -- this connection generation's
+// own heartbeat-stop channel, closed by readLoop the moment its
+// scanner loop ends for any reason, see readLoop's doc comment -- or,
+// as a secondary/backstop signal for the explicit-Close case,
+// uc.closed fires. stop is deliberately a plain per-generation
+// channel rather than something derived from mc.Context(): see the
+// caveat above ManagedConnection.Context (connection.go) -- a plain
+// remote EOF does not reliably cancel that context, only an explicit
+// mc.Close()/ConnectionManager.Shutdown() does, which would leave
+// this ticker running (and leak one per reconnect generation) well
+// past the point its connection is actually dead.
+//
+// Callers Add(1) to uc.heartbeatWG before starting this goroutine
+// (dialAndLogin, under cmMu); this defers the matching Done() so
+// Close's heartbeatWG.Wait() genuinely observes this goroutine has
+// exited, not merely that it was asked to.
+func (uc *UpstreamClient) heartbeatLoop(stop <-chan struct{}) {
+	defer uc.heartbeatWG.Done()
+	ticker := time.NewTicker(upstreamHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), uc.cfg.RequestTimeout)
+			_ = uc.sendKeepalive(ctx)
+			cancel()
+		case <-stop:
+			return
+		case <-uc.closed:
+			return
+		}
+	}
 }
 
 // convertTemplateBlobTimeout bounds how long
@@ -765,7 +943,19 @@ func targetHexToDifficulty(targetHex string) (uint64, error) {
 //     dead code, so a real connection loss previously left the
 //     client permanently down with no automatic recovery and a stuck
 //     Connected()==true reading.)
-func (uc *UpstreamClient) readLoop(mc *leaflib.ManagedConnection, loggedIn *atomic.Bool) {
+//
+// stopHeartbeat is this same generation's heartbeat-stop channel
+// (see dialAndLogin's doc comment) — the scanner loop ending is the
+// ONLY place that currently knows, generation-precisely, "this
+// specific connection attempt is over" for any reason (explicit
+// Close, remote EOF, or a login failure that never started a
+// heartbeat at all), so readLoop closes it here, exactly once, as
+// the very first action after the loop ends and before any of the
+// existing closed/loggedIn checks below — this is what stops the
+// 30s heartbeat ticker (heartbeatLoop) for this generation promptly
+// on a real remote EOF, which mc.Context().Done() alone would not
+// do reliably (see connection.go's Context doc comment).
+func (uc *UpstreamClient) readLoop(mc *leaflib.ManagedConnection, loggedIn *atomic.Bool, stopHeartbeat chan struct{}) {
 	scanner := bufio.NewScanner(mc)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	for scanner.Scan() {
@@ -775,6 +965,15 @@ func (uc *UpstreamClient) readLoop(mc *leaflib.ManagedConnection, loggedIn *atom
 		}
 		uc.handleLine(line)
 	}
+
+	// This generation's connection is over, for any reason -- stop
+	// its heartbeat ticker (if one was ever started; closing an
+	// unstarted heartbeat's channel is harmless, see dialAndLogin's
+	// doc comment). readLoop is the single, unconditional owner of
+	// this close: it runs exactly once per generation (one readLoop
+	// goroutine per dialAndLogin call, whose scanner loop can only
+	// end once), so no sync.Once/extra guarding is needed here.
+	close(stopHeartbeat)
 
 	select {
 	case <-uc.closed:
