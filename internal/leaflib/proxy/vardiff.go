@@ -51,7 +51,16 @@ func (s *Session) maybeRetarget() {
 
 	s.currentDifficulty.Store(newDiff)
 
-	job, err := s.server.jobs.NextJob(newDiff)
+	// Routed through currentJob (session.go) rather than
+	// s.server.jobs.NextJob directly -- see currentJob's own doc
+	// comment. In practice this call will almost always mint a
+	// genuinely fresh job anyway, since leaflib.ComputeRetarget only
+	// reports changed=true when the difficulty genuinely changed
+	// (matching XNP's own !miner.newDiff gate: a real retarget always
+	// forces a new job) -- but going through currentJob here too
+	// keeps a single, consistent code path across every production
+	// job-issuance call site, at no cost.
+	job, err := s.currentJob(newDiff)
 	if err != nil {
 		s.server.logger.Printf("proxy: vardiff retarget for session %s failed to build a new job: %v", s.sessionID, err)
 		return
