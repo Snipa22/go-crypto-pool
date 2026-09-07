@@ -339,6 +339,18 @@ func TestSession_LoginGetJobSubmit_FullFlow(t *testing.T) {
 	}
 }
 
+// TestSession_ShareBelowBlockTarget_CreditedLocallyNotForwarded is
+// THE CORE REGRESSION TEST for
+// fix/leaf-proxy-gate-randomx-verify-on-target: a share whose claimed
+// difficulty is ABOVE the session's own StaticDifficulty but BELOW
+// job.UpstreamShareDiff (the common "accepted locally, not forwarded
+// upstream" case) must now be credited WITHOUT ever calling the real,
+// expensive RandomX re-validation (fakeValidator.callCount() == 0) --
+// see randomx_puregolang.go's documented contract and handleSubmit's
+// own doc comment. Before this fix, this exact case called the
+// validator too (callCount() == 1) and simply discarded the result
+// once the upstream-forward decision was made -- this assertion is
+// the literal proof that expensive call is now genuinely skipped.
 func TestSession_ShareBelowBlockTarget_CreditedLocallyNotForwarded(t *testing.T) {
 	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
 	c, _ := h.connect()
@@ -363,6 +375,9 @@ func TestSession_ShareBelowBlockTarget_CreditedLocallyNotForwarded(t *testing.T)
 	if h.upstream.callCount() != 0 {
 		t.Fatalf("share below block target must NEVER be forwarded upstream, but SubmitShare was called %d time(s)", h.upstream.callCount())
 	}
+	if h.validator.callCount() != 0 {
+		t.Fatalf("REGRESSION: share below job.UpstreamShareDiff must credit locally WITHOUT ever calling the real RandomX re-validation -- got %d call(s)", h.validator.callCount())
+	}
 	if sess.shareCount.Load() != 1 {
 		t.Errorf("expected local shareCount=1, got %d", sess.shareCount.Load())
 	}
@@ -371,6 +386,12 @@ func TestSession_ShareBelowBlockTarget_CreditedLocallyNotForwarded(t *testing.T)
 	}
 }
 
+// TestSession_ShareMeetingBlockTarget_ForwardedUpstream is the
+// positive-path proof (testing requirement 2 from the brief): a
+// share meeting/exceeding job.UpstreamShareDiff must STILL call the
+// real validator exactly once and be forwarded upstream when
+// validation succeeds -- the genuine block-level-find path must be
+// completely unaffected by the reordering fix.
 func TestSession_ShareMeetingBlockTarget_ForwardedUpstream(t *testing.T) {
 	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
 	c, _ := h.connect()
@@ -385,6 +406,9 @@ func TestSession_ShareMeetingBlockTarget_ForwardedUpstream(t *testing.T) {
 	if resp.Result == nil {
 		t.Fatalf("expected accepted block-level find, got error=%v", resp.Error)
 	}
+	if h.validator.callCount() != 1 {
+		t.Fatalf("expected exactly one real RandomX re-validation call for a genuine upstream-forward candidate, got %d", h.validator.callCount())
+	}
 	if h.upstream.callCount() != 1 {
 		t.Fatalf("expected exactly one upstream submit call for a genuine block-level find, got %d", h.upstream.callCount())
 	}
@@ -393,6 +417,74 @@ func TestSession_ShareMeetingBlockTarget_ForwardedUpstream(t *testing.T) {
 	}
 	if sess.blockCount.Load() != 1 {
 		t.Errorf("expected local blockCount=1, got %d", sess.blockCount.Load())
+	}
+}
+
+// TestSession_UpstreamForwardCandidate_FailedRevalidation_RejectedNotDowngraded
+// is testing requirement 3 from the brief: a share that meets/exceeds
+// job.UpstreamShareDiff (would otherwise be forwarded upstream) but
+// fails the real RandomX re-validation must be REJECTED outright --
+// never silently downgraded to a local-only credit -- and must never
+// reach the upstream pool at all.
+func TestSession_UpstreamForwardCandidate_FailedRevalidation_RejectedNotDowngraded(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	h.validator.accept = false // real re-validation says: not a valid proof
+	c, _ := h.connect()
+	loginResp := c.login(t, "addr-failed-revalidation")
+	sess := h.onlySession()
+
+	// Difficulty ABOVE the upstream block target (1,000,000): a
+	// genuine would-be upstream-forward candidate.
+	claimedHash := hashForDifficulty(2_000_000)
+	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(9), Result: claimedHash})
+	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
+	resp := c.recvShareResponse()
+	if resp.Result != nil {
+		t.Fatal("expected a would-be upstream-forward candidate that fails real re-validation to be REJECTED outright, not credited")
+	}
+	if h.validator.callCount() != 1 {
+		t.Fatalf("expected the real RandomX re-validation to have actually been called exactly once, got %d", h.validator.callCount())
+	}
+	if h.upstream.callCount() != 0 {
+		t.Fatalf("a share failing real re-validation must NEVER be forwarded upstream, got %d call(s)", h.upstream.callCount())
+	}
+	if sess.shareCount.Load() != 0 {
+		t.Errorf("expected NO local credit (not downgraded to a local-only share) for a failed re-validation, got shareCount=%d", sess.shareCount.Load())
+	}
+	if sess.blockCount.Load() != 0 {
+		t.Errorf("expected blockCount=0 for a failed re-validation, got %d", sess.blockCount.Load())
+	}
+}
+
+// TestSession_ShareBelowStaticDifficulty_RejectedWithoutValidatorCall
+// is testing requirement 4 from the brief: a share below even the
+// session's own StaticDifficulty must be rejected before any real
+// RandomX re-validation call at all -- confirming the cheap
+// diff-derivation-then-StaticDifficulty-check ordering happens fully
+// before the expensive validator call regardless of outcome.
+func TestSession_ShareBelowStaticDifficulty_RejectedWithoutValidatorCall(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	c, _ := h.connect()
+	loginResp := c.login(t, "addr-below-static-diff")
+	sess := h.onlySession()
+
+	// Difficulty BELOW the session's own starting/configured
+	// difficulty (1000, the harness default).
+	claimedHash := hashForDifficulty(500)
+	submitParams, _ := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(10), Result: claimedHash})
+	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
+	resp := c.recvShareResponse()
+	if resp.Result != nil {
+		t.Fatal("expected a share below the session's own StaticDifficulty to be rejected")
+	}
+	if h.validator.callCount() != 0 {
+		t.Fatalf("a share below StaticDifficulty must be rejected WITHOUT any real RandomX re-validation call, got %d call(s)", h.validator.callCount())
+	}
+	if h.upstream.callCount() != 0 {
+		t.Errorf("a share below StaticDifficulty must never be forwarded upstream, got %d call(s)", h.upstream.callCount())
+	}
+	if sess.shareCount.Load() != 0 {
+		t.Errorf("expected NO local credit for a share below StaticDifficulty, got shareCount=%d", sess.shareCount.Load())
 	}
 }
 
