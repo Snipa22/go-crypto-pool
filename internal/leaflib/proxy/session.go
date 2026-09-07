@@ -54,6 +54,19 @@ type UpstreamSubmitter interface {
 // leaflib.ManagedConnection's lifecycle guarantees, mirroring
 // internal/leaflib/solo/session.go's own Session exactly in that
 // regard.
+//
+// It also carries the SAME per-session repush dedup leaf-solo/
+// leaf-direct already do (lastDeliveredJobID/lastDeliveredDifficulty/
+// alreadyDelivered below) -- ported here per Alex's real production
+// report ("Proxy is having some job staleness issues, it's disabling
+// as soon as a new job is sent, it needs to allow jobs 2-3 old, just
+// like the -direct has to"): without it, Server.repushAllSessions
+// unconditionally handed every logged-in session a BRAND NEW random
+// job_id (JobManager.NextJob always allocates one) on every upstream
+// job-update subscriber fire, evicting a miner's own in-flight job
+// out of its bounded jobHistorySize before it could even submit,
+// producing exactly the observed "unknown or stale job_id" rejections
+// within tens of milliseconds of a job being issued.
 type Session struct {
 	mc     *leaflib.ManagedConnection
 	server *Server
@@ -81,6 +94,35 @@ type Session struct {
 	connectedAt       time.Time
 	currentDifficulty atomic.Uint64
 	hashesAccumulated atomic.Uint64
+
+	// lastDeliveredJobID/lastDeliveredDifficulty mirror
+	// solo.Session's/direct.Session's own identical fields exactly --
+	// see internal/leaflib/solo/session.go's Session type doc comment
+	// for the full rationale (BUG FIX: Alex's live "duplicate jobs
+	// down the wire" report, and this type's own doc comment above
+	// for why the same mechanism was ported here). Updated in
+	// jobPayload below; consulted by Server.repushAllSessions via
+	// alreadyDelivered.
+	lastDeliveredJobID      atomic.Value // string
+	lastDeliveredDifficulty atomic.Uint64
+}
+
+// alreadyDelivered mirrors solo.Session's/direct.Session's own
+// identical method exactly -- see solo.Session.alreadyDelivered's doc
+// comment for the full rationale. Used ONLY by Server.repushAllSessions
+// to gate an unsolicited upstream-triggered job push; an explicit
+// miner-initiated getjob request and a genuine vardiff retarget push
+// both still always go through pushJob/jobPayload unconditionally --
+// this dedup is deliberately scoped to that one call site.
+func (s *Session) alreadyDelivered(job *Job) bool {
+	if job == nil {
+		return false
+	}
+	lastID, _ := s.lastDeliveredJobID.Load().(string)
+	if lastID == "" || lastID != job.ID {
+		return false
+	}
+	return s.lastDeliveredDifficulty.Load() == job.StaticDifficulty
 }
 
 const defaultProxySessionJobHistorySize = 8
@@ -467,6 +509,13 @@ func (s *Session) pushJob(job *Job) {
 // putting a job on the wire.
 func (s *Session) jobPayload(job *Job) JobPayload {
 	s.recordJob(job)
+	// Record what was actually delivered, mirroring solo.Session's/
+	// direct.Session's identical jobPayload bookkeeping exactly --
+	// see lastDeliveredJobID's doc comment. Every caller of
+	// jobPayload is putting job on the wire to THIS session right
+	// now, so this is the single correct place to update it.
+	s.lastDeliveredJobID.Store(job.ID)
+	s.lastDeliveredDifficulty.Store(job.StaticDifficulty)
 	payload := JobPayload{
 		// "rx/0" is the real wire algo string a real Monero-family
 		// pool/miner actually uses (confirmed from the real pool-server

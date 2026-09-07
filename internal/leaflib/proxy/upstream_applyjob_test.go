@@ -540,3 +540,139 @@ func TestJobManager_NextJob_AdvancedClientPatchesBothNoncesIntoRawBlobBeforeConv
 		t.Fatalf("WorkerTemplate.RawBlob was mutated by NextJob calls: before=%x after=%x", rawBlobSnapshotBefore, tmpl.RawBlob)
 	}
 }
+
+// TestApplyJob_UpstreamDupeGuard_SameJobIDIsANoOp is the Part A
+// regression test from the brief (real production log: Alex's "Proxy
+// is having some job staleness issues, it's disabling as soon as a
+// new job is sent, it needs to allow jobs 2-3 old, just like the
+// -direct has to"): applyJob must port XNP's own
+// handleNewBlockTemplate upstream-dupe guard (proxy.js ~line
+// 706-727 -- `if (pool.activeBlocktemplate.job_id ===
+// blockTemplate.job_id){ ... return; }`) exactly.
+//
+// Calls applyJob twice with the SAME JobID but a DIFFERENT Height (to
+// prove the guard is genuinely checking job_id equality, not silently
+// also refusing any update that varies some other field), and asserts:
+//   - the second call does NOT replace the stored template -- the
+//     SAME *WorkerTemplate pointer, with the FIRST call's field
+//     values (not the second call's different Height), remains
+//     current;
+//   - uc.notify is NOT fired a second time -- proven via a fake
+//     Subscribe callback invoked exactly once total across both
+//     calls, not twice.
+//
+// Then calls applyJob a THIRD time with a genuinely DIFFERENT JobID
+// and confirms the template DOES update (to the third call's own
+// values) and the subscriber DOES fire again -- proving this is real
+// job_id-equality-based dedup, not "never updates again" after the
+// first dupe check.
+func TestApplyJob_UpstreamDupeGuard_SameJobIDIsANoOp(t *testing.T) {
+	uc := NewUpstreamClient(UpstreamConfig{Login: "test-address"}, discardLogger())
+
+	var notifyCount int
+	unsub := uc.Subscribe(func(*WorkerTemplate) {
+		notifyCount++
+	})
+	defer unsub()
+
+	blobHex := hexOfLen(76)
+
+	// First call: genuinely new job_id -- must store and notify.
+	uc.applyJob(UpstreamJobPayload{
+		JobID:  "dupe-guard-job",
+		Blob:   blobHex,
+		Height: 100,
+	})
+	first := uc.CurrentTemplate()
+	if first == nil {
+		t.Fatal("expected a stored template after the first applyJob call")
+	}
+	if first.Height != 100 {
+		t.Fatalf("first template Height = %d, want 100", first.Height)
+	}
+	if notifyCount != 1 {
+		t.Fatalf("notifyCount after first applyJob call = %d, want 1", notifyCount)
+	}
+
+	// Second call: SAME job_id, but a DIFFERENT Height -- a genuine
+	// upstream no-op duplicate (e.g. a getjob poll response), per
+	// XNP's own comment ("No update with this job, it is an upstream
+	// dupe"). Must be a complete no-op: no new template stored (the
+	// SAME pointer, with the FIRST call's Height, must remain
+	// current), and the subscriber must NOT fire again.
+	uc.applyJob(UpstreamJobPayload{
+		JobID:  "dupe-guard-job",
+		Blob:   blobHex,
+		Height: 999, // deliberately different, to prove this is a job_id check, not a full-payload-equality check
+	})
+	second := uc.CurrentTemplate()
+	if second != first {
+		t.Fatalf("expected applyJob to leave the exact same *WorkerTemplate pointer stored for an upstream-dupe job_id, got a different pointer (Height=%d)", second.Height)
+	}
+	if second.Height != 100 {
+		t.Fatalf("template Height after the dupe call = %d, want 100 (the FIRST call's value, unchanged) -- the dupe call must not have replaced the stored template", second.Height)
+	}
+	if notifyCount != 1 {
+		t.Fatalf("notifyCount after the dupe applyJob call = %d, want still 1 (no second notify fire for a genuine upstream no-op duplicate)", notifyCount)
+	}
+
+	// Third call: a genuinely DIFFERENT job_id -- must update the
+	// template and fire the subscriber again, proving the dedup
+	// above is real job_id-equality checking, not "applyJob never
+	// updates again after the first dupe".
+	uc.applyJob(UpstreamJobPayload{
+		JobID:  "dupe-guard-job-2",
+		Blob:   blobHex,
+		Height: 200,
+	})
+	third := uc.CurrentTemplate()
+	if third == first || third == second {
+		t.Fatal("expected a genuinely different job_id to replace the stored template with a new *WorkerTemplate")
+	}
+	if third.JobID != "dupe-guard-job-2" {
+		t.Fatalf("third template JobID = %q, want %q", third.JobID, "dupe-guard-job-2")
+	}
+	if third.Height != 200 {
+		t.Fatalf("third template Height = %d, want 200", third.Height)
+	}
+	if notifyCount != 2 {
+		t.Fatalf("notifyCount after a genuinely different job_id's applyJob call = %d, want 2", notifyCount)
+	}
+}
+
+// TestApplyJob_UpstreamDupeGuard_EmptyJobIDNeverDedupes proves the
+// brief's explicit edge case: an EMPTY incoming job_id can never be
+// treated as a dupe (matching XNP's own plain string-equality check,
+// which likewise never matches against an empty/missing field in
+// practice) -- some upstream shapes may omit job_id entirely, and
+// that must always be treated as "cannot dedupe, always apply", never
+// silently dropped.
+func TestApplyJob_UpstreamDupeGuard_EmptyJobIDNeverDedupes(t *testing.T) {
+	uc := NewUpstreamClient(UpstreamConfig{Login: "test-address"}, discardLogger())
+
+	var notifyCount int
+	unsub := uc.Subscribe(func(*WorkerTemplate) {
+		notifyCount++
+	})
+	defer unsub()
+
+	blobHex := hexOfLen(76)
+
+	uc.applyJob(UpstreamJobPayload{JobID: "", Blob: blobHex, Height: 1})
+	first := uc.CurrentTemplate()
+	if first == nil {
+		t.Fatal("expected a stored template after the first applyJob call")
+	}
+
+	uc.applyJob(UpstreamJobPayload{JobID: "", Blob: blobHex, Height: 2})
+	second := uc.CurrentTemplate()
+	if second == first {
+		t.Fatal("expected a second applyJob call with an empty job_id to still apply as a genuine update, not be treated as a dupe of the first (also-empty) job_id")
+	}
+	if second.Height != 2 {
+		t.Fatalf("second template Height = %d, want 2", second.Height)
+	}
+	if notifyCount != 2 {
+		t.Fatalf("notifyCount = %d, want 2 (both empty-job_id calls must genuinely apply/notify)", notifyCount)
+	}
+}
