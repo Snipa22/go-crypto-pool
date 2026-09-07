@@ -502,3 +502,156 @@ func TestJobManager_NoUpstreamTemplateYet(t *testing.T) {
 		t.Fatalf("expected ErrNoUpstreamTemplate, got %v", err)
 	}
 }
+
+// TestSession_AlreadyDelivered_SameJobSameDifficultyIsDeliveredAgain is
+// the Part B regression test from the brief (Alex's live production
+// report: "Proxy is having some job staleness issues, it's disabling
+// as soon as a new job is sent, it needs to allow jobs 2-3 old, just
+// like the -direct has to"), option (a) from the brief's testing
+// guidance: a focused, Session-level unit test of alreadyDelivered
+// (mirroring solo.Session's/direct.Session's identical method
+// exactly), since JobManager.NextJob always allocates a brand-new
+// random job.ID on every call (see server.go's repushAllSessions doc
+// comment) -- driving two consecutive NextJob calls through the real
+// production entry point can never coincidentally collide on the same
+// job_id, so the real gate this method backs
+// (Server.repushAllSessions' `if sess.alreadyDelivered(job) {
+// continue }`) is only exercisable directly at this level, exactly as
+// the brief anticipates.
+//
+// Uses REAL *Job values obtained from the real JobManager (the same
+// production entry point Server.repushAllSessions itself calls), not
+// hand-fabricated ones, and drives them through the real jobPayload
+// choke point (the same one handleLogin/pushJob/repushAllSessions all
+// funnel through) rather than poking the atomic fields directly.
+func TestSession_AlreadyDelivered_SameJobSameDifficultyIsDeliveredAgain(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	c, _ := h.connect()
+	c.login(t, "test-address-1")
+	// Drain the login response's own JobPush... login's response is
+	// a LoginResponse, not a JobPush, so nothing further to drain
+	// here; c.login already consumed it via recvLoginResponse.
+
+	sess := h.onlySession()
+	if sess == nil {
+		t.Fatal("expected a session after login")
+	}
+
+	// nil job never matches -- mirrors solo.Session.alreadyDelivered's
+	// own explicit nil guard.
+	if sess.alreadyDelivered(nil) {
+		t.Fatal("alreadyDelivered(nil) must be false")
+	}
+
+	// Obtain two REAL, independently-issued jobs from the real
+	// JobManager, at the session's own current difficulty -- exactly
+	// what Server.repushAllSessions itself does on every call.
+	jobA, err := h.server.jobs.NextJob(sess.currentDifficulty.Load())
+	if err != nil {
+		t.Fatalf("NextJob (A): %v", err)
+	}
+	jobB, err := h.server.jobs.NextJob(sess.currentDifficulty.Load())
+	if err != nil {
+		t.Fatalf("NextJob (B): %v", err)
+	}
+	if jobA.ID == jobB.ID {
+		t.Fatalf("expected two independently-issued jobs to have distinct job_ids, got %q twice", jobA.ID)
+	}
+
+	// Reset this session's delivery bookkeeping to a clean, known
+	// slate (login already delivered its own job via jobPayload) so
+	// the cases below start from "nothing delivered yet".
+	sess.lastDeliveredJobID.Store("")
+	sess.lastDeliveredDifficulty.Store(uint64(0))
+	if sess.alreadyDelivered(jobA) {
+		t.Fatal("alreadyDelivered must be false before anything has actually been delivered")
+	}
+
+	// Real delivery via jobPayload -- the exact same choke point
+	// handleLogin/pushJob/repushAllSessions all go through before
+	// putting a job on the wire (see jobPayload's doc comment).
+	_ = sess.jobPayload(jobA)
+
+	// THE CORE ASSERTION (the "skip" branch): the same job, delivered
+	// again unchanged (same job_id AND same StaticDifficulty), must
+	// be reported as already delivered -- this is the exact condition
+	// that makes Server.repushAllSessions skip a redundant,
+	// unsolicited repush of a job this session already has.
+	if !sess.alreadyDelivered(jobA) {
+		t.Fatal("expected alreadyDelivered(jobA) to be true immediately after jobPayload(jobA) delivered it -- this is the real gate repushAllSessions relies on")
+	}
+
+	// THE "DOES NOT SKIP" BRANCH, case 1: a genuinely DIFFERENT job
+	// (different job_id) must NOT be considered already delivered --
+	// proving this isn't "never repush again after the first
+	// delivery".
+	if sess.alreadyDelivered(jobB) {
+		t.Fatal("expected alreadyDelivered(jobB) to be false -- jobB has a different job_id than what was actually delivered")
+	}
+
+	// THE "DOES NOT SKIP" BRANCH, case 2: the SAME job_id as jobA,
+	// but a genuinely different StaticDifficulty (a real vardiff
+	// retarget while the underlying upstream template hasn't
+	// changed) must NOT be considered already delivered -- see
+	// lastDeliveredJobID's doc comment (session.go) for why BOTH
+	// fields are tracked, not job.ID alone: a legitimate difficulty/
+	// target update sharing the same job_id must still reach the
+	// miner.
+	retargeted := &Job{ID: jobA.ID, StaticDifficulty: jobA.StaticDifficulty + 1}
+	if sess.alreadyDelivered(retargeted) {
+		t.Fatal("expected alreadyDelivered to be false when StaticDifficulty genuinely changed, even with the same job_id")
+	}
+}
+
+// TestServer_RepushAllSessions_PushesFreshJobOnGenuineUpstreamUpdate is
+// an end-to-end, real-code-path regression test for the "does not
+// skip" branch of Server.repushAllSessions' new alreadyDelivered gate
+// (Part B of the brief): a real upstream template update (fired via
+// jobs.Subscribe, the exact real production trigger -- login, getjob,
+// or an unsolicited push all funnel through UpstreamClient.notify)
+// must still result in a genuinely fresh job being pushed to every
+// logged-in downstream session, proving the new gate does not
+// silently swallow legitimate repushes.
+func TestServer_RepushAllSessions_PushesFreshJobOnGenuineUpstreamUpdate(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	c, _ := h.connect()
+	loginResp := c.login(t, "test-address-1")
+	if loginResp.Result.Status != "OK" {
+		t.Fatalf("login failed: %+v", loginResp)
+	}
+
+	newTmpl := &WorkerTemplate{
+		Blob:              fakeBlob(76, 50),
+		ReservedOffset:    50,
+		ClientNonceOffset: -1,
+		PoolOffset:        -1,
+		SeedHash:          []byte("test-seed-hash-32-bytes-exactly!"),
+		Height:            124,
+		JobID:             "upstream-job-2",
+		TargetDiff:        1_000_000,
+		Difficulty:        1000,
+	}
+
+	// repushAllSessions' unsolicited pushJob write blocks (net.Pipe is
+	// unbuffered/synchronous) until the client side actually reads it
+	// -- start that read concurrently BEFORE triggering the update,
+	// so the write below has a waiting reader instead of stalling
+	// until this harness's idle timeout tears the connection down.
+	pushCh := make(chan JobPush, 1)
+	go func() { pushCh <- c.recvJobPush() }()
+
+	h.source.setTemplate(newTmpl)
+
+	var push JobPush
+	select {
+	case push = <-pushCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for repushAllSessions to push a fresh job after a real upstream template update")
+	}
+	if push.Params.JobID == "" {
+		t.Fatal("expected repushAllSessions to push a genuinely fresh job after a real upstream template update, got none")
+	}
+	if push.Params.JobID == loginResp.Result.Job.JobID {
+		t.Fatal("expected the repushed job_id to differ from the login-issued job_id (JobManager.NextJob always allocates a fresh job_id)")
+	}
+}

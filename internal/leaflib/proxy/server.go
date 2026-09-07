@@ -224,7 +224,27 @@ func (s *Server) recordConnectionError(category string) {
 // repushAllSessions regenerates and pushes a fresh job to every
 // currently-connected, logged-in downstream session, AT THAT
 // SESSION'S OWN CURRENT VARDIFF DIFFICULTY — mirrors
-// internal/leaflib/solo/server.go's invalidateAndRepushJobs exactly.
+// internal/leaflib/solo/server.go's invalidateAndRepushJobs and
+// internal/leaflib/direct/server.go's identically-named function.
+//
+// BUG FIX (Alex, live production report: "Proxy is having some job
+// staleness issues, it's disabling as soon as a new job is sent, it
+// needs to allow jobs 2-3 old, just like the -direct has to"): gated
+// by sess.alreadyDelivered(job) exactly like leaf-direct's/leaf-solo's
+// own invalidateAndRepushJobs already are -- JobManager.NextJob always
+// allocates a brand-new random job_id (newRandomHexID) plus fresh
+// worker-/pool-nonces on EVERY call, so without this gate, every fire
+// of jobs.Subscribe (which, prior to upstream.go's applyJob upstream-
+// dupe guard, could itself fire on a genuine upstream no-op like a
+// getjob poll response) handed every logged-in session a completely
+// new, unrelated job_id -- evicting that session's own in-flight job
+// out of its bounded jobHistorySize (defaultProxySessionJobHistorySize)
+// before it could even be submitted. This is what produced the
+// observed "unknown or stale job_id" rejections within tens of
+// milliseconds of a job being issued. An explicit miner-initiated
+// getjob/vardiff-retarget push is untouched by this gate -- it still
+// always goes through pushJob/jobPayload unconditionally; the gate
+// applies ONLY here, exactly mirroring direct/solo's own scoping.
 func (s *Server) repushAllSessions() {
 	s.mu.RLock()
 	sessions := make([]*Session, 0, len(s.sessions))
@@ -239,6 +259,9 @@ func (s *Server) repushAllSessions() {
 		job, err := s.jobs.NextJob(sess.currentDifficulty.Load())
 		if err != nil {
 			s.logger.Printf("proxy: failed to regenerate job for session %s after upstream template update: %v", sess.sessionID, err)
+			continue
+		}
+		if sess.alreadyDelivered(job) {
 			continue
 		}
 		sess.pushJob(job)

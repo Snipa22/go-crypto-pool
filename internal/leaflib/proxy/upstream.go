@@ -807,6 +807,37 @@ func convertTemplateBlobToHashingBlob(blobHex string) ([]byte, error) {
 //     all, exactly as before this fix -- there is no usable blob at
 //     all in this case.
 func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
+	// BUG FIX (Alex, live production report: "Proxy is having some
+	// job staleness issues, it's disabling as soon as a new job is
+	// sent, it needs to allow jobs 2-3 old, just like the -direct has
+	// to"): port XNP's own handleNewBlockTemplate upstream-dupe guard
+	// (proxy.js ~line 706-727):
+	//
+	//	if (pool.activeBlocktemplate.job_id === blockTemplate.job_id){
+	//	    debug.pool('No update with this job, it is an upstream dupe');
+	//	    return;
+	//	}
+	//
+	// Checked as early as possible (right after job.JobID is
+	// available, before any of the blob/offset/target decoding work
+	// below) so a genuine upstream no-op duplicate -- a getjob poll
+	// response, or any repeat push, that carries the exact same
+	// job_id as the currently-stored template -- short-circuits
+	// cheaply, mirroring XNP's own early-return shape exactly:
+	// neither uc.template is touched nor uc.notify (which drives
+	// server.go's repushAllSessions) is ever fired for a dupe. An
+	// EMPTY incoming job.JobID can never dedupe (matches XNP's own
+	// plain string-equality check, which likewise never matches
+	// against an empty/missing field in practice) -- some upstream
+	// shapes may omit job_id, and treating that as "cannot dedupe,
+	// always apply" is the safe default.
+	if job.JobID != "" {
+		if current := uc.template.Load(); current != nil && current.JobID == job.JobID {
+			uc.logger.Printf("proxy: no update with this job, it is an upstream dupe (job_id=%s)", job.JobID)
+			return
+		}
+	}
+
 	var (
 		blob    []byte
 		rawBlob []byte
