@@ -122,6 +122,46 @@ type WorkerTemplate struct {
 	// until the upstream pool pushes a new job and this leaf swaps in
 	// a fresh WorkerTemplate for it).
 	nextWorkerNonce atomic.Uint32
+
+	// PoolOffset is the pool-published client_pool_offset — the
+	// POOL-level peer of ReservedOffset/ClientNonceOffset's
+	// WORKER-level offsets, confirmed from the real reference,
+	// lib/xmr.js's MasterBlockTemplate constructor:
+	//
+	//	this.poolOffset = template.client_pool_offset; // clientPoolLocation
+	//	this.poolNonce = 0;
+	//	this.blobForWorker = function () {
+	//	  this.buffer.writeUInt32BE(++this.poolNonce, this.poolOffset);
+	//	  return this.buffer.toString('hex');
+	//	};
+	//
+	// (note the legacy reference's own confusing naming: THIS
+	// blobForWorker -- MasterBlockTemplate's -- patches the POOL
+	// nonce, not a worker nonce; it is unrelated to, and not to be
+	// confused with, this file's OWN BlobForWorker method above,
+	// which patches the WORKER nonce at ReservedOffset/
+	// ClientNonceOffset instead.) -1 means "not published" --
+	// mirrors ReservedOffset/ClientNonceOffset's own -1 convention
+	// exactly (see those fields' doc comments); unlike
+	// ClientNonceOffset, there is no secondary/fallback field this
+	// leaf falls back to when PoolOffset is absent -- the real
+	// reference has no equivalent fallback for the pool-level offset
+	// either, it is read directly from client_pool_offset with
+	// nothing else to fall back to.
+	PoolOffset int
+
+	// nextPoolNonce is a per-template monotonically-incrementing
+	// counter, the exact peer of nextWorkerNonce above but for the
+	// POOL-level nonce — ported exactly from the legacy
+	// blobForWorker's own `++this.poolNonce`. Deliberately a
+	// SEPARATE, independent counter from nextWorkerNonce (not the
+	// same value reused for both): in the real reference these are
+	// two genuinely distinct counters living on different layers
+	// (workerNonce on the per-sub-worker nested BlockTemplate,
+	// poolNonce on the master-template MasterBlockTemplate) that
+	// merely happen to both advance once per job issuance in this
+	// leaf's simpler, non-nested architecture — see NextPoolNonce.
+	nextPoolNonce atomic.Uint32
 }
 
 // workerNonceOffset returns which byte offset THIS template actually
@@ -264,6 +304,58 @@ func (t *WorkerTemplate) NextBlobForWorker() (blob []byte, workerNonce uint32, e
 	workerNonce = t.nextWorkerNonce.Add(1)
 	blob, err = t.BlobForWorker(workerNonce)
 	return blob, workerNonce, err
+}
+
+// BlobForPool returns a FRESH copy of blob with poolNonce written,
+// BIG-ENDIAN, as 4 raw bytes, at t.PoolOffset — the POOL-level peer
+// of BlobForWorker's WORKER-level patch, ported exactly from the
+// legacy MasterBlockTemplate.blobForWorker's
+// `this.buffer.writeUInt32BE(++this.poolNonce, this.poolOffset)`
+// (see PoolOffset's doc comment for the full lib/xmr.js citation).
+// Same non-mutating-copy / bounds-checking / big-endian-4-byte-write
+// discipline as BlobForWorker: the input blob is never mutated, and
+// if t.PoolOffset is -1 (the upstream pool never published
+// client_pool_offset at all on this job), this simply returns an
+// unmodified copy of blob — mirroring BlobForWorker's own
+// degrade-gracefully-when-offset-absent behavior for the analogous
+// ReservedOffset/ClientNonceOffset case.
+//
+// Takes blob as an explicit parameter, rather than always reading
+// t.Blob/t.RawBlob itself: this is deliberately a small, composable
+// patch step meant to be applied to WHATEVER blob a caller already
+// has in hand (in production, BlobForWorker's own output — see
+// JobManager.NextJob, job.go, the real, single call site that
+// allocates and patches BOTH nonces into the SAME per-issuance blob
+// copy before returning it, exactly matching the real reference's
+// per-job-issuance cadence: getMasterJob calls blobForWorker() once
+// per job handed to a downstream connection, capturing the poolNonce
+// value it just baked in alongside the job — see Job.PoolNonce's doc
+// comment, job.go). Worker-nonce and pool-nonce are deliberately
+// independent counters/patches (see nextPoolNonce's doc comment) —
+// this method only ever touches t.PoolOffset, never
+// ReservedOffset/ClientNonceOffset.
+func (t *WorkerTemplate) BlobForPool(blob []byte, poolNonce uint32) ([]byte, error) {
+	out := make([]byte, len(blob))
+	copy(out, blob)
+	if t.PoolOffset < 0 {
+		return out, nil
+	}
+	if t.PoolOffset+4 > len(blob) {
+		return nil, fmt.Errorf("%w: offset=%d blob_len=%d", ErrOffsetOutOfRange, t.PoolOffset, len(blob))
+	}
+	binary.BigEndian.PutUint32(out[t.PoolOffset:t.PoolOffset+4], poolNonce)
+	return out, nil
+}
+
+// NextPoolNonce allocates the NEXT pool-nonce value from this
+// template's own counter (see nextPoolNonce's doc comment) — the
+// exact peer of NextBlobForWorker's `t.nextWorkerNonce.Add(1)`,
+// ported from the legacy blobForWorker's own `++this.poolNonce`.
+// Unlike NextBlobForWorker, this does not also return a patched blob
+// itself — see BlobForPool/JobManager.NextJob for how the returned
+// value is combined with a blob.
+func (t *WorkerTemplate) NextPoolNonce() uint32 {
+	return t.nextPoolNonce.Add(1)
 }
 
 // SeedHashHex/BlobHex are small formatting conveniences used by the

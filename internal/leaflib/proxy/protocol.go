@@ -151,13 +151,23 @@ type UpstreamJobPush struct {
 //
 // This is a genuinely different shape from solo.SubmitRequest (which
 // additionally carries a session "id" and, for C29, a "pow" cycle —
-// neither of which exists on this upstream-facing submit).
+// neither of which exists on this upstream-facing submit)... EXCEPT
+// for "id" itself, which DOES belong here too, for a different
+// reason than solo.SubmitRequest's: proxy.js's own sendData wrapper
+// (~line 240-258) injects `params.id = this.id` into the params of
+// EVERY outbound message sent after a successful login — this is not
+// specific to submit, it is generic post-login plumbing that submit
+// (like keepalived, see UpstreamKeepaliveParams) is not exempt from.
+// Mirrors UpstreamKeepaliveParams.ID exactly — see that field's doc
+// comment for the full sendData citation; upstream.go's SubmitShare
+// populates this from uc.sessionID.
 type UpstreamSubmitParams struct {
 	JobID       string `json:"job_id"`
 	Nonce       string `json:"nonce"`
 	Result      string `json:"result"`
 	WorkerNonce uint32 `json:"workerNonce,omitempty"`
 	PoolNonce   uint32 `json:"poolNonce,omitempty"`
+	ID          string `json:"id,omitempty"`
 }
 
 // UpstreamLoginParams is the real "login" request's params shape sent

@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -164,6 +165,220 @@ func TestWorkerTemplate_NextBlobForWorker_MonotonicNonOverlappingNonces(t *testi
 			if bytes.Equal(blobs[i], blobs[j]) {
 				t.Fatalf("issuances %d and %d produced identical blobs", i, j)
 			}
+		}
+	}
+}
+
+// --- BlobForPool / NextPoolNonce (pool-level nonce -- the peer
+// mechanism to BlobForWorker/NextBlobForWorker above) ---------------
+
+// TestWorkerTemplate_BlobForPool_DifferentPoolNoncesOnlyChangeOffsetBytes
+// is BlobForPool's direct analogue of
+// TestWorkerTemplate_BlobForWorker_DifferentNoncesOnlyChangeOffsetBytes
+// above -- same non-mutating-copy / bounds-checked / big-endian-write
+// discipline, applied at PoolOffset instead of ReservedOffset/
+// ClientNonceOffset.
+func TestWorkerTemplate_BlobForPool_DifferentPoolNoncesOnlyChangeOffsetBytes(t *testing.T) {
+	blob := make([]byte, 76)
+	for i := range blob {
+		blob[i] = byte(i)
+	}
+	tmpl := &WorkerTemplate{Blob: blob, ReservedOffset: -1, ClientNonceOffset: -1, PoolOffset: 60}
+
+	a, err := tmpl.BlobForPool(blob, 1)
+	if err != nil {
+		t.Fatalf("BlobForPool(blob, 1): %v", err)
+	}
+	b, err := tmpl.BlobForPool(blob, 2)
+	if err != nil {
+		t.Fatalf("BlobForPool(blob, 2): %v", err)
+	}
+
+	if len(a) != len(blob) || len(b) != len(blob) {
+		t.Fatalf("output length changed: len(a)=%d len(b)=%d want %d", len(a), len(b), len(blob))
+	}
+	if bytes.Equal(a, b) {
+		t.Fatalf("expected two different pool nonces to produce different blobs")
+	}
+	for i := 0; i < len(blob); i++ {
+		if i >= 60 && i < 64 {
+			continue
+		}
+		if a[i] != blob[i] || b[i] != blob[i] {
+			t.Fatalf("byte %d outside the pool-nonce window was mutated: original=%02x a=%02x b=%02x", i, blob[i], a[i], b[i])
+		}
+	}
+	for i, v := range blob {
+		if v != byte(i) {
+			t.Fatalf("input blob was mutated at byte %d", i)
+		}
+	}
+	if bytes.Equal(a[60:64], b[60:64]) {
+		t.Fatalf("expected the pool-nonce window itself to differ between two different pool nonces")
+	}
+}
+
+// TestWorkerTemplate_BlobForPool_NoOffsetPublishedReturnsUnmodifiedBlobNoError
+// mirrors BlobForWorker's own no-offset-published degrade-gracefully
+// behavior for PoolOffset -- when the upstream never published
+// client_pool_offset at all (PoolOffset == -1), BlobForPool must not
+// error and must not touch any byte of the blob.
+func TestWorkerTemplate_BlobForPool_NoOffsetPublishedReturnsUnmodifiedBlobNoError(t *testing.T) {
+	original := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44}
+	blob := make([]byte, len(original))
+	copy(blob, original)
+	tmpl := &WorkerTemplate{Blob: blob, ReservedOffset: -1, ClientNonceOffset: -1, PoolOffset: -1}
+
+	out, err := tmpl.BlobForPool(blob, 0xDEADBEEF)
+	if err != nil {
+		t.Fatalf("BlobForPool with no PoolOffset published: %v", err)
+	}
+	if !bytes.Equal(out, original) {
+		t.Fatalf("expected an unmodified copy of the blob when PoolOffset is unpublished, got %x, want %x", out, original)
+	}
+	out[0] = 0x00
+	if !bytes.Equal(blob, original) {
+		t.Fatalf("input blob was mutated: got %x, want unchanged %x", blob, original)
+	}
+}
+
+// TestWorkerTemplate_BlobForPool_OutOfRangeOffsetRejected mirrors
+// TestWorkerTemplate_OutOfRangeOffsetRejected for PoolOffset.
+func TestWorkerTemplate_BlobForPool_OutOfRangeOffsetRejected(t *testing.T) {
+	tmpl := &WorkerTemplate{Blob: make([]byte, 8), ReservedOffset: -1, ClientNonceOffset: -1, PoolOffset: 10}
+	if _, err := tmpl.BlobForPool(tmpl.Blob, 1); err == nil {
+		t.Fatal("expected an error for a PoolOffset that doesn't fit in the blob")
+	}
+}
+
+// TestWorkerTemplate_NextPoolNonce_MonotonicNonOverlapping mirrors
+// TestWorkerTemplate_NextBlobForWorker_MonotonicNonOverlappingNonces
+// for the pool-nonce counter.
+func TestWorkerTemplate_NextPoolNonce_MonotonicNonOverlapping(t *testing.T) {
+	tmpl := &WorkerTemplate{Blob: make([]byte, 76), ReservedOffset: -1, ClientNonceOffset: -1, PoolOffset: 60}
+
+	seen := make(map[uint32]struct{})
+	for i := 0; i < 20; i++ {
+		n := tmpl.NextPoolNonce()
+		if _, dup := seen[n]; dup {
+			t.Fatalf("pool nonce %d was issued twice", n)
+		}
+		seen[n] = struct{}{}
+	}
+}
+
+// TestJobManager_NextJob_WorkerAndPoolNoncesBothAdvanceIndependently
+// is the required brief test: exercises the REAL production call
+// path (JobManager.NextJob, the same entry point Server uses to
+// issue every downstream job) with BOTH a real ReservedOffset AND a
+// real PoolOffset configured together, delivers several jobs, and
+// confirms:
+//
+//   - each delivered job's blob has a DIFFERENT, monotonically
+//     increasing poolNonce value baked in at PoolOffset, and that
+//     baked-in value exactly matches the job's own captured
+//     PoolNonce field (read back with
+//     binary.BigEndian.Uint32(blob[offset:offset+4]));
+//   - the existing worker-nonce/ReservedOffset patching behavior is
+//     unaffected -- the worker-nonce region is read back
+//     independently and confirmed correct and distinct per job too;
+//   - the two regions/values are genuinely independent (same
+//     nonce value never accidentally shared between the two
+//     counters).
+func TestJobManager_NextJob_WorkerAndPoolNoncesBothAdvanceIndependently(t *testing.T) {
+	const (
+		blobLen        = 128
+		reservedOffset = 40
+		poolOffset     = 80
+	)
+	blob := make([]byte, blobLen)
+	tmpl := &WorkerTemplate{
+		Blob:              blob,
+		ReservedOffset:    reservedOffset,
+		ClientNonceOffset: -1,
+		PoolOffset:        poolOffset,
+		JobID:             "upstream-job-nonce-test",
+		Height:            1,
+		TargetDiff:        1000,
+	}
+	source := newFakeTemplateSource(tmpl)
+	jm := NewJobManager(source, nil)
+
+	const numJobs = 3
+	jobs := make([]*Job, 0, numJobs)
+	for i := 0; i < numJobs; i++ {
+		job, err := jm.NextJob(100)
+		if err != nil {
+			t.Fatalf("NextJob (issuance %d): %v", i, err)
+		}
+		jobs = append(jobs, job)
+	}
+
+	seenWorker := make(map[uint32]struct{})
+	seenPool := make(map[uint32]struct{})
+	for i, job := range jobs {
+		if len(job.Blob) != blobLen {
+			t.Fatalf("job %d blob length = %d, want %d", i, len(job.Blob), blobLen)
+		}
+
+		// Pool-nonce region: baked-in bytes must match the job's own
+		// captured PoolNonce field exactly.
+		gotPoolNonce := binary.BigEndian.Uint32(job.Blob[poolOffset : poolOffset+4])
+		if gotPoolNonce != job.PoolNonce {
+			t.Fatalf("job %d: blob's baked-in poolNonce = %d, want job.PoolNonce = %d", i, gotPoolNonce, job.PoolNonce)
+		}
+		if _, dup := seenPool[job.PoolNonce]; dup {
+			t.Fatalf("job %d: poolNonce %d was issued to an earlier job too -- not monotonically distinct", i, job.PoolNonce)
+		}
+		seenPool[job.PoolNonce] = struct{}{}
+
+		// Worker-nonce region: regression -- must remain correct and
+		// independent of the pool-nonce mechanism above.
+		gotWorkerNonce := binary.BigEndian.Uint32(job.Blob[reservedOffset : reservedOffset+4])
+		if gotWorkerNonce != job.WorkerNonce {
+			t.Fatalf("job %d: blob's baked-in workerNonce = %d, want job.WorkerNonce = %d", i, gotWorkerNonce, job.WorkerNonce)
+		}
+		if _, dup := seenWorker[job.WorkerNonce]; dup {
+			t.Fatalf("job %d: workerNonce %d was issued to an earlier job too -- not monotonically distinct", i, job.WorkerNonce)
+		}
+		seenWorker[job.WorkerNonce] = struct{}{}
+
+		// The two counters are independent: worker-nonce and
+		// pool-nonce must never be coupled into the same value by
+		// coincidence-masking logic (they legitimately COULD collide
+		// numerically by chance since both start at 1 and increment
+		// by 1 per issuance in this test, so instead assert the
+		// REGIONS are independently correct, which the two checks
+		// above already do -- and additionally assert every byte
+		// OUTSIDE both 4-byte windows is untouched, proving no
+		// cross-contamination between the two patch operations).
+		for b := 0; b < blobLen; b++ {
+			inWorkerWindow := b >= reservedOffset && b < reservedOffset+4
+			inPoolWindow := b >= poolOffset && b < poolOffset+4
+			if inWorkerWindow || inPoolWindow {
+				continue
+			}
+			if job.Blob[b] != 0 {
+				t.Fatalf("job %d: byte %d outside both nonce windows was mutated (got %02x, want 0x00)", i, b, job.Blob[b])
+			}
+		}
+	}
+
+	// Every delivered job's own blob must be pairwise distinct.
+	for i := 0; i < len(jobs); i++ {
+		for j := i + 1; j < len(jobs); j++ {
+			if bytes.Equal(jobs[i].Blob, jobs[j].Blob) {
+				t.Fatalf("jobs %d and %d produced identical blobs", i, j)
+			}
+		}
+	}
+
+	// The template's own original Blob must never have been mutated
+	// by any of this (non-mutating-copy discipline, same as
+	// BlobForWorker/BlobForPool individually already guarantee).
+	for i, v := range blob {
+		if v != 0 {
+			t.Fatalf("template's own original Blob was mutated at byte %d: got %02x, want 0x00", i, v)
 		}
 	}
 }

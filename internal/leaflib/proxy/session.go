@@ -369,7 +369,7 @@ func (s *Session) handleSubmit(req Request) {
 	// difficulty: forward it upstream for real, via the real pool
 	// submit RPC.
 	s.server.recordShareDecision(true)
-	accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, 0)
+	accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce)
 	if err != nil {
 		s.server.logger.Printf("proxy: upstream submit failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
 		s.server.recordBlock(false)
