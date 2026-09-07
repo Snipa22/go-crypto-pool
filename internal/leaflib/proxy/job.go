@@ -167,28 +167,39 @@ func NewJobManager(source TemplateSource, logger *log.Logger) *JobManager {
 // difficulty from the current upstream template. BOTH the
 // worker-nonce and pool-nonce counters (WorkerTemplate's
 // nextWorkerNonce/nextPoolNonce -- see those fields' doc comments)
-// advance by exactly one on every call, and the SAME returned blob
-// carries BOTH values patched in at their respective offsets
-// (worker at ReservedOffset/ClientNonceOffset via
-// NextBlobForWorker, pool at PoolOffset via BlobForPool applied on
-// top of that result) -- matching the real reference's per-job-issuance
-// cadence: getMasterJob's blobForWorker() (pool-nonce patch) is
-// called once per job handed to a downstream connection, the same
-// cadence as the ordinary/solo BlockTemplate.nextBlob's
-// workerNonce patch. These are deliberately independent counters
-// (see WorkerTemplate.nextPoolNonce's doc comment for why), even
-// though they both advance once per issuance here.
+// advance by exactly one on every call, via a SINGLE call to
+// WorkerTemplate.NextBlobForWorkerAndPool -- which patches BOTH
+// values into ONE COPY of the underlying raw buffer (RawBlob when
+// present, Blob otherwise) BEFORE any RandomX hashing-blob conversion
+// happens, then converts (if needed) exactly ONCE. This is
+// deliberately NOT two separate calls (one allocating+patching the
+// worker-nonce, a second allocating+patching the pool-nonce on top of
+// the first's OUTPUT) -- that shape was a real, live production bug
+// for the advanced-client (RawBlob != nil) dialect: the first call's
+// output is already the small, converted RandomX hashing blob, but
+// PoolOffset (like ReservedOffset/ClientNonceOffset) is only
+// meaningful relative to the FULL raw blocktemplate_blob, so
+// bounds-checking/writing it against that small output blob is
+// simply wrong, confirmed live:
+//
+//	proxy: allocating pool-nonce job: proxy: worker-nonce offset is out
+//	of range for this template's blob: offset=179 blob_len=76
+//
+// Matches the real reference's per-job-issuance cadence: getMasterJob's
+// blobForWorker() (pool-nonce patch) and the nested
+// BlockTemplate.nextBlob's workerNonce patch both write into the SAME
+// underlying raw buffer before any convert_blob/hex call -- see
+// WorkerTemplate.BlobForWorkerAndPool's doc comment for the full
+// citation. Worker-nonce and pool-nonce remain deliberately
+// independent counters (see WorkerTemplate.nextPoolNonce's doc
+// comment for why), even though they both advance once per issuance
+// here and are now patched together in a single pass.
 func (jm *JobManager) NextJob(difficulty uint64) (*Job, error) {
 	t := jm.source.CurrentTemplate()
 	if t == nil {
 		return nil, ErrNoUpstreamTemplate
 	}
-	blob, workerNonce, err := t.NextBlobForWorker()
-	if err != nil {
-		return nil, fmt.Errorf("proxy: allocating worker-nonce job: %w", err)
-	}
-	poolNonce := t.NextPoolNonce()
-	blob, err = t.BlobForPool(blob, poolNonce)
+	blob, workerNonce, poolNonce, err := t.NextBlobForWorkerAndPool()
 	if err != nil {
 		return nil, fmt.Errorf("proxy: allocating pool-nonce job: %w", err)
 	}

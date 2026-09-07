@@ -3,10 +3,13 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"io"
 	"log"
 	"testing"
+
+	"github.com/Snipa22/go-xmr-lib/support"
 )
 
 // discardLogger is a *log.Logger that throws away everything it's
@@ -81,6 +84,28 @@ const (
 	offsetDataReservedOffset = 130
 	offsetDataNonceLen       = 60
 	offsetDataHashingBlobLen = 76
+
+	// offsetDataPoolOffset is a SECOND real, verified absolute byte
+	// offset within offsetData's own 60-byte tx_extra nonce region
+	// ([130:190), per offsetDataReservedOffset's own doc comment
+	// above), used by the advanced-client pool-nonce regression test
+	// below (TestJobManager_NextJob_AdvancedClientPatchesBothNoncesIntoRawBlobBeforeConverting)
+	// to give ReservedOffset and PoolOffset two DISJOINT 4-byte
+	// windows within the same real fixture -- reproducing Alex's
+	// real production scenario (a pool publishing BOTH offsets
+	// together on the advanced/xmr-node-proxy dialect) rather than
+	// only one offset at a time. Verified the same way
+	// offsetDataReservedOffset was (see its doc comment for the
+	// method): a throwaway Go program patched 4 distinct non-zero
+	// bytes at [160:164] in a COPY of the raw offsetData blob,
+	// re-ran support.ParseBlockFromTemplateBlob on the patched hex,
+	// and confirmed the re-parsed Extra.Nonce read back those exact
+	// same 4 bytes at Extra.Nonce[30:34] (160-130=30 bytes into the
+	// 60-byte nonce region) -- and that a template with BOTH
+	// [130:134] and [160:164] patched simultaneously still parses
+	// and converts cleanly to the same 76-byte
+	// (offsetDataHashingBlobLen) hashing-blob shape.
+	offsetDataPoolOffset = 160
 )
 
 // TestApplyJob_ConvertsRealBlocktemplateBlobToHashingBlobWhenBlobAbsent
@@ -377,5 +402,141 @@ func TestWorkerTemplate_ReservedOffsetPatchesRawBlobAndRederivesHashingBlob(t *t
 	// repeated BlobForWorker calls (no shared-buffer mutation bug).
 	if !bytes.Equal(tmpl.RawBlob, rawBlobSnapshotBefore) {
 		t.Fatalf("WorkerTemplate.RawBlob was mutated by BlobForWorker calls: before=%x after=%x", rawBlobSnapshotBefore, tmpl.RawBlob)
+	}
+}
+
+// TestJobManager_NextJob_AdvancedClientPatchesBothNoncesIntoRawBlobBeforeConverting
+// is the required brief regression test: it reproduces the EXACT
+// real production scenario from Alex's log --
+//
+//	proxy: allocating pool-nonce job: proxy: worker-nonce offset is out
+//	of range for this template's blob: offset=179 blob_len=76
+//
+// -- a WorkerTemplate with a REAL, non-nil RawBlob (the real,
+// library-verified offsetData fixture, same as
+// TestWorkerTemplate_ReservedOffsetPatchesRawBlobAndRederivesHashingBlob
+// above) AND a REAL, valid PoolOffset (offsetDataPoolOffset) set
+// TOGETHER with a real ReservedOffset (offsetDataReservedOffset) --
+// the advanced-client (xmr-node-proxy-aware) dialect combination that
+// was never exercised by any pre-existing test (every pre-existing
+// BlobForPool/NextJob pool-nonce test used RawBlob == nil).
+//
+// Constructed via the real production entry points end-to-end:
+// UpstreamClient.applyJob (the real upstream-job-ingestion path) ->
+// JobManager.NextJob (the real per-downstream-session job-issuance
+// path, via a fakeTemplateSource exactly like
+// TestJobManager_NextJob_WorkerAndPoolNoncesBothAdvanceIndependently
+// in template_test.go) -- called 3 times, asserting each time:
+//
+//   - it succeeds, no ErrOffsetOutOfRange (this is the literal
+//     regression proof for Alex's exact bug: against the pre-fix
+//     code, NextJob's second step -- BlobForPool -- bounds-checked
+//     PoolOffset=160 against BlobForWorker's already-converted
+//     76-byte hashing-blob output instead of the 352-byte raw blob,
+//     and failed with exactly this class of error; confirmed by
+//     temporarily reverting job.go/template.go to their pre-fix
+//     shape and re-running this exact test during development of
+//     this fix, which failed with
+//     "proxy: allocating pool-nonce job: proxy: worker-nonce offset
+//     is out of range for this template's blob: offset=160
+//     blob_len=76" -- the same class of error as Alex's real
+//     offset=179 blob_len=76 production log line);
+//   - the FINAL delivered blob is the correctly-sized, converted
+//     hashing blob (offsetDataHashingBlobLen bytes -- NOT
+//     offsetData's own 352-byte raw length) with BOTH the
+//     worker-nonce and pool-nonce values genuinely baked in -- proven
+//     by independently re-deriving the expected hashing blob from a
+//     FRESH copy of the raw offsetData fixture with ONLY the same two
+//     nonce values patched in at the same two offsets, run through
+//     go-xmr-lib's own support.ParseBlockFromTemplateBlob +
+//     support.GetBlockHashingBlob directly (not this package's own
+//     code under test), and asserting the two are byte-IDENTICAL --
+//     a genuine correctness proof, not just "it didn't error".
+func TestJobManager_NextJob_AdvancedClientPatchesBothNoncesIntoRawBlobBeforeConverting(t *testing.T) {
+	uc := NewUpstreamClient(UpstreamConfig{Login: "test-address"}, discardLogger())
+
+	reservedOffset := offsetDataReservedOffset
+	poolOffset := offsetDataPoolOffset
+	uc.applyJob(UpstreamJobPayload{
+		JobID:             "advanced-pool-nonce-job",
+		BlocktemplateBlob: offsetData,
+		Blob:              "", // advanced-client dialect: no pre-converted "blob" field
+		ReservedOffset:    &reservedOffset,
+		ClientPoolOffset:  &poolOffset,
+		Height:            555,
+		TargetDiff:        1000,
+	})
+
+	tmpl := uc.CurrentTemplate()
+	if tmpl == nil {
+		t.Fatal("expected applyJob to store a WorkerTemplate for the real offsetData fixture")
+	}
+	if tmpl.RawBlob == nil {
+		t.Fatal("expected WorkerTemplate.RawBlob to be set (advanced-client dialect, converted via the real blocktemplate_blob path) -- this test requires the RawBlob != nil branch to actually exercise the bug")
+	}
+	if tmpl.PoolOffset != offsetDataPoolOffset {
+		t.Fatalf("WorkerTemplate.PoolOffset = %d, want %d", tmpl.PoolOffset, offsetDataPoolOffset)
+	}
+	if tmpl.ReservedOffset != offsetDataReservedOffset {
+		t.Fatalf("WorkerTemplate.ReservedOffset = %d, want %d", tmpl.ReservedOffset, offsetDataReservedOffset)
+	}
+	rawFixture, err := hex.DecodeString(offsetData)
+	if err != nil {
+		t.Fatalf("decoding raw offsetData fixture: %v", err)
+	}
+	rawBlobSnapshotBefore := append([]byte(nil), tmpl.RawBlob...)
+
+	source := newFakeTemplateSource(tmpl)
+	jm := NewJobManager(source, discardLogger())
+
+	const numJobs = 3
+	seenWorker := make(map[uint32]struct{})
+	seenPool := make(map[uint32]struct{})
+	for i := 0; i < numJobs; i++ {
+		job, err := jm.NextJob(100)
+		if err != nil {
+			t.Fatalf("NextJob (issuance %d): %v -- this is the exact regression Alex hit in production (proxy: allocating pool-nonce job: proxy: worker-nonce offset is out of range for this template's blob), it must NOT happen after the fix", i, err)
+		}
+
+		if len(job.Blob) != offsetDataHashingBlobLen {
+			t.Fatalf("job %d: final delivered blob length = %d, want the real hashing-blob length %d (not the raw %d-byte full blob) -- got %x", i, len(job.Blob), offsetDataHashingBlobLen, len(rawFixture), job.Blob)
+		}
+
+		if _, dup := seenWorker[job.WorkerNonce]; dup {
+			t.Fatalf("job %d: workerNonce %d was issued to an earlier job too -- not monotonically distinct", i, job.WorkerNonce)
+		}
+		seenWorker[job.WorkerNonce] = struct{}{}
+		if _, dup := seenPool[job.PoolNonce]; dup {
+			t.Fatalf("job %d: poolNonce %d was issued to an earlier job too -- not monotonically distinct", i, job.PoolNonce)
+		}
+		seenPool[job.PoolNonce] = struct{}{}
+
+		// Genuine correctness proof: independently re-derive the
+		// expected hashing blob from a FRESH copy of the raw fixture
+		// with ONLY this job's own two nonce values patched in at
+		// the same two real offsets, using go-xmr-lib's support
+		// package directly (not any of this package's own code under
+		// test), and confirm the bytes are IDENTICAL to what NextJob
+		// actually delivered.
+		expectedRaw := append([]byte(nil), rawFixture...)
+		binary.BigEndian.PutUint32(expectedRaw[offsetDataReservedOffset:offsetDataReservedOffset+4], job.WorkerNonce)
+		binary.BigEndian.PutUint32(expectedRaw[offsetDataPoolOffset:offsetDataPoolOffset+4], job.PoolNonce)
+		parsedBlock, err := support.ParseBlockFromTemplateBlob(hex.EncodeToString(expectedRaw))
+		if err != nil {
+			t.Fatalf("job %d: independently re-parsing the nonce-patched raw fixture: %v", i, err)
+		}
+		expectedHashingBlob, err := support.GetBlockHashingBlob(parsedBlock)
+		if err != nil {
+			t.Fatalf("job %d: independently re-deriving the expected hashing blob: %v", i, err)
+		}
+		if !bytes.Equal(job.Blob, expectedHashingBlob) {
+			t.Fatalf("job %d: delivered blob = %x, want the independently-derived hashing blob %x (workerNonce=%d poolNonce=%d) -- both nonces must be baked into the SAME raw-blob copy before the ONE conversion call", i, job.Blob, expectedHashingBlob, job.WorkerNonce, job.PoolNonce)
+		}
+	}
+
+	// The template's own RawBlob must never have been mutated by any
+	// of this (non-mutating-copy discipline).
+	if !bytes.Equal(tmpl.RawBlob, rawBlobSnapshotBefore) {
+		t.Fatalf("WorkerTemplate.RawBlob was mutated by NextJob calls: before=%x after=%x", rawBlobSnapshotBefore, tmpl.RawBlob)
 	}
 }
