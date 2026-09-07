@@ -367,7 +367,42 @@ func (s *Session) handleGetJob(req Request) {
 
 // handleSubmit implements the real "submit" method for a downstream
 // RandomX/XMR miner. This is the core of leaf-proxy's local
-// re-validation contract:
+// re-validation contract.
+//
+// REAL PRODUCTION BUG FIX (this session, Alex's repeated job-staleness
+// reports): the real, expensive RandomX re-validation call
+// (s.server.validator.ValidateBlobSeedResult, ~258ms/hash pure-Go —
+// see internal/leaflib/validator/randomx_puregolang.go's own doc
+// comment for the full cost rationale) used to run UNCONDITIONALLY on
+// every submit that passed the cheap ownership/expiry/nonce checks —
+// BEFORE the claimed difficulty was even derived, let alone compared
+// against job.StaticDifficulty/job.UpstreamShareDiff. That contradicts
+// randomx_puregolang.go's own documented design contract for this
+// leaf ("leaf-proxy... only calls its Validator's
+// ValidateBlobSeedResult when a downstream miner's claimed share
+// ALREADY meets the real upstream pool's BLOCK-level target") and the
+// maintainer's own explicit authorization quoted there ("It /only/
+// needs to verify before sending it upstream"). At real per-share
+// submit rates (observed: roughly one accepted share every 0.4-0.5s
+// from a single CPU miner), a ~258ms synchronous stall on this
+// session's single read-loop goroutine on EVERY share is easily long
+// enough to let a burst of already-queued miner submits land against
+// a job that has since aged out by the time the stall clears —
+// producing exactly the observed "several rejects, all in the same
+// millisecond, against one stale job_id" pattern. Fixed by reordering
+// so the expensive call only runs for a genuine upstream-forward
+// candidate; see step 7 below and its own comment for the exact new
+// rule. Ordering also cross-checked against XNP's own real reference
+// implementation (xmr-node-proxy's lib/xmr.js, processShare): XNP
+// derives hashDiff from the CLAIMED result first (no real hash
+// computed yet), compares it against blockTemplate.targetDiff
+// (block-level) and job.difficulty (own configured difficulty)
+// BEFORE ever running its own real hash computation, and only
+// actually computes+verifies the real hash in the branch where
+// hashDiff already meets the block-level target — i.e. the exact
+// cheap-comparisons-before-expensive-verification, and
+// expensive-verification-gated-on-block-level-target-only, shape this
+// fix restores here.
 //
 //  1. SECURITY: session-ownership check on job_id FIRST (s.ownJob) —
 //     identical structural guarantee to leaf-solo's job-ownership fix
@@ -385,29 +420,43 @@ func (s *Session) handleGetJob(req Request) {
 //     offset (blockheader.go) — this constructs the actual bytes a
 //     real RandomX hash would be computed over.
 //  4. Real per-job used-nonce tracking (replay rejection).
-//  5. Real local RandomX re-validation via the already-merged
-//     RandomXValidator (s.server.validator), NOT a passthrough.
-//  6. Real difficulty derivation of the already-confirmed-real hash
-//     (difficulty.go's littleEndianDifficulty, the same well-known
-//     CryptoNote/RandomX target/difficulty relationship already used
-//     for Tari's RXT elsewhere in this codebase).
-//  7. THE CORE LEAF-PROXY BEHAVIOR: if that real difficulty meets or
-//     exceeds the job's real upstream pool-requested share difficulty
+//  5. Real difficulty DERIVATION from the miner's already-received,
+//     UNVERIFIED claimed hash (difficulty.go's littleEndianDifficulty,
+//     the same well-known CryptoNote/RandomX target/difficulty
+//     relationship already used for Tari's RXT elsewhere in this
+//     codebase) — this is a pure computation over bytes the miner
+//     already sent in submit.Result; it requires NO RandomX call at
+//     all, and is what determines whether the expensive real
+//     verification below is even worth running.
+//  6. Reject outright, with NO RandomX call spent, if that claimed
+//     difficulty doesn't even meet this session's own
+//     configured/vardiff share difficulty (job.StaticDifficulty): a
+//     share that fails its own requested-difficulty check is rejected
+//     on that basis alone, regardless of whether the underlying PoW
+//     would even be valid.
+//  7. THE CORE LEAF-PROXY BEHAVIOR, and the exact gate this fix
+//     restores: the real, expensive local RandomX re-validation via
+//     the already-merged RandomXValidator (s.server.validator) is
+//     called ONLY when the claimed difficulty ALSO meets or exceeds
+//     the job's real upstream pool-requested share difficulty
 //     (Job.UpstreamShareDiff — the SAME target_diff field an ordinary
 //     miner receives on login/getjob, confirmed directly from the
 //     real pool-server source; NOT a network/block-level target,
 //     which this leaf has no visibility into and does not need for
-//     this purpose), it is worth forwarding upstream for real via
-//     s.server.upstream (UpstreamClient.SubmitShare), per the
-//     maintainer's explicit rule: "we only submit shares upstream
-//     when a miner share > the pool's requested diff". If it only
-//     meets the session's own configured/vardiff share difficulty,
-//     it is credited LOCALLY ONLY (this session's own
+//     this purpose) — i.e. only for a genuine "about to forward
+//     upstream" candidate, per the maintainer's explicit rule quoted
+//     above. A share that only meets the session's own configured
+//     share difficulty is credited LOCALLY ONLY (this session's own
 //     shareCount/vardiff accept-history) and NEVER forwarded
-//     upstream — mirroring leaf-solo's identical "accept locally
-//     always, only escalate on a genuine block-level event" shape,
-//     just with "forward upstream" in place of "call GRPC
-//     SubmitBlock".
+//     upstream, WITHOUT ever calling ValidateBlobSeedResult at all —
+//     this is the real behavior change this fix makes (previously the
+//     validator was called for this case too, and its result simply
+//     discarded once the upstream-forward decision was made). If the
+//     real re-validation of a genuine upstream-forward candidate
+//     fails or errors, the submit is rejected outright — a share
+//     claiming to meet the upstream target but failing real
+//     re-validation is genuinely suspect and is never silently
+//     downgraded to a local-only credit.
 func (s *Session) handleSubmit(req Request) {
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before submit", "")
@@ -463,16 +512,11 @@ func (s *Session) handleSubmit(req Request) {
 		return
 	}
 
-	valid, err := s.server.validator.ValidateBlobSeedResult(context.Background(), fullBlob, job.SeedHash, submit.Result)
-	if err != nil {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
-		return
-	}
-	if !valid {
-		s.writeShareResponse(req.ID, false, "share is not a cryptographically valid RandomX proof for this job")
-		return
-	}
-
+	// Cheap difficulty DERIVATION from the miner's already-received,
+	// UNVERIFIED claimed hash — no RandomX call required at all, and
+	// what determines whether the expensive real verification below
+	// is even worth running (see this function's own doc comment,
+	// steps 5-7, and randomx_puregolang.go's documented contract).
 	claimedHash, err := hex.DecodeString(submit.Result)
 	if err != nil {
 		s.writeShareResponse(req.ID, false, "claimed result is not valid hex")
@@ -485,16 +529,13 @@ func (s *Session) handleSubmit(req Request) {
 	}
 
 	if diff < job.StaticDifficulty {
+		// Below the session's OWN requested/configured difficulty:
+		// reject on that basis alone, with NO RandomX call spent
+		// verifying a share that would be rejected regardless of
+		// whether the underlying PoW is even valid.
 		s.writeShareResponse(req.ID, false, "share does not meet configured difficulty")
 		return
 	}
-
-	// Real, cryptographically valid share meeting this session's own
-	// configured/vardiff difficulty: local-only credit (this is the
-	// vardiff accept-history signal too — same shape as leaf-solo's
-	// s.hashesAccumulated.Add(job.StaticDifficulty)).
-	s.shareCount.Add(1)
-	s.hashesAccumulated.Add(job.StaticDifficulty)
 
 	if job.UpstreamShareDiff == 0 || diff < job.UpstreamShareDiff {
 		// Below the real upstream pool's own requested share
@@ -502,16 +543,46 @@ func (s *Session) handleSubmit(req Request) {
 		// field an ordinary miner receives, NOT a network/block-level
 		// target): credited locally only, per the maintainer's
 		// explicit rule ("we only submit shares upstream when a
-		// miner share > the pool's requested diff") — NEVER
-		// forwarded upstream.
+		// miner share > the pool's requested diff") — NEVER forwarded
+		// upstream, and — THE REAL FIX — WITHOUT ever calling the
+		// expensive s.server.validator.ValidateBlobSeedResult at all,
+		// matching randomx_puregolang.go's documented contract
+		// exactly (this leaf only re-validates a genuine
+		// upstream-forward candidate).
+		s.shareCount.Add(1)
+		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.server.recordShareDecision(false)
 		s.writeShareResponse(req.ID, true, "")
 		return
 	}
 
-	// Meets/exceeds the real upstream pool's own requested share
-	// difficulty: forward it upstream for real, via the real pool
-	// submit RPC.
+	// Genuine upstream-forward candidate: claimed difficulty meets
+	// or exceeds the real upstream pool's own requested share
+	// difficulty. THIS is the only case that pays the real, ~258ms
+	// pure-Go RandomX re-validation cost (s.server.validator.
+	// ValidateBlobSeedResult) — see this function's doc comment and
+	// randomx_puregolang.go's documented contract. A share that
+	// fails real re-validation here is rejected outright, never
+	// silently downgraded to a local-only credit: it claimed to meet
+	// the upstream target, and this leaf could not itself confirm
+	// that claim.
+	valid, err := s.server.validator.ValidateBlobSeedResult(context.Background(), fullBlob, job.SeedHash, submit.Result)
+	if err != nil {
+		s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+		return
+	}
+	if !valid {
+		s.writeShareResponse(req.ID, false, "share is not a cryptographically valid RandomX proof for this job")
+		return
+	}
+
+	// Real, cryptographically re-validated genuine upstream-forward
+	// candidate: local credit (this is the vardiff accept-history
+	// signal too — same shape as leaf-solo's
+	// s.hashesAccumulated.Add(job.StaticDifficulty)), then forward it
+	// upstream for real, via the real pool submit RPC.
+	s.shareCount.Add(1)
+	s.hashesAccumulated.Add(job.StaticDifficulty)
 	s.server.recordShareDecision(true)
 	accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce)
 	if err != nil {
