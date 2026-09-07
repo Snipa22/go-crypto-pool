@@ -542,9 +542,16 @@ func (uc *UpstreamClient) login(ctx context.Context) (UpstreamLoginResult, error
 }
 
 // SubmitShare sends a real "submit" request upstream — ported from
-// the reference's Pool.sendShare. Called ONLY for genuine
-// block-level finds (see server.go's handleSubmit): shares below the
-// upstream pool's real block target are never forwarded here.
+// the reference's Pool.sendShare, PLUS proxy.js's generic
+// `sendData`'s own `params.id = this.id` post-login injection (see
+// UpstreamSubmitParams.ID's doc comment): submit is sent after
+// login has already populated uc.sessionID (login() sets it from
+// result.ID before this leaf ever issues a downstream job to
+// forward), so every real submit carries the pool-assigned session
+// id, exactly like keepalived already does (sendKeepalive). Called
+// ONLY for genuine block-level finds (see server.go's handleSubmit):
+// shares below the upstream pool's real block target are never
+// forwarded here.
 func (uc *UpstreamClient) SubmitShare(ctx context.Context, jobID, nonceHex, resultHex string, workerNonce, poolNonce uint32) (bool, error) {
 	params, err := json.Marshal(UpstreamSubmitParams{
 		JobID:       jobID,
@@ -552,6 +559,7 @@ func (uc *UpstreamClient) SubmitShare(ctx context.Context, jobID, nonceHex, resu
 		Result:      resultHex,
 		WorkerNonce: workerNonce,
 		PoolNonce:   poolNonce,
+		ID:          uc.sessionID,
 	})
 	if err != nil {
 		return false, err
@@ -840,6 +848,10 @@ func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
 	if job.ReservedOffset != nil {
 		reservedOffset = *job.ReservedOffset
 	}
+	poolOffset := -1
+	if job.ClientPoolOffset != nil {
+		poolOffset = *job.ClientPoolOffset
+	}
 
 	targetDiff := job.TargetDiff
 	if targetDiff == 0 && job.Target != "" {
@@ -864,6 +876,7 @@ func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
 		RawBlob:           rawBlob,
 		ReservedOffset:    reservedOffset,
 		ClientNonceOffset: clientNonceOffset,
+		PoolOffset:        poolOffset,
 		SeedHash:          seed,
 		Height:            job.Height,
 		JobID:             job.JobID,

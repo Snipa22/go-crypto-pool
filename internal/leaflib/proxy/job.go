@@ -39,6 +39,27 @@ type Job struct {
 	// upstream-pool-published offset for this specific job issuance.
 	WorkerNonce uint32
 
+	// PoolNonce is the 4-byte pool-level nonce value written into
+	// Blob at the upstream-pool-published PoolOffset (client_pool_
+	// offset) for this specific job issuance — the POOL-level peer
+	// of WorkerNonce above. Ported exactly from the real reference's
+	// getMasterJob (lib/xmr.js): it calls
+	// `activeBlockTemplate.blobForWorker()` (which increments and
+	// bakes the pool nonce into the blob about to be handed out),
+	// THEN immediately captures that exact same value,
+	// `activeBlockTemplate.poolNonce`, into `localData.poolNonce`
+	// alongside the job's own masterJobID in a per-worker circular
+	// buffer — so that later, on submit, Pool.sendShare can look the
+	// job back up by id and echo back the EXACT poolNonce value that
+	// was baked into THAT SPECIFIC job's blob delivery (not some
+	// global/current template value, which could have since moved on
+	// to a different job's issuance). This field is this leaf's
+	// equivalent of that captured localData.poolNonce — see
+	// JobManager.NextJob for where it is allocated/captured, and
+	// session.go's handleSubmit for where it is echoed back on
+	// upstream submit.
+	PoolNonce uint32
+
 	// UpstreamJobID is the upstream pool's OWN job_id for the
 	// template this Job was derived from — required to forward a
 	// share upstream (UpstreamClient.SubmitShare's job_id param).
@@ -143,7 +164,20 @@ func NewJobManager(source TemplateSource, logger *log.Logger) *JobManager {
 }
 
 // NextJob allocates a brand new Job at the given (session-owned)
-// difficulty from the current upstream template.
+// difficulty from the current upstream template. BOTH the
+// worker-nonce and pool-nonce counters (WorkerTemplate's
+// nextWorkerNonce/nextPoolNonce -- see those fields' doc comments)
+// advance by exactly one on every call, and the SAME returned blob
+// carries BOTH values patched in at their respective offsets
+// (worker at ReservedOffset/ClientNonceOffset via
+// NextBlobForWorker, pool at PoolOffset via BlobForPool applied on
+// top of that result) -- matching the real reference's per-job-issuance
+// cadence: getMasterJob's blobForWorker() (pool-nonce patch) is
+// called once per job handed to a downstream connection, the same
+// cadence as the ordinary/solo BlockTemplate.nextBlob's
+// workerNonce patch. These are deliberately independent counters
+// (see WorkerTemplate.nextPoolNonce's doc comment for why), even
+// though they both advance once per issuance here.
 func (jm *JobManager) NextJob(difficulty uint64) (*Job, error) {
 	t := jm.source.CurrentTemplate()
 	if t == nil {
@@ -153,6 +187,11 @@ func (jm *JobManager) NextJob(difficulty uint64) (*Job, error) {
 	if err != nil {
 		return nil, fmt.Errorf("proxy: allocating worker-nonce job: %w", err)
 	}
+	poolNonce := t.NextPoolNonce()
+	blob, err = t.BlobForPool(blob, poolNonce)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: allocating pool-nonce job: %w", err)
+	}
 	id, err := newRandomHexID()
 	if err != nil {
 		return nil, fmt.Errorf("proxy: generating job id: %w", err)
@@ -161,6 +200,7 @@ func (jm *JobManager) NextJob(difficulty uint64) (*Job, error) {
 		ID:                id,
 		Blob:              blob,
 		WorkerNonce:       workerNonce,
+		PoolNonce:         poolNonce,
 		UpstreamJobID:     t.JobID,
 		SeedHash:          t.SeedHash,
 		Height:            t.Height,

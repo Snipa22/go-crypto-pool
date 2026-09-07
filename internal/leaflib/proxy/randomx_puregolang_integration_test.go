@@ -50,6 +50,7 @@ func TestSession_RealPureGoRandomXValidator_BlockLevelFind_ForwardedUpstream(t *
 		Blob:              blob,
 		ReservedOffset:    50,
 		ClientNonceOffset: -1,
+		PoolOffset:        -1, // this fake upstream never publishes client_pool_offset
 		SeedHash:          seedHash,
 		Height:            123,
 		JobID:             "upstream-job-real-rx",

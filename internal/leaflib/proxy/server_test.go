@@ -131,6 +131,7 @@ func TestServer_SessionSnapshots_UpstreamHealthReportedWhenImplemented(t *testin
 		Blob:              fakeBlob(76, 50),
 		ReservedOffset:    50,
 		ClientNonceOffset: -1,
+		PoolOffset:        -1, // this fake upstream never publishes client_pool_offset
 		SeedHash:          []byte("test-seed-hash-32-bytes-exactly!"),
 		Height:            123,
 		JobID:             "upstream-job-1",
