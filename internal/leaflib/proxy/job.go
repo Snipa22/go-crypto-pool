@@ -163,8 +163,60 @@ func NewJobManager(source TemplateSource, logger *log.Logger) *JobManager {
 	return &JobManager{source: source, logger: logger}
 }
 
+// currentTemplateJobID reports the current upstream template's OWN
+// job_id (WorkerTemplate.JobID) WITHOUT allocating a new Job or
+// burning any worker-/pool-nonce — a pure, side-effect-free read,
+// mirroring XNP's own getJob() check of `activeBlockTemplate.id`
+// (lib/xmr.js) before deciding whether miner.cachedJob can be reused.
+// Returns ("", false) if no upstream template has been published yet
+// (jm.source.CurrentTemplate() == nil) — Session.currentJob treats
+// that identically to "cannot cache" and falls through to NextJob,
+// which will itself return ErrNoUpstreamTemplate in that case.
+func (jm *JobManager) currentTemplateJobID() (id string, ok bool) {
+	t := jm.source.CurrentTemplate()
+	if t == nil {
+		return "", false
+	}
+	return t.JobID, true
+}
+
 // NextJob allocates a brand new Job at the given (session-owned)
-// difficulty from the current upstream template. BOTH the
+// difficulty from the current upstream template, UNCONDITIONALLY --
+// every single call burns a fresh worker-/pool-nonce pair and mints a
+// brand-new random job_id, even if the caller's previous call was for
+// the exact same session against the exact same, completely unchanged
+// upstream template and difficulty. This is the correct, deliberate
+// behavior for THIS low-level primitive -- it must remain unconditional
+// because Session.currentJob (session.go) is what adds the actual
+// caching/dedup discipline ON TOP of it (mirroring
+// internal/leaflib/solo/job.go's JobManager.jobForXN/
+// JobForXNAtDifficulty, which caches per-xn, and XNP's own getJob()
+// (lib/xmr.js), which short-circuits on an unchanged
+// activeBlockTemplate.id/!miner.newDiff via miner.cachedJob).
+//
+// BUG FIX CONTEXT (Alex, live production report, third occurrence of
+// this bug class): before Session.currentJob existed, EVERY call site
+// (handleLogin, handleGetJob, maybeRetarget, Server.repushAllSessions)
+// called this method directly and unconditionally, so a redundant
+// getjob poll or repush -- even with the upstream template and
+// requested difficulty both completely unchanged -- still minted a
+// brand-new job_id and burned a fresh slot in the session's bounded
+// 8-entry job history (Session.recordJob), exhausting it far faster
+// than genuine upstream job changes (~5-15s) could explain: a job
+// accepted normally, then an immediate burst of 8 rejects against
+// that SAME job_id in the same millisecond, only ~1.5s after a
+// genuine new upstream job event. Production call sites now go
+// through Session.currentJob instead; this method remains the
+// correct, unconditional "always mint" primitive it always was --
+// used internally by currentJob, and still used directly by tests
+// that intentionally want that unconditional behavior (e.g.
+// template_test.go/e2e_blob_size_test.go/session_test.go's
+// TestSession_AlreadyDelivered_SameJobSameDifficultyIsDeliveredAgain,
+// which needs two genuinely distinct job_ids to exercise
+// alreadyDelivered directly). Do not add caching logic here -- add it
+// to Session.currentJob instead.
+//
+// BOTH the
 // worker-nonce and pool-nonce counters (WorkerTemplate's
 // nextWorkerNonce/nextPoolNonce -- see those fields' doc comments)
 // advance by exactly one on every call, via a SINGLE call to

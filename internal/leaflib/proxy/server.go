@@ -231,20 +231,33 @@ func (s *Server) recordConnectionError(category string) {
 // staleness issues, it's disabling as soon as a new job is sent, it
 // needs to allow jobs 2-3 old, just like the -direct has to"): gated
 // by sess.alreadyDelivered(job) exactly like leaf-direct's/leaf-solo's
-// own invalidateAndRepushJobs already are -- JobManager.NextJob always
-// allocates a brand-new random job_id (newRandomHexID) plus fresh
-// worker-/pool-nonces on EVERY call, so without this gate, every fire
-// of jobs.Subscribe (which, prior to upstream.go's applyJob upstream-
-// dupe guard, could itself fire on a genuine upstream no-op like a
-// getjob poll response) handed every logged-in session a completely
-// new, unrelated job_id -- evicting that session's own in-flight job
-// out of its bounded jobHistorySize (defaultProxySessionJobHistorySize)
-// before it could even be submitted. This is what produced the
-// observed "unknown or stale job_id" rejections within tens of
-// milliseconds of a job being issued. An explicit miner-initiated
-// getjob/vardiff-retarget push is untouched by this gate -- it still
-// always goes through pushJob/jobPayload unconditionally; the gate
-// applies ONLY here, exactly mirroring direct/solo's own scoping.
+// own invalidateAndRepushJobs already are.
+//
+// SECOND BUG FIX, one level deeper (third report of this same class of
+// issue): this now calls sess.currentJob(difficulty) (session.go)
+// instead of s.jobs.NextJob(difficulty) directly. Before
+// Session.currentJob existed, JobManager.NextJob's unconditional
+// "always allocate a brand-new random job_id plus fresh worker-/
+// pool-nonces" behavior meant EVERY fire of jobs.Subscribe (which,
+// prior to upstream.go's applyJob upstream-dupe guard, could itself
+// fire on a genuine upstream no-op like a getjob poll response) handed
+// every logged-in session a completely new, unrelated job_id --
+// evicting that session's own in-flight job out of its bounded
+// jobHistorySize (defaultProxySessionJobHistorySize) before it could
+// even be submitted. alreadyDelivered already gated the SYMPTOM at
+// this one unsolicited-push call site; currentJob now fixes the
+// underlying ROOT CAUSE everywhere (this call site included): a
+// redundant repush against an unchanged template/difficulty now
+// returns the SAME cached *Job instead of minting a new one, so
+// alreadyDelivered's gate below will, in the common case, now also
+// see the SAME job.ID it already delivered (the two mechanisms are
+// complementary, not redundant: currentJob avoids minting a wasted job
+// in the first place; alreadyDelivered still avoids re-pushing an
+// unchanged job down the wire at all). An explicit miner-initiated
+// getjob/vardiff-retarget push is untouched by the alreadyDelivered
+// gate -- it still always goes through pushJob/jobPayload
+// unconditionally; that gate applies ONLY here, exactly mirroring
+// direct/solo's own scoping.
 func (s *Server) repushAllSessions() {
 	s.mu.RLock()
 	sessions := make([]*Session, 0, len(s.sessions))
@@ -256,7 +269,7 @@ func (s *Server) repushAllSessions() {
 		if !sess.loggedIn.Load() {
 			continue
 		}
-		job, err := s.jobs.NextJob(sess.currentDifficulty.Load())
+		job, err := sess.currentJob(sess.currentDifficulty.Load())
 		if err != nil {
 			s.logger.Printf("proxy: failed to regenerate job for session %s after upstream template update: %v", sess.sessionID, err)
 			continue

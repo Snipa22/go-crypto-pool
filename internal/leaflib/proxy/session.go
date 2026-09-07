@@ -67,6 +67,27 @@ type UpstreamSubmitter interface {
 // out of its bounded jobHistorySize before it could even submit,
 // producing exactly the observed "unknown or stale job_id" rejections
 // within tens of milliseconds of a job being issued.
+//
+// It ALSO carries a per-session JOB CACHE (jobCacheMu/cachedJob below,
+// backed by currentJob) -- the THIRD report of this same class of bug,
+// one level deeper than the repush dedup above: JobManager.NextJob has
+// NO caching at all, so even the repush-dedup fix above didn't help an
+// explicit, redundant miner-initiated getjob (some miner software
+// polls periodically in addition to waiting for pushed jobs) or a
+// vardiff retarget tick that didn't actually change anything -- EVERY
+// one of those still called NextJob directly and minted a brand-new
+// job_id/nonce pair, burning a job-history slot for genuinely zero
+// reason. Confirmed live: a job accepted normally, then an immediate
+// burst of 8 rejects against that SAME job_id in the same
+// millisecond, only ~1.5s after a genuine new upstream job event --
+// far more evictions than the actual upstream job cadence (~5-15s)
+// could explain on its own. Ported from XNP's own getJob() (lib/
+// xmr.js), which short-circuits on an unchanged
+// activeBlockTemplate.id/!miner.newDiff via miner.cachedJob, and from
+// this repo's own already-correct solo.JobManager.jobForXN/
+// JobForXNAtDifficulty (internal/leaflib/solo/job.go), which caches
+// per-xn the same way. See currentJob's own doc comment for the exact
+// caching rule.
 type Session struct {
 	mc     *leaflib.ManagedConnection
 	server *Server
@@ -105,6 +126,16 @@ type Session struct {
 	// alreadyDelivered.
 	lastDeliveredJobID      atomic.Value // string
 	lastDeliveredDifficulty atomic.Uint64
+
+	// jobCacheMu/cachedJob back currentJob's per-session job-caching
+	// discipline -- see that method's doc comment for the exact rule.
+	// Deliberately a SEPARATE lock from jobsMu (jobList/jobLog): a
+	// cache hit under currentJob's own critical section must not need
+	// to also take jobsMu (which recordJob/ownJob already serialize
+	// independently), and vice versa -- keeping these independent
+	// avoids any lock-ordering coupling between the two mechanisms.
+	jobCacheMu sync.Mutex
+	cachedJob  *Job
 }
 
 // alreadyDelivered mirrors solo.Session's/direct.Session's own
@@ -123,6 +154,77 @@ func (s *Session) alreadyDelivered(job *Job) bool {
 		return false
 	}
 	return s.lastDeliveredDifficulty.Load() == job.StaticDifficulty
+}
+
+// currentJob is the real per-session job-caching choke point every
+// production job-issuance call site (handleLogin, handleGetJob,
+// maybeRetarget, Server.repushAllSessions) now goes through instead
+// of calling s.server.jobs.NextJob(difficulty) directly. It ports the
+// SAME caching discipline this repo's own already-correct
+// solo.JobManager.jobForXN/JobForXNAtDifficulty
+// (internal/leaflib/solo/job.go) already has, and that XNP's own
+// getJob() (lib/xmr.js) already has via miner.cachedJob/
+// activeBlockTemplate.id/!miner.newDiff -- adapted to leaf-proxy's own
+// architecture, which has no per-connection "xn"/nonce-space concept
+// (proxy partitions worker-/pool-nonces at the WorkerTemplate level,
+// not per-session -- see JobManager.NextJob) but DOES have a
+// per-session cache key that matters just as much: "is the upstream
+// template this session was last handed still the SAME template, at
+// the SAME requested difficulty".
+//
+// The rule, in order:
+//
+//  1. Read the CURRENT upstream template's own job_id via
+//     s.server.jobs.currentTemplateJobID() -- a pure, side-effect-free
+//     read, no nonce/ID allocated.
+//  2. If that job_id is EMPTY (some pool dialects never publish
+//     job_id at all -- confirmed possible, see UpstreamJobPayload.
+//     JobID's own omitempty tag), caching is UNSAFE: an empty id can
+//     never distinguish "same template" from "genuinely different
+//     template", so this ALWAYS falls through to minting a fresh job
+//     via NextJob -- exactly matching upstream.go's applyJob dupe
+//     guard's own identical empty-job_id-can-never-dedupe rule (see
+//     that function's doc comment), kept consistent here rather than
+//     inventing a different rule for the same underlying ambiguity.
+//  3. Otherwise, under jobCacheMu: if s.cachedJob is non-nil AND
+//     s.cachedJob.UpstreamJobID equals the current template's job_id
+//     AND s.cachedJob.StaticDifficulty equals the requested
+//     difficulty, return the EXISTING s.cachedJob UNCHANGED -- no
+//     NextJob call, no new nonce/ID minted, no job-history slot
+//     burned. This is the actual fix: a redundant getjob poll, or a
+//     vardiff tick that didn't change anything, now costs nothing.
+//  4. Otherwise (template genuinely changed, OR requested difficulty
+//     genuinely changed, OR no cached job yet): call NextJob, store
+//     the result as the new s.cachedJob, and return it.
+//
+// maybeRetarget (vardiff.go) routes through this too even though
+// leaflib.ComputeRetarget only reports changed=true on a genuine
+// difficulty change (so in practice this will almost always mint
+// fresh there, matching XNP's own !miner.newDiff gate -- a genuine
+// retarget always forces a new job) -- doing so keeps a single,
+// consistent code path for every production caller and costs nothing
+// extra.
+func (s *Session) currentJob(difficulty uint64) (*Job, error) {
+	templateJobID, ok := s.server.jobs.currentTemplateJobID()
+	if !ok || templateJobID == "" {
+		// No template yet, or this pool dialect never publishes
+		// job_id: caching is unsafe/impossible -- always mint fresh.
+		return s.server.jobs.NextJob(difficulty)
+	}
+
+	s.jobCacheMu.Lock()
+	defer s.jobCacheMu.Unlock()
+
+	if s.cachedJob != nil && s.cachedJob.UpstreamJobID == templateJobID && s.cachedJob.StaticDifficulty == difficulty {
+		return s.cachedJob, nil
+	}
+
+	job, err := s.server.jobs.NextJob(difficulty)
+	if err != nil {
+		return nil, err
+	}
+	s.cachedJob = job
+	return job, nil
 }
 
 const defaultProxySessionJobHistorySize = 8
@@ -230,7 +332,7 @@ func (s *Session) handleLogin(req Request) {
 	s.worker.Store(worker)
 	s.loggedIn.Store(true)
 
-	job, err := s.server.jobs.NextJob(s.currentDifficulty.Load())
+	job, err := s.currentJob(s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("proxy: failed to get job for session %s: %v", s.sessionID, err)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
@@ -254,7 +356,7 @@ func (s *Session) handleGetJob(req Request) {
 		s.writeGeneralResponse(req.ID, "login required before getjob", "")
 		return
 	}
-	job, err := s.server.jobs.NextJob(s.currentDifficulty.Load())
+	job, err := s.currentJob(s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("proxy: failed to get job for session %s: %v", s.sessionID, err)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
