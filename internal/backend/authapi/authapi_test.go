@@ -427,6 +427,27 @@ func TestChangePayoutThreshold(t *testing.T) {
 	}
 }
 
+func TestChangePayoutThreshold_DecimalValueRoundsToNearestAtomicUnit(t *testing.T) {
+	repo := newFakeRepo()
+	h := newTestHandler(t, repo)
+	repo.addUser(User{Username: "alice"})
+	token, _ := h.signToken(1, false)
+
+	rr := doReq(t, h.Mux(), http.MethodPost, "/authed/changePayoutThreshold?token="+token, `{"threshold":1.5}`, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]string
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp["msg"] != "Threshold updated, set to: 2" {
+		t.Fatalf("unexpected msg: %q", resp["msg"])
+	}
+	u, _ := repo.GetUserByID(context.Background(), 1)
+	if u.PayoutThreshold != 2 {
+		t.Fatalf("threshold not persisted as rounded int64: %+v", u)
+	}
+}
+
 func TestForcePayment_DefaultsAlgoAndNetwork(t *testing.T) {
 	repo := newFakeRepo()
 	h := newTestHandler(t, repo) // Config.Network = TESTNET
@@ -496,6 +517,28 @@ func TestUpdateThreshold_CreatesUserIfMissing(t *testing.T) {
 	}
 	if u.PayoutThreshold != 123 || u.Email != "null@null.null" {
 		t.Fatalf("unexpected created user: %+v", u)
+	}
+}
+
+func TestUpdateThreshold_DecimalValueRoundsToNearestAtomicUnit(t *testing.T) {
+	repo := newFakeRepo()
+	h := newTestHandler(t, repo)
+
+	rr := doReq(t, h.Mux(), http.MethodPost, "/user/updateThreshold", `{"username":"newuser","threshold":1.5}`, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]string
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp["msg"] != "Threshold updated, set to: 2" {
+		t.Fatalf("unexpected msg: %q", resp["msg"])
+	}
+	u, err := repo.GetUserByUsername(context.Background(), "newuser")
+	if err != nil {
+		t.Fatalf("expected user to be created: %v", err)
+	}
+	if u.PayoutThreshold != 2 {
+		t.Fatalf("threshold not persisted as rounded int64: %+v", u)
 	}
 }
 

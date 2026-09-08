@@ -95,6 +95,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -523,8 +524,19 @@ func (h *Handler) handleToggleEmail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"msg": "Email toggled"})
 }
 
+// changePayoutThresholdRequest.Threshold is float64 (not int64)
+// because legacy's lib/api.js read this field with parseFloat and so
+// never rejected a decimal value here -- encoding/json, unlike
+// parseFloat, hard-errors trying to unmarshal a JSON number with a
+// fractional part into an int64 field. payout_threshold is itself an
+// atomic-unit bigint column (see brief-auth.md), i.e. inherently
+// integral, so any fractional value received is rounded (not
+// truncated) to the nearest atomic unit before being persisted --
+// this matches ordinary decimal-rounding expectations for a
+// caller-supplied numeric amount and avoids silently shaving value
+// off a threshold on truncation.
 type changePayoutThresholdRequest struct {
-	Threshold int64 `json:"threshold"`
+	Threshold float64 `json:"threshold"`
 }
 
 func (h *Handler) handleChangePayoutThreshold(w http.ResponseWriter, r *http.Request) {
@@ -540,12 +552,13 @@ func (h *Handler) handleChangePayoutThreshold(w http.ResponseWriter, r *http.Req
 		writeJSONErr(w, http.StatusBadRequest, "malformed JSON body")
 		return
 	}
+	threshold := int64(math.Round(req.Threshold))
 
-	if err := h.repo.UpdateUserPayoutThreshold(r.Context(), c.ID, req.Threshold); err != nil {
+	if err := h.repo.UpdateUserPayoutThreshold(r.Context(), c.ID, threshold); err != nil {
 		writeJSONErr(w, http.StatusInternalServerError, "update failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"msg": fmt.Sprintf("Threshold updated, set to: %d", req.Threshold)})
+	writeJSON(w, http.StatusOK, map[string]string{"msg": fmt.Sprintf("Threshold updated, set to: %d", threshold)})
 }
 
 // forcePaymentRequest is the JSON body POST /user/forcePayment
@@ -597,9 +610,14 @@ func (h *Handler) handleForcePayment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"msg": "Payout scheduled"})
 }
 
+// updateThresholdRequest.Threshold is float64 for the same reason as
+// changePayoutThresholdRequest.Threshold above: legacy's parseFloat
+// never rejected a decimal here, and this handler rounds to the
+// nearest atomic unit before persisting (see that type's doc comment
+// for the full rationale).
 type updateThresholdRequest struct {
-	Username  string `json:"username"`
-	Threshold int64  `json:"threshold"`
+	Username  string  `json:"username"`
+	Threshold float64 `json:"threshold"`
 }
 
 func (h *Handler) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) {
@@ -613,6 +631,7 @@ func (h *Handler) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) 
 		writeJSONErr(w, http.StatusBadRequest, "username is required")
 		return
 	}
+	threshold := int64(math.Round(req.Threshold))
 
 	// NOTE (explicit gap, per brief-auth.md): this backend has no
 	// single reusable, coin-agnostic "ValidateAddress" function --
@@ -624,11 +643,11 @@ func (h *Handler) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) 
 	// shape does not). Rather than inventing new address-decode
 	// logic, address-format validation is deliberately skipped here.
 
-	if err := h.repo.UpsertUserThreshold(r.Context(), req.Username, req.Threshold); err != nil {
+	if err := h.repo.UpsertUserThreshold(r.Context(), req.Username, threshold); err != nil {
 		writeJSONErr(w, http.StatusInternalServerError, "update failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"msg": fmt.Sprintf("Threshold updated, set to: %d", req.Threshold)})
+	writeJSON(w, http.StatusOK, map[string]string{"msg": fmt.Sprintf("Threshold updated, set to: %d", threshold)})
 }
 
 func (h *Handler) handleGetUser(w http.ResponseWriter, r *http.Request) {
