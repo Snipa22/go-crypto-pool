@@ -76,6 +76,25 @@ func lastSeenUnix(rows []IdentifierRecord) int64 {
 	return max
 }
 
+// buildMinerStatRow assembles a minerStatRow from an already-computed
+// share aggregate (sharesSum/shareCount — either the whole-address
+// aggregate or one worker's own aggregate) plus that row's LTS and
+// identifer. This is the one, shared place the lts/hash/totalHash/
+// validShares/invalidShares computation lives, so
+// handleMinerStats (identifer="") and handleMinerStatsAllWorkers
+// (identifer="global" for its address-wide aggregate row, and each
+// worker's own identifier for its per-worker rows) never duplicate it.
+func buildMinerStatRow(lts, sharesSum, shareCount int64, identifer string) minerStatRow {
+	return minerStatRow{
+		LTS:           lts,
+		Identifer:     identifer,
+		Hash:          estimateHashrateHS(sharesSum, defaultWindowSeconds),
+		TotalHash:     sharesSum,
+		ValidShares:   shareCount,
+		InvalidShares: 0,
+	}
+}
+
 // handleMinerStats implements GET /miner/:address/stats: the
 // whole-address aggregate (ShareStatsSince, summed across every
 // worker) plus the real amtPaid/amtDue (summed pending/paid balance
@@ -121,25 +140,25 @@ func (h *Handler) handleMinerStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, minerStatRowWithBalance{
-		minerStatRow: minerStatRow{
-			LTS:           lastSeenUnix(idents),
-			Identifer:     "",
-			Hash:          estimateHashrateHS(shareStats.SharesSum, defaultWindowSeconds),
-			TotalHash:     shareStats.SharesSum,
-			ValidShares:   shareStats.ShareCount,
-			InvalidShares: 0,
-		},
-		AmtPaid:  amtPaid,
-		AmtDue:   amtDue,
-		TxnCount: txnCount,
+		minerStatRow: buildMinerStatRow(lastSeenUnix(idents), shareStats.SharesSum, shareStats.ShareCount, ""),
+		AmtPaid:      amtPaid,
+		AmtDue:       amtDue,
+		TxnCount:     txnCount,
 	})
 }
 
 // handleMinerStatsAllWorkers implements
-// GET /miner/:address/stats/allWorkers: one minerStatRow per worker
-// this address has ever registered (sourced the same way
-// handleMinerHashrateChartAllWorkers sources its key set — see that
-// handler's doc comment), returned as a JSON array.
+// GET /miner/:address/stats/allWorkers, matching legacy's own
+// getAllWorkerStats shape: a JSON OBJECT keyed by worker identifier,
+// PLUS a "global" key holding the same address-wide aggregate
+// handleMinerStats computes for its own bare, non-worker-scoped
+// response (built via the same shared buildMinerStatRow helper, with
+// Identifer forced to the literal string "global" rather than
+// handleMinerStats's own empty string). The worker-identifier KEY SET
+// is sourced the same way handleMinerHashrateChartAllWorkers sources
+// its own key set (every worker this address has ever registered —
+// see that handler's doc comment), not merely from whichever workers
+// happen to have a nonzero share sum in this window.
 func (h *Handler) handleMinerStatsAllWorkers(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	algo := resolveAlgo(q.Get("algo"))
@@ -147,6 +166,11 @@ func (h *Handler) handleMinerStatsAllWorkers(w http.ResponseWriter, r *http.Requ
 	address, paymentID := splitLegacyAddress(r.PathValue("address"))
 
 	since := nowUnix() - defaultWindowSeconds
+	globalStats, err := h.stats.ShareStatsSince(r.Context(), algo, network, address, paymentID, since)
+	if err != nil {
+		writeJSONErr(w, http.StatusInternalServerError, "query failed")
+		return
+	}
 	workerStats, err := h.stats.WorkerShareStatsSince(r.Context(), algo, network, address, paymentID, since)
 	if err != nil {
 		writeJSONErr(w, http.StatusInternalServerError, "query failed")
@@ -167,21 +191,15 @@ func (h *Handler) handleMinerStatsAllWorkers(w http.ResponseWriter, r *http.Requ
 		byWorker[ws.Identifier] = workerAgg{sharesSum: ws.SharesSum, shareCount: ws.ShareCount}
 	}
 
-	out := make([]minerStatRow, 0, len(idents))
+	out := make(map[string]minerStatRow, len(idents)+1)
+	out["global"] = buildMinerStatRow(lastSeenUnix(idents), globalStats.SharesSum, globalStats.ShareCount, "global")
 	for _, ident := range idents {
 		agg := byWorker[ident.WorkerName]
 		var lts int64
 		if ident.LastShare != nil {
 			lts = ident.LastShare.Unix()
 		}
-		out = append(out, minerStatRow{
-			LTS:           lts,
-			Identifer:     ident.WorkerName,
-			Hash:          estimateHashrateHS(agg.sharesSum, defaultWindowSeconds),
-			TotalHash:     agg.sharesSum,
-			ValidShares:   agg.shareCount,
-			InvalidShares: 0,
-		})
+		out[ident.WorkerName] = buildMinerStatRow(lts, agg.sharesSum, agg.shareCount, ident.WorkerName)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

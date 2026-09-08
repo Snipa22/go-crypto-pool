@@ -614,29 +614,51 @@ func TestHandleMinerStats_Bare(t *testing.T) {
 
 func TestHandleMinerStatsAllWorkers_IncludesInactiveWorkers(t *testing.T) {
 	h, d := newTestHandler(Config{})
+	d.stats.shareStats = statsapi.ShareStatsRecord{SharesSum: 4294967296, ShareCount: 11}
 	d.stats.workerStats = []statsapi.WorkerShareStatsRecord{{Identifier: "rig1", SharesSum: 10, ShareCount: 1}}
-	d.idents.rows = []IdentifierRecord{{WorkerName: "rig1"}, {WorkerName: "rig2"}}
+	lastShare := time.Unix(9999, 0)
+	d.idents.rows = []IdentifierRecord{{WorkerName: "rig1", LastShare: &lastShare}, {WorkerName: "rig2"}}
 
 	rr := doGet(t, h.Mux(), "/miner/addr-1/stats/allWorkers")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
-	var rows []minerStatRow
-	if err := json.Unmarshal(rr.Body.Bytes(), &rows); err != nil {
+	var body map[string]minerStatRow
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("len(rows) = %d, want 2", len(rows))
+	if len(body) != 3 {
+		t.Fatalf("len(body) = %d, want 3 (global + rig1 + rig2)", len(body))
 	}
-	byName := map[string]minerStatRow{}
-	for _, r := range rows {
-		byName[r.Identifer] = r
+
+	global, ok := body["global"]
+	if !ok {
+		t.Fatalf("missing global key: %+v", body)
 	}
-	if byName["rig1"].ValidShares != 1 {
-		t.Errorf("rig1 validShares = %d, want 1", byName["rig1"].ValidShares)
+	if global.Identifer != "global" {
+		t.Errorf("global.Identifer = %q, want %q", global.Identifer, "global")
 	}
-	if byName["rig2"].ValidShares != 0 || byName["rig2"].TotalHash != 0 {
-		t.Errorf("rig2 = %+v, want zero-valued (no recent activity)", byName["rig2"])
+	if global.ValidShares != 11 || global.TotalHash != 4294967296 {
+		t.Errorf("global = %+v, want the address-wide aggregate (validShares=11, totalHash=4294967296)", global)
+	}
+	if global.LTS != 9999 {
+		t.Errorf("global.LTS = %d, want 9999 (most recent LastShare across idents)", global.LTS)
+	}
+
+	rig1, ok := body["rig1"]
+	if !ok {
+		t.Fatalf("missing rig1 key: %+v", body)
+	}
+	if rig1.ValidShares != 1 {
+		t.Errorf("rig1 validShares = %d, want 1", rig1.ValidShares)
+	}
+
+	rig2, ok := body["rig2"]
+	if !ok {
+		t.Fatalf("missing rig2 key (registered but zero activity, must still appear): %+v", body)
+	}
+	if rig2.ValidShares != 0 || rig2.TotalHash != 0 {
+		t.Errorf("rig2 = %+v, want zero-valued (no recent activity)", rig2)
 	}
 }
 
