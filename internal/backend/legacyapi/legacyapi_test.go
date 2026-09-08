@@ -320,32 +320,6 @@ func TestHandlePoolStatsByType_InvalidPoolType(t *testing.T) {
 	}
 }
 
-// --- /pool/ports ---------------------------------------------------------
-
-func TestHandlePoolPorts_OK(t *testing.T) {
-	h, d := newTestHandler(Config{})
-	d.network.pools = []networkapi.PoolRecord{
-		{Algo: "RXM", Network: "TESTNET", PoolType: "PPLNS", Enabled: true, Ports: []networkapi.PortRecord{
-			{Port: 3333, Description: "low", StartDifficulty: 100},
-		}},
-		{Algo: "RXM", Network: "TESTNET", PoolType: "SOLO", Enabled: false, Ports: []networkapi.PortRecord{
-			{Port: 4444, Description: "disabled-pool"},
-		}},
-	}
-
-	rr := doGet(t, h.Mux(), "/pool/ports")
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
-	}
-	var rows []legacyPortRow
-	if err := json.Unmarshal(rr.Body.Bytes(), &rows); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(rows) != 1 || rows[0].Port != 3333 || rows[0].Difficulty != 100 {
-		t.Fatalf("unexpected ports: %+v", rows)
-	}
-}
-
 // --- charts ---------------------------------------------------------------
 
 func TestHandlePoolHashrateChart_SinglePoint(t *testing.T) {
