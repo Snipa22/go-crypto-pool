@@ -136,3 +136,26 @@ address_flags_file = ""
 # How often address_flags_file is re-read. Ignored if address_flags_file is
 # unset, in seconds. (default: 30)
 address_flags_poll_interval_seconds = 30
+
+# NATS server URL for the template-relay fast-invalidation broadcast (see
+# internal/leaflib/relay). leaf-solo has no found-block broadcast use case of
+# its own -- this is purely for the template relay (a sibling leaf instance's
+# own tip-poll finding a new height can invalidate this instance's per-xn job
+# cache immediately). Empty (default) fully disables the relay -- a complete
+# no-op, never required. (default: "")
+relay_nats_url = ""
+
+# NATS subject for the (unused, by leaf-solo) found-block relay stream (empty
+# = relay package default). (default: "")
+relay_subject = ""
+
+# NATS subject for the template (new-tip) relay fast-invalidation broadcast
+# (empty = relay.DefaultTemplateSubject). Reuses the SAME relay_nats_url
+# connection above -- no second NATS URL. (default: "")
+template_relay_subject = ""
+
+# Real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL,
+# faster block-invalidation trigger on top of the existing tip-poll baseline.
+# Empty (default) disables this entirely -- a complete no-op. Ignored for
+# coin=tari. (default: "")
+monero_zmq_url = ""

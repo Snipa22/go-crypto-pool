@@ -319,3 +319,317 @@ func TestRelayDefaultSubjectUsedWhenUnset(t *testing.T) {
 		t.Fatal("expected delivery on the default subject")
 	}
 }
+
+// TestRelayTemplateDisabledIsCompleteNoOp mirrors
+// TestRelayDisabledIsCompleteNoOp exactly, for the template relay.
+func TestRelayTemplateDisabledIsCompleteNoOp(t *testing.T) {
+	r := NewRelay(Config{URL: ""})
+	if r.Enabled() {
+		t.Fatal("expected Enabled()=false for an empty-URL Relay")
+	}
+
+	if err := r.PublishTemplate(context.Background(), TemplateMessage{Height: 1, Hash: "deadbeef"}); err != nil {
+		t.Fatalf("PublishTemplate on a disabled Relay must be a harmless no-op, got error: %v", err)
+	}
+
+	called := false
+	unsub, err := r.SubscribeTemplate(func(TemplateMessage) { called = true })
+	if err != nil {
+		t.Fatalf("SubscribeTemplate on a disabled Relay must be a harmless no-op, got error: %v", err)
+	}
+	unsub() // must not panic
+
+	time.Sleep(50 * time.Millisecond)
+	if called {
+		t.Fatal("handler was invoked on a disabled Relay — SubscribeTemplate must be a real no-op, not merely error-free")
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close on a disabled Relay must be a no-op, got error: %v", err)
+	}
+}
+
+// TestRelayTemplatePublishDeliversToRealSubscriber mirrors
+// TestRelayPublishDeliversToRealSubscriber exactly, for the template
+// relay: a real embedded NATS server, two separate Relay instances, a
+// genuine wire round trip.
+func TestRelayTemplatePublishDeliversToRealSubscriber(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServer(t)
+	defer shutdown()
+
+	publisher := NewRelay(Config{URL: url})
+	defer publisher.Close()
+	subscriber := NewRelay(Config{URL: url})
+	defer subscriber.Close()
+
+	if !publisher.Enabled() || !subscriber.Enabled() {
+		t.Fatalf("expected both relays to be Enabled() after connecting to a real NATS server at %s", url)
+	}
+
+	received := make(chan TemplateMessage, 1)
+	unsub, err := subscriber.SubscribeTemplate(func(msg TemplateMessage) {
+		received <- msg
+	})
+	if err != nil {
+		t.Fatalf("SubscribeTemplate: %v", err)
+	}
+	defer unsub()
+
+	time.Sleep(100 * time.Millisecond)
+
+	want := TemplateMessage{
+		Algo: "sha3x", Network: "testnet", Height: 12345,
+		Hash: "real-template-hash-from-publisher", TemplateData: []byte{1, 2, 3, 4},
+	}
+	if err := publisher.PublishTemplate(context.Background(), want); err != nil {
+		t.Fatalf("PublishTemplate: %v", err)
+	}
+
+	select {
+	case got := <-received:
+		if got.Height != want.Height || got.Hash != want.Hash || got.Algo != want.Algo || got.Network != want.Network {
+			t.Errorf("received message = %+v, want fields matching %+v", got, want)
+		}
+		if string(got.TemplateData) != string(want.TemplateData) {
+			t.Errorf("received TemplateData = %v, want %v", got.TemplateData, want.TemplateData)
+		}
+		if got.PublisherID == "" {
+			t.Error("expected a non-empty PublisherID stamped by the publisher")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber never received the published template message over the real embedded NATS server within 5s")
+	}
+}
+
+// TestRelayTemplateSkipsMessagesFromOwnPublisherID mirrors
+// TestRelaySkipsMessagesFromOwnPublisherID exactly, for the template
+// relay.
+func TestRelayTemplateSkipsMessagesFromOwnPublisherID(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServer(t)
+	defer shutdown()
+
+	selfRelay := NewRelay(Config{URL: url})
+	defer selfRelay.Close()
+	otherPublisher := NewRelay(Config{URL: url})
+	defer otherPublisher.Close()
+
+	var selfInvocations, otherInvocations int
+	selfReceivedOwn := make(chan struct{}, 1)
+	receivedFromOther := make(chan TemplateMessage, 1)
+
+	unsub, err := selfRelay.SubscribeTemplate(func(msg TemplateMessage) {
+		if msg.Hash == "own-published-template-hash" {
+			selfInvocations++
+			selfReceivedOwn <- struct{}{}
+			return
+		}
+		otherInvocations++
+		receivedFromOther <- msg
+	})
+	if err != nil {
+		t.Fatalf("SubscribeTemplate: %v", err)
+	}
+	defer unsub()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := selfRelay.PublishTemplate(context.Background(), TemplateMessage{Height: 1, Hash: "own-published-template-hash"}); err != nil {
+		t.Fatalf("PublishTemplate (self): %v", err)
+	}
+
+	if err := otherPublisher.PublishTemplate(context.Background(), TemplateMessage{Height: 2, Hash: "other-published-template-hash"}); err != nil {
+		t.Fatalf("PublishTemplate (other): %v", err)
+	}
+
+	select {
+	case got := <-receivedFromOther:
+		if got.Hash != "other-published-template-hash" {
+			t.Errorf("received hash = %q, want %q", got.Hash, "other-published-template-hash")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the handler to fire for the OTHER publisher's message within 5s")
+	}
+
+	select {
+	case <-selfReceivedOwn:
+		t.Fatal("REAL DEDUP FAILURE: selfRelay's own handler fired for a message it published itself — PublisherID dedup-skip is broken")
+	case <-time.After(300 * time.Millisecond):
+		// expected: no invocation for the self-published message
+	}
+
+	if selfInvocations != 0 {
+		t.Errorf("selfInvocations = %d, want 0 (own-publisher messages must be skipped)", selfInvocations)
+	}
+	if otherInvocations != 1 {
+		t.Errorf("otherInvocations = %d, want 1", otherInvocations)
+	}
+}
+
+// TestRelayTemplateDedupsRedeliveredHash mirrors
+// TestRelayDedupsRedeliveredHash exactly, for the template relay —
+// also proves the dedup cache is genuinely SHARED with BlockMessage's
+// own dedup (see markSeen's doc comment): publishing the same hash
+// value once as a BlockMessage and once as a TemplateMessage still
+// only allows the FIRST occurrence through.
+func TestRelayTemplateDedupsRedeliveredHash(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServer(t)
+	defer shutdown()
+
+	subscriber := NewRelay(Config{URL: url})
+	defer subscriber.Close()
+	publisher := NewRelay(Config{URL: url})
+	defer publisher.Close()
+
+	invocations := make(chan TemplateMessage, 4)
+	unsub, err := subscriber.SubscribeTemplate(func(msg TemplateMessage) {
+		invocations <- msg
+	})
+	if err != nil {
+		t.Fatalf("SubscribeTemplate: %v", err)
+	}
+	defer unsub()
+
+	time.Sleep(100 * time.Millisecond)
+
+	dup := TemplateMessage{Height: 99, Hash: "duplicate-template-hash-value"}
+	for i := 0; i < 2; i++ {
+		if err := publisher.PublishTemplate(context.Background(), dup); err != nil {
+			t.Fatalf("PublishTemplate (iteration %d): %v", i, err)
+		}
+	}
+
+	select {
+	case <-invocations:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected at least one delivery of the duplicate-hash template message")
+	}
+
+	select {
+	case msg := <-invocations:
+		t.Fatalf("REAL DEDUP FAILURE: handler fired a second time for the same hash %q (msg=%+v) — markSeen's recent-hash cache is not working", dup.Hash, msg)
+	case <-time.After(500 * time.Millisecond):
+		// expected: no second invocation
+	}
+}
+
+// TestRelayTemplateInitialConnectFailureDegradesGracefully mirrors
+// TestRelayInitialConnectFailureDegradesGracefully exactly, for the
+// template relay.
+func TestRelayTemplateInitialConnectFailureDegradesGracefully(t *testing.T) {
+	r := NewRelay(Config{URL: "not a valid nats url ::: at all"})
+	if r == nil {
+		t.Fatal("NewRelay must never return nil")
+	}
+	if r.Enabled() {
+		t.Fatal("expected Enabled()=false for a syntactically-invalid NATS URL")
+	}
+	if err := r.PublishTemplate(context.Background(), TemplateMessage{Hash: "x"}); err != nil {
+		t.Fatalf("PublishTemplate on a degraded Relay must still be a no-op, got: %v", err)
+	}
+}
+
+// TestRelayTemplateDefaultSubjectUsedWhenUnset mirrors
+// TestRelayDefaultSubjectUsedWhenUnset exactly, for the template
+// relay, confirming DefaultTemplateSubject fallback.
+func TestRelayTemplateDefaultSubjectUsedWhenUnset(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServer(t)
+	defer shutdown()
+
+	r := NewRelay(Config{URL: url}) // TemplateSubject left empty -> DefaultTemplateSubject
+	defer r.Close()
+
+	received := make(chan TemplateMessage, 1)
+	unsub, err := r.SubscribeTemplate(func(msg TemplateMessage) { received <- msg })
+	if err != nil {
+		t.Fatalf("SubscribeTemplate: %v", err)
+	}
+	defer unsub()
+
+	other := NewRelay(Config{URL: url, TemplateSubject: DefaultTemplateSubject})
+	defer other.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := other.PublishTemplate(context.Background(), TemplateMessage{Hash: "default-template-subject-check"}); err != nil {
+		t.Fatalf("PublishTemplate: %v", err)
+	}
+
+	select {
+	case got := <-received:
+		if got.Hash != "default-template-subject-check" {
+			t.Errorf("got hash %q, want %q", got.Hash, "default-template-subject-check")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected delivery on the default template subject")
+	}
+}
+
+// TestRelayBlockAndTemplateSubjectsAreIndependent proves BlockMessage/
+// Publish/Subscribe (subject A) and TemplateMessage/PublishTemplate/
+// SubscribeTemplate (subject B), over the SAME Relay/*nats.Conn, never
+// cross-deliver to each other's handlers — real proof the two message
+// types don't leak into each other despite sharing one connection and
+// one dedup cache.
+func TestRelayBlockAndTemplateSubjectsAreIndependent(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServer(t)
+	defer shutdown()
+
+	publisher := NewRelay(Config{URL: url})
+	defer publisher.Close()
+	subscriber := NewRelay(Config{URL: url})
+	defer subscriber.Close()
+
+	blockReceived := make(chan BlockMessage, 1)
+	unsubBlock, err := subscriber.Subscribe(func(msg BlockMessage) { blockReceived <- msg })
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer unsubBlock()
+
+	templateReceived := make(chan TemplateMessage, 1)
+	unsubTemplate, err := subscriber.SubscribeTemplate(func(msg TemplateMessage) { templateReceived <- msg })
+	if err != nil {
+		t.Fatalf("SubscribeTemplate: %v", err)
+	}
+	defer unsubTemplate()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := publisher.Publish(context.Background(), BlockMessage{Height: 1, Hash: "cross-subject-block-hash"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := publisher.PublishTemplate(context.Background(), TemplateMessage{Height: 2, Hash: "cross-subject-template-hash"}); err != nil {
+		t.Fatalf("PublishTemplate: %v", err)
+	}
+
+	// Both must arrive on their OWN handler...
+	select {
+	case got := <-blockReceived:
+		if got.Hash != "cross-subject-block-hash" {
+			t.Errorf("block handler received hash = %q, want %q", got.Hash, "cross-subject-block-hash")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the block handler to receive the BlockMessage within 5s")
+	}
+	select {
+	case got := <-templateReceived:
+		if got.Hash != "cross-subject-template-hash" {
+			t.Errorf("template handler received hash = %q, want %q", got.Hash, "cross-subject-template-hash")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the template handler to receive the TemplateMessage within 5s")
+	}
+
+	// ...and NEITHER handler must ever receive the OTHER stream's
+	// message (real proof of subject independence, not just "both
+	// eventually fired once").
+	select {
+	case got := <-blockReceived:
+		t.Fatalf("block handler unexpectedly received a second message: %+v (template/block subjects are leaking into each other)", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+	select {
+	case got := <-templateReceived:
+		t.Fatalf("template handler unexpectedly received a second message: %+v (template/block subjects are leaking into each other)", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+}

@@ -4,12 +4,14 @@ package solo
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -234,6 +236,36 @@ type JobManagerConfig struct {
 	// miner.go). Configurable via LEAF_SOLO_JOB_MAX_AGE in
 	// cmd/leaf-solo/main.go.
 	JobMaxAge time.Duration
+
+	// Network is this JobManager's own network tag ("mainnet"/
+	// "testnet"), stamped onto every published TemplateMessage's
+	// Network field (see tipPollLoop's template-relay publish) and
+	// used as part of the synthetic dedup hash (syntheticTipDedupHash)
+	// so two DIFFERENT networks' tip movements never collide in the
+	// relay's shared dedup cache. leaf-solo had no existing Network
+	// concept on JobManagerConfig before this field was added (unlike
+	// leaf-direct's Server.network) — wired from cmd/leaf-solo/
+	// main.go's own -network flag exactly like every other leaf-solo
+	// config value threaded into JobManagerConfig. Left empty (the
+	// zero value) is safe: it just means every published/dedup-hashed
+	// message carries an empty Network tag, which is still internally
+	// consistent (every one of THIS instance's own messages uses the
+	// same empty tag).
+	Network string
+
+	// Relay is the optional best-effort NATS template-relay mechanism
+	// (internal/leaflib/relay's TemplateMessage/PublishTemplate/
+	// SubscribeTemplate) this JobManager uses for a real latency win:
+	// a sibling leaf instance's own tip-poll finding a new height
+	// beats this instance's own next poll tick (see tipPollLoop's
+	// publish call and Start's SubscribeTemplate wiring). nil-safe:
+	// every relay.Relay method used here (Enabled/PublishTemplate/
+	// SubscribeTemplate) is already safe to call on a nil *relay.Relay
+	// receiver (see relay.Relay.Enabled()'s own `r != nil` check) --
+	// this field is left nil in every pre-existing caller/test that
+	// does not explicitly set it, which is functionally identical to
+	// this feature not existing at all.
+	Relay *relay.Relay
 
 	Logger *log.Logger
 }
@@ -533,11 +565,45 @@ func (jm *JobManager) notify() {
 	}
 }
 
-// Start launches the periodic refresh and tip-poll loops. It returns
-// immediately; both loops run until ctx is cancelled.
+// Start launches the periodic refresh and tip-poll loops, and
+// subscribes this JobManager to its configured template relay (see
+// JobManagerConfig.Relay) so a sibling leaf instance's own tip-poll
+// finding a new height can invalidate THIS instance's per-xn job
+// cache immediately, instead of waiting for this instance's own next
+// tipPollLoop tick — the real latency win this feature exists for.
+// It returns immediately; every launched loop/subscription runs until
+// ctx is cancelled.
 func (jm *JobManager) Start(ctx context.Context) {
 	go jm.refreshLoop(ctx)
 	go jm.tipPollLoop(ctx)
+	jm.startTemplateRelaySubscription(ctx)
+}
+
+// startTemplateRelaySubscription subscribes to jm.cfg.Relay's
+// template broadcasts, invalidating the ENTIRE per-xn job cache
+// (jm.InvalidateAll) on every genuinely new (non-self, non-duplicate
+// — already guaranteed by relay.Relay.SubscribeTemplate's own
+// contract) template message received. Safe to call unconditionally
+// even when jm.cfg.Relay is nil or disabled/unconfigured:
+// SubscribeTemplate itself is nil/disabled-Relay-safe (see
+// relay.Relay.Enabled()'s `r != nil` check), returning a no-op
+// unsubscribe func and a nil error in that case. The returned
+// unsubscribe func is invoked once ctx is cancelled, tying this
+// subscription's lifetime to the SAME ctx refreshLoop/tipPollLoop
+// already use.
+func (jm *JobManager) startTemplateRelaySubscription(ctx context.Context) {
+	unsub, err := jm.cfg.Relay.SubscribeTemplate(func(msg relay.TemplateMessage) {
+		jm.logger.Printf("solo: received template relay message from another instance (height=%d algo=%s network=%s), invalidating per-xn job cache", msg.Height, msg.Algo, msg.Network)
+		jm.InvalidateAll()
+	})
+	if err != nil {
+		jm.logger.Printf("solo: template relay subscribe failed (template-relay fast-invalidation disabled, primary tip-poll path unaffected): %v", err)
+		return
+	}
+	go func() {
+		<-ctx.Done()
+		unsub()
+	}()
 }
 
 func (jm *JobManager) refreshLoop(ctx context.Context) {
@@ -587,9 +653,52 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 				jm.lastTipHeight = height
 				jm.mu.Unlock()
 				jm.InvalidateAll()
+				jm.publishTemplate(ctx, height)
 			}
 		}
 	}
+}
+
+// publishTemplate best-effort-broadcasts a relay.TemplateMessage for
+// this JobManager's own genuine local tip increase (see tipPollLoop's
+// `height > last` branch, which is the ONLY call site — never called
+// on the first tip observation/baseline seed, and never called when
+// height is unchanged) over jm.cfg.Relay, so a sibling leaf instance's
+// own JobManager can invalidate its per-xn job cache immediately
+// instead of waiting for its own next tip-poll tick. Never blocks or
+// fails the primary tip-poll path: PublishTemplate itself is already
+// a complete no-op on a nil/disabled Relay (see
+// relay.Relay.Enabled()), and any real publish error is only logged.
+func (jm *JobManager) publishTemplate(ctx context.Context, height uint64) {
+	algo := algoWireName(jm.cfg.Algo)
+	network := jm.cfg.Network
+	msg := relay.TemplateMessage{
+		Algo:    algo,
+		Network: network,
+		Height:  height,
+		Hash:    syntheticTipDedupHash(algo, network, height),
+	}
+	if err := jm.cfg.Relay.PublishTemplate(ctx, msg); err != nil {
+		jm.logger.Printf("solo: template relay publish failed (non-fatal, primary tip-poll path unaffected): %v", err)
+	}
+}
+
+// syntheticTipDedupHash builds relay.TemplateMessage.Hash's dedup key
+// for a bare tip-height observation: hex(sha256("<algo>|<network>|
+// <height>")). This is a SYNTHETIC dedup key, not a real chain-tip
+// hash — JobManager.tipPollLoop only has a bare height available from
+// NodeClient.GetTipInfo (see that interface method's doc comment), no
+// cheaper real tip-identifying hash to use instead. It is still
+// deterministic and fit for purpose: two DIFFERENT sibling leaf
+// instances (different relay.Relay.PublisherID) independently
+// observing the SAME real height/algo/network compute the IDENTICAL
+// hash, so relay.Relay's own shared dedup cache (markSeen) correctly
+// collapses duplicate relay chatter from multiple instances observing
+// the same real tip movement — exactly the behavior a real shared tip
+// hash would produce, without this layer needing one.
+func syntheticTipDedupHash(algo, network string, height uint64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d", algo, network, height)))
+	return hex.EncodeToString(sum[:])
 }
 
 // jobIDFromBlockHash derives the real miner-facing job_id from a raw

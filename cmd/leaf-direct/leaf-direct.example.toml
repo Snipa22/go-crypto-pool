@@ -161,3 +161,14 @@ relay_nats_url = ""
 
 # NATS subject for the relay (empty = relay package default). (default: "")
 relay_subject = ""
+
+# NATS subject for the template (new-tip) relay fast-invalidation broadcast
+# (empty = relay.DefaultTemplateSubject). Reuses the SAME relay_nats_url
+# connection above -- no second NATS URL. (default: "")
+template_relay_subject = ""
+
+# Real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL,
+# faster block-invalidation trigger on top of the existing tip-poll baseline.
+# Empty (default) disables this entirely -- a complete no-op. Ignored for
+# coin=tari. (default: "")
+monero_zmq_url = ""
