@@ -264,7 +264,6 @@ func (h *Handler) Mux() *http.ServeMux {
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /pool/stats", h.handlePoolStats)
 	mux.HandleFunc("GET /pool/stats/{pool_type}", h.handlePoolStatsByType)
-	mux.HandleFunc("GET /pool/ports", h.handlePoolPorts)
 
 	mux.HandleFunc("GET /pool/chart/hashrate", h.handlePoolHashrateChart)
 	mux.HandleFunc("GET /pool/chart/hashrate/{pool_type}", h.handlePoolHashrateChartByType)

@@ -183,62 +183,6 @@ func (h *Handler) feePercentFor(schemaPoolType string) float64 {
 	}
 }
 
-// legacyPortRow is one entry in GET /pool/ports' flat array response.
-// Legacy's own exact /pool/ports field names were not present in the
-// transcribed lib/api.js excerpt this wrapper was built against (see
-// dispatch brief) — this shape is a reasonable, directly-derived
-// rendering of networkapi.PortRecord's own real fields, not a fabricated
-// guess at legacy's exact historical key names.
-type legacyPortRow struct {
-	Port       int32  `json:"port"`
-	Difficulty int64  `json:"difficulty"`
-	PoolType   string `json:"pool_type"`
-	Algo       string `json:"algo"`
-	Network    string `json:"network"`
-	Desc       string `json:"desc"`
-}
-
-// handlePoolPorts implements GET /pool/ports — a thin wrap of
-// networkapi.Repository.ListPools' own real ports data, flattened
-// across every enabled pool for (algo, network) into a single array
-// (see this package's doc comment on cmd/backend's build-time skip if
-// the parallel feat/legacyapi-auth-jwt branch already implements this
-// exact route — it did not as of this PR, see the dispatch brief's
-// own instruction to check for that first).
-func (h *Handler) handlePoolPorts(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	algo := resolveAlgo(q.Get("algo"))
-	network := h.resolveNetwork(q.Get("network"))
-
-	pools, err := h.network.ListPools(r.Context(), algo, network)
-	if err != nil {
-		writeJSONErr(w, http.StatusInternalServerError, "query failed")
-		return
-	}
-
-	var out []legacyPortRow
-	for _, p := range pools {
-		if !p.Enabled {
-			continue
-		}
-		for _, pt := range p.Ports {
-			out = append(out, legacyPortRow{
-				Port:       pt.Port,
-				Difficulty: pt.StartDifficulty,
-				PoolType:   p.PoolType,
-				Algo:       p.Algo,
-				Network:    p.Network,
-				Desc:       pt.Description,
-			})
-		}
-	}
-	if out == nil {
-		out = []legacyPortRow{}
-	}
-
-	writeJSON(w, http.StatusOK, out)
-}
-
 // blockResponseRow is one GET /pool/blocks[/:pool_type] row, using
 // db.Block's own real field names (lowercased) as JSON keys per the
 // dispatch brief's explicit instruction — see this package's doc
