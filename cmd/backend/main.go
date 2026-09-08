@@ -128,6 +128,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/disburse"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/leafflagsapi"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/legacyapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkpoller"
@@ -749,6 +750,94 @@ func (a leafFlagsRepositoryAdapter) ListActiveAddressFlags(ctx context.Context) 
 			PaymentAddress:      f.PaymentAddress,
 			Banned:              f.Banned,
 			ForcedMinDifficulty: f.ForcedMinDifficulty,
+		})
+	}
+	return out, nil
+}
+
+// legacyBlocksRepositoryAdapter adapts *db.Repository (whose
+// ListBlocks operates on db.Block) to legacyapi.BlocksRepository
+// (which operates on legacyapi.BlockRecord), mirroring
+// networkAPIRepositoryAdapter's role above for the SXMR-legacy-shaped
+// GET /pool/blocks[/:pool_type] wrapper route.
+type legacyBlocksRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a legacyBlocksRepositoryAdapter) ListBlocks(ctx context.Context, algo, network, poolType string, limit, offset int) ([]legacyapi.BlockRecord, error) {
+	rows, err := a.repo.ListBlocks(ctx, algo, network, poolType, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]legacyapi.BlockRecord, 0, len(rows))
+	for _, b := range rows {
+		out = append(out, legacyapi.BlockRecord{
+			Algo:       b.Algo,
+			Network:    b.Network,
+			PoolType:   b.PoolType,
+			Hash:       b.Hash,
+			Height:     b.Height,
+			Difficulty: b.Difficulty,
+			Shares:     b.Shares,
+			Timestamp:  b.Timestamp,
+			Unlocked:   b.Unlocked,
+			Valid:      b.Valid,
+			Value:      b.Value,
+		})
+	}
+	return out, nil
+}
+
+// legacyPayoutsRepositoryAdapter adapts *db.Repository (whose
+// ListPayouts operates on db.Payout) to legacyapi.PayoutsRepository
+// (which operates on legacyapi.PayoutRecord), mirroring
+// legacyBlocksRepositoryAdapter's role above for the SXMR-legacy-
+// shaped GET /pool/payments[/:pool_type] and
+// GET /miner/:address/payments wrapper routes.
+type legacyPayoutsRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a legacyPayoutsRepositoryAdapter) ListPayouts(ctx context.Context, algo, network string, paymentAddress *string, limit, offset int) ([]legacyapi.PayoutRecord, int64, error) {
+	rows, total, err := a.repo.ListPayouts(ctx, algo, network, paymentAddress, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := make([]legacyapi.PayoutRecord, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, legacyapi.PayoutRecord{
+			ID:          p.ID,
+			Status:      p.Status,
+			BalanceIDs:  p.BalanceIDs,
+			Amount:      p.Amount,
+			Fee:         p.Fee,
+			TxHash:      p.TxHash,
+			CompletedAt: p.CompletedAt,
+		})
+	}
+	return out, total, nil
+}
+
+// legacyIdentifiersRepositoryAdapter adapts *db.Repository (whose
+// MinerIdentifiersSince operates on db.MinerIdentifier) to
+// legacyapi.IdentifiersRepository (which operates on
+// legacyapi.IdentifierRecord), mirroring legacyBlocksRepositoryAdapter's
+// role above for the SXMR-legacy-shaped GET /miner/:address/identifiers
+// route and the allWorkers stats/chart shapes.
+type legacyIdentifiersRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a legacyIdentifiersRepositoryAdapter) MinerIdentifiersSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]legacyapi.IdentifierRecord, error) {
+	rows, err := a.repo.MinerIdentifiersSince(ctx, algo, network, paymentAddress, paymentID, sinceUnix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]legacyapi.IdentifierRecord, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, legacyapi.IdentifierRecord{
+			WorkerName: m.WorkerName,
+			LastShare:  m.LastShare,
 		})
 	}
 	return out, nil
@@ -1473,6 +1562,36 @@ func run(cfg config) error {
 	// this endpoint.
 	leafFlagsHandler := leafflagsapi.NewHandler(leafFlagsRepositoryAdapter{repo: repo})
 
+	// legacyAPIHandler serves the SXMR-legacy-shaped wrapper routes
+	// (bare, non-/api/v1-prefixed paths like GET /pool/stats,
+	// GET /miner/:address/stats, POST /user/updateTariAddress, etc.)
+	// that reshape statsHandler/networkAPIHandler/addressMapHandler's
+	// own real data into the exact field-name/casing/nesting shape
+	// the legacy nodejs-pool-sxmr stack's lib/api.js served -- see
+	// internal/backend/legacyapi's package doc comment for the full
+	// rationale and the real, explicitly flagged gaps (fields with no
+	// backing query anywhere in this repo) it deliberately does not
+	// paper over. Purely additive: it reuses statsHandler/
+	// networkAPIHandler/addressMapHandler's own exported Repository
+	// interfaces directly (no new dependency on internal/backend/db
+	// beyond the three small additive read methods in
+	// internal/backend/db/legacyapi_reads.go), and registers only
+	// routes no existing handler in this file already owns.
+	legacyAPIHandler := legacyapi.NewHandler(
+		networkAPIRepositoryAdapter{repo: repo},
+		statsRepositoryAdapter{repo: repo},
+		addressMapRepositoryAdapter{repo: repo},
+		legacyBlocksRepositoryAdapter{repo: repo},
+		legacyPayoutsRepositoryAdapter{repo: repo},
+		legacyIdentifiersRepositoryAdapter{repo: repo},
+		legacyapi.Config{
+			Network:         network,
+			PPSFeePercent:   cfg.payoutPPSFeePercent,
+			PPLNSFeePercent: cfg.payoutPPLNSFeePercent,
+			SoloFeePercent:  cfg.payoutSoloFeePercent,
+		},
+	)
+
 	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("configuring block unlocker: %w", err)
@@ -1579,6 +1698,7 @@ func run(cfg config) error {
 	addressMapHandler.RegisterRoutes(mux)
 	networkAPIHandler.RegisterRoutes(mux)
 	leafFlagsHandler.RegisterRoutes(mux)
+	legacyAPIHandler.RegisterRoutes(mux)
 
 	srv := &http.Server{
 		Addr:              listenAddr,
