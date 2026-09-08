@@ -219,6 +219,26 @@ func validateXMRAddress(addr string) error {
 	return errors.New("xmr_address is not a valid Monero address (bad checksum or unrecognized network byte)")
 }
 
+// ValidateXMRAddress is validateXMRAddress's exported form — added
+// purely so internal/backend/legacyapi's SXMR-legacy-shaped
+// POST /user/updateTariAddress wrapper can reuse this package's real,
+// byte-exact Monero address validation without re-deriving it (see
+// that package's own doc comment: legacyapi's whole point is response/
+// request SHAPE translation, never re-implementing validation logic
+// that already exists here). Purely additive — every existing
+// internal call site keeps calling the lowercase validateXMRAddress
+// directly; this is just a thin, exported alias for external reuse.
+func ValidateXMRAddress(addr string) error {
+	return validateXMRAddress(addr)
+}
+
+// ValidateTariAddress is validateTariAddress's exported form —
+// mirrors ValidateXMRAddress's exact rationale/role above, for the
+// Tari side.
+func ValidateTariAddress(addr string) error {
+	return validateTariAddress(addr)
+}
+
 // upsertRequest is the JSON body POST /api/v1/address-map expects.
 type upsertRequest struct {
 	XMRAddress  string `json:"xmr_address"`
