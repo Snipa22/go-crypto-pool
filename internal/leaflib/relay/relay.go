@@ -12,6 +12,13 @@
 // logging/dedup, not any Tari-specific field. A future Monero-family
 // leaf can publish/consume through this exact same package.
 //
+// This package also carries a second, independent message stream on
+// the SAME shared *nats.Conn: TemplateMessage/PublishTemplate/
+// SubscribeTemplate, a best-effort "a sibling leaf instance's tip-poll
+// just observed a new chain tip" broadcast (internal/leaflib/solo's
+// JobManager is the real consumer/producer) — a latency win, not a
+// correctness requirement, exactly like the found-block relay above.
+//
 // Design/trust notes (see AGENTS.md's "http first, NATS later"
 // architecture note and this session's explicit direction from Alex):
 //   - This is a SECONDARY, best-effort mechanism. It is never allowed
@@ -50,10 +57,21 @@ import (
 // themselves after receiving a message (see Relay.Subscribe).
 const DefaultSubject = "pool.blocks.found"
 
+// DefaultTemplateSubject is the shared fanout subject template
+// (new-tip) messages are published/subscribed on when
+// Config.TemplateSubject is left empty — mirrors DefaultSubject's
+// exact rationale/convention for BlockMessage, just on a SEPARATE
+// subject so the two message streams never cross-deliver to each
+// other's handlers (see Relay.Subscribe vs Relay.SubscribeTemplate).
+const DefaultTemplateSubject = "pool.templates.new"
+
 // dedupCacheSize bounds the recent-message dedup cache (see
 // Relay.Subscribe) to a small, fixed number of entries — this is a
 // best-effort "don't resubmit a block we just published ourselves, or
 // reprocess an at-least-once redelivery" guard, not a permanent ledger.
+// Shared, on purpose, by BOTH BlockMessage and TemplateMessage dedup
+// (see markSeen's doc comment) — a hash string is a hash string
+// regardless of which message type it came from.
 const dedupCacheSize = 256
 
 // BlockMessage is the real, coin-agnostic wire schema published on a
@@ -98,6 +116,51 @@ type BlockMessage struct {
 	FoundAt time.Time `json:"found_at"`
 }
 
+// TemplateMessage is the coin-agnostic wire schema published whenever
+// an instance's own chain-tip poll observes a genuine new tip (see
+// internal/leaflib/solo's JobManager.tipPollLoop) — a best-effort
+// latency win, NOT a correctness requirement: a sibling leaf
+// instance's own JobManager can invalidate its per-xn job cache the
+// moment it hears about this, instead of waiting out its own next
+// poll tick. Mirrors BlockMessage's exact shape/doc-comment style
+// (same generalization rationale: this package does not know or care
+// what TemplateData holds, only how to carry it).
+type TemplateMessage struct {
+	// Algo/Network identify which coin/algo/network this observed tip
+	// belongs to, using this repo's own poolpb-style string tags (see
+	// BlockMessage.Algo's doc comment for the exact same convention).
+	Algo    string `json:"algo"`
+	Network string `json:"network"`
+
+	// Height is the newly observed tip height.
+	Height uint64 `json:"height"`
+
+	// TemplateData is whatever tip/template-identifying bytes the
+	// receiving leaf's own JobManager needs (e.g. a tip hash or
+	// serialized header) — this package does not itself know or care
+	// what's inside, exactly like BlockMessage.BlockData. May be
+	// empty; a bare Height is already enough for the real, current
+	// consumer (JobManager.InvalidateAll on receipt).
+	TemplateData []byte `json:"template_data"`
+
+	// Hash is a hex-encoded identifying value for this observed tip,
+	// used for dedup (see Relay.SubscribeTemplate, which reuses the
+	// EXACT SAME markSeen/dedup cache as BlockMessage) and logging.
+	Hash string `json:"hash"`
+
+	// PublisherID identifies which Relay instance published this
+	// message — stamped by PublishTemplate exactly like
+	// BlockMessage.PublisherID, used by SubscribeTemplate to skip
+	// messages this SAME instance just published itself.
+	PublisherID string `json:"publisher_id"`
+
+	// ObservedAt is when the publishing instance observed this new
+	// tip (BlockMessage's analogous field is called FoundAt; this is
+	// named ObservedAt since "found" doesn't apply to a bare tip-poll
+	// observation).
+	ObservedAt time.Time `json:"observed_at"`
+}
+
 // Config configures a Relay.
 type Config struct {
 	// URL is the NATS server URL, e.g. "nats://127.0.0.1:4222". Empty
@@ -111,6 +174,13 @@ type Config struct {
 	// Subject overrides DefaultSubject.
 	Subject string
 
+	// TemplateSubject overrides DefaultTemplateSubject. Empty (the
+	// default) falls back to DefaultTemplateSubject, mirroring
+	// Subject/DefaultSubject's exact convention. Always a DIFFERENT
+	// subject from Subject on the SAME underlying *nats.Conn — see
+	// PublishTemplate/SubscribeTemplate.
+	TemplateSubject string
+
 	Logger *log.Logger
 }
 
@@ -118,10 +188,11 @@ type Config struct {
 // broadcast/resubmission. The zero value is not usable; construct via
 // NewRelay. Safe for concurrent use.
 type Relay struct {
-	enabled bool
-	subject string
-	id      string
-	logger  *log.Logger
+	enabled         bool
+	subject         string
+	templateSubject string
+	id              string
+	logger          *log.Logger
 
 	conn *nats.Conn
 
@@ -149,15 +220,20 @@ func NewRelay(cfg Config) *Relay {
 	if subject == "" {
 		subject = DefaultSubject
 	}
+	templateSubject := cfg.TemplateSubject
+	if templateSubject == "" {
+		templateSubject = DefaultTemplateSubject
+	}
 
 	id := newRelayID()
 
 	r := &Relay{
-		enabled:   cfg.URL != "",
-		subject:   subject,
-		id:        id,
-		logger:    logger,
-		dedupSeen: make(map[string]time.Time),
+		enabled:         cfg.URL != "",
+		subject:         subject,
+		templateSubject: templateSubject,
+		id:              id,
+		logger:          logger,
+		dedupSeen:       make(map[string]time.Time),
 	}
 
 	if !r.enabled {
@@ -303,6 +379,77 @@ func (r *Relay) Subscribe(handler func(BlockMessage)) (unsubscribe func(), err e
 	if err != nil {
 		r.logger.Printf("relay: subscribe failed: %v", err)
 		return func() {}, fmt.Errorf("relay: subscribe: %w", err)
+	}
+	return func() { _ = sub.Unsubscribe() }, nil
+}
+
+// PublishTemplate best-effort-broadcasts msg on the relay's template
+// subject (r.templateSubject — a SEPARATE NATS subject from
+// r.subject, but the SAME underlying *nats.Conn; see Config.
+// TemplateSubject). Same contract as Publish exactly: never blocks the
+// caller beyond nats.go's own internal buffering, a non-nil error here
+// must NEVER be treated as a reason to fail any primary path, and a
+// no-op (nil error, no dial ever attempted) when !r.Enabled(). msg.
+// PublisherID is stamped with this Relay's own id, and msg.ObservedAt
+// defaults to time.Now() if left zero.
+func (r *Relay) PublishTemplate(_ context.Context, msg TemplateMessage) error {
+	if !r.Enabled() {
+		return nil
+	}
+	msg.PublisherID = r.id
+	if msg.ObservedAt.IsZero() {
+		msg.ObservedAt = time.Now()
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		r.logger.Printf("relay: failed to marshal template message for publish (height %d, hash %s): %v", msg.Height, msg.Hash, err)
+		return fmt.Errorf("relay: marshal template: %w", err)
+	}
+	if err := r.conn.Publish(r.templateSubject, data); err != nil {
+		r.logger.Printf("relay: template publish failed (height %d, hash %s): %v", msg.Height, msg.Hash, err)
+		return fmt.Errorf("relay: publish template: %w", err)
+	}
+	r.logger.Printf("relay: published new-tip template height=%d hash=%s algo=%s network=%s", msg.Height, msg.Hash, msg.Algo, msg.Network)
+	return nil
+}
+
+// SubscribeTemplate registers handler to be called for every
+// TemplateMessage received on the relay's template subject that (a)
+// did NOT originate from this same Relay instance (msg.PublisherID !=
+// r.id) and (b) has not already been seen recently — reusing the
+// EXACT SAME markSeen/dedupSeen/dedupList recent-hash cache
+// Subscribe's BlockMessage dedup uses (see markSeen's doc comment:
+// mixing block-hash and template-hash strings into one bounded cache
+// is fine and intended). Same contract as Subscribe exactly: a
+// complete no-op (registers nothing, returns a no-op unsubscribe and a
+// nil error) when the relay is disabled/unconfigured.
+func (r *Relay) SubscribeTemplate(handler func(TemplateMessage)) (unsubscribe func(), err error) {
+	if !r.Enabled() {
+		return func() {}, nil
+	}
+	sub, err := r.conn.Subscribe(r.templateSubject, func(m *nats.Msg) {
+		var msg TemplateMessage
+		if err := json.Unmarshal(m.Data, &msg); err != nil {
+			r.logger.Printf("relay: received unparseable template message, dropping: %v", err)
+			return
+		}
+		if msg.PublisherID == r.id {
+			// This is a message we ourselves published — our own
+			// tip-poll already handled it locally. See
+			// Subscribe's identical self-skip for the full rationale.
+			return
+		}
+		if !r.markSeen(msg.Hash) {
+			// Already processed this hash recently (duplicate
+			// delivery) — skip re-triggering invalidation.
+			return
+		}
+		r.logger.Printf("relay: received new-tip template from another instance (publisher=%s height=%d hash=%s algo=%s network=%s), triggering local invalidation", msg.PublisherID, msg.Height, msg.Hash, msg.Algo, msg.Network)
+		handler(msg)
+	})
+	if err != nil {
+		r.logger.Printf("relay: template subscribe failed: %v", err)
+		return func() {}, fmt.Errorf("relay: subscribe template: %w", err)
 	}
 	return func() { _ = sub.Unsubscribe() }, nil
 }

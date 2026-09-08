@@ -37,6 +37,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/direct"
+	monerozmq "github.com/Snipa22/go-crypto-pool/internal/leaflib/monero/zmq"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/transport"
@@ -143,6 +144,23 @@ type config struct {
 	relayNATSURL string
 	relaySubject string
 
+	// templateRelaySubject is LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT:
+	// overrides relay.DefaultTemplateSubject for the template-relay
+	// fast-invalidation broadcast (see internal/leaflib/relay's
+	// TemplateMessage/PublishTemplate/SubscribeTemplate). Empty (the
+	// default) falls back to relay.DefaultTemplateSubject. Reuses the
+	// SAME relayNATSURL connection above -- there is no separate NATS
+	// URL for this.
+	templateRelaySubject string
+
+	// moneroZMQURL is LEAF_DIRECT_MONERO_ZMQ_URL: the real monerod ZMQ
+	// endpoint (e.g. "tcp://127.0.0.1:28082") to subscribe to for a
+	// real, ADDITIONAL fast block-invalidation trigger on top of the
+	// existing tip-poll baseline (see internal/leaflib/monero/zmq).
+	// Empty (the default) disables this entirely -- a complete no-op,
+	// never dialed. Ignored entirely for -coin=tari.
+	moneroZMQURL string
+
 	// configFile is the optional path to a TOML file providing
 	// defaults for any flag above that the operator did not set
 	// explicitly via CLI flag or environment variable. See
@@ -200,6 +218,8 @@ func loadConfig() (config, error) {
 
 	flag.StringVar(&cfg.relayNATSURL, "relay-nats-url", envOr("LEAF_DIRECT_RELAY_NATS_URL", ""), "NATS server URL for the best-effort found-block relay broadcast/resubmit mechanism. Empty (default) fully disables the relay -- a complete no-op, never required. Env: LEAF_DIRECT_RELAY_NATS_URL")
 	flag.StringVar(&cfg.relaySubject, "relay-subject", envOr("LEAF_DIRECT_RELAY_SUBJECT", ""), "NATS subject for the relay (empty = relay package default). Env: LEAF_DIRECT_RELAY_SUBJECT")
+	flag.StringVar(&cfg.templateRelaySubject, "template-relay-subject", envOr("LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT", ""), "NATS subject for the template (new-tip) relay fast-invalidation broadcast (empty = relay.DefaultTemplateSubject). Reuses the SAME -relay-nats-url connection above -- no second NATS URL flag. Env: LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT")
+	flag.StringVar(&cfg.moneroZMQURL, "monero-zmq-url", envOr("LEAF_DIRECT_MONERO_ZMQ_URL", ""), "real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL, faster block-invalidation trigger on top of the existing tip-poll baseline (see internal/leaflib/monero/zmq). Empty (default) disables this entirely -- a complete no-op. Ignored for -coin=tari. Env: LEAF_DIRECT_MONERO_ZMQ_URL")
 
 	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_DIRECT_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-direct.example.toml. Env: LEAF_DIRECT_CONFIG_FILE")
 
@@ -268,6 +288,9 @@ type fileConfig struct {
 
 	RelayNATSURL *string `toml:"relay_nats_url"`
 	RelaySubject *string `toml:"relay_subject"`
+
+	TemplateRelaySubject *string `toml:"template_relay_subject"`
+	MoneroZMQURL         *string `toml:"monero_zmq_url"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -359,6 +382,9 @@ func applyConfigFile(cfg *config) error {
 
 	cfgfile.ApplyString(&cfg.relayNATSURL, fc.RelayNATSURL, visited, "relay-nats-url", "LEAF_DIRECT_RELAY_NATS_URL")
 	cfgfile.ApplyString(&cfg.relaySubject, fc.RelaySubject, visited, "relay-subject", "LEAF_DIRECT_RELAY_SUBJECT")
+
+	cfgfile.ApplyString(&cfg.templateRelaySubject, fc.TemplateRelaySubject, visited, "template-relay-subject", "LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT")
+	cfgfile.ApplyString(&cfg.moneroZMQURL, fc.MoneroZMQURL, visited, "monero-zmq-url", "LEAF_DIRECT_MONERO_ZMQ_URL")
 
 	return nil
 }
@@ -645,10 +671,27 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Optional, best-effort NATS relay -- a complete no-op if
+	// LEAF_DIRECT_RELAY_NATS_URL is unset (see internal/leaflib/relay).
+	// Constructed BEFORE JobManager (below) so the SAME *relay.Relay
+	// (one shared *nats.Conn for both the found-block AND template
+	// relay streams -- see relay.go's own doc comment) can be threaded
+	// into solo.JobManagerConfig.Relay at construction time.
+	blockRelay := relay.NewRelay(relay.Config{
+		URL: cfg.relayNATSURL, Subject: cfg.relaySubject, TemplateSubject: cfg.templateRelaySubject, Logger: logger,
+	})
+	defer func() { _ = blockRelay.Close() }()
+	if blockRelay.Enabled() {
+		logger.Printf("NATS relay enabled at %s", cfg.relayNATSURL)
+	} else {
+		logger.Printf("NATS relay disabled (LEAF_DIRECT_RELAY_NATS_URL is empty) -- complete no-op, never required for correctness")
+	}
+
 	jobManager := solo.NewJobManager(solo.JobManagerConfig{
 		Node: node, PayoutAddress: cfg.payoutAddress, Algo: resolveAlgo(cfg),
 		StaticDifficulty: ports[0].Difficulty, RefreshInterval: cfg.refreshInterval,
 		TipPollInterval: cfg.tipPollInterval, JobMaxAge: cfg.jobMaxAge, Logger: logger,
+		Network: cfg.network, Relay: blockRelay,
 	})
 
 	logger.Println("probing base node connectivity...")
@@ -656,6 +699,20 @@ func main() {
 		logger.Fatalf("base node connectivity probe failed: %v", err)
 	}
 	jobManager.Start(ctx)
+
+	// Real, ADDITIONAL fast-invalidation trigger for the real monerod
+	// ZMQ pub/sub stream -- -coin=monero ONLY, and only when
+	// -monero-zmq-url is explicitly set (a complete no-op otherwise --
+	// see internal/leaflib/monero/zmq's own doc comment). This never
+	// REPLACES jobManager's own tip-poll loop (already started above),
+	// it is purely an additional, faster trigger running alongside it.
+	if isMoneroCoin(cfg.coin) && cfg.moneroZMQURL != "" {
+		zmqClient := monerozmq.NewClient(cfg.moneroZMQURL, jobManager.InvalidateAll, logger)
+		go zmqClient.Start(ctx)
+		logger.Printf("real monerod ZMQ fast-invalidation trigger enabled at %s (topic %q)", cfg.moneroZMQURL, monerozmq.TopicNewBlock)
+	} else if cfg.moneroZMQURL != "" {
+		logger.Printf("note: -monero-zmq-url is set but -coin != monero -- ignoring it (%s); no ZMQ subscription started", cfg.moneroZMQURL)
+	}
 
 	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{
 		MaxConnections: cfg.maxConnections, IdleTimeout: cfg.idleTimeout,
@@ -707,16 +764,6 @@ func main() {
 			_ = multiSubmit.Close()
 		}
 	}()
-
-	// Optional, best-effort NATS relay -- a complete no-op if
-	// LEAF_DIRECT_RELAY_NATS_URL is unset (see internal/leaflib/relay).
-	blockRelay := relay.NewRelay(relay.Config{URL: cfg.relayNATSURL, Subject: cfg.relaySubject, Logger: logger})
-	defer func() { _ = blockRelay.Close() }()
-	if blockRelay.Enabled() {
-		logger.Printf("NATS relay enabled at %s", cfg.relayNATSURL)
-	} else {
-		logger.Printf("NATS relay disabled (LEAF_DIRECT_RELAY_NATS_URL is empty) -- complete no-op, never required for correctness")
-	}
 
 	server := direct.NewServer(direct.ServerConfig{
 		ConnectionManager: cm, JobManager: jobManager, Node: node, Validators: validators,

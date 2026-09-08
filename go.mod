@@ -7,6 +7,7 @@ require (
 	github.com/Snipa22/go-tari-grpc-lib/v3 v3.2.0
 	github.com/Snipa22/go-tari-lib v1.3.0
 	github.com/Snipa22/go-xmr-lib v0.2.5
+	github.com/go-zeromq/zmq4 v0.17.0
 	github.com/gtank/ristretto255 v0.2.0
 	github.com/holiman/uint256 v1.3.2
 	github.com/jackc/pgx/v5 v5.7.5
@@ -27,6 +28,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dchest/blake2b v1.0.0 // indirect
+	github.com/go-zeromq/goczmq/v4 v4.2.2 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
