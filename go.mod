@@ -8,6 +8,7 @@ require (
 	github.com/Snipa22/go-tari-lib v1.3.0
 	github.com/Snipa22/go-xmr-lib v0.2.5
 	github.com/go-zeromq/zmq4 v0.17.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gtank/ristretto255 v0.2.0
 	github.com/holiman/uint256 v1.3.2
 	github.com/jackc/pgx/v5 v5.7.5
