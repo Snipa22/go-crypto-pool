@@ -103,6 +103,17 @@
 //	                         GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC,
 //	                         GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH,
 //	                         GCPOOL_DISBURSE_POLL_INTERVAL).
+//	GCPOOL_JWT_SECRET        (required) HMAC-SHA256 signing secret for
+//	                         internal/backend/authapi's JWTs (also
+//	                         reused as its password-hashing key --
+//	                         see that package's doc comment). The
+//	                         authapi routes (POST /authenticate,
+//	                         /authed/*, /user/*) are always registered
+//	                         by this command, so this is required
+//	                         unconditionally, unlike every other env
+//	                         var above (which gate genuinely optional
+//	                         features) -- run() fails fast at startup
+//	                         if this is unset.
 package main
 
 import (
@@ -124,11 +135,13 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/addressmap"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/api"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/authapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/disburse"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/leafflagsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/legacyapi"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/legacyconfig"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkpoller"
@@ -219,6 +232,16 @@ type config struct {
 
 	walletStatsPollInterval time.Duration
 
+	// jwtSecret is the HMAC-SHA256 signing secret for
+	// internal/backend/authapi's JWTs (also reused as its password-
+	// hashing key -- see that package's doc comment). Required --
+	// run() fails fast at startup if this is empty, since the authapi
+	// routes it gates are always registered (see run()'s own doc
+	// comment / wiring below), unlike every other feature in this
+	// file, which is opt-in based on whether its own config knob was
+	// set.
+	jwtSecret string
+
 	// configFile is the optional path to a TOML file providing
 	// defaults for any flag above that the operator did not set
 	// explicitly via CLI flag or environment variable. See
@@ -278,6 +301,8 @@ func loadConfig() (config, error) {
 
 	flag.DurationVar(&cfg.walletStatsPollInterval, "wallet-stats-poll-interval", envOrDuration("GCPOOL_WALLET_STATS_POLL_INTERVAL", defaultWalletStatsPollInterval), "how often the wallet-stats poller calls GetBalance on every configured wallet. Only consulted if at least one wallet RPC is configured. Env: GCPOOL_WALLET_STATS_POLL_INTERVAL")
 
+	flag.StringVar(&cfg.jwtSecret, "jwt-secret", envOr("GCPOOL_JWT_SECRET", ""), "(required) HMAC-SHA256 signing secret for internal/backend/authapi's JWTs (also reused as its password-hashing key -- see that package's doc comment). Env: GCPOOL_JWT_SECRET")
+
 	flag.StringVar(&cfg.configFile, "config", envOr("BACKEND_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below not explicitly set via CLI flag or environment variable. See backend.example.toml. Env: BACKEND_CONFIG_FILE")
 
 	flag.Parse()
@@ -336,6 +361,8 @@ type fileConfig struct {
 	TariWalletFeePerGram *uint64 `toml:"tari_wallet_fee_per_gram"`
 
 	WalletStatsPollIntervalSeconds *int `toml:"wallet_stats_poll_interval_seconds"`
+
+	JWTSecret *string `toml:"jwt_secret"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -407,6 +434,8 @@ func applyConfigFile(cfg *config) error {
 		d := time.Duration(*fc.WalletStatsPollIntervalSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.walletStatsPollInterval, &d, visited, "wallet-stats-poll-interval", "GCPOOL_WALLET_STATS_POLL_INTERVAL")
 	}
+
+	cfgfile.ApplyString(&cfg.jwtSecret, fc.JWTSecret, visited, "jwt-secret", "GCPOOL_JWT_SECRET")
 
 	return nil
 }
@@ -642,6 +671,105 @@ func (a addressMapRepositoryAdapter) Get(ctx context.Context, xmrAddress string)
 		TariAddress: m.TariAddress,
 		CreatedAt:   m.CreatedAt,
 		UpdatedAt:   m.UpdatedAt,
+	}, nil
+}
+
+// authRepositoryAdapter adapts *db.Repository (whose
+// GetUserByUsername/GetUserByID/UpdateUserPassword/
+// ToggleUserEnableEmail/ToggleUserEnableEmailByUsername/
+// UpdateUserPayoutThreshold/UpsertUserThreshold/SetForcePayout
+// operate on db.User) to authapi.Repository (which operates on
+// authapi.User), mirroring addressMapRepositoryAdapter's role above
+// for the SXMR-legacy authentication/account-settings API.
+type authRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func dbUserToAuthUser(u db.User) authapi.User {
+	return authapi.User{
+		ID:              u.ID,
+		Username:        u.Username,
+		Email:           u.Email,
+		Pass:            u.Pass,
+		Admin:           u.Admin,
+		EnableEmail:     u.EnableEmail,
+		PayoutThreshold: u.PayoutThreshold,
+	}
+}
+
+func (a authRepositoryAdapter) GetUserByUsername(ctx context.Context, username string) (authapi.User, error) {
+	u, err := a.repo.GetUserByUsername(ctx, username)
+	if err != nil {
+		if errors.Is(err, db.ErrUserNotFound) {
+			return authapi.User{}, authapi.ErrUserNotFound
+		}
+		return authapi.User{}, err
+	}
+	return dbUserToAuthUser(u), nil
+}
+
+func (a authRepositoryAdapter) GetUserByID(ctx context.Context, id int64) (authapi.User, error) {
+	u, err := a.repo.GetUserByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, db.ErrUserNotFound) {
+			return authapi.User{}, authapi.ErrUserNotFound
+		}
+		return authapi.User{}, err
+	}
+	return dbUserToAuthUser(u), nil
+}
+
+func (a authRepositoryAdapter) UpdateUserPassword(ctx context.Context, id int64, passHash string) error {
+	return a.repo.UpdateUserPassword(ctx, id, passHash)
+}
+
+func (a authRepositoryAdapter) ToggleUserEnableEmail(ctx context.Context, id int64) error {
+	return a.repo.ToggleUserEnableEmail(ctx, id)
+}
+
+func (a authRepositoryAdapter) ToggleUserEnableEmailByUsername(ctx context.Context, username string) error {
+	return a.repo.ToggleUserEnableEmailByUsername(ctx, username)
+}
+
+func (a authRepositoryAdapter) UpdateUserPayoutThreshold(ctx context.Context, id int64, threshold int64) error {
+	return a.repo.UpdateUserPayoutThreshold(ctx, id, threshold)
+}
+
+func (a authRepositoryAdapter) UpsertUserThreshold(ctx context.Context, username string, threshold int64) error {
+	return a.repo.UpsertUserThreshold(ctx, username, threshold)
+}
+
+func (a authRepositoryAdapter) SetForcePayout(ctx context.Context, algo, network, paymentAddress string, paymentID *string) error {
+	err := a.repo.SetForcePayout(ctx, algo, network, paymentAddress, paymentID)
+	if err != nil && errors.Is(err, db.ErrBalanceNotFound) {
+		return authapi.ErrBalanceNotFound
+	}
+	return err
+}
+
+// legacyConfigRepositoryAdapter adapts *db.Repository (whose
+// LatestMotd operates on db.Motd) to legacyconfig.Repository (which
+// operates on legacyconfig.MotdRecord), mirroring
+// authRepositoryAdapter's role above for the SXMR-legacy GET
+// /pool/motd endpoint.
+type legacyConfigRepositoryAdapter struct {
+	repo *db.Repository
+}
+
+func (a legacyConfigRepositoryAdapter) LatestMotd(ctx context.Context) (legacyconfig.MotdRecord, error) {
+	m, err := a.repo.LatestMotd(ctx)
+	if err != nil {
+		if errors.Is(err, db.ErrMotdNotFound) {
+			return legacyconfig.MotdRecord{}, legacyconfig.ErrMotdNotFound
+		}
+		return legacyconfig.MotdRecord{}, err
+	}
+	return legacyconfig.MotdRecord{
+		Created: m.Created,
+		Subject: m.Subject,
+		Body:    m.Body,
+		Type:    m.Type,
+		Active:  m.Active,
 	}, nil
 }
 
@@ -1487,6 +1615,9 @@ func run(cfg config) error {
 	if cfg.dbDSN == "" {
 		return errors.New("GCPOOL_DB_DSN (or -db-dsn) is required")
 	}
+	if strings.TrimSpace(cfg.jwtSecret) == "" {
+		return errors.New("GCPOOL_JWT_SECRET (or -jwt-secret) is required")
+	}
 
 	listenAddr := cfg.listenAddr
 	if listenAddr == "" {
@@ -1591,6 +1722,40 @@ func run(cfg config) error {
 			SoloFeePercent:  cfg.payoutSoloFeePercent,
 		},
 	)
+
+	// authHandler serves the SXMR-legacy authentication/account-
+	// settings endpoints (POST /authenticate, GET/POST /authed/*,
+	// POST/GET /user/*) on the same listener -- see
+	// internal/backend/authapi's package doc comment for why this is
+	// its own Handler/trust-boundary, independent of every other
+	// handler wired above. NewHandler fails (and so does run(), via
+	// this err check) if cfg.jwtSecret is somehow empty here despite
+	// the earlier fail-fast check at the top of run() -- defense in
+	// depth, not reachable in practice.
+	authHandler, err := authapi.NewHandler(authRepositoryAdapter{repo: repo}, authapi.Config{
+		JWTSecret: cfg.jwtSecret,
+		Network:   network,
+	})
+	if err != nil {
+		return fmt.Errorf("configuring authapi: %w", err)
+	}
+
+	// legacyConfigHandler serves the SXMR-legacy small/cheap
+	// standalone endpoints (GET /config, GET /pool/motd,
+	// GET /pool/ports, GET /pool/address_type/{address}) -- see
+	// internal/backend/legacyconfig's package doc comment. It
+	// composes networkAPIHandler's own ListFlatPorts (an additive
+	// method on the same Handler constructed above, not a second
+	// query path) to serve GET /pool/ports without duplicating
+	// networkapi's ListPools query.
+	legacyConfigHandler := legacyconfig.NewHandler(legacyConfigRepositoryAdapter{repo: repo}, networkAPIHandler, legacyconfig.Config{
+		PPSFeePercent:          cfg.payoutPPSFeePercent,
+		SoloFeePercent:         cfg.payoutSoloFeePercent,
+		DevDonationPercent:     cfg.payoutDevDonationPercent,
+		PoolDevDonationPercent: cfg.payoutPoolDevDonationPercent,
+		MinWalletPayoutAtomic:  cfg.disburseMinPayoutAtomic,
+		MaturityDepth:          cfg.unlockerTariMaturity,
+	})
 
 	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig(cfg)
 	if err != nil {
@@ -1699,6 +1864,8 @@ func run(cfg config) error {
 	networkAPIHandler.RegisterRoutes(mux)
 	leafFlagsHandler.RegisterRoutes(mux)
 	legacyAPIHandler.RegisterRoutes(mux)
+	authHandler.RegisterRoutes(mux)
+	legacyConfigHandler.RegisterRoutes(mux)
 
 	srv := &http.Server{
 		Addr:              listenAddr,
