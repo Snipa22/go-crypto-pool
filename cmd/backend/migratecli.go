@@ -15,13 +15,14 @@
 // exercise, applying migrations/*.up.sql (in filename/numeric-prefix
 // order) against whatever database -dsn/GCPOOL_DB_DSN points at.
 //
-// ApplyMigrations does not track which migrations have already run
-// (see its own doc comment) -- it is only safe to run against a
-// fresh database, or one already fully migrated by a previous
-// `backend migrate apply` (in which case every statement will fail
-// with an "already exists"-style error and this command will report
-// that error and exit nonzero; nothing is silently skipped or
-// retried). There is deliberately no -yes flag here, unlike
+// ApplyMigrations now tracks applied migrations via a
+// `schema_migrations` table (see its own doc comment) and is safe to
+// re-run: only genuinely new/unapplied migrations get executed, and
+// running this command again against an already-migrated database is
+// a no-op, not an error. Pre-existing databases bootstrapped by an
+// older, untracked version of ApplyMigrations are backfilled
+// automatically the first time this command runs against them.
+// There is deliberately no -yes flag here, unlike
 // retentioncli.go/blockcli.go's destructive-write commands: applying
 // forward migrations to a fresh schema is the normal, expected
 // bootstrap operation this command exists for, not a judgement call

@@ -48,6 +48,7 @@ func resetSchema(t *testing.T, pool *pgxpool.Pool) {
 	for _, stmt := range []string{
 		"DROP TABLE IF EXISTS motd CASCADE",
 		"DROP TABLE IF EXISTS users CASCADE",
+		"DROP TABLE IF EXISTS schema_migrations CASCADE",
 		"DROP TABLE IF EXISTS network_state CASCADE",
 		"DROP TABLE IF EXISTS address_flags CASCADE",
 		"DROP TABLE IF EXISTS address_map CASCADE",
