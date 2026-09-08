@@ -195,6 +195,57 @@ type poolResponseRow struct {
 	Ports     []portResponseRow `json:"ports"`
 }
 
+// FlatPort is one pool+port combination, flattened with its parent
+// pool's algo/network/pool_type context folded directly onto it --
+// the shape GET /pool/ports (internal/backend/legacyconfig) needs to
+// mirror legacy's own flat `poolPorts` cache (a flat array of port
+// objects with pool-type context, see brief-auth.md). This is an
+// additive, non-breaking export: it does not change PoolRecord/
+// PortRecord or either route already registered by RegisterRoutes
+// above, and legacyconfig composes it rather than this package
+// duplicating ListPools' query.
+type FlatPort struct {
+	Algo            string
+	Network         string
+	PoolType        string
+	Port            int32
+	Description     string
+	MinDifficulty   int64
+	MaxDifficulty   *int64
+	StartDifficulty int64
+	VariableDiff    bool
+}
+
+// ListFlatPorts calls this Handler's own Repository.ListPools (the
+// exact same query handlePools uses, not a duplicate) and flattens
+// every pool's Ports into one FlatPort per pool/port combination.
+// algo/network are optional filters, identical in meaning to
+// handlePools' own query parameters (empty string means "no filter").
+func (h *Handler) ListFlatPorts(ctx context.Context, algo, network string) ([]FlatPort, error) {
+	pools, err := h.repo.ListPools(ctx, algo, network)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []FlatPort
+	for _, p := range pools {
+		for _, pt := range p.Ports {
+			out = append(out, FlatPort{
+				Algo:            p.Algo,
+				Network:         p.Network,
+				PoolType:        p.PoolType,
+				Port:            pt.Port,
+				Description:     pt.Description,
+				MinDifficulty:   pt.MinDifficulty,
+				MaxDifficulty:   pt.MaxDifficulty,
+				StartDifficulty: pt.StartDifficulty,
+				VariableDiff:    pt.VariableDiff,
+			})
+		}
+	}
+	return out, nil
+}
+
 func (h *Handler) handlePools(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	algo, network := q.Get("algo"), q.Get("network")
