@@ -73,7 +73,14 @@ func newXNPTestJobRXM(reservedOffset int, rawTemplateBlob []byte) *Job {
 		StaticDifficulty: 1000,
 		VmKey:            []byte("test-monero-seed-hash-32-bytes!"),
 		ReservedOffset:   reservedOffset,
-		RawTemplateBlob:  rawTemplateBlob,
+		// ReservedOffsetUsable: true -- this fixture represents a
+		// normal, healthy job whose real GetBlockTemplate bounds
+		// check (monero_node.go) passed. See
+		// TestJobPayloadXNPReservationUnavailableRXM below for the
+		// degraded (false) case, constructed directly rather than
+		// through this helper.
+		ReservedOffsetUsable: true,
+		RawTemplateBlob:      rawTemplateBlob,
 	}
 }
 
@@ -287,4 +294,60 @@ func TestJobPayloadXNPCaseSensitivity(t *testing.T) {
 	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
 		t.Fatalf("wrong-case agent must not trigger proxy shape, got: %+v", got)
 	}
+}
+
+// TestJobPayloadXNPReservationUnavailableRXM is the real regression
+// test for the confirmed production bug this pass fixed: a real live
+// leaf-proxy rejection ("proxy: worker-nonce offset is out of range
+// for this template's blob: offset=179 blob_len=76") against a
+// genuine low-tx-volume testnet block, root-caused to
+// monero_node.go's GetBlockTemplate never validating that
+// ReservedOffset+12 actually fits within the real returned
+// blocktemplate_blob length. Constructs a Job with
+// ReservedOffsetUsable: false (exactly what GetBlockTemplate now sets
+// for such a job — see monero_node_test.go's
+// TestMoneroNodeClient_GetBlockTemplate_ReservationDoesNotFitDegradesGracefully
+// for the end-to-end proof of THAT half) and confirms jobPayload
+// degrades this one job to omit all four XNP-proxy-shape fields —
+// exactly the existing "nil means not offered" convention already
+// used for RXT's ReservedOffset/ClientPoolOffset — via a real
+// marshaled-JSON byte-diff, not just Go struct field assertions,
+// even for a real XNP-proxy-detected agent that would otherwise
+// receive the full shape.
+func TestJobPayloadXNPReservationUnavailableRXM(t *testing.T) {
+	s := newXNPTestSession("xmr-node-proxy/0.0.3", "ab12")
+	job := &Job{
+		ID:               "0011223344556677",
+		Algo:             poolpb.Algo_ALGO_RXM,
+		Height:           999999,
+		Header:           []byte("test-monero-hashing-blob-32byte!"),
+		StaticDifficulty: 1000,
+		VmKey:            []byte("test-monero-seed-hash-32-bytes!"),
+		ReservedOffset:   179,
+		// ReservedOffsetUsable: false -- the exact degraded state
+		// GetBlockTemplate sets when ReservedOffset+12 does not fit
+		// within the real returned blocktemplate_blob (real
+		// production repro: offset=179 blob_len=76).
+		ReservedOffsetUsable: false,
+		RawTemplateBlob:      make([]byte, 76),
+	}
+
+	got := s.jobPayload(job)
+
+	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
+		t.Fatalf("ReservedOffsetUsable=false must omit all four XNP-proxy-shape fields even for a detected XNP-proxy agent, got: %+v", got)
+	}
+
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal actual JobPayload: %v", err)
+	}
+	legacyJSON, err := json.Marshal(asLegacy(got))
+	if err != nil {
+		t.Fatalf("marshal legacy projection: %v", err)
+	}
+	if !bytes.Equal(gotJSON, legacyJSON) {
+		t.Fatalf("ReservedOffsetUsable=false non-regression FAILED (a real byte-diff, not just struct fields):\n  before (legacy shape): %s\n  after  (actual JobPayload): %s", legacyJSON, gotJSON)
+	}
+	t.Logf("ReservedOffsetUsable=false degrades correctly, real byte-diff proof — before: %s\n                                                    after:  %s", legacyJSON, gotJSON)
 }

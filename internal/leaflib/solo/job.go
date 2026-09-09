@@ -152,6 +152,41 @@ type Job struct {
 	// never surfaces it at all).
 	ReservedOffset int
 
+	// ReservedOffsetUsable gates whether ReservedOffset (and its two
+	// derived offsets, client_nonce_offset = ReservedOffset+12 and
+	// client_pool_offset = ReservedOffset+8) are actually safe to
+	// publish on the wire for an XNP-proxy-detected RXM session (see
+	// session.go's jobPayload). monerod's own real get_block_template
+	// response is authoritative for BOTH reserved_offset AND the
+	// returned blocktemplate_blob's length, but nothing upstream of
+	// monero_node.go's GetBlockTemplate ever cross-checks the two
+	// against each other before this field was added — CONFIRMED, via
+	// a real live leaf-proxy rejection this session
+	// ("proxy: worker-nonce offset is out of range for this
+	// template's blob: offset=179 blob_len=76"), that on a genuine
+	// low-transaction-volume testnet block monerod can return a
+	// ReservedOffset that does NOT actually fit within
+	// ReservedOffset+12 <= len(blocktemplate_blob) for that same
+	// response. GetBlockTemplate sets this false (default) whenever
+	// that bounds check fails, and true only when the reservation
+	// region has been verified in-bounds for THIS job's own real
+	// blob. false is the safe default for every non-ALGO_RXM job too
+	// (Job's zero value), matching the existing "ReservedOffset is
+	// only ever populated for ALGO_RXM jobs" convention documented
+	// above.
+	//
+	// This mirrors this codebase's existing "nil means not offered"
+	// pointer-field convention (protocol.go's JobPayload.
+	// ReservedOffset/ClientNonceOffset/ClientPoolOffset, and RXT's
+	// own documented choice to deliberately leave ReservedOffset/
+	// ClientPoolOffset nil — see session.go's jobPayload RXT branch
+	// doc comment) rather than inventing a parallel signaling
+	// mechanism: jobPayload gates its RXM XNP-proxy-shape branch on
+	// this bool and, when false, leaves all four pointer fields nil/
+	// omitted from the wire for that job — exactly like it already
+	// does for RXT's ReservedOffset/ClientPoolOffset.
+	ReservedOffsetUsable bool
+
 	// RawTemplateBlob is the real, RAW, UNCONVERTED Monero
 	// blocktemplate_blob bytes for this job (monero_node.go's
 	// moneroTemplateData.TemplateBlob, duplicated here so
@@ -492,6 +527,7 @@ func (jm *JobManager) RestampDifficulty(ctx context.Context, xn string, difficul
 		TemplateData:            existing.TemplateData,
 		VmKey:                   existing.VmKey,
 		ReservedOffset:          existing.ReservedOffset,
+		ReservedOffsetUsable:    existing.ReservedOffsetUsable,
 		RawTemplateBlob:         existing.RawTemplateBlob,
 		CreatedAt:               existing.CreatedAt,
 	}

@@ -56,7 +56,16 @@ func newXNPTestJobRXM(reservedOffset int, rawTemplateBlob []byte) *solo.Job {
 		StaticDifficulty: 1000,
 		VmKey:            []byte("test-monero-seed-hash-32-bytes!"),
 		ReservedOffset:   reservedOffset,
-		RawTemplateBlob:  rawTemplateBlob,
+		// ReservedOffsetUsable: true -- this fixture represents a
+		// normal, healthy job whose real GetBlockTemplate bounds
+		// check (monero_node.go) passed, i.e. reservedOffset+12 fits
+		// within rawTemplateBlob for every existing/non-regression
+		// test that calls this helper. TestDirectJobPayloadXNP
+		// ReservationUnavailableRXM below constructs its own
+		// ReservedOffsetUsable:false job directly, rather than
+		// through this helper, to exercise the degraded path.
+		ReservedOffsetUsable: true,
+		RawTemplateBlob:      rawTemplateBlob,
 	}
 }
 
@@ -229,4 +238,49 @@ func TestDirectJobPayloadXNPCaseSensitivity(t *testing.T) {
 	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
 		t.Fatalf("wrong-case agent must not trigger proxy shape, got: %+v", got)
 	}
+}
+
+// TestDirectJobPayloadXNPReservationUnavailableRXM mirrors solo's
+// TestJobPayloadXNPReservationUnavailableRXM exactly, for leaf-direct's
+// own jobPayload -- both leaf-solo and leaf-direct share the SAME
+// solo.MoneroNodeClient.GetBlockTemplate implementation, so the same
+// real production bug (a real live leaf-proxy rejection, "offset=179
+// blob_len=76") and fix (ReservedOffsetUsable-gated degradation to
+// omitted proxy-shape fields) apply identically here.
+func TestDirectJobPayloadXNPReservationUnavailableRXM(t *testing.T) {
+	s := newXNPTestSession("xmr-node-proxy/0.0.3", "ab12")
+	job := &solo.Job{
+		ID:               "0011223344556677",
+		Algo:             poolpb.Algo_ALGO_RXM,
+		Height:           999999,
+		Header:           []byte("test-monero-hashing-blob-32byte!"),
+		StaticDifficulty: 1000,
+		VmKey:            []byte("test-monero-seed-hash-32-bytes!"),
+		ReservedOffset:   179,
+		// ReservedOffsetUsable: false -- the exact degraded state
+		// GetBlockTemplate sets when ReservedOffset+12 does not fit
+		// within the real returned blocktemplate_blob (real
+		// production repro: offset=179 blob_len=76).
+		ReservedOffsetUsable: false,
+		RawTemplateBlob:      make([]byte, 76),
+	}
+
+	got := s.jobPayload(job)
+
+	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
+		t.Fatalf("ReservedOffsetUsable=false must omit all four XNP-proxy-shape fields even for a detected XNP-proxy agent, got: %+v", got)
+	}
+
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal actual JobPayload: %v", err)
+	}
+	legacyJSON, err := json.Marshal(asLegacy(got))
+	if err != nil {
+		t.Fatalf("marshal legacy projection: %v", err)
+	}
+	if !bytes.Equal(gotJSON, legacyJSON) {
+		t.Fatalf("leaf-direct ReservedOffsetUsable=false non-regression FAILED (real byte-diff):\n  before (legacy shape): %s\n  after  (actual JobPayload): %s", legacyJSON, gotJSON)
+	}
+	t.Logf("leaf-direct ReservedOffsetUsable=false degrades correctly, real byte-diff proof — before: %s\n                                                               after:  %s", legacyJSON, gotJSON)
 }

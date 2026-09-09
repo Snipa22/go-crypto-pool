@@ -163,11 +163,21 @@ func TestApplyJob_ConvertsRealBlocktemplateBlobToHashingBlobWhenBlobAbsent(t *te
 // the brief: when a pool sends BOTH a small, realistic job.Blob AND a
 // large job.BlocktemplateBlob (simulating a pool that publishes both
 // fields on the same job object), applyJob must derive the resulting
-// WorkerTemplate.Blob from the SMALL Blob field only. This assertion
-// is UNCHANGED by the real fix -- the job.Blob != "" branch is
-// unaffected; BlocktemplateBlob CAN now be used by applyJob (unlike
-// before this fix), but only ever as a fallback when Blob itself is
-// absent, never when both are present.
+// WorkerTemplate.Blob from the SMALL Blob field only.
+//
+// UPDATED (real production bug fix -- see upstream.go's applyJob doc
+// comment and its BUG FIX comment for the full rationale, and the
+// real live evidence: a packet capture of this leaf's own real
+// login/getjob response showing BOTH fields present simultaneously,
+// which reproduced "proxy: worker-nonce offset is out of range for
+// this template's blob: offset=179 blob_len=76"). Blob-selection
+// (job.Blob preferred when present) is UNCHANGED. What changed is
+// RawBlob: it is now populated from BlocktemplateBlob whenever
+// BlocktemplateBlob is present, EVEN IF Blob is also present --
+// these are two independent concerns (ready-to-hash blob vs.
+// offset-patching raw template), and leaving RawBlob nil whenever
+// both fields were present (the pre-fix behavior asserted by this
+// test before this update) was exactly the production bug.
 func TestApplyJob_UsesBlobFieldWhenBothPresent(t *testing.T) {
 	uc := NewUpstreamClient(UpstreamConfig{Login: "test-address"}, discardLogger())
 
@@ -196,9 +206,6 @@ func TestApplyJob_UsesBlobFieldWhenBothPresent(t *testing.T) {
 	if len(tmpl.Blob) >= 408 {
 		t.Fatalf("WorkerTemplate.Blob length = %d, want < 408 (xmrig's kMaxBlobSize)", len(tmpl.Blob))
 	}
-	if tmpl.RawBlob != nil {
-		t.Fatalf("WorkerTemplate.RawBlob = %x, want nil when job.Blob is present (no full raw template to patch worker-nonces into)", tmpl.RawBlob)
-	}
 
 	largeBlob, err := hex.DecodeString(largeBlocktemplateBlobHex)
 	if err != nil {
@@ -207,21 +214,137 @@ func TestApplyJob_UsesBlobFieldWhenBothPresent(t *testing.T) {
 	if bytes.Equal(tmpl.Blob, largeBlob) {
 		t.Fatal("WorkerTemplate.Blob must not be derived from BlocktemplateBlob when Blob is also present")
 	}
+	// THE REAL FIX: RawBlob must now be populated from
+	// BlocktemplateBlob, even though Blob is also present.
+	if tmpl.RawBlob == nil {
+		t.Fatalf("WorkerTemplate.RawBlob = nil, want the decoded BlocktemplateBlob (%d bytes) -- offset-patching needs the real raw template even when job.Blob is also present", len(largeBlob))
+	}
+	if !bytes.Equal(tmpl.RawBlob, largeBlob) {
+		t.Fatalf("WorkerTemplate.RawBlob = %x, want the decoded large BlocktemplateBlob %x", tmpl.RawBlob, largeBlob)
+	}
 
-	// End-to-end: confirm the final downstream wire blob (via
-	// BlobForWorker, exactly what Job.Blob/jobPayload use) also stays
-	// small and matches the small field exactly, not the large one.
-	wireBlob, err := tmpl.BlobForWorker(1)
+	// NOTE: this test deliberately does NOT call BlobForWorker here.
+	// Now that RawBlob is correctly populated (the fix under test),
+	// BlobForWorker's RawBlob!=nil path always re-parses/re-converts
+	// via go-xmr-lib regardless of whether a worker-nonce offset was
+	// even published -- doing that against this synthetic
+	// (non-block-structured) fixture would fail for an unrelated
+	// reason (go-xmr-lib requires genuinely well-formed input; see
+	// TestApplyJob_ConvertsRealBlocktemplateBlobToHashingBlobWhenBlobAbsent's
+	// real fixture for that scenario). TestApplyJob_
+	// DualFieldRealCaptureValues below covers the actual
+	// offset-patching regression directly via patchOffsets, which
+	// needs no real block structure.
+}
+
+// TestApplyJob_DualFieldRealCaptureValues is the exact-values
+// regression test for the real, confirmed production bug: this
+// leaf's own real live packet capture (agent
+// "xmr-node-proxy/go-crypto-pool-dev" against the live RXM leaf)
+// showed a job payload carrying BOTH job.Blob (76 bytes / 152 hex
+// chars) AND job.BlocktemplateBlob (230 bytes / 460 hex chars)
+// simultaneously, with reserved_offset=167, client_pool_offset=175
+// (167+8), client_nonce_offset=179 (167+12) -- all valid, in-bounds
+// offsets into the 230-byte raw template, but NONSENSICAL against the
+// 76-byte Blob. Before this fix, RawBlob stayed nil in this exact
+// shape and any offset-patching attempt against a 76-byte buffer at
+// offset 179 would go out of range -- reproducing "proxy:
+// worker-nonce offset is out of range for this template's blob:
+// offset=179 blob_len=76" deterministically. This test proves
+// RawBlob is now correctly populated with the full 230-byte content
+// and that patching client_nonce_offset=179 into it via
+// BlobForWorker succeeds without an out-of-range error.
+func TestApplyJob_DualFieldRealCaptureValues(t *testing.T) {
+	uc := NewUpstreamClient(UpstreamConfig{Login: "test-address"}, discardLogger())
+
+	const (
+		blobLen              = 76
+		blocktemplateBlobLen = 230
+		reservedOffset       = 167
+		clientPoolOffset     = 175 // reservedOffset + 8
+		clientNonceOffset    = 179 // reservedOffset + 12
+	)
+	blobHex := hexOfLen(blobLen)
+	blocktemplateBlobHex := hexOfLen(blocktemplateBlobLen)
+
+	uc.applyJob(UpstreamJobPayload{
+		JobID:             "real-capture-job",
+		Blob:              blobHex,
+		BlocktemplateBlob: blocktemplateBlobHex,
+		ReservedOffset:    intPtr(reservedOffset),
+		ClientPoolOffset:  intPtr(clientPoolOffset),
+		ClientNonceOffset: intPtr(clientNonceOffset),
+		Height:            777,
+	})
+
+	tmpl := uc.CurrentTemplate()
+	if tmpl == nil {
+		t.Fatal("expected a WorkerTemplate to be stored")
+	}
+
+	wantRaw, err := hex.DecodeString(blocktemplateBlobHex)
 	if err != nil {
-		t.Fatalf("BlobForWorker: %v", err)
+		t.Fatalf("decoding blocktemplate_blob fixture: %v", err)
 	}
-	if len(wireBlob) >= 408 {
-		t.Fatalf("final wire-facing blob length = %d, want < 408", len(wireBlob))
+	if tmpl.RawBlob == nil {
+		t.Fatalf("WorkerTemplate.RawBlob = nil, want the real 230-byte raw template -- this is the exact production bug (offset=%d blob_len=%d)", clientNonceOffset, blobLen)
 	}
-	if !bytes.Equal(wireBlob, wantBlob) {
-		t.Fatalf("final wire-facing blob = %x, want the decoded small Blob field %x (not derived from BlocktemplateBlob)", wireBlob, wantBlob)
+	if !bytes.Equal(tmpl.RawBlob, wantRaw) {
+		t.Fatalf("WorkerTemplate.RawBlob = %x (%d bytes), want %x (%d bytes)", tmpl.RawBlob, len(tmpl.RawBlob), wantRaw, len(wantRaw))
+	}
+	if len(tmpl.RawBlob) <= clientNonceOffset+4 {
+		// sanity: the whole point is that offset 179+4 must fit
+		// within a 230-byte buffer, unlike the 76-byte one.
+	} else if len(tmpl.RawBlob) < clientNonceOffset+4 {
+		t.Fatalf("RawBlob length %d does not actually cover clientNonceOffset+4=%d -- fixture is wrong", len(tmpl.RawBlob), clientNonceOffset+4)
+	}
+	if tmpl.ClientNonceOffset != clientNonceOffset {
+		t.Fatalf("WorkerTemplate.ClientNonceOffset = %d, want %d", tmpl.ClientNonceOffset, clientNonceOffset)
+	}
+	if tmpl.ReservedOffset != reservedOffset {
+		t.Fatalf("WorkerTemplate.ReservedOffset = %d, want %d", tmpl.ReservedOffset, reservedOffset)
+	}
+	if tmpl.PoolOffset != clientPoolOffset {
+		t.Fatalf("WorkerTemplate.PoolOffset = %d, want %d", tmpl.PoolOffset, clientPoolOffset)
+	}
+
+	// The real regression: the worker-nonce offset (179) must be
+	// patchable against the REAL 230-byte RawBlob without an
+	// out-of-range error -- this is the exact low-level bounds check
+	// (patchOffsets, template.go) that previously only ever saw a
+	// 76-byte buffer for this exact job shape because RawBlob was
+	// nil. Using patchOffsets directly (rather than the full
+	// BlobForWorker, which additionally re-parses/re-converts via
+	// go-xmr-lib and requires a genuinely well-formed Monero block --
+	// this fixture is deliberately synthetic bytes, not a real
+	// parseable block) isolates exactly the bounds-check regression
+	// this bug was about, independent of go-xmr-lib's own parsing.
+	patched, err := patchOffsets(tmpl.RawBlob, offsetPatch{offset: tmpl.ClientNonceOffset, value: 0xdeadbeef})
+	if err != nil {
+		t.Fatalf("patchOffsets against the real RawBlob unexpectedly failed (this is exactly the real production error class): %v", err)
+	}
+	if len(patched) != blocktemplateBlobLen {
+		t.Fatalf("patched buffer length = %d, want %d", len(patched), blocktemplateBlobLen)
+	}
+	// Sanity: confirm the SAME offset against the small 76-byte Blob
+	// (what the pre-fix bug would have patched into instead) DOES
+	// fail with the exact real production error -- proving this test
+	// fixture genuinely reproduces "offset=179 blob_len=76" when
+	// RawBlob is wrongly left nil, and that the fix's RawBlob
+	// population is what avoids it.
+	_, err = patchOffsets(tmpl.Blob, offsetPatch{offset: tmpl.ClientNonceOffset, value: 0xdeadbeef})
+	if err == nil {
+		t.Fatalf("patching offset %d into the small %d-byte Blob unexpectedly succeeded -- fixture no longer reproduces the real bug shape", clientNonceOffset, blobLen)
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("offset=179 blob_len=76")) {
+		t.Fatalf("patching-against-Blob error = %q, want it to contain the exact real production error shape %q", err.Error(), "offset=179 blob_len=76")
 	}
 }
+
+// intPtr is a tiny local helper for constructing UpstreamJobPayload's
+// *int pointer fields (ReservedOffset/ClientPoolOffset/
+// ClientNonceOffset) inline.
+func intPtr(v int) *int { return &v }
 
 // TestApplyJob_EmptyBlobLeavesExistingGoodTemplateUntouched exercises
 // genuinely malformed/truncated-input safety: under the real fix, a

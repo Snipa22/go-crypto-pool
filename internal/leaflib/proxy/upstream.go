@@ -797,18 +797,34 @@ func convertTemplateBlobToHashingBlob(blobHex string) ([]byte, error) {
 // just BlockHeader + merkle-root-of-tx-hashes + tx-count-varint --
 // the correctly-sized, ~76-byte RandomX hashing blob real miners
 // need; this is the Go port of cryptonote_format_utils.cpp's
-// get_block_hashing_blob). job.Blob, when present, is still preferred
-// over job.BlocktemplateBlob -- some pools (e.g. pool.supportxmr.com,
-// for an ordinary, non-advanced-client login) publish it directly
-// already correctly sized, requiring no conversion at all. Priority
-// order, mirroring the reference's own "prefer the already-usable
-// field" behavior:
+// get_block_hashing_blob).
+//
+// job.Blob and job.BlocktemplateBlob are two GENUINELY INDEPENDENT
+// concerns, not mutually-exclusive alternatives (real, confirmed live
+// production evidence: this leaf's own real login/getjob response
+// legitimately carries BOTH simultaneously -- job.Blob for backward
+// compat with ordinary non-XNP miners that only ever read "blob", and
+// job.BlocktemplateBlob so an XNP-class multi-tier proxy can patch its
+// own worker-nonce offsets into the real raw template). A prior
+// version of this function treated them as a strict either/or
+// priority order (job.Blob preferred whenever non-empty), which meant
+// WorkerTemplate.RawBlob was NEVER populated whenever BOTH fields
+// were present -- reproducing the real "worker-nonce offset is out of
+// range for this template's blob" error whenever downstream
+// nonce-offset patching then had to fall back to the small hashing
+// blob instead of the real raw template. See this function's own
+// BUG FIX comment (right above the case switch) for the full,
+// byte-level reproduction. Priority order now:
 //
 //   - job.Blob != "": decode it directly as the outbound hashing
-//     blob (unchanged from before this fix). The resulting
-//     WorkerTemplate.RawBlob is nil -- there is no full raw template
-//     to patch worker-nonces into in this case, see template.go's
-//     WorkerTemplate.RawBlob doc comment.
+//     blob (unchanged from before this fix; this preserves the
+//     ordinary-miner path byte-for-byte and avoids a redundant
+//     re-conversion when this leaf already computed it correctly).
+//     job.BlocktemplateBlob, if ALSO present, is now additionally
+//     decoded into WorkerTemplate.RawBlob (a genuinely new behavior
+//     vs. before this fix) -- a malformed BlocktemplateBlob in this
+//     combined case degrades gracefully (RawBlob stays nil, blob is
+//     unaffected) rather than aborting the whole job.
 //   - job.Blob == "" && job.BlocktemplateBlob != "": the real
 //     conversion path described above. On a parse/conversion error
 //     (e.g. genuinely malformed or truncated input), this logs a
@@ -854,6 +870,50 @@ func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
 		}
 	}
 
+	// BUG FIX (real, confirmed live production evidence: a packet
+	// capture from this leaf's own real login/getjob response showed
+	// BOTH job.Blob (~76 bytes -- the small, already-converted
+	// RandomX hashing blob, published unconditionally for backward
+	// compat with ordinary non-XNP miners that only ever read "blob")
+	// AND job.BlocktemplateBlob (~230 bytes -- the real, raw template
+	// carrying the reserved_offset/client_nonce_offset/
+	// client_pool_offset region) present SIMULTANEOUSLY in the SAME
+	// job payload -- a real, legitimate wire shape, not malformed
+	// input. The switch below used to be a strict priority order
+	// (job.Blob preferred whenever non-empty, matching some pools
+	// e.g. pool.supportxmr.com that publish ONLY job.Blob and have no
+	// raw template at all), which meant that whenever BOTH fields
+	// were present, rawBlob was NEVER populated even though a real,
+	// valid BlocktemplateBlob was sitting right there in the same
+	// payload. Downstream nonce-offset patching for an XNP-proxy
+	// session (WorkerTemplate.BlobForWorker) then had no real raw
+	// blob to patch reserved_offset/client_nonce_offset/
+	// client_pool_offset into, and fell back to using the small
+	// hashing blob instead -- reproducing EXACTLY the real error this
+	// session ("proxy: worker-nonce offset is out of range for this
+	// template's blob: offset=179 blob_len=76": offset 179 is a real,
+	// valid client_nonce_offset into the 230-byte raw template, but
+	// is nonsensical against the 76-byte hashing blob).
+	//
+	// FIX: rawBlob is now populated from job.BlocktemplateBlob
+	// whenever it is present, INDEPENDENTLY of whether job.Blob is
+	// also present -- these are two genuinely separate concerns
+	// (which bytes are the ready-to-hash blob for ordinary miners vs.
+	// which bytes the offset-patching path needs) that must not share
+	// one single either/or branch. blob (the ready-to-hash field
+	// every session actually mines against) still prefers job.Blob
+	// when present, since that's already correct and cheaper than
+	// re-deriving it via convertTemplateBlobToHashingBlob -- this
+	// preserves the ordinary-miner path byte-for-byte. Only when
+	// job.Blob is ABSENT does this derive blob from
+	// BlocktemplateBlob via the real conversion helper (unchanged
+	// from before this fix). A malformed/unparseable
+	// BlocktemplateBlob, when job.Blob is otherwise present and
+	// valid, is now a genuine partial-degradation case: rawBlob stays
+	// nil (offset-patching unavailable for this job) but blob/the
+	// ordinary mining path is NOT aborted over it, mirroring
+	// monero_node.go's server-side "degrade this one optional
+	// feature, don't fail the whole job" philosophy.
 	var (
 		blob    []byte
 		rawBlob []byte
@@ -866,6 +926,14 @@ func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
 			return
 		}
 		blob = decoded
+		if job.BlocktemplateBlob != "" {
+			rawDecoded, err := hex.DecodeString(job.BlocktemplateBlob)
+			if err != nil {
+				uc.logger.Printf("proxy: upstream job carried an unparseable blocktemplate_blob alongside a valid blob -- worker-nonce offset patching unavailable for this job, ordinary mining unaffected: %v", err)
+			} else {
+				rawBlob = rawDecoded
+			}
+		}
 	case job.BlocktemplateBlob != "":
 		decoded, err := hex.DecodeString(job.BlocktemplateBlob)
 		if err != nil {

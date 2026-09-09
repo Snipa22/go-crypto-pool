@@ -887,14 +887,27 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	if solo.IsXNPProxyAgent(s.agent.Load().(string)) {
 		switch job.Algo {
 		case poolpb.Algo_ALGO_RXM:
-			rawBlobHex := hex.EncodeToString(job.RawTemplateBlob)
-			reservedOffset := job.ReservedOffset
-			clientNonceOffset := job.ReservedOffset + 12
-			clientPoolOffset := job.ReservedOffset + 8
-			payload.BlocktemplateBlob = &rawBlobHex
-			payload.ReservedOffset = &reservedOffset
-			payload.ClientNonceOffset = &clientNonceOffset
-			payload.ClientPoolOffset = &clientPoolOffset
+			// BOUNDS-CHECK GATE (real production bug fix -- see
+			// job.go's Job.ReservedOffsetUsable doc comment and
+			// monero_node.go's GetBlockTemplate for the full
+			// rationale and live-reproduction evidence). When
+			// monerod's real reserved_offset does not fit within its
+			// own returned blocktemplate_blob for THIS job,
+			// ReservedOffsetUsable is false and this whole branch is
+			// skipped, leaving all four pointer fields nil/omitted --
+			// exactly the same "nil means not offered" degradation
+			// already used for RXT's ReservedOffset/ClientPoolOffset
+			// below, not a parallel signaling mechanism.
+			if job.ReservedOffsetUsable {
+				rawBlobHex := hex.EncodeToString(job.RawTemplateBlob)
+				reservedOffset := job.ReservedOffset
+				clientNonceOffset := job.ReservedOffset + 12
+				clientPoolOffset := job.ReservedOffset + 8
+				payload.BlocktemplateBlob = &rawBlobHex
+				payload.ReservedOffset = &reservedOffset
+				payload.ClientNonceOffset = &clientNonceOffset
+				payload.ClientPoolOffset = &clientPoolOffset
+			}
 		case poolpb.Algo_ALGO_RXT:
 			blobHex := payload.Blob
 			clientNonceOffset := rxtXmrigNonceOffset

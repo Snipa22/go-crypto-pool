@@ -255,6 +255,14 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetr
 	m.SetSnapshotSource(s.sessionSnapshots)
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
+	// Wire the real XNP-reservation-unavailable counter into this
+	// server's own MoneroNodeClient, if that's what it's actually
+	// running against -- mirrors solo.Server.EnableMetrics' identical
+	// wiring exactly (both leaf-solo and leaf-direct share the SAME
+	// solo.MoneroNodeClient implementation for -coin=monero).
+	if mnc, ok := s.node.(*solo.MoneroNodeClient); ok {
+		mnc.SetReservationUnavailableMetric(m.XNPReservationUnavailableTotal)
+	}
 	return m
 }
 
