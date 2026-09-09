@@ -133,6 +133,44 @@ type Job struct {
 	// submit time (session.go's handleSubmit).
 	VmKey []byte
 
+	// ReservedOffset is the real Monero get_block_template
+	// reserved_offset — the byte offset, within the RAW (unconverted)
+	// blocktemplate_blob, of the reserve_size-byte area monerod set
+	// aside for pool extranonce insertion into the coinbase tx (see
+	// monero_node.go's GetBlockTemplate, which requests reserve_size:
+	// 60 and now threads the daemon's own returned reserved_offset
+	// through here instead of discarding it). Coin-agnostic field
+	// placement mirrors VmKey/StaticDifficulty above: only ever
+	// populated for ALGO_RXM jobs (monero_node.go's GetBlockTemplate);
+	// every other algo (SHA3X/C29/RXT) leaves this at its zero value,
+	// which is safe since it is only ever read when
+	// job.Algo == poolpb.Algo_ALGO_RXM AND the reading session has
+	// been detected as an XNP-class proxy client (see session.go's
+	// jobPayload — protocol.go's JobPayload.ReservedOffset/
+	// ClientNonceOffset/ClientPoolOffset are derived from this field
+	// only in that case; an ordinary xmrig-class miner's job payload
+	// never surfaces it at all).
+	ReservedOffset int
+
+	// RawTemplateBlob is the real, RAW, UNCONVERTED Monero
+	// blocktemplate_blob bytes for this job (monero_node.go's
+	// moneroTemplateData.TemplateBlob, duplicated here so
+	// session.go's jobPayload can reach it without a cross-package
+	// type assertion into the opaque TemplateData field — see that
+	// field's own doc comment on why algo-specific NodeClient
+	// internals are normally kept out of this coin-agnostic shell).
+	// This is deliberately the SAME raw bytes handed to an
+	// XNP-proxy-detected session's wire "blocktemplate_blob" field
+	// (protocol.go's JobPayload) — see this repo's XNP-proxy fix doc
+	// comment on session.go's jobPayload for why sending the raw,
+	// unconverted template (rather than the hashing blob already in
+	// Header) is the deliberate, safety-reviewed behavior for that
+	// one case: the receiving XNP-class proxy does its OWN
+	// raw-blob-to-hashing-blob conversion downstream. Only ever
+	// populated for ALGO_RXM jobs; zero-value (nil) for every other
+	// algo.
+	RawTemplateBlob []byte
+
 	CreatedAt time.Time
 
 	// nonceMu/usedNonces implement per-job used-nonce tracking, ported
@@ -453,6 +491,8 @@ func (jm *JobManager) RestampDifficulty(ctx context.Context, xn string, difficul
 		NetworkTargetDifficulty: existing.NetworkTargetDifficulty,
 		TemplateData:            existing.TemplateData,
 		VmKey:                   existing.VmKey,
+		ReservedOffset:          existing.ReservedOffset,
+		RawTemplateBlob:         existing.RawTemplateBlob,
 		CreatedAt:               existing.CreatedAt,
 	}
 
