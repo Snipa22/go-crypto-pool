@@ -46,6 +46,44 @@ func TestPoolTypeFromString(t *testing.T) {
 	}
 }
 
+// TestServerConfigAlgoUsesResolveAlgoNotAlgoFromString is a regression
+// test for a real, confirmed-live bug: main() used to construct
+// direct.ServerConfig with `Algo: algoFromString(cfg.algo)` -- a
+// coin-UNAWARE helper with no knowledge of -coin/LEAF_DIRECT_COIN --
+// instead of the coin-aware `resolveAlgo(cfg)` (which
+// solo.NewJobManager's config correctly already used). On a real
+// -coin=monero deployment where LEAF_DIRECT_ALGO is left at its
+// default ("sha3x", since it's irrelevant/ignored for monero coin),
+// this made JobManager correctly produce ALGO_RXM jobs while Server's
+// algo was wrongly ALGO_SHA3X -- and internal/leaflib/direct/
+// session.go's handleLogin dispatches
+// solo.ValidateAddressForAlgo(s.server.algo, login.Login), so a real,
+// valid Monero payout address on login got wrongly validated as a
+// Tari address and rejected.
+//
+// This test asserts the exact value that main() passes as
+// direct.ServerConfig.Algo (i.e. resolveAlgo(cfg), NOT
+// algoFromString(cfg.algo)) for the real default configuration that
+// triggered the bug: -coin=monero with LEAF_DIRECT_ALGO left unset
+// (so cfg.algo defaults to "sha3x").
+func TestServerConfigAlgoUsesResolveAlgoNotAlgoFromString(t *testing.T) {
+	cfg := config{coin: "monero", algo: "sha3x"}
+
+	// Sanity-check the premise: algoFromString(cfg.algo) alone (the
+	// buggy call site's old expression) would have wrongly resolved
+	// to ALGO_SHA3X here since it has no knowledge of cfg.coin.
+	if got := algoFromString(cfg.algo); got != poolpb.Algo_ALGO_SHA3X {
+		t.Fatalf("algoFromString(%q) = %v, want %v (premise of this regression test broken)", cfg.algo, got, poolpb.Algo_ALGO_SHA3X)
+	}
+
+	// The real fix: direct.ServerConfig.Algo must be resolveAlgo(cfg),
+	// which is coin-aware and correctly resolves to ALGO_RXM for
+	// -coin=monero regardless of cfg.algo.
+	if got := resolveAlgo(cfg); got != poolpb.Algo_ALGO_RXM {
+		t.Errorf("resolveAlgo(%+v) = %v, want %v -- direct.ServerConfig.Algo must use resolveAlgo(cfg), not algoFromString(cfg.algo), or a real Monero payout address on login gets wrongly validated as a Tari address and rejected", cfg, got, poolpb.Algo_ALGO_RXM)
+	}
+}
+
 // TestDefaultCoinbaseExtraTagPerAlgo mirrors leaf-solo's own identical
 // test -- confirms leaf-direct's defaultCoinbaseExtraTag computes the
 // same per-algo "supportxtm-<algo>" pattern.
