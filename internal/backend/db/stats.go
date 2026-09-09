@@ -101,7 +101,7 @@ func (r *Repository) MinerBalances(ctx context.Context, paymentAddress, algo, ne
 // internal/backend/payout's doc comment: this is the same
 // "hashes"/difficulty-equivalent weight PPS/PPLNS payout math already
 // treats it as) and the raw row count. SharesSum is the input to the
-// standard difficulty*2^32/elapsed-time hashrate approximation (see
+// standard difficulty/elapsed-time hashrate approximation (see
 // internal/backend/statsapi's EstimateHashrateHS, which mirrors
 // internal/leaflib.EstimateHashrateHz's exact formula/convention on
 // the backend's DB-query-based side of the pool).
