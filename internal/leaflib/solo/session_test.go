@@ -296,10 +296,11 @@ func (h *testHarness) recvShareResponse() ShareResponse {
 
 // recvLegacyShareResponse decodes a submit response using the
 // pre-PR-#56 bare-bool/bare-string LegacyShareResponse shape — used by
-// C29 test harnesses only, since ALGO_C29 sessions now genuinely emit
-// this different wire shape (see session.go's writeShareResponse and
-// protocol.go's LegacyShareResponse doc comment for the confirmed
-// regression this preserves against).
+// C29 AND SHA3X (the default) test harnesses, since ALGO_C29 and
+// ALGO_SHA3X sessions now genuinely emit this different wire shape
+// (see session.go's writeShareResponse and protocol.go's
+// LegacyShareResponse doc comment for the confirmed regression this
+// preserves against).
 func (h *testHarness) recvLegacyShareResponse() LegacyShareResponse {
 	h.t.Helper()
 	var resp LegacyShareResponse
@@ -314,6 +315,21 @@ func (h *testHarness) recvErrorResponse() ErrorResponse {
 	var resp ErrorResponse
 	if err := json.Unmarshal(h.recvRaw(), &resp); err != nil {
 		h.t.Fatalf("unmarshal error response: %v", err)
+	}
+	return resp
+}
+
+// recvLegacyErrorResponse decodes a general-purpose response using the
+// pre-PR-#56 bare-string LegacyErrorResponse shape — used by C29 and
+// SHA3X test harnesses, since ALGO_C29/ALGO_SHA3X sessions now
+// genuinely emit this different wire shape (see session.go's
+// writeGeneralResponse and protocol.go's LegacyErrorResponse doc
+// comment for the confirmed regression this preserves against).
+func (h *testHarness) recvLegacyErrorResponse() LegacyErrorResponse {
+	h.t.Helper()
+	var resp LegacyErrorResponse
+	if err := json.Unmarshal(h.recvRaw(), &resp); err != nil {
+		h.t.Fatalf("unmarshal legacy error response: %v", err)
 	}
 	return resp
 }
@@ -400,9 +416,9 @@ func TestSessionGetJobWithoutLoginIsRejected(t *testing.T) {
 	h := newTestHarness(t, 1000, 1<<62)
 
 	h.send(Request{ID: 5, Method: "getjob"})
-	resp := h.recvErrorResponse()
+	resp := h.recvLegacyErrorResponse()
 
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Error("expected getjob before login to be rejected with an error")
 	}
 	if resp.Result != "" {
@@ -428,13 +444,13 @@ func TestSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 12345),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Error != nil {
-		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
 	}
-	if resp.Result == nil || resp.Result.Status != "OK" {
-		t.Fatalf("expected result={\"status\":\"OK\"} for an accepted share, got %#v", resp)
+	if !resp.Result {
+		t.Fatalf("expected result=true for an accepted share, got %#v", resp)
 	}
 	if h.node.submitCalls.Load() != 0 {
 		t.Errorf("SubmitBlock should not have been called, got %d calls", h.node.submitCalls.Load())
@@ -472,13 +488,13 @@ func TestSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 999),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Error != nil {
-		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
 	}
-	if resp.Result == nil || resp.Result.Status != "OK" {
-		t.Fatalf("expected result={\"status\":\"OK\"} for a block-finding share, got %#v", resp)
+	if !resp.Result {
+		t.Fatalf("expected result=true for a block-finding share, got %#v", resp)
 	}
 	if h.node.submitCalls.Load() != 1 {
 		t.Errorf("expected exactly 1 SubmitBlock call, got %d", h.node.submitCalls.Load())
@@ -503,13 +519,13 @@ func TestSessionSubmitCryptographicallyInvalid(t *testing.T) {
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 1),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected an error for a share that fails PoW validation")
 	}
-	if resp.Result != nil {
-		t.Fatalf("expected result absent for an invalid share, got %#v", resp)
+	if resp.Result {
+		t.Fatalf("expected result=false for an invalid share, got %#v", resp)
 	}
 	if h.node.submitCalls.Load() != 0 {
 		t.Errorf("SubmitBlock must not be called for an invalid share, got %d calls", h.node.submitCalls.Load())
@@ -529,13 +545,13 @@ func TestSessionSubmitUnknownJobIDIsRejected(t *testing.T) {
 		JobID: "0000000000000000",
 		Nonce: xnPrefixedNonceHex(xn, 1),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected an error for an unknown job_id")
 	}
-	if resp.Result != nil {
-		t.Error("expected result absent for an unknown job_id")
+	if resp.Result {
+		t.Error("expected result=false for an unknown job_id")
 	}
 }
 
@@ -550,25 +566,25 @@ func TestSessionSubmitDuplicateNonceIsRejected(t *testing.T) {
 	sessionID, xn := login(t, h, "addr-6")
 
 	jobID := currentJobIDForXN(t, h, xn)
-	submit := func() ShareResponse {
+	submit := func() LegacyShareResponse {
 		h.send(Request{ID: 7, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			ID:    sessionID,
 			JobID: jobID,
 			Nonce: xnPrefixedNonceHex(xn, 42424242),
 		})})
-		return h.recvShareResponse()
+		return h.recvLegacyShareResponse()
 	}
 
 	first := submit()
-	if first.Result == nil || first.Result.Status != "OK" {
+	if !first.Result {
 		t.Fatalf("expected the first submission of a nonce to be accepted, got %#v", first)
 	}
 
 	second := submit()
-	if second.Result != nil {
+	if second.Result {
 		t.Fatal("expected a replayed nonce to be rejected")
 	}
-	if second.Error == nil {
+	if second.Error == "" {
 		t.Error("expected an error message on a replayed-nonce rejection")
 	}
 
@@ -604,16 +620,16 @@ func TestSessionSubmitWithWrongXNPrefixIsRejectedBeforeValidation(t *testing.T) 
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(wrongXN, 999),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a submit with a nonce not prefixed by the session's own xn to be rejected")
 	}
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Error("expected a clear rejection error for an xn-prefix mismatch")
 	}
-	if !strings.Contains(strings.ToLower(resp.Error.Message), "xnonce") {
-		t.Errorf("expected the rejection error to mention XNonce, got %q", resp.Error.Message)
+	if !strings.Contains(strings.ToLower(resp.Error), "xnonce") {
+		t.Errorf("expected the rejection error to mention XNonce, got %q", resp.Error)
 	}
 	// Nothing downstream of the xn check must have run: no share
 	// credited, no SubmitBlock call, even though this nonce/job would
@@ -720,16 +736,16 @@ func TestSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
 		JobID: jobIDA,
 		Nonce: xnPrefixedNonceHex(xnA, 999),
 	})})
-	resp := hB.recvShareResponse()
+	resp := hB.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("SECURITY REGRESSION: session B's submit against session A's real job was ACCEPTED — cross-session job submission must be structurally impossible")
 	}
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected a clear rejection error for a cross-session job submission")
 	}
-	if !strings.Contains(resp.Error.Message, "unknown or stale job_id") {
-		t.Errorf("expected rejection to be classed as \"unknown or stale job_id\" (the session-ownership boundary), got %q", resp.Error.Message)
+	if !strings.Contains(resp.Error, "unknown or stale job_id") {
+		t.Errorf("expected rejection to be classed as \"unknown or stale job_id\" (the session-ownership boundary), got %q", resp.Error)
 	}
 	if h.node.submitCalls.Load() != 0 {
 		t.Errorf("SubmitBlock must NOT be called for a cross-session job submission, got %d calls", h.node.submitCalls.Load())
@@ -750,8 +766,8 @@ func TestSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
 		JobID: jobIDA,
 		Nonce: xnPrefixedNonceHex(xnA, 999),
 	})})
-	okResp := hA.recvShareResponse()
-	if okResp.Result == nil || okResp.Result.Status != "OK" {
+	okResp := hA.recvLegacyShareResponse()
+	if !okResp.Result {
 		t.Fatalf("expected session A's own submit against its own job to be accepted, got %#v", okResp)
 	}
 }
@@ -784,19 +800,19 @@ func TestSessionSubmitAgainstExpiredJobIsRejected(t *testing.T) {
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 1),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a submit against an expired job to be rejected")
 	}
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected a clear rejection error for an expired job")
 	}
-	if !strings.Contains(resp.Error.Message, "expired") {
-		t.Errorf("expected the rejection error to mention expiry, got %q", resp.Error.Message)
+	if !strings.Contains(resp.Error, "expired") {
+		t.Errorf("expected the rejection error to mention expiry, got %q", resp.Error)
 	}
-	if strings.Contains(resp.Error.Message, "unknown or stale job_id") {
-		t.Errorf("expired-job rejection must be a DISTINCT reason from unknown-job_id, got %q", resp.Error.Message)
+	if strings.Contains(resp.Error, "unknown or stale job_id") {
+		t.Errorf("expired-job rejection must be a DISTINCT reason from unknown-job_id, got %q", resp.Error)
 	}
 	if h.node.submitCalls.Load() != 0 {
 		t.Errorf("SubmitBlock must not be called for an expired-job submit, got %d calls", h.node.submitCalls.Load())
@@ -853,7 +869,7 @@ func TestSessionJobHistoryIsBounded(t *testing.T) {
 		// because this test loop itself never needs to submit
 		// anything between pushes.
 		h.send(Request{ID: 900 + i, Method: "keepalived"})
-		_ = h.recvErrorResponse()
+		_ = h.recvLegacyErrorResponse()
 	}
 
 	total := len(jobIDs)
@@ -870,11 +886,11 @@ func TestSessionJobHistoryIsBounded(t *testing.T) {
 			JobID: jobIDs[i],
 			Nonce: xnPrefixedNonceHex(xn, uint64(2000+i)),
 		})})
-		resp := h.recvShareResponse()
-		if resp.Result != nil {
+		resp := h.recvLegacyShareResponse()
+		if resp.Result {
 			t.Fatalf("job index %d (job_id %q) should have been trimmed from the bounded history, but was accepted", i, jobIDs[i])
 		}
-		if resp.Error == nil || !strings.Contains(resp.Error.Message, "unknown or stale job_id") {
+		if resp.Error == "" || !strings.Contains(resp.Error, "unknown or stale job_id") {
 			t.Errorf("job index %d: expected an unknown-job_id rejection for a trimmed job, got %v", i, resp.Error)
 		}
 	}
@@ -887,8 +903,8 @@ func TestSessionJobHistoryIsBounded(t *testing.T) {
 			JobID: jobIDs[i],
 			Nonce: xnPrefixedNonceHex(xn, uint64(3000+i)),
 		})})
-		resp := h.recvShareResponse()
-		if resp.Result == nil {
+		resp := h.recvLegacyShareResponse()
+		if !resp.Result {
 			t.Fatalf("job index %d (job_id %q) should still be within the bounded history and accepted, got error %v", i, jobIDs[i], resp.Error)
 		}
 	}
@@ -1205,12 +1221,12 @@ func TestSessionSHA3XSubmitWithoutXNPrefixIsRejected(t *testing.T) {
 		JobID: jobID,
 		Nonce: badNonce,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a SHA3X submit whose nonce does not start with the session's own xn to be REJECTED")
 	}
-	if resp.Error == nil || !strings.Contains(resp.Error.Message, "Invalid XNonce") {
+	if resp.Error == "" || !strings.Contains(resp.Error, "Invalid XNonce") {
 		t.Errorf("expected rejection to be the xn-prefix check (\"Invalid XNonce\"), got %v", resp.Error)
 	}
 }
@@ -1440,12 +1456,12 @@ func TestSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
 		JobID: jobID,
 		Nonce: shortNonce,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a 4-byte SHA3X nonce to be rejected")
 	}
-	if resp.Error == nil || !strings.Contains(resp.Error.Message, "must be 8 bytes") {
+	if resp.Error == "" || !strings.Contains(resp.Error, "must be 8 bytes") {
 		t.Fatalf("BUG REGRESSION: SHA3X's 8-byte nonce requirement was loosened -- got error %v, want the \"must be 8 bytes\" message", resp.Error)
 	}
 }

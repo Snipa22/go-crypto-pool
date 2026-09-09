@@ -56,10 +56,16 @@ func TestSessionLogin_RejectsBannedAddress(t *testing.T) {
 	h.send(Request{ID: 1, Method: "login", Params: mustJSON(t, LoginRequest{Login: addr, Pass: "rig1", Agent: "XMRig/6.21.0", Algo: []string{"sha3x"}})})
 	raw := h.recvRaw()
 
+	// newTestHarness defaults to ALGO_SHA3X, which now uses the
+	// legacy bare-string LegacyErrorResponse wire shape for
+	// writeGeneralResponse (see session.go's writeGeneralResponse
+	// and protocol.go's LegacyErrorResponse doc comment) -- decode
+	// with a bare string Error field, not the object/null *RPCError
+	// shape.
 	var generic struct {
-		Status string          `json:"status"`
-		Error  *RPCError       `json:"error"`
-		Result json.RawMessage `json:"result"`
+		Status string `json:"status"`
+		Error  string `json:"error"`
+		Result string `json:"result"`
 	}
 	if err := json.Unmarshal(raw, &generic); err != nil {
 		t.Fatalf("unmarshal login rejection response: %v (raw=%s)", err, raw)
@@ -67,7 +73,7 @@ func TestSessionLogin_RejectsBannedAddress(t *testing.T) {
 	if generic.Status == "OK" {
 		t.Fatalf("expected a banned address's login to be rejected, got status=OK (raw=%s)", raw)
 	}
-	if generic.Error == nil || generic.Error.Message == "" {
+	if generic.Error == "" {
 		t.Errorf("expected a non-empty rejection error message, got none (raw=%s)", raw)
 	}
 }
@@ -111,8 +117,8 @@ func TestSessionSubmit_RejectsAddressBannedMidSession(t *testing.T) {
 		JobID: jobID,
 		Nonce: xn + "00000000",
 	})})
-	resp := h.recvShareResponse()
-	if resp.Result != nil {
+	resp := h.recvLegacyShareResponse()
+	if resp.Result {
 		t.Fatal("expected a submit from a now-mid-session-banned address to be rejected, got accepted")
 	}
 }

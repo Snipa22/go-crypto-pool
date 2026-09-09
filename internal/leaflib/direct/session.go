@@ -770,11 +770,16 @@ func (s *Session) ownJob(id string) (*solo.Job, bool) {
 
 // writeGeneralResponse dispatches on this session's configured algo, mirroring
 // solo.Session's own writeGeneralResponse exactly (see that function's doc
-// comment for the full rationale): ALGO_C29 gets solo.LegacyErrorResponse's
-// real bare-string wire shape, every other algo keeps the PR #56 object/null
+// comment for the full rationale): ALGO_C29 and ALGO_SHA3X get the legacy
+// bare-bool/bare-string shape (both are lolMiner/graxil-class clients
+// requiring this dialect — SHA3X's real reference implementation is
+// go-tari-sha3x-solo-stratum's subsystems/messages/minerStructs.go
+// MinerRPCShareResponse/MinerRPCResponse, bare bool Result / bare string
+// Error just like C29's go-tari-c29-solo-stratum), while ALGO_RXT/ALGO_RXM
+// (genuinely xmrig-family clients) keep the PR #56 object/null
 // solo.ErrorResponse shape.
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
-	if s.server.algo == poolpb.Algo_ALGO_C29 {
+	if algo := s.server.algo; algo == poolpb.Algo_ALGO_C29 || algo == poolpb.Algo_ALGO_SHA3X {
 		s.writeJSON(solo.LegacyErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
 		return
 	}
@@ -786,14 +791,18 @@ func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 }
 
 // writeShareResponse dispatches on this session's configured algo, mirroring
-// solo.Session's own writeShareResponse exactly: ALGO_C29 gets
-// solo.LegacyShareResponse's real bare-bool wire shape (the shape
-// lolMiner/graxil29 actually require — see protocol.go's LegacyShareResponse
-// doc comment in the solo package), every other algo keeps the confirmed-
-// working object/null solo.ShareResponse shape from PR #56.
+// solo.Session's own writeShareResponse exactly: ALGO_C29 and ALGO_SHA3X get
+// the legacy bare-bool/bare-string shape (both are lolMiner/graxil-class
+// clients requiring this dialect — SHA3X's real reference implementation is
+// go-tari-sha3x-solo-stratum's subsystems/messages/minerStructs.go
+// MinerRPCShareResponse/MinerRPCResponse, bare bool Result / bare string
+// Error just like C29's go-tari-c29-solo-stratum, see protocol.go's
+// LegacyShareResponse doc comment in the solo package), while ALGO_RXT/
+// ALGO_RXM (genuinely xmrig-family clients) keep the confirmed-working
+// object/null solo.ShareResponse shape from PR #56.
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	s.server.recordShare(accepted)
-	if s.server.algo == poolpb.Algo_ALGO_C29 {
+	if algo := s.server.algo; algo == poolpb.Algo_ALGO_C29 || algo == poolpb.Algo_ALGO_SHA3X {
 		s.writeJSON(solo.LegacyShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
 		return
 	}

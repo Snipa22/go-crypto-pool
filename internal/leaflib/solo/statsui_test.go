@@ -27,8 +27,8 @@ func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 12345),
 	})})
-	resp := h.recvShareResponse()
-	if resp.Result == nil {
+	resp := h.recvLegacyShareResponse()
+	if !resp.Result {
 		t.Fatalf("expected the setup submit to be accepted, got %#v", resp)
 	}
 
@@ -93,7 +93,7 @@ func TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured(t *testing.T) {
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 12345),
 	})})
-	if resp := h.recvShareResponse(); resp.Result == nil {
+	if resp := h.recvLegacyShareResponse(); !resp.Result {
 		t.Fatalf("expected the setup submit to be accepted, got %#v", resp)
 	}
 
