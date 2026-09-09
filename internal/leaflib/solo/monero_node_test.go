@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -530,5 +533,130 @@ func TestMoneroRPCCall_SurfacesDaemonError(t *testing.T) {
 	}
 	if rpcErr.Code != -6 || rpcErr.Message != "Wrong block blob" {
 		t.Fatalf("rpcErr = %+v, want code=-6 message=\"Wrong block blob\"", rpcErr)
+	}
+}
+
+// realFixtureBlobHex is the same genuine, real-varint-parseable
+// blockhashing_blob fixture TestParseMoneroBlockHeaderNonceOffset_
+// RealFixture uses (76 bytes, real nonce offset 39) -- reused here as
+// BOTH blockhashing_blob and blocktemplate_blob for the two mocked
+// get_block_template tests below (they are byte-identical, which
+// trivially satisfies GetBlockTemplate's own header-prefix-match
+// check).
+const realFixtureBlobHex = "1010c3f4a4d4062d5456c2d3d54707336bc352fc9910c8adbd586603439b548fca04de64c1973d00000000936c23078acfd28dc0b307b8a2e63eb4eef27681ebb63f9ec67f09b8e3b59cef01"
+
+// mockGetBlockTemplateServer starts a real local httptest server whose
+// /json_rpc get_block_template response carries the given
+// reservedOffset -- both blockhashing_blob and blocktemplate_blob are
+// realFixtureBlobHex (76 bytes total, real nonce offset 39), so the
+// ONLY thing under test is the reservedOffset/blob-length bounds
+// check itself.
+func mockGetBlockTemplateServer(t *testing.T, reservedOffset int) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/json_rpc", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":"0","jsonrpc":"2.0","result":{
+			"blockhashing_blob":"%s",
+			"blocktemplate_blob":"%s",
+			"difficulty":1000,
+			"height":123,
+			"prev_hash":"%s",
+			"reserved_offset":%d,
+			"seed_hash":"%s",
+			"seed_height":100,
+			"status":"OK"
+		}}`, realFixtureBlobHex, realFixtureBlobHex, hex.EncodeToString(bytes.Repeat([]byte{0xAB}, 32)), reservedOffset, hex.EncodeToString(bytes.Repeat([]byte{0xCD}, 32)))
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestMoneroNodeClient_GetBlockTemplate_ReservationDoesNotFitDegradesGracefully
+// is the real regression test for the confirmed production bug (a
+// real live leaf-proxy rejection, "proxy: worker-nonce offset is out
+// of range for this template's blob: offset=179 blob_len=76", against
+// a genuine low-transaction-volume testnet block): a mocked monerod
+// get_block_template response whose real reserved_offset (65) does
+// NOT fit within the returned blocktemplate_blob's real length (76
+// bytes: 65+12=77 > 76) must NOT fail the whole GetBlockTemplate call
+// (a).  The resulting Job's XNP-eligibility signal
+// (ReservedOffsetUsable) must correctly reflect "not usable" (b).
+func TestMoneroNodeClient_GetBlockTemplate_ReservationDoesNotFitDegradesGracefully(t *testing.T) {
+	const reservedOffset = 65 // 65+12=77 > 76 (the fixture's real length)
+	srv := mockGetBlockTemplateServer(t, reservedOffset)
+	defer srv.Close()
+
+	client := NewMoneroNodeClient(srv.URL)
+	job, err := client.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("GetBlockTemplate must NOT fail the whole job over an out-of-bounds reservation offset (normal, non-XNP mining is unaffected): %v", err)
+	}
+	if job == nil {
+		t.Fatal("GetBlockTemplate returned a nil job")
+	}
+	if job.ReservedOffsetUsable {
+		t.Fatalf("job.ReservedOffsetUsable = true, want false (reserved_offset=%d does not fit within a %d-byte blob)", reservedOffset, len(job.RawTemplateBlob))
+	}
+	if job.ReservedOffset != reservedOffset {
+		t.Fatalf("job.ReservedOffset = %d, want %d (still recorded verbatim, even though unusable)", job.ReservedOffset, reservedOffset)
+	}
+	if job.RawTemplateBlob == nil {
+		t.Fatal("job.RawTemplateBlob is nil -- the raw template blob itself must still be populated for the ordinary, non-XNP hashing path")
+	}
+}
+
+// TestMoneroNodeClient_GetBlockTemplate_ReservationFitsIsMarkedUsable
+// is the positive-case non-regression guard: a normal-sized blob
+// whose real reserved_offset DOES fit must still be marked usable, so
+// a real XNP-proxy-detected session continues to get the full
+// proxy-shape fields exactly as before this fix.
+func TestMoneroNodeClient_GetBlockTemplate_ReservationFitsIsMarkedUsable(t *testing.T) {
+	const reservedOffset = 10 // 10+12=22 <= 76
+	srv := mockGetBlockTemplateServer(t, reservedOffset)
+	defer srv.Close()
+
+	client := NewMoneroNodeClient(srv.URL)
+	job, err := client.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("GetBlockTemplate: %v", err)
+	}
+	if !job.ReservedOffsetUsable {
+		t.Fatalf("job.ReservedOffsetUsable = false, want true (reserved_offset=%d fits within a %d-byte blob -- this must NOT regress the working case)", reservedOffset, len(job.RawTemplateBlob))
+	}
+	if job.ReservedOffset != reservedOffset {
+		t.Fatalf("job.ReservedOffset = %d, want %d", job.ReservedOffset, reservedOffset)
+	}
+}
+
+// TestMoneroNodeClient_GetBlockTemplate_ReservationUnavailableIncrementsMetric
+// confirms SetReservationUnavailableMetric's counter is actually
+// incremented once for a degraded call and NOT incremented for a
+// healthy one -- the real observability half of this fix.
+func TestMoneroNodeClient_GetBlockTemplate_ReservationUnavailableIncrementsMetric(t *testing.T) {
+	const reservedOffset = 65
+	srv := mockGetBlockTemplateServer(t, reservedOffset)
+	defer srv.Close()
+
+	client := NewMoneroNodeClient(srv.URL)
+	counter := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_xnp_reservation_unavailable_total"})
+	client.SetReservationUnavailableMetric(counter)
+
+	if _, err := client.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM); err != nil {
+		t.Fatalf("GetBlockTemplate: %v", err)
+	}
+	if got := testutil.ToFloat64(counter); got != 1 {
+		t.Fatalf("counter = %v, want 1 after one degraded call", got)
+	}
+
+	// A second, healthy call must NOT increment it further.
+	srv2 := mockGetBlockTemplateServer(t, 10)
+	defer srv2.Close()
+	client2 := NewMoneroNodeClient(srv2.URL)
+	client2.SetReservationUnavailableMetric(counter)
+	if _, err := client2.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM); err != nil {
+		t.Fatalf("GetBlockTemplate (healthy): %v", err)
+	}
+	if got := testutil.ToFloat64(counter); got != 1 {
+		t.Fatalf("counter = %v after a healthy call, want unchanged at 1", got)
 	}
 }

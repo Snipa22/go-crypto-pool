@@ -9,12 +9,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
+
+// minReservedOffsetHeadroom is the largest byte offset any XNP-proxy-
+// shape field actually needs into the reservation region: client_
+// nonce_offset = ReservedOffset+12 (session.go's jobPayload,
+// ALGO_RXM branch) is bigger than client_pool_offset's ReservedOffset
+// +8, so it is the real binding constraint this bounds check must
+// satisfy.
+const minReservedOffsetHeadroom = 12
 
 // MoneroNodeClient is the production NodeClient implementation for
 // Monero (ALGO_RXM), backed by a real monerod JSON-RPC 2.0 connection
@@ -56,6 +67,31 @@ type MoneroNodeClient struct {
 	baseURL string
 	client  *http.Client
 	nowFunc func() time.Time
+
+	// reservationUnavailableCounter, if non-nil (wired via
+	// SetReservationUnavailableMetric — cmd/leaf-solo and
+	// cmd/leaf-direct's main.go, or their respective Server.
+	// EnableMetrics, do this after constructing both the metrics
+	// registry and this client), is incremented once per
+	// GetBlockTemplate call whose real ReservedOffset+12 does not fit
+	// within the real returned blocktemplate_blob length (see
+	// GetBlockTemplate's bounds check below and Job.
+	// ReservedOffsetUsable's doc comment for the full rationale).
+	// Left nil (a no-op) in every test/call site that doesn't wire a
+	// counter, matching this field's own "optional observability
+	// hook" nil-is-safe convention.
+	reservationUnavailableCounter prometheus.Counter
+}
+
+// SetReservationUnavailableMetric wires a Prometheus counter that this
+// client increments every time a real monerod get_block_template
+// response's ReservedOffset does not fit within its own returned
+// blocktemplate_blob (see GetBlockTemplate's bounds check and Job.
+// ReservedOffsetUsable's doc comment). Safe to call with nil (clears
+// the hook back to a no-op). Not safe to call concurrently with
+// in-flight GetBlockTemplate calls on the same client.
+func (c *MoneroNodeClient) SetReservationUnavailableMetric(counter prometheus.Counter) {
+	c.reservationUnavailableCounter = counter
 }
 
 // NewMoneroNodeClient returns a MoneroNodeClient talking to the real
@@ -277,6 +313,35 @@ func (c *MoneroNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress s
 		return nil, fmt.Errorf("solo: monero: blockhashing_blob and blocktemplate_blob header prefixes (through the parsed nonce offset %d) do not match — refusing to build a job from mismatched blobs", nonceOffset)
 	}
 
+	// XNP-PROXY RESERVATION BOUNDS CHECK — the actual fix for a real,
+	// confirmed production bug (see Job.ReservedOffsetUsable's doc
+	// comment for the full live-reproduction evidence: leaf-proxy
+	// correctly rejected a job with "offset=179 blob_len=76" rather
+	// than corrupting data, because monerod's own real reserved_offset
+	// for that low-tx-volume testnet block did not actually fit
+	// within its own returned blocktemplate_blob).
+	//
+	// This is deliberately NOT folded into the fmt.Errorf checks
+	// above: an out-of-bounds ReservedOffset is a defect in ONE
+	// specific, optional job feature (the XNP-proxy-shape fields),
+	// not in the template as a whole — an ordinary xmrig-class miner
+	// never reads ReservedOffset at all (it mines against
+	// job.Header/the converted blockhashing_blob via the completely
+	// separate nonceOffset already validated above), so failing the
+	// WHOLE GetBlockTemplate call over this would incorrectly take
+	// down normal mining every time monerod returns a genuinely
+	// short, low-tx coinbase-only block. Degrading gracefully (job
+	// still returned, ReservedOffsetUsable left false) keeps normal
+	// mining unaffected and only removes the proxy-shape fields for
+	// this one job.
+	reservationUsable := result.ReservedOffset >= 0 && result.ReservedOffset+minReservedOffsetHeadroom <= len(templateBlob)
+	if !reservationUsable {
+		log.Printf("solo: monero: get_block_template's real reservation region (offset=%d) does not fit in the returned template blob (len=%d) -- XNP-proxy shape omitted for this job, height=%d", result.ReservedOffset, len(templateBlob), result.Height)
+		if c.reservationUnavailableCounter != nil {
+			c.reservationUnavailableCounter.Inc()
+		}
+	}
+
 	job := &Job{
 		ID:                      moneroJobID(result.PrevHash, result.Height),
 		Algo:                    algo,
@@ -293,10 +358,11 @@ func (c *MoneroNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress s
 			Height:         result.Height,
 			ReservedOffset: result.ReservedOffset,
 		},
-		VmKey:           seedHash,
-		ReservedOffset:  result.ReservedOffset,
-		RawTemplateBlob: templateBlob,
-		CreatedAt:       c.now(),
+		VmKey:                seedHash,
+		ReservedOffset:       result.ReservedOffset,
+		ReservedOffsetUsable: reservationUsable,
+		RawTemplateBlob:      templateBlob,
+		CreatedAt:            c.now(),
 	}
 	return job, nil
 }
