@@ -297,9 +297,10 @@ func (h *directTestHarness) recvShareResponse() solo.ShareResponse {
 
 // recvLegacyShareResponse decodes a submit response using the
 // pre-PR-#56 bare-bool/bare-string LegacyShareResponse shape — used by
-// C29 test harnesses only, mirroring solo package's own
-// recvLegacyShareResponse test helper (see that helper's doc comment
-// for the confirmed regression this preserves against).
+// C29 AND SHA3X (the default) test harnesses, mirroring solo
+// package's own recvLegacyShareResponse test helper (see that
+// helper's doc comment for the confirmed regression this preserves
+// against).
 func (h *directTestHarness) recvLegacyShareResponse() solo.LegacyShareResponse {
 	h.t.Helper()
 	var resp solo.LegacyShareResponse
@@ -314,6 +315,21 @@ func (h *directTestHarness) recvErrorResponse() solo.ErrorResponse {
 	var resp solo.ErrorResponse
 	if err := json.Unmarshal(h.recvRaw(), &resp); err != nil {
 		h.t.Fatalf("unmarshal error response: %v", err)
+	}
+	return resp
+}
+
+// recvLegacyErrorResponse decodes a general-purpose response using
+// the pre-PR-#56 bare-string LegacyErrorResponse shape — used by C29
+// and SHA3X test harnesses, since ALGO_C29/ALGO_SHA3X sessions now
+// genuinely emit this different wire shape (see session.go's
+// writeGeneralResponse and solo/protocol.go's LegacyErrorResponse doc
+// comment for the confirmed regression this preserves against).
+func (h *directTestHarness) recvLegacyErrorResponse() solo.LegacyErrorResponse {
+	h.t.Helper()
+	var resp solo.LegacyErrorResponse
+	if err := json.Unmarshal(h.recvRaw(), &resp); err != nil {
+		h.t.Fatalf("unmarshal legacy error response: %v", err)
 	}
 	return resp
 }
@@ -603,12 +619,12 @@ func TestDirectSessionSHA3XSubmitWithoutXNPrefixIsStillRejected(t *testing.T) {
 		JobID: jobID,
 		Nonce: badNonce,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a SHA3X submit whose nonce does not start with the session's own xn to be REJECTED")
 	}
-	if resp.Error == nil || !strings.Contains(resp.Error.Message, "Invalid XNonce") {
+	if resp.Error == "" || !strings.Contains(resp.Error, "Invalid XNonce") {
 		t.Errorf("expected rejection to be the xn-prefix check (\"Invalid XNonce\"), got %v", resp.Error)
 	}
 }
@@ -632,10 +648,10 @@ func TestDirectSessionSHA3XShareCarriesNonZeroTimestamp(t *testing.T) {
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 111),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 	after := time.Now().Unix()
 
-	if resp.Result == nil {
+	if !resp.Result {
 		t.Fatalf("expected the share to be accepted, got %#v", resp)
 	}
 	if h.transport.shareCount() != 1 {
@@ -886,9 +902,9 @@ func TestDirectSessionGetJobWithoutLoginIsRejected(t *testing.T) {
 	h := newDirectTestHarness(t, 1000, 1<<62)
 
 	h.send(solo.Request{ID: 5, Method: "getjob"})
-	resp := h.recvErrorResponse()
+	resp := h.recvLegacyErrorResponse()
 
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Error("expected getjob before login to be rejected with an error")
 	}
 }
@@ -908,13 +924,13 @@ func TestDirectSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 12345),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Error != nil {
-		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
 	}
-	if resp.Result == nil || resp.Result.Status != "OK" {
-		t.Fatalf("expected result={\"status\":\"OK\"} for an accepted share, got %#v", resp)
+	if !resp.Result {
+		t.Fatalf("expected result=true for an accepted share, got %#v", resp)
 	}
 	if h.submit.calls.Load() != 0 {
 		t.Errorf("MultiSubmit.SubmitBlock should not have been called, got %d calls", h.submit.calls.Load())
@@ -949,13 +965,13 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 999),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Error != nil {
-		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	if resp.Error != "" {
+		t.Fatalf("unexpected error: %s", resp.Error)
 	}
-	if resp.Result == nil || resp.Result.Status != "OK" {
-		t.Fatalf("expected result={\"status\":\"OK\"} for a block-finding share, got %#v", resp)
+	if !resp.Result {
+		t.Fatalf("expected result=true for a block-finding share, got %#v", resp)
 	}
 	if h.submit.calls.Load() != 1 {
 		t.Errorf("expected exactly 1 MultiSubmit.SubmitBlock call, got %d", h.submit.calls.Load())
@@ -1029,8 +1045,8 @@ func TestDirectSessionBlockFindCarriesNonZeroShares(t *testing.T) {
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 888),
 	})})
-	resp := h.recvShareResponse()
-	if resp.Result == nil {
+	resp := h.recvLegacyShareResponse()
+	if !resp.Result {
 		t.Fatalf("expected the block-finding share to be accepted, got %#v", resp)
 	}
 
@@ -1065,13 +1081,13 @@ func TestDirectSessionSubmitCryptographicallyInvalid(t *testing.T) {
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 1),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected an error for a share that fails PoW validation")
 	}
-	if resp.Result != nil {
-		t.Fatalf("expected result absent for an invalid share, got %#v", resp)
+	if resp.Result {
+		t.Fatalf("expected result=false for an invalid share, got %#v", resp)
 	}
 	if h.submit.calls.Load() != 0 {
 		t.Errorf("MultiSubmit.SubmitBlock must not be called for an invalid share, got %d calls", h.submit.calls.Load())
@@ -1090,13 +1106,13 @@ func TestDirectSessionSubmitUnknownJobIDIsRejected(t *testing.T) {
 		JobID: "0000000000000000",
 		Nonce: directXNPrefixedNonceHex(xn, 1),
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected an error for an unknown job_id")
 	}
-	if resp.Result != nil {
-		t.Error("expected result absent for an unknown job_id")
+	if resp.Result {
+		t.Error("expected result=false for an unknown job_id")
 	}
 }
 
@@ -1105,24 +1121,24 @@ func TestDirectSessionSubmitDuplicateNonceIsRejected(t *testing.T) {
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-6"))
 
 	jobID := directCurrentJobIDForXN(t, h, xn)
-	submit := func() solo.ShareResponse {
+	submit := func() solo.LegacyShareResponse {
 		h.send(solo.Request{ID: 7, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 			ID:    sessionID,
 			JobID: jobID,
 			Nonce: directXNPrefixedNonceHex(xn, 42424242),
 		})})
-		return h.recvShareResponse()
+		return h.recvLegacyShareResponse()
 	}
 
 	first := submit()
-	if first.Result == nil || first.Result.Status != "OK" {
+	if !first.Result {
 		t.Fatalf("expected the first submission of a nonce to be accepted, got %#v", first)
 	}
 	second := submit()
-	if second.Result != nil {
+	if second.Result {
 		t.Fatal("expected a replayed nonce to be rejected")
 	}
-	if second.Error == nil {
+	if second.Error == "" {
 		t.Error("expected an error message on a replayed-nonce rejection")
 	}
 }
@@ -1165,16 +1181,16 @@ func TestDirectSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
 		JobID: jobIDA,
 		Nonce: directXNPrefixedNonceHex(xnA, 999),
 	})})
-	resp := hB.recvShareResponse()
+	resp := hB.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("SECURITY REGRESSION: session B's submit against session A's real job was ACCEPTED — cross-session job submission must be structurally impossible in leaf-direct")
 	}
-	if resp.Error == nil {
+	if resp.Error == "" {
 		t.Fatal("expected a clear rejection error for a cross-session job submission")
 	}
-	if !strings.Contains(resp.Error.Message, "unknown or stale job_id") {
-		t.Errorf("expected rejection to be classed as \"unknown or stale job_id\" (the session-ownership boundary), got %q", resp.Error.Message)
+	if !strings.Contains(resp.Error, "unknown or stale job_id") {
+		t.Errorf("expected rejection to be classed as \"unknown or stale job_id\" (the session-ownership boundary), got %q", resp.Error)
 	}
 	if h.submit.calls.Load() != 0 {
 		t.Errorf("MultiSubmit.SubmitBlock must NOT be called for a cross-session job submission, got %d calls", h.submit.calls.Load())
@@ -1342,12 +1358,12 @@ func TestDirectSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
 		JobID: jobID,
 		Nonce: shortNonce,
 	})})
-	resp := h.recvShareResponse()
+	resp := h.recvLegacyShareResponse()
 
-	if resp.Result != nil {
+	if resp.Result {
 		t.Fatal("expected a 4-byte SHA3X nonce to be rejected")
 	}
-	if resp.Error == nil || !strings.Contains(resp.Error.Message, "must be 8 bytes") {
+	if resp.Error == "" || !strings.Contains(resp.Error, "must be 8 bytes") {
 		t.Fatalf("BUG REGRESSION: SHA3X's 8-byte nonce requirement was loosened -- got error %v, want the \"must be 8 bytes\" message", resp.Error)
 	}
 }

@@ -1089,14 +1089,15 @@ func (s *Session) ownJob(id string) (*Job, bool) {
 }
 
 // writeGeneralResponse dispatches on this session's configured algo:
-// ALGO_C29 gets the real, genuinely different bare-string LegacyErrorResponse
-// wire shape (matching go-tari-c29-solo-stratum's own MinerRPCResponse — see
-// protocol.go's LegacyErrorResponse doc comment for the confirmed
-// regression this avoids), while every other algo (SHA3X/RXT/RXM, all
-// confirmed working xmrig-class clients) keeps the object/null
-// ErrorResponse shape from the PR #56 xmrig-compatibility fix.
+// ALGO_C29 and ALGO_SHA3X get the legacy bare-bool/bare-string shape (both
+// are lolMiner/graxil-class clients requiring this dialect — SHA3X's real
+// reference implementation is go-tari-sha3x-solo-stratum's
+// subsystems/messages/minerStructs.go MinerRPCShareResponse/MinerRPCResponse,
+// bare bool Result / bare string Error just like C29's
+// go-tari-c29-solo-stratum), while ALGO_RXT/ALGO_RXM (genuinely xmrig-family
+// clients) keep the PR #56 object/null shape.
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
-	if s.server.jobManager.Algo() == poolpb.Algo_ALGO_C29 {
+	if algo := s.server.jobManager.Algo(); algo == poolpb.Algo_ALGO_C29 || algo == poolpb.Algo_ALGO_SHA3X {
 		s.writeJSON(LegacyErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
 		return
 	}
@@ -1108,11 +1109,13 @@ func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 }
 
 // writeShareResponse dispatches on this session's configured algo, same
-// rationale as writeGeneralResponse above: ALGO_C29 gets the real bare-bool
-// LegacyShareResponse shape lolMiner/graxil29 actually require on the wire
-// (matching go-tari-c29-solo-stratum's MinerRPCShareResponse exactly — see
-// protocol.go's LegacyShareResponse doc comment), while SHA3X/RXT/RXM keep
-// the confirmed-working object/null ShareResponse shape from PR #56.
+// rationale as writeGeneralResponse above: ALGO_C29 and ALGO_SHA3X get the
+// legacy bare-bool/bare-string shape (both are lolMiner/graxil-class
+// clients requiring this dialect — SHA3X's real reference implementation
+// is go-tari-sha3x-solo-stratum's subsystems/messages/minerStructs.go
+// MinerRPCShareResponse/MinerRPCResponse, bare bool Result / bare string
+// Error just like C29's go-tari-c29-solo-stratum), while ALGO_RXT/ALGO_RXM
+// (genuinely xmrig-family clients) keep the PR #56 object/null shape.
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// Every submit outcome (share or block, accepted or rejected)
 	// flows through this single response-writing helper, so hooking
@@ -1121,7 +1124,7 @@ func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// branch point exactly once, uniformly labeled by result, without
 	// touching any of the actual accept/reject decision logic above.
 	s.server.recordShare(accepted)
-	if s.server.jobManager.Algo() == poolpb.Algo_ALGO_C29 {
+	if algo := s.server.jobManager.Algo(); algo == poolpb.Algo_ALGO_C29 || algo == poolpb.Algo_ALGO_SHA3X {
 		s.writeJSON(LegacyShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
 		return
 	}
