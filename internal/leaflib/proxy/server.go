@@ -35,6 +35,33 @@ type UpstreamHealth interface {
 	ReconnectCount() uint64
 }
 
+// UpstreamGenerationSource is an OPTIONAL capability a Server's real
+// UpstreamSubmitter may additionally implement to expose the real
+// upstream-connection generation counter (see upstream.go's
+// UpstreamClient.generation doc comment for the full root-cause/fix
+// rationale) — implemented by the real UpstreamClient in production
+// via CurrentGeneration(). Deliberately NOT folded into the
+// UpstreamSubmitter interface itself, for the exact same reason
+// UpstreamHealth above isn't: session_test.go's plain fakeUpstream
+// only implements SubmitShare and must keep compiling unmodified.
+// Session.handleSubmit type-asserts s.server.upstream against this
+// interface at submit time and degrades gracefully — fails OPEN, not
+// closed — when the concrete upstream doesn't implement it (e.g. in
+// most existing tests): "no generation info available" is treated as
+// "cannot check staleness, allow the submit through unchanged", never
+// as a reason to reject a submit that would otherwise have been
+// accepted before this capability existed.
+type UpstreamGenerationSource interface {
+	// CurrentGeneration reports the upstream-connection generation
+	// number of the upstream client's CURRENTLY-live template. A
+	// Job whose own TemplateGeneration (job.go) is less than this
+	// value was minted against a template from a since-superseded
+	// upstream connection generation (e.g. the upstream pool
+	// connection dropped and reconnected since that Job was issued)
+	// and should be rejected locally rather than forwarded upstream.
+	CurrentGeneration() uint64
+}
+
 // Server ties together internal/leaflib.ConnectionManager (downstream
 // miner connection lifecycle — reused, not reimplemented), a
 // JobManager (issuing per-session Jobs from the real upstream pool's

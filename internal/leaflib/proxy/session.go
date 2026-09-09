@@ -412,15 +412,32 @@ func (s *Session) handleGetJob(req Request) {
 //     which another session's job_id could even be looked up here.
 //  2. Real per-job expiry (job max age), independent of upstream
 //     template invalidation.
-//  3. Decode the miner's claimed 4-byte nonce (real Monero-family
+//  3. REAL PRODUCTION BUG FIX (this session, confirmed live log
+//     evidence of "upstream submit failed... share does not meet
+//     configured difficulty or is cryptographically invalid" tens of
+//     seconds after a real upstream reconnect): upstream-template
+//     GENERATION staleness (job.TemplateGeneration vs. the upstream
+//     client's own CurrentGeneration(), via the optional
+//     UpstreamGenerationSource capability — see that interface's doc
+//     comment in server.go). A Job minted against a template from a
+//     since-superseded upstream-connection generation (the upstream
+//     pool connection dropped and reconnected since this Job was
+//     issued) is rejected locally here — cheaply, before any
+//     nonce/difficulty/RandomX-validation work below, and BEFORE ever
+//     contacting upstream — rather than uselessly forwarded to a pool
+//     that has already discarded the old session/job state and would
+//     only reject it anyway. Fails OPEN (this check is skipped
+//     entirely) when the concrete upstream doesn't implement
+//     UpstreamGenerationSource at all.
+//  4. Decode the miner's claimed 4-byte nonce (real Monero-family
 //     wire convention: 8 hex chars — CONFIRMED DIFFERENT from Tari
 //     SHA3X/C29's 8-BYTE/16-hex-char nonce already used elsewhere in
 //     this codebase) and write it into this job's own
 //     worker-nonce-partitioned blob at the real block_header nonce
 //     offset (blockheader.go) — this constructs the actual bytes a
 //     real RandomX hash would be computed over.
-//  4. Real per-job used-nonce tracking (replay rejection).
-//  5. Real difficulty DERIVATION from the miner's already-received,
+//  5. Real per-job used-nonce tracking (replay rejection).
+//  6. Real difficulty DERIVATION from the miner's already-received,
 //     UNVERIFIED claimed hash (difficulty.go's littleEndianDifficulty,
 //     the same well-known CryptoNote/RandomX target/difficulty
 //     relationship already used for Tari's RXT elsewhere in this
@@ -428,13 +445,13 @@ func (s *Session) handleGetJob(req Request) {
 //     already sent in submit.Result; it requires NO RandomX call at
 //     all, and is what determines whether the expensive real
 //     verification below is even worth running.
-//  6. Reject outright, with NO RandomX call spent, if that claimed
+//  7. Reject outright, with NO RandomX call spent, if that claimed
 //     difficulty doesn't even meet this session's own
 //     configured/vardiff share difficulty (job.StaticDifficulty): a
 //     share that fails its own requested-difficulty check is rejected
 //     on that basis alone, regardless of whether the underlying PoW
 //     would even be valid.
-//  7. THE CORE LEAF-PROXY BEHAVIOR, and the exact gate this fix
+//  8. THE CORE LEAF-PROXY BEHAVIOR, and the exact gate this fix
 //     restores: the real, expensive local RandomX re-validation via
 //     the already-merged RandomXValidator (s.server.validator) is
 //     called ONLY when the claimed difficulty ALSO meets or exceeds
@@ -481,6 +498,22 @@ func (s *Session) handleSubmit(req Request) {
 	if maxAge := s.server.jobMaxAge; maxAge > 0 {
 		if age := time.Since(job.CreatedAt); age > maxAge {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("job expired: job_id %s was issued %s ago (max age %s)", submit.JobID, age.Round(time.Second), maxAge))
+			return
+		}
+	}
+
+	// REAL PRODUCTION BUG FIX: reject a submit whose Job was minted
+	// against an upstream-connection generation that has since been
+	// superseded by a real reconnect (upstream.go's reconnectLoop) —
+	// see this function's own doc comment (step 3) and
+	// server.go's UpstreamGenerationSource doc comment for the full
+	// rationale. Fails OPEN (skips this check entirely, matching
+	// pre-fix behavior exactly) when the concrete upstream doesn't
+	// implement UpstreamGenerationSource at all -- this must never
+	// become a hard requirement of UpstreamSubmitter itself.
+	if gs, ok := s.server.upstream.(UpstreamGenerationSource); ok {
+		if current := gs.CurrentGeneration(); job.TemplateGeneration < current {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("job's upstream template generation is stale (this leaf's upstream connection has reconnected since this job was issued) -- job_id %s", submit.JobID))
 			return
 		}
 	}
