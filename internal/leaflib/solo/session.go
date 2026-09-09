@@ -1241,6 +1241,90 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	if (job.Algo == poolpb.Algo_ALGO_RXT || job.Algo == poolpb.Algo_ALGO_RXM) && len(job.VmKey) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.VmKey)
 	}
+	// XNP-PROXY SHAPE (see protocol.go's JobPayload doc comment for
+	// the full field-by-field provenance from the real nodejs-pool-
+	// sxmr reference): a login whose self-reported agent string
+	// identifies it as an XNP-class multi-tier proxy
+	// (IsXNPProxyAgent — real reference gate:
+	// `agent.includes('xmr-node-proxy')`, lib/pool.js ~211-231)
+	// additionally gets the raw-template-blob + reservation-offset
+	// fields below, ADDITIONALLY alongside every field already set
+	// above, not as a replacement — leaving the already-correct
+	// Blob/Target/etc. fields on the wire too is safe and prioritizes
+	// "the proxy client gets everything it needs" over exact
+	// key-set parity with the JS reference (see JobPayload's doc
+	// comment).
+	//
+	// NON-REGRESSION: for every OTHER agent (the overwhelming
+	// majority of real logins — xmrig et al.), and for every
+	// non-RXM/RXT algo regardless of agent, this whole block is
+	// skipped (either the IsXNPProxyAgent check or the inner algo
+	// switch's default no-op), so all four pointer fields stay nil
+	// and are omitted from the wire (omitempty) — see
+	// protocol_xnp_test.go for a real marshaled-JSON byte-diff
+	// proving this holds both for SHA3X/C29 jobs and for RXM/RXT
+	// jobs served to a non-proxy agent.
+	if IsXNPProxyAgent(s.agent.Load().(string)) {
+		switch job.Algo {
+		case poolpb.Algo_ALGO_RXM:
+			// RXM: the raw, unconverted monerod blocktemplate_blob
+			// (job.go's Job.RawTemplateBlob — kept deliberately
+			// separate from job.Header/payload.Blob, which is
+			// already the CONVERTED blockhashing_blob every
+			// ordinary miner needs; see that field's doc comment)
+			// plus the real monerod reserved_offset and its two
+			// derived client_nonce_offset/client_pool_offset byte
+			// offsets (real nodejs-pool-sxmr lib/coins/xmr.js
+			// ~137-152: client_nonce_offset = reserved_offset+12,
+			// client_pool_offset = reserved_offset+8). Do NOT
+			// convert/patch this blob server-side — the receiving
+			// XNP-class proxy does its own raw-blob-to-hashing-blob
+			// conversion downstream, exactly mirroring this repo's
+			// own leaf-proxy/upstream.go applyJob on the OTHER end
+			// of this same real convention.
+			rawBlobHex := hex.EncodeToString(job.RawTemplateBlob)
+			reservedOffset := job.ReservedOffset
+			clientNonceOffset := job.ReservedOffset + 12
+			clientPoolOffset := job.ReservedOffset + 8
+			payload.BlocktemplateBlob = &rawBlobHex
+			payload.ReservedOffset = &reservedOffset
+			payload.ClientNonceOffset = &clientNonceOffset
+			payload.ClientPoolOffset = &clientPoolOffset
+		case poolpb.Algo_ALGO_RXT:
+			// RXT INVESTIGATION FINDING (see rxt.go's
+			// createTariMiningBlob/rxtXmrigNonceOffset doc comments
+			// and the real Tari GRPC GetNewBlockResult/MinerData
+			// shapes): Tari's protocol has NO real analog of
+			// Monero's reserve_size/coinbase-tx-reservation
+			// mechanism — no reserved coinbase-extra byte range is
+			// ever returned by the Tari base node. The RXT mining
+			// blob already built above (createTariMiningBlob(
+			// job.Header, 0, rxtPowAlgoByte, ...)) already IS the
+			// final, raw, complete, self-contained 76-byte blob;
+			// there is no separate "template vs hashing blob"
+			// distinction the way Monero has. Given that:
+			//   - ClientNonceOffset IS set, to the real, meaningful,
+			//     already-existing rxtXmrigNonceOffset constant
+			//     (39) — this genuinely is the one real byte offset
+			//     a multi-tier RXT proxy would need to patch a
+			//     sub-miner's nonce into before forwarding.
+			//   - ReservedOffset/ClientPoolOffset are deliberately
+			//     left nil: inventing values for a reservation
+			//     concept that does not exist in Tari's protocol
+			//     would be dishonest, not just harmlessly redundant.
+			//   - BlocktemplateBlob is set to the SAME hex value as
+			//     Blob (payload.Blob, already computed above) —
+			//     numerically identical because RXT, unlike RXM,
+			//     has no raw-template/hashing-blob distinction;
+			//     included only for shape-parity with the RXM proxy
+			//     convention, not because a real distinct raw blob
+			//     exists.
+			blobHex := payload.Blob
+			clientNonceOffset := rxtXmrigNonceOffset
+			payload.BlocktemplateBlob = &blobHex
+			payload.ClientNonceOffset = &clientNonceOffset
+		}
+	}
 	return payload
 }
 

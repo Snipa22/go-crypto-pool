@@ -217,11 +217,21 @@ func (c *MoneroNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress s
 		// reservation for pool extranonce insertion into the
 		// coinbase tx (see node.go's NodeClient doc comment —
 		// reserved_offset is a SEPARATE concept from the nonce
-		// offset this file parses for). This leaf does not yet use
-		// the reservation itself (no per-xn extranonce wiring for
-		// Monero in this pass — see this file's package doc comment
-		// for what's deferred), but reserving space keeps the
-		// template's own coinbase shape stable if that lands later.
+		// offset this file parses for). This leaf DOES now use the
+		// reservation for XNP-proxy-detected sessions: the parsed
+		// result.ReservedOffset below is threaded onto both
+		// moneroTemplateData and Job.ReservedOffset so session.go's
+		// jobPayload can surface reserved_offset/client_nonce_offset/
+		// client_pool_offset on the wire for a login whose agent
+		// string identifies it as an xmr-node-proxy-class multi-tier
+		// proxy client (see the real nodejs-pool-sxmr reference,
+		// lib/pool.js ~211-231/478-548 and lib/coins/xmr.js ~137-152)
+		// — an ordinary xmrig-class miner never sees these fields
+		// (see protocol.go's JobPayload doc comment). Reserving space
+		// unconditionally (regardless of whether any given session
+		// turns out to be XNP-proxy-detected) also keeps the
+		// template's own coinbase shape stable, which was this
+		// field's original rationale before that use existed.
 		"reserve_size": 60,
 	}, &result)
 	if err != nil {
@@ -275,15 +285,18 @@ func (c *MoneroNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress s
 		BlockHash:               prevHash,
 		NetworkTargetDifficulty: result.Difficulty,
 		TemplateData: &moneroTemplateData{
-			HashingBlob:  hashingBlob,
-			TemplateBlob: templateBlob,
-			NonceOffset:  nonceOffset,
-			SeedHash:     seedHash,
-			Difficulty:   result.Difficulty,
-			Height:       result.Height,
+			HashingBlob:    hashingBlob,
+			TemplateBlob:   templateBlob,
+			NonceOffset:    nonceOffset,
+			SeedHash:       seedHash,
+			Difficulty:     result.Difficulty,
+			Height:         result.Height,
+			ReservedOffset: result.ReservedOffset,
 		},
-		VmKey:     seedHash,
-		CreatedAt: c.now(),
+		VmKey:           seedHash,
+		ReservedOffset:  result.ReservedOffset,
+		RawTemplateBlob: templateBlob,
+		CreatedAt:       c.now(),
 	}
 	return job, nil
 }
@@ -301,6 +314,17 @@ type moneroTemplateData struct {
 	SeedHash     []byte
 	Difficulty   uint64
 	Height       uint64
+
+	// ReservedOffset is the real monerod get_block_template
+	// reserved_offset for this template (result.ReservedOffset,
+	// confirmed parsed above) — mirrors Job.ReservedOffset exactly;
+	// see that field's doc comment (job.go) for the full XNP-proxy
+	// rationale. Kept here too (in addition to Job.ReservedOffset)
+	// purely so this type's own fields stay self-describing/complete
+	// alongside HashingBlob/TemplateBlob, matching this struct's
+	// existing convention of holding everything GetBlockTemplate
+	// parsed for this template.
+	ReservedOffset int
 }
 
 // moneroJobID derives a miner-facing job id from a Monero template's

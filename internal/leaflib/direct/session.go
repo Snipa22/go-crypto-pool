@@ -864,6 +864,44 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	if (job.Algo == poolpb.Algo_ALGO_RXT || job.Algo == poolpb.Algo_ALGO_RXM) && len(job.VmKey) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.VmKey)
 	}
+	// XNP-PROXY SHAPE: mirrors solo.Session's own identical jobPayload
+	// addition exactly — see solo/protocol.go's JobPayload doc comment
+	// for the full field-by-field provenance from the real
+	// nodejs-pool-sxmr reference, and solo/session.go's jobPayload for
+	// the full RXM/RXT branch rationale (including the RXT
+	// investigation finding: Tari's protocol has no real analog of
+	// Monero's reserve_size/coinbase-reservation mechanism, so
+	// ReservedOffset/ClientPoolOffset are deliberately left nil for
+	// RXT while ClientNonceOffset is set to the real, meaningful
+	// rxtXmrigNonceOffset constant). solo.IsXNPProxyAgent is the
+	// single shared implementation of the case-sensitive
+	// "xmr-node-proxy" substring check both packages use, so leaf-solo
+	// and leaf-direct can never drift on detection logic.
+	//
+	// NON-REGRESSION: for every non-proxy agent, and for every
+	// non-RXM/RXT algo regardless of agent, all four pointer fields
+	// stay nil and are omitted from the wire (omitempty) — see
+	// protocol_xnp_test.go (solo package) and this package's own
+	// session_xnp_test.go for real marshaled-JSON byte-diffs proving
+	// this.
+	if solo.IsXNPProxyAgent(s.agent.Load().(string)) {
+		switch job.Algo {
+		case poolpb.Algo_ALGO_RXM:
+			rawBlobHex := hex.EncodeToString(job.RawTemplateBlob)
+			reservedOffset := job.ReservedOffset
+			clientNonceOffset := job.ReservedOffset + 12
+			clientPoolOffset := job.ReservedOffset + 8
+			payload.BlocktemplateBlob = &rawBlobHex
+			payload.ReservedOffset = &reservedOffset
+			payload.ClientNonceOffset = &clientNonceOffset
+			payload.ClientPoolOffset = &clientPoolOffset
+		case poolpb.Algo_ALGO_RXT:
+			blobHex := payload.Blob
+			clientNonceOffset := rxtXmrigNonceOffset
+			payload.BlocktemplateBlob = &blobHex
+			payload.ClientNonceOffset = &clientNonceOffset
+		}
+	}
 	return payload
 }
 

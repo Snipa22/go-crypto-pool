@@ -1,7 +1,10 @@
 // Copyright and license: see repository LICENSE (MIT).
 package solo
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // Wire protocol: newline-delimited JSON objects in both directions,
 // speaking the real Monero-style JSON-RPC 2.0 stratum dialect used by
@@ -145,6 +148,33 @@ type SubmitRequest struct {
 //     "seed_hash" field the miner needs to (re)prime its own RandomX
 //     VM against). Absent (omitempty) for SHA3X/C29 jobs, which have
 //     no seed concept.
+//
+// XNP-PROXY SHAPE (BlocktemplateBlob/ReservedOffset/ClientNonceOffset/
+// ClientPoolOffset): real nodejs-pool-sxmr (lib/pool.js ~211-231,
+// ~478-548) gates an entirely different job-payload shape on a login
+// "agent" string substring check (`agent.includes('xmr-node-proxy')`):
+// an XNP-class multi-tier proxy client is handed the RAW, UNCONVERTED
+// block template blob (not the hashing blob every other field above
+// derives from) plus the real Monero get_block_template
+// reserved_offset/client_nonce_offset/client_pool_offset byte offsets
+// (lib/coins/xmr.js ~137-152: client_nonce_offset = reserved_offset+12,
+// client_pool_offset = reserved_offset+8) — the receiving proxy does
+// its OWN raw-blob-to-hashing-blob conversion and nonce/pool-tag
+// patching downstream, this server does not attempt any blob
+// conversion for this path. Field JSON key names are reused
+// byte-for-byte from this repo's OWN existing upstream-client shape
+// for this exact real convention (proxy/protocol.go's
+// UpstreamJobPayload) rather than invented fresh.
+//
+// All four fields are pointer-typed with omitempty specifically so
+// they are PROVABLY ABSENT from the wire for the overwhelming majority
+// of real logins (anything whose agent does not contain the literal,
+// case-sensitive substring "xmr-node-proxy") — see session.go's
+// jobPayload for the detection/branch logic and protocol_xnp_test.go
+// for a real marshaled-JSON non-regression diff proving this. Only
+// ever populated for ALGO_RXM and ALGO_RXT jobs on an XNP-proxy-
+// detected session; every other algo/session combination leaves all
+// four nil.
 type JobPayload struct {
 	Algo     string `json:"algo"`
 	Blob     string `json:"blob"`
@@ -153,6 +183,75 @@ type JobPayload struct {
 	Target   string `json:"target"`
 	XN       string `json:"xn,omitempty"`
 	SeedHash string `json:"seed_hash,omitempty"`
+
+	// BlocktemplateBlob is the hex-encoded RAW, UNCONVERTED Monero/Tari
+	// block template blob for an XNP-proxy-detected RXM/RXT job — see
+	// this type's XNP-PROXY SHAPE doc comment above. For RXM this is
+	// genuinely distinct from Blob (job.go's Job.RawTemplateBlob, the
+	// real monerod blocktemplate_blob, vs. Blob's already-converted
+	// blockhashing_blob). For RXT there is no real raw-template/
+	// hashing-blob distinction in Tari's protocol (see session.go's
+	// jobPayload RXT branch doc comment for the full investigation
+	// finding), so it is set numerically identical to Blob there,
+	// included only for shape-parity with the RXM convention.
+	BlocktemplateBlob *string `json:"blocktemplate_blob,omitempty"`
+
+	// ReservedOffset is the real Monero get_block_template
+	// reserved_offset (job.go's Job.ReservedOffset, itself parsed from
+	// monerod's own result.ReservedOffset in monero_node.go) for an
+	// XNP-proxy-detected RXM job — the byte offset, within
+	// BlocktemplateBlob, of the reserve_size-byte coinbase area a
+	// multi-tier proxy is expected to patch its own sub-pool
+	// extranonce/tag data into before forwarding. RXT-only: always
+	// nil — Tari's protocol has no real analog of Monero's
+	// reserve_size/coinbase-tx-reservation mechanism (confirmed: no
+	// reserved coinbase-extra byte range is ever returned by the Tari
+	// base node's GetNewBlockResult/MinerData), so fabricating a value
+	// here for RXT would be dishonest, not just harmlessly redundant —
+	// see session.go's jobPayload RXT branch doc comment.
+	ReservedOffset *int `json:"reserved_offset,omitempty"`
+
+	// ClientNonceOffset is reserved_offset+12 for an XNP-proxy-detected
+	// RXM job (lib/coins/xmr.js ~137-152's real convention). For RXT it
+	// is instead the real, already-existing rxtXmrigNonceOffset
+	// constant (39) — the one genuinely meaningful byte offset a
+	// multi-tier RXT proxy would need to patch a sub-miner's nonce into
+	// before forwarding (see rxt.go's rxtXmrigNonceOffset doc comment
+	// for the confirmed-from-XMRig's-real-source provenance of that
+	// constant) — NOT reserved_offset-derived, since RXT has no
+	// reserved_offset concept at all (see ReservedOffset's doc
+	// comment).
+	ClientNonceOffset *int `json:"client_nonce_offset,omitempty"`
+
+	// ClientPoolOffset is reserved_offset+8 for an XNP-proxy-detected
+	// RXM job (lib/coins/xmr.js ~137-152). RXT-only: always nil, same
+	// rationale as ReservedOffset above — there is no real reserved
+	// coinbase area for RXT to report an offset within.
+	ClientPoolOffset *int `json:"client_pool_offset,omitempty"`
+}
+
+// xnpProxyAgentSubstring is the exact, case-sensitive substring real
+// nodejs-pool-sxmr gates its own proxy-vs-ordinary-miner job-payload
+// shape on (lib/pool.js ~211-231: `if (agent &&
+// agent.includes('xmr-node-proxy')) { this.proxy = true; }`).
+const xnpProxyAgentSubstring = "xmr-node-proxy"
+
+// IsXNPProxyAgent reports whether agent (a login's self-reported
+// LoginRequest.Agent string, e.g. "xmr-node-proxy/0.0.3") identifies
+// the connecting client as an XNP-class multi-tier proxy, using the
+// SAME case-sensitive substring check the real reference uses
+// (JavaScript's String.prototype.includes is case-sensitive — this
+// deliberately uses strings.Contains, NOT strings.EqualFold or any
+// other case-insensitive comparison, to match that exactly: an agent
+// containing "XMR-NODE-PROXY" in the wrong case must NOT be detected
+// as a proxy). Exported so both leaf-solo's own session.go and
+// leaf-direct's session.go (which has no protocol.go/job.go of its
+// own — see this package's doc comment on why leaf-direct reuses
+// these types directly rather than duplicating them) share one single
+// implementation of this detection, rather than two copies that could
+// drift.
+func IsXNPProxyAgent(agent string) bool {
+	return strings.Contains(agent, xnpProxyAgentSubstring)
 }
 
 // LoginResult is the real login response's nested "result" object.
