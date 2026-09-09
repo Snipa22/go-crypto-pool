@@ -41,6 +41,30 @@ upstream_agent = "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0"
 # Downstream miner-facing TCP listen address. (default: ":5555")
 listen_address = ":5555"
 
+# Optional SECOND downstream miner-facing TCP listen address, served over
+# TLS using the shared self-signed-or-operator-supplied cert (see
+# tls_cert_file/tls_key_file/tls_cert_persist_path below), alongside (never
+# instead of) listen_address. Empty (default) disables it entirely -- zero
+# behavior change. (default: "")
+tls_listen_address = ""
+
+# Optional PEM-encoded TLS certificate file for the shared, process-wide
+# self-signed-or-operator-supplied cert used by tls_listen_address. Empty
+# (default) auto-generates a self-signed cert instead -- see
+# tls_cert_persist_path. Ignored entirely if tls_listen_address is unset.
+# (default: "")
+tls_cert_file = ""
+
+# Optional PEM-encoded TLS private key file paired with tls_cert_file.
+# (default: "")
+tls_key_file = ""
+
+# Where to persist an auto-generated self-signed TLS cert/key pair so
+# restarts reload it instead of rotating it. Empty (default) means
+# in-memory only -- a fresh self-signed cert is generated on every restart.
+# Ignored if tls_cert_file/tls_key_file are set. (default: "")
+tls_cert_persist_path = ""
+
 # Starting downstream share difficulty; vardiff adjusts it from here.
 # (default: 10000)
 starting_difficulty = 10000

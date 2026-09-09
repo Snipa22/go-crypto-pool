@@ -79,10 +79,30 @@ coinbase_extra_tag = ""
 # Starting share difficulty for a newly-connected session. (default: 10000)
 starting_difficulty = 10000
 
-# Comma-separated list of address:difficulty[:desc] port tiers. When unset,
-# listen_address/starting_difficulty are used as a single implicit tier.
+# Comma-separated list of address:difficulty[:desc][:tls] port tiers. The
+# optional trailing ":tls" marker (case-insensitive) enables the shared
+# self-signed TLS listener for that ONE port tier only -- see tls_cert_file/
+# tls_key_file/tls_cert_persist_path below. When unset, listen_address/
+# starting_difficulty are used as a single implicit tier (plain, no TLS).
 # (default: "")
 ports = ""
+
+# Optional PEM-encoded TLS certificate file for the shared, process-wide
+# self-signed-or-operator-supplied cert used by any ":tls"-suffixed ports
+# entry. Empty (default) auto-generates a self-signed cert instead -- see
+# tls_cert_persist_path. Ignored entirely if no port has TLS enabled.
+# (default: "")
+tls_cert_file = ""
+
+# Optional PEM-encoded TLS private key file paired with tls_cert_file.
+# (default: "")
+tls_key_file = ""
+
+# Where to persist an auto-generated self-signed TLS cert/key pair so
+# restarts reload it instead of rotating it. Empty (default) means
+# in-memory only -- a fresh self-signed cert is generated on every restart.
+# Ignored if tls_cert_file/tls_key_file are set. (default: "")
+tls_cert_persist_path = ""
 
 # Absolute floor vardiff will never retarget below. (default: 100)
 min_difficulty = 100

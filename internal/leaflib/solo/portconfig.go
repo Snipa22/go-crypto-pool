@@ -21,11 +21,15 @@ package solo
 // "0.0.0.0:4445", etc.), not bare numeric ports, so Address (a string)
 // takes the place of the reference's PoolPort (an int). PortDesc is
 // carried through unchanged as an operator-facing label ("low-diff",
-// "high-diff", etc.) for logging. PortType/Hidden/Ssl from the
-// reference struct are not needed for this leaf (no proxy protocol
-// variants, no port-listing API, no per-port TLS support today) and
-// are intentionally omitted rather than carried as unused dead fields
-// — add them here if/when this leaf actually needs them.
+// "high-diff", etc.) for logging. PortType/Hidden from the reference
+// struct are still not needed for this leaf (no proxy protocol
+// variants, no port-listing API) and remain intentionally omitted.
+// Ssl WAS also intentionally omitted before "since this leaf didn't
+// need per-port TLS" -- that has now flipped: optional TLS listener
+// support was added (see cmd/leaf-solo and cmd/leaf-direct's own
+// ":tls" port-entry suffix, and internal/leaflib.LoadOrGenerateCert),
+// so the TLS field below now exists to carry that per-port choice
+// through to listener construction.
 type PortConfig struct {
 	// Address is the net.Listen("tcp", Address) address this port
 	// tier listens on, e.g. ":4444" or "0.0.0.0:4445".
@@ -47,4 +51,17 @@ type PortConfig struct {
 	// valid and simply omitted from log lines that would otherwise
 	// include it.
 	PortDesc string
+
+	// TLS, when true, tells the owning cmd/leaf-*/main.go to wrap
+	// this port tier's net.Listener with tls.NewListener using the
+	// ONE shared, process-wide cert/key pair (see
+	// internal/leaflib.LoadOrGenerateCert) before ever handing it to
+	// Server.Serve. Server.Serve/handleConn themselves are completely
+	// TLS-unaware -- a *tls.Listener's Accept() produces real
+	// *tls.Conn values, which satisfy net.Conn identically to a plain
+	// TCP connection, so this field only ever affects listener
+	// construction at the call site, never this package's own
+	// Serve/handleConn logic. Defaults to false (plain TCP), matching
+	// every port-tier entry parsed before this field existed.
+	TLS bool
 }
