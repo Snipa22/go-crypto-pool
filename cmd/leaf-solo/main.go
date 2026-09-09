@@ -37,6 +37,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -149,6 +150,16 @@ type config struct {
 	vardiffTargetTime  int
 	vardiffInterval    time.Duration
 
+	// tlsCertFile / tlsKeyFile / tlsCertPersistPath mirror
+	// leaf-direct's identical trio exactly (see that binary's config
+	// struct doc comment for the full design rationale) -- only ever
+	// consulted if at least one -ports/LEAF_SOLO_PORTS entry carries
+	// the ":tls" suffix (see parsePortEntry). If no port has TLS
+	// enabled, none of these three are touched at all.
+	tlsCertFile        string
+	tlsKeyFile         string
+	tlsCertPersistPath string
+
 	refreshInterval time.Duration
 	tipPollInterval time.Duration
 	jobMaxAge       time.Duration
@@ -234,11 +245,15 @@ func loadConfig() (config, error) {
 	// smooth migration, but LEAF_SOLO_STARTING_DIFFICULTY takes
 	// precedence when both are set.
 	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64Fallback("LEAF_SOLO_STARTING_DIFFICULTY", "LEAF_SOLO_DIFFICULTY", 10000), "starting share difficulty for a newly-connected session; vardiff adjusts it from here based on that session's own accept history. Env: LEAF_SOLO_STARTING_DIFFICULTY (falls back to legacy LEAF_SOLO_DIFFICULTY if unset)")
-	flag.StringVar(&cfg.portsRaw, "ports", envOr("LEAF_SOLO_PORTS", ""), "comma-separated list of address:difficulty[:desc] port tiers, e.g. ':4444:10000:low-diff,:4445:1000000:high-diff'. When set, this REPLACES -listen-address/-starting-difficulty entirely (they are ignored). When unset (the default), -listen-address/-starting-difficulty are used as a single implicit port tier, preserving the pre-multi-port behavior exactly. Env: LEAF_SOLO_PORTS")
+	flag.StringVar(&cfg.portsRaw, "ports", envOr("LEAF_SOLO_PORTS", ""), "comma-separated list of address:difficulty[:desc][:tls] port tiers, e.g. ':4444:10000:low-diff,:4445:1000000:high-diff:tls'. The optional trailing ':tls' marker (case-insensitive) enables the shared self-signed TLS listener for that ONE port tier only -- see -tls-cert-file/-tls-key-file/-tls-cert-persist-path. When set, this REPLACES -listen-address/-starting-difficulty entirely (they are ignored). When unset (the default), -listen-address/-starting-difficulty are used as a single implicit port tier, preserving the pre-multi-port behavior exactly. Env: LEAF_SOLO_PORTS")
 	flag.Uint64Var(&cfg.minDifficulty, "min-difficulty", envOrUint64("LEAF_SOLO_MIN_DIFFICULTY", 100), "absolute floor vardiff will never retarget below. Env: LEAF_SOLO_MIN_DIFFICULTY")
 	flag.Uint64Var(&cfg.maxDifficulty, "max-difficulty", envOrUint64("LEAF_SOLO_MAX_DIFFICULTY", 1_000_000_000), "absolute ceiling vardiff will never retarget above. Env: LEAF_SOLO_MAX_DIFFICULTY")
 	flag.IntVar(&cfg.vardiffTargetTime, "vardiff-target-time", envOrInt("LEAF_SOLO_VARDIFF_TARGET_TIME", 30), "seconds between shares vardiff aims for. Env: LEAF_SOLO_VARDIFF_TARGET_TIME")
 	flag.DurationVar(&cfg.vardiffInterval, "vardiff-retarget-interval", envOrDuration("LEAF_SOLO_VARDIFF_RETARGET_INTERVAL", 60*time.Second), "how often each session's own vardiff retarget timer fires (also the minimum connection age before a session's first retarget). Env: LEAF_SOLO_VARDIFF_RETARGET_INTERVAL")
+
+	flag.StringVar(&cfg.tlsCertFile, "tls-cert-file", envOr("LEAF_SOLO_TLS_CERT_FILE", ""), "optional PEM-encoded TLS certificate file for the shared, process-wide self-signed-or-operator-supplied cert used by any ':tls'-suffixed -ports entry. Empty (default) auto-generates a self-signed cert instead -- see -tls-cert-persist-path. Ignored entirely if no port has TLS enabled. Env: LEAF_SOLO_TLS_CERT_FILE")
+	flag.StringVar(&cfg.tlsKeyFile, "tls-key-file", envOr("LEAF_SOLO_TLS_KEY_FILE", ""), "optional PEM-encoded TLS private key file paired with -tls-cert-file. Env: LEAF_SOLO_TLS_KEY_FILE")
+	flag.StringVar(&cfg.tlsCertPersistPath, "tls-cert-persist-path", envOr("LEAF_SOLO_TLS_CERT_PERSIST_PATH", ""), "where to persist an auto-generated self-signed TLS cert/key pair so restarts reload it instead of rotating it. Empty (default) means in-memory only -- a fresh self-signed cert is generated on every restart. Ignored if -tls-cert-file/-tls-key-file are set. Env: LEAF_SOLO_TLS_CERT_PERSIST_PATH")
 
 	flag.DurationVar(&cfg.refreshInterval, "refresh-interval", envOrDuration("LEAF_SOLO_REFRESH_INTERVAL", 30*time.Second), "unconditional block-template refresh interval. Env: LEAF_SOLO_REFRESH_INTERVAL")
 	flag.DurationVar(&cfg.tipPollInterval, "tip-poll-interval", envOrDuration("LEAF_SOLO_TIP_POLL_INTERVAL", 5*time.Second), "chain-tip poll interval (forces an immediate refresh on tip movement). Env: LEAF_SOLO_TIP_POLL_INTERVAL")
@@ -307,6 +322,10 @@ type fileConfig struct {
 	MaxDifficulty          *uint64 `toml:"max_difficulty"`
 	VardiffTargetTime      *int    `toml:"vardiff_target_time_seconds"`
 	VardiffIntervalSeconds *int    `toml:"vardiff_retarget_interval_seconds"`
+
+	TLSCertFile        *string `toml:"tls_cert_file"`
+	TLSKeyFile         *string `toml:"tls_key_file"`
+	TLSCertPersistPath *string `toml:"tls_cert_persist_path"`
 
 	RefreshIntervalSeconds *int `toml:"refresh_interval_seconds"`
 	TipPollIntervalSeconds *int `toml:"tip_poll_interval_seconds"`
@@ -381,6 +400,10 @@ func applyConfigFile(cfg *config) error {
 		d := time.Duration(*fc.VardiffIntervalSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.vardiffInterval, &d, visited, "vardiff-retarget-interval", "LEAF_SOLO_VARDIFF_RETARGET_INTERVAL")
 	}
+
+	cfgfile.ApplyString(&cfg.tlsCertFile, fc.TLSCertFile, visited, "tls-cert-file", "LEAF_SOLO_TLS_CERT_FILE")
+	cfgfile.ApplyString(&cfg.tlsKeyFile, fc.TLSKeyFile, visited, "tls-key-file", "LEAF_SOLO_TLS_KEY_FILE")
+	cfgfile.ApplyString(&cfg.tlsCertPersistPath, fc.TLSCertPersistPath, visited, "tls-cert-persist-path", "LEAF_SOLO_TLS_CERT_PERSIST_PATH")
 
 	if fc.RefreshIntervalSeconds != nil {
 		d := time.Duration(*fc.RefreshIntervalSeconds) * time.Second
@@ -460,15 +483,30 @@ func resolvePorts(cfg config) ([]solo.PortConfig, error) {
 }
 
 // parsePortEntry parses one "address:difficulty" or
-// "address:difficulty:desc" entry. address itself is free to contain
-// colons (bare ":4444", "0.0.0.0:4444", "[::1]:4444") — difficulty
-// (and an optional trailing desc) are peeled off the END of the
-// colon-separated fields rather than assuming address has no colons of
-// its own.
+// "address:difficulty:desc" entry, with an optional trailing ":tls"
+// marker (case-insensitive) enabling the shared TLS listener for that
+// port tier -- see PortConfig.TLS's doc comment. address itself is
+// free to contain colons (bare ":4444", "0.0.0.0:4444", "[::1]:4444")
+// — difficulty (and an optional trailing desc) are peeled off the END
+// of the colon-separated fields rather than assuming address has no
+// colons of its own.
 func parsePortEntry(raw string) (solo.PortConfig, error) {
 	fields := strings.Split(raw, ":")
+
+	// Strip an optional trailing ":tls" marker FIRST, before any of
+	// the existing difficulty/desc peeling logic below runs. This
+	// makes the grammar a strict superset of the pre-existing one:
+	// any entry with no trailing ":tls" field is untouched by this
+	// block and parses exactly as before (byte-for-byte identical
+	// PortConfig{TLS: false, ...}).
+	var tlsEnabled bool
+	if len(fields) > 0 && strings.EqualFold(fields[len(fields)-1], "tls") {
+		tlsEnabled = true
+		fields = fields[:len(fields)-1]
+	}
+
 	if len(fields) < 2 {
-		return solo.PortConfig{}, errors.New(`expected "address:difficulty" or "address:difficulty:desc"`)
+		return solo.PortConfig{}, errors.New(`expected "address:difficulty" or "address:difficulty:desc", optionally with a trailing ":tls"`)
 	}
 
 	// Try treating the LAST field as difficulty first (the
@@ -501,7 +539,7 @@ func parsePortEntry(raw string) (solo.PortConfig, error) {
 	if difficulty == 0 {
 		return solo.PortConfig{}, errors.New("difficulty must be > 0")
 	}
-	return solo.PortConfig{Address: address, Difficulty: difficulty, PortDesc: desc}, nil
+	return solo.PortConfig{Address: address, Difficulty: difficulty, PortDesc: desc, TLS: tlsEnabled}, nil
 }
 
 func envOr(key, def string) string {
@@ -847,6 +885,28 @@ func main() {
 	}
 
 	listeners := make([]net.Listener, 0, len(ports))
+
+	// One shared tls.Certificate for the whole process (see
+	// internal/leaflib.LoadOrGenerateCert's doc comment) -- only
+	// constructed at all if at least one configured port tier has
+	// TLS enabled. If no port has TLS enabled, this is skipped
+	// entirely: no behavior change, no wasted work.
+	var tlsCert tls.Certificate
+	var tlsConfigured bool
+	for _, p := range ports {
+		if p.TLS {
+			tlsConfigured = true
+			break
+		}
+	}
+	if tlsConfigured {
+		cert, err := leaflib.LoadOrGenerateCert(cfg.tlsCertFile, cfg.tlsKeyFile, cfg.tlsCertPersistPath, cfg.listenAddress, logger)
+		if err != nil {
+			logger.Fatalf("failed to load/generate shared TLS certificate: %v", err)
+		}
+		tlsCert = cert
+	}
+
 	for _, p := range ports {
 		ln, err := net.Listen("tcp", p.Address)
 		if err != nil {
@@ -855,8 +915,13 @@ func main() {
 			}
 			logger.Fatalf("failed to listen on %s: %v", p.Address, err)
 		}
+		if p.TLS {
+			ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{tlsCert}})
+			logger.Printf("listening for miners on %s (TLS) (starting difficulty %d)", p.Address, p.Difficulty)
+		} else {
+			logger.Printf("listening for miners on %s (starting difficulty %d)", p.Address, p.Difficulty)
+		}
 		listeners = append(listeners, ln)
-		logger.Printf("listening for miners on %s (starting difficulty %d)", p.Address, p.Difficulty)
 	}
 
 	errCh := make(chan error, len(listeners))

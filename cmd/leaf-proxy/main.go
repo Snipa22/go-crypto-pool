@@ -36,6 +36,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -71,6 +72,26 @@ type config struct {
 	vardiffTargetTime  int
 	vardiffInterval    time.Duration
 	jobMaxAge          time.Duration
+
+	// tlsListenAddress is -tls-listen-address/LEAF_PROXY_TLS_LISTEN_ADDRESS:
+	// a SECOND, optional downstream-facing listen address served over
+	// TLS, alongside (never instead of) the existing plain
+	// listenAddress above. Empty (the default) disables it entirely
+	// -- a complete no-op, zero behavior change for every existing
+	// deployment. leaf-proxy has no multi-port-tier mechanism (unlike
+	// leaf-solo/leaf-direct); this is deliberately a single extra
+	// listener, not a list, matching this binary's existing
+	// single-listen-address shape.
+	tlsListenAddress string
+
+	// tlsCertFile / tlsKeyFile / tlsCertPersistPath mirror leaf-solo/
+	// leaf-direct's identical trio exactly (see
+	// internal/leaflib.LoadOrGenerateCert's doc comment for the full
+	// design rationale) -- only ever consulted if tlsListenAddress is
+	// non-empty.
+	tlsCertFile        string
+	tlsKeyFile         string
+	tlsCertPersistPath string
 
 	maxConnections int
 	idleTimeout    time.Duration
@@ -144,12 +165,17 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.upstreamAgent, "upstream-agent", envOr("LEAF_PROXY_UPSTREAM_AGENT", "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0"), "mining-client agent string sent on upstream login -- defaults to an identifier containing the literal substring \"xmr-node-proxy\" (see this flag's doc comment) so the upstream pool grants the advanced xmr-node-proxy-client dialect and publishes client_nonce_offset/client_pool_offset, which this leaf needs to give downstream miners non-colliding blobs; the resulting raw blocktemplate_blob is safely handled via a real blocktemplate_blob->hashing-blob conversion path. Env: LEAF_PROXY_UPSTREAM_AGENT")
 
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_PROXY_LISTEN_ADDRESS", ":5555"), "downstream miner-facing TCP listen address. Env: LEAF_PROXY_LISTEN_ADDRESS")
+	flag.StringVar(&cfg.tlsListenAddress, "tls-listen-address", envOr("LEAF_PROXY_TLS_LISTEN_ADDRESS", ""), "optional SECOND downstream miner-facing TCP listen address, served over TLS using the shared self-signed-or-operator-supplied cert (see -tls-cert-file/-tls-key-file/-tls-cert-persist-path), alongside (never instead of) -listen-address. Empty (default) disables it entirely -- zero behavior change. Env: LEAF_PROXY_TLS_LISTEN_ADDRESS")
 	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_PROXY_STARTING_DIFFICULTY", 10000), "starting downstream share difficulty; vardiff adjusts it from here. Env: LEAF_PROXY_STARTING_DIFFICULTY")
 	flag.Uint64Var(&cfg.minDifficulty, "min-difficulty", envOrUint64("LEAF_PROXY_MIN_DIFFICULTY", 100), "absolute floor vardiff will never retarget below. Env: LEAF_PROXY_MIN_DIFFICULTY")
 	flag.Uint64Var(&cfg.maxDifficulty, "max-difficulty", envOrUint64("LEAF_PROXY_MAX_DIFFICULTY", 1_000_000_000), "absolute ceiling vardiff will never retarget above. Env: LEAF_PROXY_MAX_DIFFICULTY")
 	flag.IntVar(&cfg.vardiffTargetTime, "vardiff-target-time", envOrInt("LEAF_PROXY_VARDIFF_TARGET_TIME", 30), "seconds between shares vardiff aims for. Env: LEAF_PROXY_VARDIFF_TARGET_TIME")
 	flag.DurationVar(&cfg.vardiffInterval, "vardiff-retarget-interval", envOrDuration("LEAF_PROXY_VARDIFF_RETARGET_INTERVAL", 60*time.Second), "how often each downstream session's own vardiff retarget timer fires. Env: LEAF_PROXY_VARDIFF_RETARGET_INTERVAL")
 	flag.DurationVar(&cfg.jobMaxAge, "job-max-age", envOrDuration("LEAF_PROXY_JOB_MAX_AGE", 6*time.Minute), "real per-job expiry threshold; a submit against an older job is rejected. Env: LEAF_PROXY_JOB_MAX_AGE")
+
+	flag.StringVar(&cfg.tlsCertFile, "tls-cert-file", envOr("LEAF_PROXY_TLS_CERT_FILE", ""), "optional PEM-encoded TLS certificate file for the shared, process-wide self-signed-or-operator-supplied cert used by -tls-listen-address. Empty (default) auto-generates a self-signed cert instead -- see -tls-cert-persist-path. Ignored entirely if -tls-listen-address is unset. Env: LEAF_PROXY_TLS_CERT_FILE")
+	flag.StringVar(&cfg.tlsKeyFile, "tls-key-file", envOr("LEAF_PROXY_TLS_KEY_FILE", ""), "optional PEM-encoded TLS private key file paired with -tls-cert-file. Env: LEAF_PROXY_TLS_KEY_FILE")
+	flag.StringVar(&cfg.tlsCertPersistPath, "tls-cert-persist-path", envOr("LEAF_PROXY_TLS_CERT_PERSIST_PATH", ""), "where to persist an auto-generated self-signed TLS cert/key pair so restarts reload it instead of rotating it. Empty (default) means in-memory only -- a fresh self-signed cert is generated on every restart. Ignored if -tls-cert-file/-tls-key-file are set. Env: LEAF_PROXY_TLS_CERT_PERSIST_PATH")
 
 	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_PROXY_MAX_CONNECTIONS", 0), "max concurrent downstream miner connections, 0 = unlimited. Env: LEAF_PROXY_MAX_CONNECTIONS")
 	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", envOrDuration("LEAF_PROXY_IDLE_TIMEOUT", 2*time.Minute), "rolling per-downstream-connection idle timeout. Env: LEAF_PROXY_IDLE_TIMEOUT")
@@ -188,12 +214,17 @@ type fileConfig struct {
 	UpstreamAgent    *string `toml:"upstream_agent"`
 
 	ListenAddress          *string `toml:"listen_address"`
+	TLSListenAddress       *string `toml:"tls_listen_address"`
 	StartingDifficulty     *uint64 `toml:"starting_difficulty"`
 	MinDifficulty          *uint64 `toml:"min_difficulty"`
 	MaxDifficulty          *uint64 `toml:"max_difficulty"`
 	VardiffTargetTime      *int    `toml:"vardiff_target_time_seconds"`
 	VardiffIntervalSeconds *int    `toml:"vardiff_retarget_interval_seconds"`
 	JobMaxAgeSeconds       *int    `toml:"job_max_age_seconds"`
+
+	TLSCertFile        *string `toml:"tls_cert_file"`
+	TLSKeyFile         *string `toml:"tls_key_file"`
+	TLSCertPersistPath *string `toml:"tls_cert_persist_path"`
 
 	MaxConnections     *int `toml:"max_connections"`
 	IdleTimeoutSeconds *int `toml:"idle_timeout_seconds"`
@@ -230,6 +261,7 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.upstreamAgent, fc.UpstreamAgent, visited, "upstream-agent", "LEAF_PROXY_UPSTREAM_AGENT")
 
 	cfgfile.ApplyString(&cfg.listenAddress, fc.ListenAddress, visited, "listen-address", "LEAF_PROXY_LISTEN_ADDRESS")
+	cfgfile.ApplyString(&cfg.tlsListenAddress, fc.TLSListenAddress, visited, "tls-listen-address", "LEAF_PROXY_TLS_LISTEN_ADDRESS")
 	cfgfile.ApplyUint64(&cfg.startingDifficulty, fc.StartingDifficulty, visited, "starting-difficulty", "LEAF_PROXY_STARTING_DIFFICULTY")
 	cfgfile.ApplyUint64(&cfg.minDifficulty, fc.MinDifficulty, visited, "min-difficulty", "LEAF_PROXY_MIN_DIFFICULTY")
 	cfgfile.ApplyUint64(&cfg.maxDifficulty, fc.MaxDifficulty, visited, "max-difficulty", "LEAF_PROXY_MAX_DIFFICULTY")
@@ -243,6 +275,10 @@ func applyConfigFile(cfg *config) error {
 		d := time.Duration(*fc.JobMaxAgeSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.jobMaxAge, &d, visited, "job-max-age", "LEAF_PROXY_JOB_MAX_AGE")
 	}
+
+	cfgfile.ApplyString(&cfg.tlsCertFile, fc.TLSCertFile, visited, "tls-cert-file", "LEAF_PROXY_TLS_CERT_FILE")
+	cfgfile.ApplyString(&cfg.tlsKeyFile, fc.TLSKeyFile, visited, "tls-key-file", "LEAF_PROXY_TLS_KEY_FILE")
+	cfgfile.ApplyString(&cfg.tlsCertPersistPath, fc.TLSCertPersistPath, visited, "tls-cert-persist-path", "LEAF_PROXY_TLS_CERT_PERSIST_PATH")
 
 	cfgfile.ApplyInt(&cfg.maxConnections, fc.MaxConnections, visited, "max-connections", "LEAF_PROXY_MAX_CONNECTIONS")
 	if fc.IdleTimeoutSeconds != nil {
@@ -414,13 +450,45 @@ func main() {
 	}
 	logger.Printf("listening for downstream miners on %s (starting difficulty %d)", cfg.listenAddress, cfg.startingDifficulty)
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- server.Serve(ctx, ln, cfg.startingDifficulty) }()
+	// listeners mirrors leaf-direct/leaf-solo's own []net.Listener
+	// shape (see those binaries' identical multi-listener fan-out)
+	// even though leaf-proxy only ever has at most 2 listeners here:
+	// the always-present plain one, plus an optional TLS one below.
+	listeners := []net.Listener{ln}
+
+	// Optional SECOND, TLS-wrapped downstream listener, alongside
+	// (never instead of) the plain one above -- a complete no-op
+	// when -tls-listen-address/LEAF_PROXY_TLS_LISTEN_ADDRESS is
+	// unset (the default), matching every other optional feature's
+	// contract in this repo.
+	if cfg.tlsListenAddress != "" {
+		cert, err := leaflib.LoadOrGenerateCert(cfg.tlsCertFile, cfg.tlsKeyFile, cfg.tlsCertPersistPath, cfg.tlsListenAddress, logger)
+		if err != nil {
+			logger.Fatalf("failed to load/generate shared TLS certificate: %v", err)
+		}
+		plainTLSLn, err := net.Listen("tcp", cfg.tlsListenAddress)
+		if err != nil {
+			_ = ln.Close()
+			logger.Fatalf("failed to listen on %s: %v", cfg.tlsListenAddress, err)
+		}
+		tlsLn := tls.NewListener(plainTLSLn, &tls.Config{Certificates: []tls.Certificate{cert}})
+		listeners = append(listeners, tlsLn)
+		logger.Printf("listening for downstream miners on %s (TLS) (starting difficulty %d)", cfg.tlsListenAddress, cfg.startingDifficulty)
+	} else {
+		logger.Printf("TLS downstream listener disabled (-tls-listen-address is empty)")
+	}
+
+	errCh := make(chan error, len(listeners))
+	for _, l := range listeners {
+		go func(l net.Listener) { errCh <- server.Serve(ctx, l, cfg.startingDifficulty) }(l)
+	}
 
 	select {
 	case <-ctx.Done():
 		logger.Println("shutdown signal received, draining connections...")
-		_ = ln.Close()
+		for _, l := range listeners {
+			_ = l.Close()
+		}
 		cm.Shutdown()
 	case err := <-errCh:
 		if err != nil {
