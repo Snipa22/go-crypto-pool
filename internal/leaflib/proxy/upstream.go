@@ -144,35 +144,46 @@ type UpstreamConfig struct {
 	Pass  string
 
 	// Agent is the mining-client identifier string sent on login.
-	// Historically (PR #60, the stopgap this real fix supersedes)
-	// this MUST NOT have contained the literal substring
-	// "xmr-node-proxy" -- live-confirmed against
-	// pool.supportxmr.com, that substring (present in the legacy
-	// reference's own literal "xmr-node-proxy/0.0.3") is what a real
-	// pool's agent-string sniffing (nodejs-pool-sxmr's lib/pool.js:
-	// `agent.includes("xmr-node-proxy")`) uses to grant the
-	// "advanced xmr-node-proxy client" protocol extension, which
-	// replaces the ordinary, correctly-sized "blob" job field with a
-	// raw, untrimmed, arbitrarily-large blocktemplate_blob.
+	// Historically (PR #60, a stopgap this real fix now supersedes)
+	// this deliberately did NOT contain the literal substring
+	// "xmr-node-proxy", to avoid a real pool's agent-string sniffing
+	// (nodejs-pool-sxmr's lib/pool.js: `agent.includes("xmr-node-proxy")`)
+	// granting the "advanced xmr-node-proxy client" protocol
+	// extension -- which, at the time, meant a raw, untrimmed,
+	// arbitrarily-large blocktemplate_blob in place of the ordinary,
+	// correctly-sized "blob" job field, something this leaf could not
+	// yet safely handle.
 	//
-	// NOW THAT applyJob has a real, correct
-	// blocktemplate_blob->hashing-blob conversion path (see applyJob's
-	// doc comment: support.ParseBlockFromTemplateBlob +
-	// support.GetBlockHashingBlob), the agent-string avoidance above
-	// is no longer the ONLY safety mechanism against that dialect --
-	// real conversion now makes it safe even if a pool grants the
-	// advanced dialect regardless of what agent string this leaf
-	// sends. This field's DEFAULT value is deliberately left as PR
-	// #60 set it anyway (defense-in-depth / least surprise: there is
-	// no clear reason to now deliberately court the advanced dialect
-	// by default when the ordinary "blob" dialect is simpler and
-	// already fully supported) -- an operator who explicitly wants
-	// the advanced dialect (e.g. to exercise reserved_offset/
-	// worker-nonce partitioning against a pool that only publishes
-	// it under that dialect) can still opt in by setting this flag to
-	// an agent string containing "xmr-node-proxy" themselves.
-	// Defaults to "go-crypto-pool-leaf-proxy/<version>" — see
-	// cmd/leaf-proxy/main.go.
+	// REVERSED (this pass, live production incident): applyJob now
+	// has a real, correct blocktemplate_blob->hashing-blob conversion
+	// path (see applyJob's doc comment:
+	// support.ParseBlockFromTemplateBlob + support.GetBlockHashingBlob),
+	// so receiving that raw blob is no longer a hazard -- but NOT
+	// opting into the advanced dialect turned out to be its own,
+	// worse hazard: without it, a real pool (confirmed against
+	// pool.supportxmr.com) never publishes client_nonce_offset/
+	// client_pool_offset on its jobs, so
+	// WorkerTemplate.workerNonceOffset() (template.go) always
+	// returns -1 and WorkerTemplate.BlobForWorker falls back to
+	// handing every downstream miner behind this leaf a
+	// byte-identical blob. At low share difficulty independent
+	// miners then routinely land on the same nonce and submit the
+	// same (job_id, nonce, result) triple, which the upstream pool
+	// correctly flags as a duplicate share -- and enough of those in
+	// nodejs-pool-sxmr's banThreshold/banPercent window gets this
+	// leaf's public IP banned for "using an invalid mining protocol".
+	// That is a live-confirmed production incident this default is
+	// now fixing, not a hypothetical. This field's DEFAULT is
+	// therefore now an agent string containing "xmr-node-proxy" --
+	// opting IN to the advanced dialect by default, since it is both
+	// safe (post-conversion-fix) and required to get the
+	// client_nonce_offset/client_pool_offset partitioning that keeps
+	// downstream miners from colliding. An operator who genuinely
+	// needs the ordinary, non-advanced dialect instead can still opt
+	// out by setting this field to an agent string that does NOT
+	// contain "xmr-node-proxy" themselves.
+	// Defaults to "go-crypto-pool-leaf-proxy/xmr-node-proxy-<version>"
+	// — see cmd/leaf-proxy/main.go.
 	Agent string
 
 	DialTimeout    time.Duration
@@ -192,7 +203,12 @@ func (cfg UpstreamConfig) normalized() UpstreamConfig {
 		out.RequestTimeout = 15 * time.Second
 	}
 	if out.Agent == "" {
-		out.Agent = "go-crypto-pool-leaf-proxy/dev"
+		// Deliberately contains the literal substring
+		// "xmr-node-proxy" -- see UpstreamConfig.Agent's doc comment
+		// for why this is now the default (opting into the
+		// advanced/aggregating-proxy dialect on purpose) rather than
+		// something to avoid.
+		out.Agent = "go-crypto-pool-leaf-proxy/xmr-node-proxy-dev"
 	}
 	return out
 }
