@@ -147,3 +147,13 @@ tari_wallet_fee_per_gram = 0
 # wallet, in seconds. Only consulted if at least one wallet RPC is
 # configured. (default: 60)
 wallet_stats_poll_interval_seconds = 60
+
+# (required) HMAC-SHA256 signing secret for internal/backend/authapi's JWTs
+# (also reused as its password-hashing key -- see that package's doc
+# comment). No default -- startup fails fast if this is unset.
+#
+# WARNING: this is a secret. Prefer setting it via the GCPOOL_JWT_SECRET
+# env var or a real secrets manager instead of committing it to a config
+# file on disk. Left commented out here for that reason -- uncomment only
+# if you understand the tradeoff.
+# jwt_secret = ""
