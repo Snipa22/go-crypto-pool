@@ -137,7 +137,7 @@ var (
 	// CapAddressHashrates).
 	minerHashrateByAddressDesc = prometheus.NewDesc(
 		"leaf_direct_miner_hashrate_hash_per_second",
-		"Real, per-address SUM of currently-connected sessions' estimated hashrate in hashes/second (see leaflib.EstimateHashrateHz's doc comment for the difficulty*2^32/time estimation formula). Same capped cardinality as leaf_direct_miners_by_address; overflow aggregated into address=\"other\".",
+		"Real, per-address SUM of currently-connected sessions' estimated hashrate in hashes/second (see leaflib.EstimateHashrateHz's doc comment for the difficulty/time estimation formula). Same capped cardinality as leaf_direct_miners_by_address; overflow aggregated into address=\"other\".",
 		[]string{"address"}, nil,
 	)
 )

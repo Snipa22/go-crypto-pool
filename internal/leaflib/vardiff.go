@@ -132,22 +132,6 @@ func ComputeRetarget(curDiff, hashes uint64, connSeconds, targetTime int, minDif
 	return nd, true
 }
 
-// hashesPerDifficultyUnit is the standard difficulty-to-hash-attempts
-// conversion factor (2^32) that nearly every real Stratum-style mining
-// pool codebase (ckpool, node-stratum-pool, nodejs-pool, and the legacy
-// go-tari-*-solo-stratum family this repo already ports from elsewhere)
-// uses to turn a difficulty-weighted accept-history accumulator into an
-// approximate hashes/second figure: a single accepted share at
-// difficulty D represents, on expectation, D * 2^32 hash attempts. This
-// is an APPROXIMATION — the real work-per-difficulty-unit is genuinely
-// algo-specific (SHA3X/C29/RandomX all have different real per-attempt
-// cost) — but it is the industry-standard shape operators expect from a
-// "real hashrate" figure on a stats page/gauge, and it is exactly the
-// same convention this repo's own vardiff formula already implicitly
-// assumes (ComputeRetarget above treats hashesAccumulated/connSeconds as
-// directly comparable to a difficulty value).
-const hashesPerDifficultyUnit = 4294967296 // 2^32
-
 // EstimateHashrateHz estimates a session's real, per-session hashrate in
 // hashes/second from its difficulty-weighted accept-history accumulator
 // (hashesAccumulated — the same counter ComputeRetarget above consumes;
@@ -155,6 +139,17 @@ const hashesPerDifficultyUnit = 4294967296 // 2^32
 // of job.StaticDifficulty over every share accepted so far, never reset
 // for the life of the connection) and the connection's age (elapsed
 // wall-clock time since connectedAt).
+//
+// hashesAccumulated is ALREADY a real, direct sum of per-share job
+// difficulty values — it is not a raw hash-attempt count, and no
+// further scaling (e.g. a 2^32-style difficulty-to-hash-attempts
+// conversion) is applied here. This mirrors ComputeRetarget above,
+// which treats hashesAccumulated/connSeconds as directly comparable to
+// a difficulty value with no such multiplier; EstimateHashrateHz uses
+// the exact same convention: hashesAccumulated/elapsed. A previous
+// version of this function incorrectly multiplied by a 2^32 constant,
+// producing wildly inflated (e+13-scale) hashrate figures — see the fix
+// commit for the live diagnosis.
 //
 // Returns 0 for a session that has not yet been credited with any
 // accepted-share difficulty, or whose connectedAt is in the future/now
@@ -168,5 +163,5 @@ func EstimateHashrateHz(hashesAccumulated uint64, connectedAt time.Time) float64
 	if elapsed <= 0 {
 		return 0
 	}
-	return float64(hashesAccumulated) * hashesPerDifficultyUnit / elapsed
+	return float64(hashesAccumulated) / elapsed
 }
