@@ -351,3 +351,92 @@ func TestJobPayloadXNPReservationUnavailableRXM(t *testing.T) {
 	}
 	t.Logf("ReservedOffsetUsable=false degrades correctly, real byte-diff proof — before: %s\n                                                    after:  %s", legacyJSON, gotJSON)
 }
+
+// TestSubmitRequestWorkerNoncePoolNonceRoundTrip is the required
+// table-driven test for SubmitRequest's WorkerNonce/PoolNonce wire
+// shape: the exact real wire capture from this fix's task brief
+// ({"job_id":"x","nonce":"...","result":"...","workerNonce":9,
+// "poolNonce":9,"id":"..."}) must round-trip through json.Unmarshal
+// with both fields non-nil and equal to 9, AND an ordinary submit
+// WITHOUT those fields (every real xmrig-class RXM/RXT submit) must
+// decode with both nil -- NOT zero-valued non-nil pointers -- since
+// that pointer-vs-zero distinction is the entire reason these fields
+// are pointer-typed (see protocol.go's doc comment).
+func TestSubmitRequestWorkerNoncePoolNonceRoundTrip(t *testing.T) {
+	tests := []struct {
+		name       string
+		wireJSON   string
+		wantWorker *uint32
+		wantPool   *uint32
+		wantJobID  string
+		wantNonce  string
+		wantResult string
+		wantID     string
+	}{
+		{
+			name:       "XNP-class proxy submit carries both fields",
+			wireJSON:   `{"job_id":"x","nonce":"59280000","result":"deadbeef","workerNonce":9,"poolNonce":9,"id":"session-1"}`,
+			wantWorker: uint32Ptr(9),
+			wantPool:   uint32Ptr(9),
+			wantJobID:  "x",
+			wantNonce:  "59280000",
+			wantResult: "deadbeef",
+			wantID:     "session-1",
+		},
+		{
+			name:       "ordinary xmrig-class submit omits both fields",
+			wireJSON:   `{"job_id":"y","nonce":"818d1a00","result":"cafebabe","id":"session-2"}`,
+			wantWorker: nil,
+			wantPool:   nil,
+			wantJobID:  "y",
+			wantNonce:  "818d1a00",
+			wantResult: "cafebabe",
+			wantID:     "session-2",
+		},
+		{
+			name:       "explicit zero values are distinguishable from absent",
+			wireJSON:   `{"job_id":"z","nonce":"00000000","result":"","workerNonce":0,"poolNonce":0,"id":"session-3"}`,
+			wantWorker: uint32Ptr(0),
+			wantPool:   uint32Ptr(0),
+			wantJobID:  "z",
+			wantNonce:  "00000000",
+			wantResult: "",
+			wantID:     "session-3",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got SubmitRequest
+			if err := json.Unmarshal([]byte(tc.wireJSON), &got); err != nil {
+				t.Fatalf("json.Unmarshal: %v", err)
+			}
+			if got.JobID != tc.wantJobID {
+				t.Errorf("JobID = %q, want %q", got.JobID, tc.wantJobID)
+			}
+			if got.Nonce != tc.wantNonce {
+				t.Errorf("Nonce = %q, want %q", got.Nonce, tc.wantNonce)
+			}
+			if got.Result != tc.wantResult {
+				t.Errorf("Result = %q, want %q", got.Result, tc.wantResult)
+			}
+			if got.ID != tc.wantID {
+				t.Errorf("ID = %q, want %q", got.ID, tc.wantID)
+			}
+			assertUint32PtrEqual(t, "WorkerNonce", got.WorkerNonce, tc.wantWorker)
+			assertUint32PtrEqual(t, "PoolNonce", got.PoolNonce, tc.wantPool)
+		})
+	}
+}
+
+func uint32Ptr(v uint32) *uint32 { return &v }
+
+func assertUint32PtrEqual(t *testing.T, field string, got, want *uint32) {
+	t.Helper()
+	if (got == nil) != (want == nil) {
+		t.Fatalf("%s: nil-ness mismatch (got nil=%v, want nil=%v) -- this is exactly the pointer-vs-zero distinction these fields exist to preserve", field, got == nil, want == nil)
+	}
+	if got != nil && *got != *want {
+		t.Fatalf("%s = %d, want %d", field, *got, *want)
+	}
+}

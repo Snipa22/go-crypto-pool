@@ -119,6 +119,45 @@ type SubmitRequest struct {
 	Nonce  string   `json:"nonce"`
 	POW    []uint64 `json:"pow,omitempty"`
 	Result string   `json:"result"`
+
+	// WorkerNonce and PoolNonce are the real, camelCase (NOT
+	// snake_case) wire params an XNP-class multi-tier proxy client
+	// sends on every ALGO_RXM submit — confirmed from a live wire
+	// capture this session:
+	//
+	//	C->S submit: {"id":87,"jsonrpc":"2.0","method":"submit","params":{"job_id":"...","nonce":"59280000","result":"...","workerNonce":9,"poolNonce":9,"id":"..."}}
+	//
+	// and from the real reference's own submit handling
+	// (lib/pool.js processShare, ~line 1026) and the real
+	// blocktemplate_blob offsets those two values get patched into
+	// (lib/coins/xmr.js's BlockTemplate ctor):
+	//
+	//	// lib/coins/xmr.js BlockTemplate ctor:
+	//	this.clientNonceLocation = this.reserveOffset + 12;  // worker nonce write offset
+	//	this.clientPoolLocation  = this.reserveOffset + 8;   // pool nonce write offset
+	//
+	//	// lib/pool.js processShare:
+	//	let template = new Buffer(blockTemplate.buffer.length);
+	//	if (!miner.proxy) {
+	//	    blockTemplate.buffer.copy(template);
+	//	    template.writeUInt32BE(job.extraNonce, blockTemplate.reserveOffset);
+	//	} else {
+	//	    blockTemplate.buffer.copy(template);
+	//	    template.writeUInt32BE(job.extraNonce, blockTemplate.reserveOffset);
+	//	    template.writeUInt32BE(params.poolNonce, job.clientPoolLocation);   // BIG-ENDIAN
+	//	    template.writeUInt32BE(params.workerNonce, job.clientNonceLocation); // BIG-ENDIAN
+	//	}
+	//
+	// Pointer-typed (like JobPayload's own ReservedOffset/
+	// ClientNonceOffset/ClientPoolOffset above) specifically so
+	// "field absent" (an ordinary xmrig-class RXM/RXT submit, which
+	// has no code path that would ever send these) is distinguishable
+	// from "field present with value 0" (a real proxy sub-worker
+	// nonce that happens to be zero) — session.go's handleSubmit
+	// gates the XNP-aware patching path on both being non-nil, not on
+	// either being non-zero.
+	WorkerNonce *uint32 `json:"workerNonce,omitempty"`
+	PoolNonce   *uint32 `json:"poolNonce,omitempty"`
 }
 
 // JobPayload is the real job object shape (messages.MinerJobJSON in the
