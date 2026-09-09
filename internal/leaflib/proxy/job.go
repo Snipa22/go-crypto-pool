@@ -65,6 +65,40 @@ type Job struct {
 	// share upstream (UpstreamClient.SubmitShare's job_id param).
 	UpstreamJobID string
 
+	// TemplateGeneration captures which upstream-CONNECTION
+	// generation (WorkerTemplate.Generation, at the moment this Job
+	// was minted — see that field's doc comment for the full
+	// root-cause citation) this Job's underlying upstream template
+	// belongs to. Its SOLE purpose is letting session.go's
+	// handleSubmit reject a submit whose Job predates the CURRENT
+	// live generation before ever forwarding it upstream — fixing a
+	// real, confirmed production issue: when the upstream pool
+	// connection drops and reconnects
+	// (upstream.go's reconnectLoop), any in-flight downstream miner
+	// submit whose Job was minted against the OLD (now-gone) upstream
+	// template still passes this leaf's own local job-ownership check
+	// (session.go's ownJob) and, without this field, would get
+	// forwarded upstream via UpstreamClient.SubmitShare regardless —
+	// where the pool (having discarded that old session/job state on
+	// disconnect) correctly rejects it as "share does not meet
+	// configured difficulty or is cryptographically invalid",
+	// wastefully spending an upstream round-trip on a submit this
+	// leaf could and should have known was hopeless. Repeated
+	// invalid-share submits like that risk exactly the kind of
+	// ban-threshold/invalid-share-ratio enforcement this codebase's
+	// own doc comments already describe elsewhere for a real upstream
+	// pool (nodejs-pool's real banPercent/banThreshold mechanism).
+	//
+	// Deliberately NOT derived from a job_id string comparison alone:
+	// a reconnect always produces a new upstream job_id from THIS
+	// leaf's own applyJob dupe-guard's perspective (see that
+	// function's doc comment), but an upstream pool COULD in
+	// principle reuse job_id space across a reconnect under some
+	// other dialect this leaf doesn't yet support — job_id string
+	// equality is not a substitute for a real, monotonic
+	// connection-generation counter.
+	TemplateGeneration uint64
+
 	SeedHash []byte
 	Height   uint64
 
@@ -260,16 +294,17 @@ func (jm *JobManager) NextJob(difficulty uint64) (*Job, error) {
 		return nil, fmt.Errorf("proxy: generating job id: %w", err)
 	}
 	return &Job{
-		ID:                id,
-		Blob:              blob,
-		WorkerNonce:       workerNonce,
-		PoolNonce:         poolNonce,
-		UpstreamJobID:     t.JobID,
-		SeedHash:          t.SeedHash,
-		Height:            t.Height,
-		StaticDifficulty:  difficulty,
-		UpstreamShareDiff: t.TargetDiff,
-		CreatedAt:         time.Now(),
+		ID:                 id,
+		Blob:               blob,
+		WorkerNonce:        workerNonce,
+		PoolNonce:          poolNonce,
+		UpstreamJobID:      t.JobID,
+		TemplateGeneration: t.Generation,
+		SeedHash:           t.SeedHash,
+		Height:             t.Height,
+		StaticDifficulty:   difficulty,
+		UpstreamShareDiff:  t.TargetDiff,
+		CreatedAt:          time.Now(),
 	}, nil
 }
 

@@ -382,3 +382,55 @@ func TestJobManager_NextJob_WorkerAndPoolNoncesBothAdvanceIndependently(t *testi
 		}
 	}
 }
+
+// TestJobManager_NextJob_CarriesThroughTemplateGeneration is required
+// test 1 from the leaf-proxy-stale-generation-submit fix: a Job
+// minted from a WorkerTemplate with a given Generation value must
+// carry that SAME value through as Job.TemplateGeneration -- this is
+// the plumbing session.go's handleSubmit staleness check (comparing
+// job.TemplateGeneration against the upstream client's own
+// CurrentGeneration()) depends on end-to-end.
+func TestJobManager_NextJob_CarriesThroughTemplateGeneration(t *testing.T) {
+	tmpl := &WorkerTemplate{
+		Blob:              make([]byte, 76),
+		ReservedOffset:    -1,
+		ClientNonceOffset: -1,
+		PoolOffset:        -1,
+		JobID:             "generation-passthrough-job",
+		Height:            1,
+		TargetDiff:        1000,
+		Generation:        42,
+	}
+	source := newFakeTemplateSource(tmpl)
+	jm := NewJobManager(source, nil)
+
+	job, err := jm.NextJob(100)
+	if err != nil {
+		t.Fatalf("NextJob: %v", err)
+	}
+	if job.TemplateGeneration != 42 {
+		t.Fatalf("job.TemplateGeneration = %d, want 42 (the WorkerTemplate's own Generation value)", job.TemplateGeneration)
+	}
+
+	// A DIFFERENT template generation must carry through as a
+	// different value too -- proving this is a real passthrough, not
+	// a hardcoded/coincidental match.
+	tmpl2 := &WorkerTemplate{
+		Blob:              make([]byte, 76),
+		ReservedOffset:    -1,
+		ClientNonceOffset: -1,
+		PoolOffset:        -1,
+		JobID:             "generation-passthrough-job-2",
+		Height:            2,
+		TargetDiff:        1000,
+		Generation:        43,
+	}
+	source.setTemplate(tmpl2)
+	job2, err := jm.NextJob(100)
+	if err != nil {
+		t.Fatalf("NextJob (second template): %v", err)
+	}
+	if job2.TemplateGeneration != 43 {
+		t.Fatalf("job2.TemplateGeneration = %d, want 43", job2.TemplateGeneration)
+	}
+}

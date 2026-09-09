@@ -114,6 +114,33 @@ type WorkerTemplate struct {
 	TargetDiff uint64 // real block-level target difficulty
 	Difficulty uint64 // pool-suggested share difficulty (informational only; downstream vardiff owns the real per-session value)
 
+	// Generation is this template's upstream-CONNECTION generation
+	// number, set from UpstreamClient.applyJob at construction time
+	// (uc.generation.Load(), post-increment for a genuinely new,
+	// non-dupe job -- see applyJob's doc comment). It is NOT bumped
+	// on every job update -- only on a genuine reconnect-triggered
+	// login's own applyJob call, since a reconnect always produces a
+	// fresh upstream job_id (login() calls applyJob unconditionally
+	// on every successful login, including every reconnect) -- see
+	// UpstreamClient.generation's doc comment for the full
+	// root-cause/fix rationale this field exists for: without it, a
+	// downstream submit whose Job was minted against a template from
+	// BEFORE a reconnect passes this leaf's own local job-ownership
+	// check (session.go's ownJob) even though the upstream pool has
+	// already discarded that old session/job state, wasting an
+	// upstream round-trip on a submit that was always going to be
+	// rejected as "share does not meet configured difficulty or is
+	// cryptographically invalid" -- confirmed real production log
+	// evidence, repeated invalid-share submits like this risk
+	// exactly the kind of ban-threshold/invalid-share-ratio
+	// enforcement nodejs-pool's real banPercent/banThreshold
+	// mechanism implements. job.go's Job.TemplateGeneration copies
+	// this value at issuance time; session.go's handleSubmit
+	// compares it against the upstream client's CURRENT generation
+	// (UpstreamClient.CurrentGeneration()) to reject a stale-template
+	// submit locally, before ever contacting upstream.
+	Generation uint64
+
 	// nextWorkerNonce is a per-template monotonically-incrementing
 	// counter, ported exactly from the legacy `++this.workerNonce`
 	// above: every single job issuance (to any downstream miner)

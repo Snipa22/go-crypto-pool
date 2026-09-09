@@ -799,3 +799,94 @@ func TestApplyJob_UpstreamDupeGuard_EmptyJobIDNeverDedupes(t *testing.T) {
 		t.Fatalf("notifyCount = %d, want 2 (both empty-job_id calls must genuinely apply/notify)", notifyCount)
 	}
 }
+
+// TestApplyJob_GenerationIncrementsExactlyOnceForGenuinelyNewJob is
+// the single most important regression guard for the
+// leaf-proxy-stale-generation-submit fix: applyJob must increment
+// uc.generation (observed via CurrentGeneration()) by EXACTLY 1 for
+// each genuinely new (non-dupe) job_id, and the newly-stored
+// WorkerTemplate's own Generation field must match that new value
+// exactly -- proving the increment and the value stamped onto the
+// template are the SAME number, set together (see
+// UpstreamClient.CurrentGeneration's doc comment on why that pairing
+// matters).
+func TestApplyJob_GenerationIncrementsExactlyOnceForGenuinelyNewJob(t *testing.T) {
+	uc := NewUpstreamClient(UpstreamConfig{Login: "test-address"}, discardLogger())
+
+	if got := uc.CurrentGeneration(); got != 0 {
+		t.Fatalf("precondition failed: expected generation 0 before any applyJob call, got %d", got)
+	}
+
+	blobHex := hexOfLen(76)
+
+	uc.applyJob(UpstreamJobPayload{JobID: "gen-job-1", Blob: blobHex, Height: 1})
+	if got := uc.CurrentGeneration(); got != 1 {
+		t.Fatalf("CurrentGeneration() after first genuinely new job = %d, want 1", got)
+	}
+	first := uc.CurrentTemplate()
+	if first == nil {
+		t.Fatal("expected a stored template after the first applyJob call")
+	}
+	if first.Generation != 1 {
+		t.Fatalf("first template's own Generation field = %d, want 1 (must match CurrentGeneration() exactly)", first.Generation)
+	}
+
+	uc.applyJob(UpstreamJobPayload{JobID: "gen-job-2", Blob: blobHex, Height: 2})
+	if got := uc.CurrentGeneration(); got != 2 {
+		t.Fatalf("CurrentGeneration() after second genuinely new job = %d, want 2", got)
+	}
+	second := uc.CurrentTemplate()
+	if second == nil {
+		t.Fatal("expected a stored template after the second applyJob call")
+	}
+	if second.Generation != 2 {
+		t.Fatalf("second template's own Generation field = %d, want 2", second.Generation)
+	}
+}
+
+// TestApplyJob_GenerationDoesNotIncrementForUpstreamDupe is the other
+// half of the single most important regression guard: a job_id that
+// hits the existing upstream-dupe guard (the SAME job_id as the
+// currently-stored template -- e.g. a harmless getjob-poll-triggered
+// applyJob call) must NOT bump uc.generation at all. An over-eager
+// increment here would falsely stale-reject legitimate in-flight
+// submits after a harmless dupe, defeating the whole point of the
+// generation mechanism (see UpstreamClient.generation's own doc
+// comment).
+func TestApplyJob_GenerationDoesNotIncrementForUpstreamDupe(t *testing.T) {
+	uc := NewUpstreamClient(UpstreamConfig{Login: "test-address"}, discardLogger())
+
+	blobHex := hexOfLen(76)
+
+	uc.applyJob(UpstreamJobPayload{JobID: "dupe-gen-job", Blob: blobHex, Height: 1})
+	if got := uc.CurrentGeneration(); got != 1 {
+		t.Fatalf("CurrentGeneration() after the first, genuinely new job = %d, want 1", got)
+	}
+	first := uc.CurrentTemplate()
+
+	// SAME job_id, a getjob-poll-style dupe -- must be a complete
+	// no-op for the generation counter too, not just for
+	// uc.template/uc.notify (already covered by
+	// TestApplyJob_UpstreamDupeGuard_SameJobIDIsANoOp above).
+	uc.applyJob(UpstreamJobPayload{JobID: "dupe-gen-job", Blob: blobHex, Height: 999})
+	if got := uc.CurrentGeneration(); got != 1 {
+		t.Fatalf("CurrentGeneration() after an upstream-dupe applyJob call = %d, want still 1 (a dupe must NOT bump the generation)", got)
+	}
+	second := uc.CurrentTemplate()
+	if second != first {
+		t.Fatal("expected the dupe call to leave the exact same *WorkerTemplate pointer stored")
+	}
+	if second.Generation != 1 {
+		t.Fatalf("template's own Generation field after the dupe call = %d, want still 1", second.Generation)
+	}
+
+	// A genuinely different job_id afterward must still correctly
+	// bump the generation to 2, not 3 -- proving the dupe call
+	// genuinely consumed no generation number at all (not merely
+	// that it didn't advance the CURRENT value, which could also be
+	// true of an off-by-one bug that skips a value on a dupe).
+	uc.applyJob(UpstreamJobPayload{JobID: "dupe-gen-job-genuinely-new", Blob: blobHex, Height: 2})
+	if got := uc.CurrentGeneration(); got != 2 {
+		t.Fatalf("CurrentGeneration() after a genuinely new job following a dupe = %d, want 2 (the dupe call must not have consumed a generation number)", got)
+	}
+}

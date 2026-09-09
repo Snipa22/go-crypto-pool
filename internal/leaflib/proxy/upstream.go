@@ -113,6 +113,37 @@ type UpstreamClient struct {
 	// loss (the initial Connect is NOT counted).
 	connected  atomic.Bool
 	reconnects atomic.Uint64
+
+	// generation is a monotonic counter identifying which
+	// upstream-connection "generation" the CURRENTLY-stored template
+	// belongs to -- incremented by exactly 1 every time applyJob
+	// actually stores a genuinely NEW template (i.e. inside the
+	// upstream-dupe guard's non-dupe branch, right alongside
+	// uc.template.Store(t)); a dupe (a getjob poll response or any
+	// repeat push carrying the SAME upstream job_id as the currently
+	// stored template) does NOT bump this, since it is the same live
+	// template, not a new one -- see applyJob's own comment at the
+	// exact increment point for why that distinction matters (an
+	// over-eager increment on a harmless dupe would falsely
+	// stale-reject legitimate in-flight submits).
+	//
+	// This exists to fix a real, confirmed production issue: when
+	// reconnectLoop redials and re-logs-in after a lost upstream
+	// connection, login() always calls applyJob with the pool's own
+	// FRESH job (a reconnect always produces a genuinely new upstream
+	// job_id, so applyJob's dupe guard never suppresses it) -- but
+	// any downstream submit already in flight against the OLD,
+	// pre-disconnect template still passes this leaf's own local
+	// job-ownership check (session.go's ownJob) and, without this
+	// generation mechanism, would sail through straight to
+	// UpstreamClient.SubmitShare, wasting an upstream round-trip on a
+	// submit the pool (having discarded that old session/job state on
+	// disconnect) was always going to reject as "share does not meet
+	// configured difficulty or is cryptographically invalid".
+	// CurrentGeneration() below is the cheap, TOCTOU-free read
+	// session.go's handleSubmit uses to reject such a stale submit
+	// locally instead.
+	generation atomic.Uint64
 }
 
 // UpstreamConfig configures a real upstream pool connection.
@@ -450,6 +481,20 @@ func (uc *UpstreamClient) SessionID() string { return uc.sessionID }
 // a *WorkerTemplate, or nil if no job has been received yet.
 func (uc *UpstreamClient) CurrentTemplate() *WorkerTemplate {
 	return uc.template.Load()
+}
+
+// CurrentGeneration returns the upstream-connection generation number
+// of the CURRENTLY-stored template (see uc.generation's doc comment)
+// -- implements server.go's UpstreamGenerationSource. Deliberately a
+// separate read from CurrentTemplate/WorkerTemplate.Generation rather
+// than requiring callers to go through CurrentTemplate() themselves:
+// this keeps the staleness check in session.go's handleSubmit cheap
+// and avoids any risk of a TOCTOU race between reading the template
+// pointer and reading its generation field, since applyJob sets both
+// uc.template and uc.generation together, under the same call, before
+// either is ever observed by another goroutine.
+func (uc *UpstreamClient) CurrentGeneration() uint64 {
+	return uc.generation.Load()
 }
 
 // Subscribe registers fn to be called (with the new WorkerTemplate)
@@ -997,6 +1042,16 @@ func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
 		JobID:             job.JobID,
 		TargetDiff:        targetDiff,
 		Difficulty:        job.Difficulty,
+		// Generation: this IS a genuinely new template (the
+		// upstream-dupe guard above already returned early for a
+		// dupe), so this call bumps uc.generation by exactly 1 and
+		// stamps that new value onto the template being stored --
+		// see uc.generation's and WorkerTemplate.Generation's own
+		// doc comments for the full root-cause/fix rationale
+		// (session.go's handleSubmit is what actually uses this to
+		// reject a stale-template submit locally, before ever
+		// contacting upstream).
+		Generation: uc.generation.Add(1),
 	}
 	uc.template.Store(t)
 	uc.notify(t)

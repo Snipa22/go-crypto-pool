@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -745,5 +746,172 @@ func TestServer_RepushAllSessions_PushesFreshJobOnGenuineUpstreamUpdate(t *testi
 	}
 	if push.Params.JobID == loginResp.Result.Job.JobID {
 		t.Fatal("expected the repushed job_id to differ from the login-issued job_id (JobManager.NextJob always allocates a fresh job_id)")
+	}
+}
+
+// fakeUpstreamWithGeneration additionally implements the optional
+// UpstreamGenerationSource capability (server.go), for testing the
+// real generation-staleness type-assertion path in
+// Session.handleSubmit -- mirrors server_test.go's
+// fakeUpstreamWithHealth pattern exactly (embed the plain
+// fakeUpstream, add only the new capability's method(s) on top).
+type fakeUpstreamWithGeneration struct {
+	fakeUpstream
+	generation atomic.Uint64
+}
+
+func (f *fakeUpstreamWithGeneration) CurrentGeneration() uint64 { return f.generation.Load() }
+
+// TestSession_StaleTemplateGenerationRejectedLocally_NotForwardedUpstream
+// is the real, end-to-end regression test for the
+// leaf-proxy-stale-generation-submit fix (confirmed real production
+// log evidence: "upstream submit failed... share does not meet
+// configured difficulty or is cryptographically invalid", tens of
+// seconds after a real upstream reconnect had already succeeded).
+//
+// Sequence: mint a job while the upstream client's own
+// CurrentGeneration() is 1 (matching the template's own Generation),
+// submit a genuine would-be upstream-forward candidate against it --
+// this must proceed completely normally (non-regression: a
+// current-generation job must still forward upstream exactly as
+// before this fix). THEN simulate a reconnect completing (bump the
+// fake upstream's own generation to 2, WITHOUT touching the
+// session's already-cached job, exactly mirroring the real race this
+// fix closes: the session doesn't yet know its job is stale) and
+// submit AGAIN against the SAME (now-stale) job_id with a fresh
+// nonce -- this must be rejected LOCALLY, with fakeUpstream.
+// SubmitShare and the real RandomX validator BOTH never called a
+// second time.
+func TestSession_StaleTemplateGenerationRejectedLocally_NotForwardedUpstream(t *testing.T) {
+	tmpl := &WorkerTemplate{
+		Blob:              fakeBlob(76, 50),
+		ReservedOffset:    50,
+		ClientNonceOffset: -1,
+		PoolOffset:        -1,
+		SeedHash:          []byte("test-seed-hash-32-bytes-exactly!"),
+		Height:            123,
+		JobID:             "upstream-job-1",
+		TargetDiff:        1_000_000,
+		Difficulty:        1000,
+		Generation:        1,
+	}
+	source := newFakeTemplateSource(tmpl)
+	jm := NewJobManager(source, nil)
+	validator := &fakeValidator{accept: true}
+	upstream := &fakeUpstreamWithGeneration{}
+	upstream.accept = true
+	upstream.generation.Store(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 30 * time.Second})
+	server := NewServer(cm, jm, validator, upstream, log.New(nil2Writer{}, "", 0), leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+
+	serverConn, clientConn := net.Pipe()
+	go server.handleConn(ctx, serverConn, 1000)
+	t.Cleanup(func() { _ = clientConn.Close() })
+	c := &testClient{t: t, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
+
+	loginResp := c.login(t, "addr-generation-test")
+
+	// Non-regression sanity: the job was minted while
+	// job.TemplateGeneration (1) == upstream.CurrentGeneration() (1)
+	// -- a genuine upstream-forward candidate submitted now must
+	// proceed completely normally, exactly as before this fix.
+	claimedHash := hashForDifficulty(2_000_000) // above the 1,000,000 upstream block target
+	submitParams, err := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(1), Result: claimedHash})
+	if err != nil {
+		t.Fatalf("marshal submit params: %v", err)
+	}
+	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
+	resp := c.recvShareResponse()
+	if resp.Result == nil {
+		t.Fatalf("expected the current-generation submit to be accepted, got error=%v", resp.Error)
+	}
+	if upstream.callCount() != 1 {
+		t.Fatalf("expected exactly 1 upstream submit call for the current-generation share, got %d", upstream.callCount())
+	}
+	if validator.callCount() != 1 {
+		t.Fatalf("expected exactly 1 real RandomX re-validation call for the current-generation share, got %d", validator.callCount())
+	}
+
+	// Simulate a real reconnect completing: the upstream client's
+	// OWN live generation advances (exactly what applyJob's
+	// generation increment does on a reconnect-triggered login), but
+	// this session's already-issued job -- still job_id
+	// loginResp.Result.Job.JobID -- still carries the OLD
+	// generation (1), exactly reproducing the real race this fix
+	// closes.
+	upstream.generation.Store(2)
+
+	// Submit AGAIN against the SAME (now-stale) job_id, with a fresh
+	// nonce (avoids the unrelated duplicate-nonce rejection) and
+	// still a genuine would-be upstream-forward-candidate difficulty.
+	submitParams2, err := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(2), Result: claimedHash})
+	if err != nil {
+		t.Fatalf("marshal second submit params: %v", err)
+	}
+	c.send(Request{ID: 3, JsonRPC: "2.0", Method: "submit", Params: submitParams2})
+	resp2 := c.recvShareResponse()
+	if resp2.Result != nil {
+		t.Fatal("expected a submit against a stale-generation job to be REJECTED locally, got accepted")
+	}
+	if resp2.Error == nil || resp2.Error.Message == "" {
+		t.Fatal("expected a non-empty rejection message explaining the generation staleness")
+	}
+
+	// THE core assertions: neither the expensive real RandomX
+	// re-validation nor the upstream forward call must have been
+	// invoked a SECOND time -- the stale submit must be rejected
+	// before any of that work, and must never reach the upstream
+	// pool at all.
+	if upstream.callCount() != 1 {
+		t.Fatalf("a stale-generation submit must NEVER be forwarded upstream -- expected callCount to remain 1, got %d", upstream.callCount())
+	}
+	if validator.callCount() != 1 {
+		t.Fatalf("a stale-generation submit must be rejected before the expensive RandomX re-validation call -- expected callCount to remain 1, got %d", validator.callCount())
+	}
+}
+
+// TestSession_GenerationCheck_FailsOpenWhenUpstreamHasNoGenerationCapability
+// is the explicit "fail open, don't regress" contract test required
+// by the leaf-proxy-stale-generation-submit fix: when the concrete
+// upstream type is a bare fakeUpstream that does NOT implement
+// UpstreamGenerationSource at all (exactly like the vast majority of
+// this package's existing tests, via newHarness), a submit must
+// behave EXACTLY as before this change -- no false-positive
+// staleness rejection is even possible, since the type-assertion in
+// Session.handleSubmit simply fails and the whole staleness check is
+// skipped.
+func TestSession_GenerationCheck_FailsOpenWhenUpstreamHasNoGenerationCapability(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+
+	// Precondition, made explicit: this harness's upstream is a bare
+	// fakeUpstream with no generation capability at all.
+	if _, ok := h.server.upstream.(UpstreamGenerationSource); ok {
+		t.Fatal("precondition failed: this test requires an upstream that does NOT implement UpstreamGenerationSource")
+	}
+
+	c, _ := h.connect()
+	loginResp := c.login(t, "addr-no-generation-capability")
+
+	// A genuine would-be upstream-forward candidate must still
+	// proceed all the way through to a real upstream forward,
+	// completely unaffected by the (skipped) staleness check.
+	claimedHash := hashForDifficulty(2_000_000)
+	submitParams, err := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: loginResp.Result.Job.JobID, Nonce: nonceHexAt(3), Result: claimedHash})
+	if err != nil {
+		t.Fatalf("marshal submit params: %v", err)
+	}
+	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
+	resp := c.recvShareResponse()
+	if resp.Result == nil {
+		t.Fatalf("expected the submit to be accepted (no generation capability -> staleness check skipped entirely), got error=%v", resp.Error)
+	}
+	if h.upstream.callCount() != 1 {
+		t.Fatalf("expected exactly 1 upstream submit call, got %d -- a missing UpstreamGenerationSource capability must never block a genuine upstream forward", h.upstream.callCount())
+	}
+	if h.validator.callCount() != 1 {
+		t.Fatalf("expected exactly 1 real RandomX re-validation call, got %d", h.validator.callCount())
 	}
 }
