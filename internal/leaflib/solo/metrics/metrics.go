@@ -271,7 +271,7 @@ var (
 	// are even more attacker-controllable via connection churn).
 	minerHashrateByAddressDesc = prometheus.NewDesc(
 		"leaf_miner_hashrate_hash_per_second",
-		"Real, per-address SUM of currently-connected sessions' estimated hashrate in hashes/second (see leaflib.EstimateHashrateHz's doc comment for the difficulty*2^32/time estimation formula — an industry-standard approximation, not a cryptographically exact hash count). Same capped cardinality as leaf_miners_by_address; overflow aggregated into address=\"other\".",
+		"Real, per-address SUM of currently-connected sessions' estimated hashrate in hashes/second (see leaflib.EstimateHashrateHz's doc comment for the difficulty/time estimation formula). Same capped cardinality as leaf_miners_by_address; overflow aggregated into address=\"other\".",
 		[]string{"address"}, nil,
 	)
 )
