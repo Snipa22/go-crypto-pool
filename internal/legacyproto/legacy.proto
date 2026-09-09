@@ -1,0 +1,108 @@
+// Copyright and license: see repository LICENSE (MIT).
+//
+// Legacy nodejs-pool-sxmr wire schema, hand-modeled on the REAL production
+// source of a sibling clone of `nodejs-pool` fetched for this task:
+//
+//   - `nodejs-pool/lib/data.proto` (the actual proto2 schema `/leafApi`
+//     decodes with -- field numbers/types/names below are byte-for-byte
+//     identical to that file; this is NOT a reinterpretation or a proto3
+//     port, it is proto2, on purpose, matching the real wire format a
+//     legacy nodejs-pool-sxmr backend still expects on the wire today).
+//   - `nodejs-pool/lib/remoteShare.js` (the real `/leafApi` POST handler
+//     that decodes a `WSData` envelope, checks `msgData.key` against
+//     `global.config.api.authKey` with `!==`, and dispatches on
+//     `msgData.msgType` to SHARE/BLOCK/INVALIDSHARE handling -- see
+//     internal/leaflib/legacytransport's package doc comment for the
+//     full behavioral notes this schema is paired with).
+//
+// Non-finding, documented per task instructions: this repo's own
+// internal/proto/share.proto previously speculated that an older/
+// different legacy Share schema might have existed with `blobData`/
+// `minerHex`/`seedHash` fields (RandomX-specific blob/seed/result trio).
+// A full check of the real nodejs-pool repository (single-commit git
+// history; `git log --all -- '*.proto'` shows exactly one proto file in
+// the entire history) found NO such schema anywhere -- `seedHash` only
+// ever appears in unrelated block-template construction code
+// (`lib/coins/xmr.js`), never as a Share message field. The schema below
+// is the one, real, only wire schema `/leafApi` has ever used. Do not
+// reintroduce a speculative blobData/minerHex/seedHash Share variant --
+// it does not exist in the real legacy source.
+syntax = "proto2";
+
+package legacy;
+
+option go_package = "github.com/Snipa22/go-crypto-pool/internal/legacyproto;legacypb";
+
+// POOLTYPE mirrors nodejs-pool's real data.proto POOLTYPE enum exactly
+// (field values are part of the real wire contract -- do not renumber).
+enum POOLTYPE {
+    PPLNS = 0;
+    PPS = 1;
+    PROP = 2;
+    SOLO = 3;
+}
+
+// MESSAGETYPE mirrors nodejs-pool's real data.proto MESSAGETYPE enum
+// exactly (field values are part of the real wire contract -- do not
+// renumber).
+enum MESSAGETYPE {
+    SHARE = 0;
+    BLOCK = 1;
+    INVALIDSHARE = 2;
+}
+
+// WSData is the real outer envelope every `/leafApi` POST body decodes
+// as (see lib/remoteShare.js: `global.protos.WSData.decode(req.body)`).
+// Auth is carried as the plain `key` string field, checked with `!==`
+// server-side against `global.config.api.authKey` -- there is no
+// HTTP-header-based auth on this endpoint at all.
+message WSData {
+    required MESSAGETYPE msgType = 1;
+    required string key = 2;
+    required bytes msg = 3;
+    required int32 exInt = 4;
+}
+
+// InvalidShare mirrors nodejs-pool's real data.proto InvalidShare
+// message exactly. go-crypto-pool's LegacyTransport does not currently
+// construct/send this message type (see legacytransport's doc comment)
+// -- it is included here purely for schema completeness/fidelity with
+// the real wire format, and is covered by this package's round-trip
+// test.
+message InvalidShare {
+    required string paymentAddress = 1;
+    optional string paymentID = 2;
+    required string identifier = 3;
+}
+
+// Share mirrors nodejs-pool's real data.proto Share message exactly.
+message Share {
+    required int32 shares = 1;
+    required string paymentAddress = 2;
+    required bool foundBlock = 3;
+    optional string paymentID = 4;
+    required bool trustedShare = 5;
+    required POOLTYPE poolType = 6;
+    required int32 poolID = 7;
+    required int64 blockDiff = 8;
+    required bool bitcoin = 9;
+    required int32 blockHeight = 10;
+    required int64 timestamp = 11;
+    required string identifier = 12;
+}
+
+// Block mirrors nodejs-pool's real data.proto Block message exactly.
+// Note there is no height field here -- height only ever traveled via
+// the outer WSData.exInt (confirmed from lib/pool.js's
+// `storeBlock(job.height, ...)` call, forwarded verbatim by
+// remoteShare.js as `msgData.exInt`).
+message Block {
+    required string hash = 1;
+    required int64 difficulty = 2;
+    required int64 shares = 3;
+    required int64 timestamp = 4;
+    required POOLTYPE poolType = 5;
+    required bool unlocked = 6;
+    required bool valid = 7;
+    optional int64 value = 8;
+}

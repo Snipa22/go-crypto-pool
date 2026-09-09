@@ -37,11 +37,13 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/direct"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/legacytransport"
 	monerozmq "github.com/Snipa22/go-crypto-pool/internal/leaflib/monero/zmq"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/transport"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
+	legacypb "github.com/Snipa22/go-crypto-pool/internal/legacyproto"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -118,6 +120,49 @@ type config struct {
 	backendAuthValue    string
 	backendShareTimeout time.Duration
 	backendBlockTimeout time.Duration
+
+	// legacyMode / legacyBackendURL / legacyAuthKey / legacyPoolType /
+	// legacyPoolID configure the opt-in, default-off legacy
+	// nodejs-pool-sxmr wire-protocol mode (see
+	// internal/leaflib/legacytransport). When legacyMode is false (the
+	// default), all four legacy* fields below are ignored entirely --
+	// no validation, no effect, zero behavior change from the pre-
+	// existing HTTPProtobufTransport path.
+	legacyMode bool
+
+	// legacyBackendURL is LEAF_DIRECT_LEGACY_BACKEND_URL: the legacy
+	// backend's full base URL (scheme+host+port), e.g.
+	// "https://schwifty37.snipanet.com:4443". legacytransport.New
+	// appends "/leafApi" itself. REQUIRED when legacyMode is true.
+	legacyBackendURL string
+
+	// legacyAuthKey is LEAF_DIRECT_LEGACY_AUTH_KEY: the real WSData.key
+	// secret (a plain string field, not an HTTP header -- see
+	// legacytransport's package doc comment). Never logged, never
+	// written to any file this code creates. REQUIRED when legacyMode
+	// is true.
+	legacyAuthKey string
+
+	// legacyPoolType is LEAF_DIRECT_LEGACY_POOL_TYPE: pplns|pps|prop|solo.
+	// REQUIRED when legacyMode is true.
+	//
+	// This is deliberately a SEPARATE flag from -pool-type, since the
+	// legacy backend is a genuinely different deployment that may use a
+	// different payout-model value than this leaf's own go-crypto-pool-
+	// side -pool-type. This is an OPEN DESIGN QUESTION -- confirm with
+	// Alex whether legacy-mode pool-type/pool-id should ever be allowed
+	// to just mirror -pool-type/-pool-id, or whether they must always be
+	// independently configured like this. Defaulting to independent
+	// config here as the safer assumption.
+	legacyPoolType string
+
+	// legacyPoolID is LEAF_DIRECT_LEGACY_POOL_ID: REQUIRED (> 0) when
+	// legacyMode is true.
+	//
+	// Same rationale/doc-comment as legacyPoolType above -- independent
+	// from -pool-id by design, flagged as needing Alex's explicit
+	// confirmation.
+	legacyPoolID int
 
 	// addressFlagsPollInterval configures the real, manual ban/
 	// forced-minimum-difficulty enforcement described in
@@ -214,6 +259,12 @@ func loadConfig() (config, error) {
 	flag.DurationVar(&cfg.backendBlockTimeout, "backend-block-timeout", envOrDuration("LEAF_DIRECT_BACKEND_BLOCK_TIMEOUT", 10*time.Second), "per-call timeout reporting a found block to the backend. Env: LEAF_DIRECT_BACKEND_BLOCK_TIMEOUT")
 	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_DIRECT_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often the backend's GET /api/v1/leaf/address-flags endpoint is polled for manual ban/forced-minimum-difficulty state (see internal/leaflib/addressflags). Env: LEAF_DIRECT_ADDRESS_FLAGS_POLL_INTERVAL")
 
+	flag.BoolVar(&cfg.legacyMode, "legacy-mode", envOr("LEAF_DIRECT_LEGACY_MODE", "false") == "true", "opt-in, default-off legacy nodejs-pool-sxmr /leafApi wire-protocol mode: when true, leaf-direct forwards validated shares/blocks to a legacy nodejs-pool-sxmr backend (internal/leaflib/legacytransport) instead of the normal HTTP+Protobuf backend transport. Requires -legacy-backend-url/-legacy-auth-key/-legacy-pool-type/-legacy-pool-id to all be set. Disabled by default -- zero behavior change for existing deployments. Env: LEAF_DIRECT_LEGACY_MODE (\"true\" to enable)")
+	flag.StringVar(&cfg.legacyBackendURL, "legacy-backend-url", envOr("LEAF_DIRECT_LEGACY_BACKEND_URL", ""), "legacy nodejs-pool-sxmr backend base URL (e.g. https://schwifty37.snipanet.com:4443) -- the transport appends /leafApi itself. No scheme is assumed; the real target very likely terminates TLS externally in front of the Node process's plain app.listen(8000), so https is the expected common case. REQUIRED when -legacy-mode=true, ignored otherwise. Env: LEAF_DIRECT_LEGACY_BACKEND_URL")
+	flag.StringVar(&cfg.legacyAuthKey, "legacy-auth-key", envOr("LEAF_DIRECT_LEGACY_AUTH_KEY", ""), "real legacy WSData.key secret (a plain string field checked server-side, NOT an HTTP header). Never logged. REQUIRED when -legacy-mode=true, ignored otherwise. Env: LEAF_DIRECT_LEGACY_AUTH_KEY")
+	flag.StringVar(&cfg.legacyPoolType, "legacy-pool-type", envOr("LEAF_DIRECT_LEGACY_POOL_TYPE", ""), "legacy backend payout-model value stamped onto every share/block forwarded in legacy mode: pplns|pps|prop|solo. Deliberately SEPARATE from -pool-type -- the legacy backend is a genuinely different deployment that may use a different payout model value. OPEN DESIGN QUESTION: confirm with Alex whether legacy-mode pool-type/pool-id should ever be allowed to just mirror -pool-type/-pool-id, or whether they must always be independently configured like this; defaulting to independent config here as the safer assumption. REQUIRED when -legacy-mode=true, ignored otherwise. Env: LEAF_DIRECT_LEGACY_POOL_TYPE")
+	flag.IntVar(&cfg.legacyPoolID, "legacy-pool-id", envOrInt("LEAF_DIRECT_LEGACY_POOL_ID", 0), "legacy backend pool-server-source identifier stamped onto every share/block forwarded in legacy mode, must be > 0. Deliberately SEPARATE from -pool-id -- same OPEN DESIGN QUESTION/rationale as -legacy-pool-type above; confirm with Alex. REQUIRED when -legacy-mode=true, ignored otherwise. Env: LEAF_DIRECT_LEGACY_POOL_ID")
+
 	flag.StringVar(&cfg.submitNodesRaw, "submit-nodes", envOr("LEAF_DIRECT_SUBMIT_NODES", ""), "comma-separated list of ADDITIONAL Tari base node GRPC addresses (beyond -node-grpc-address, which is always included) to submit a genuine block find to, in real parallel. Env: LEAF_DIRECT_SUBMIT_NODES")
 
 	flag.StringVar(&cfg.relayNATSURL, "relay-nats-url", envOr("LEAF_DIRECT_RELAY_NATS_URL", ""), "NATS server URL for the best-effort found-block relay broadcast/resubmit mechanism. Empty (default) fully disables the relay -- a complete no-op, never required. Env: LEAF_DIRECT_RELAY_NATS_URL")
@@ -283,6 +334,12 @@ type fileConfig struct {
 	BackendBlockTimeoutSeconds *int    `toml:"backend_block_timeout_seconds"`
 
 	AddressFlagsPollIntervalSeconds *int `toml:"address_flags_poll_interval_seconds"`
+
+	LegacyMode       *bool   `toml:"legacy_mode"`
+	LegacyBackendURL *string `toml:"legacy_backend_url"`
+	LegacyAuthKey    *string `toml:"legacy_auth_key"`
+	LegacyPoolType   *string `toml:"legacy_pool_type"`
+	LegacyPoolID     *int    `toml:"legacy_pool_id"`
 
 	SubmitNodesRaw *string `toml:"submit_nodes"`
 
@@ -377,6 +434,12 @@ func applyConfigFile(cfg *config) error {
 		d := time.Duration(*fc.AddressFlagsPollIntervalSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.addressFlagsPollInterval, &d, visited, "address-flags-poll-interval", "LEAF_DIRECT_ADDRESS_FLAGS_POLL_INTERVAL")
 	}
+
+	cfgfile.ApplyBool(&cfg.legacyMode, fc.LegacyMode, visited, "legacy-mode", "LEAF_DIRECT_LEGACY_MODE")
+	cfgfile.ApplyString(&cfg.legacyBackendURL, fc.LegacyBackendURL, visited, "legacy-backend-url", "LEAF_DIRECT_LEGACY_BACKEND_URL")
+	cfgfile.ApplyString(&cfg.legacyAuthKey, fc.LegacyAuthKey, visited, "legacy-auth-key", "LEAF_DIRECT_LEGACY_AUTH_KEY")
+	cfgfile.ApplyString(&cfg.legacyPoolType, fc.LegacyPoolType, visited, "legacy-pool-type", "LEAF_DIRECT_LEGACY_POOL_TYPE")
+	cfgfile.ApplyInt(&cfg.legacyPoolID, fc.LegacyPoolID, visited, "legacy-pool-id", "LEAF_DIRECT_LEGACY_POOL_ID")
 
 	cfgfile.ApplyString(&cfg.submitNodesRaw, fc.SubmitNodesRaw, visited, "submit-nodes", "LEAF_DIRECT_SUBMIT_NODES")
 
@@ -569,6 +632,27 @@ func poolTypeFromString(s string) (poolpb.PoolType, bool) {
 	}
 }
 
+// legacyPoolTypeFromString parses the -legacy-pool-type flag/env value
+// into the legacy legacypb.POOLTYPE enum, using the identical
+// pplns|pps|prop|solo string convention as poolTypeFromString above
+// (case-insensitive). Returns ok=false for any unrecognized value --
+// callers MUST treat that as a fatal startup misconfiguration, exactly
+// like poolTypeFromString's own doc comment describes for -pool-type.
+func legacyPoolTypeFromString(s string) (legacypb.POOLTYPE, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "pplns":
+		return legacypb.POOLTYPE_PPLNS, true
+	case "pps":
+		return legacypb.POOLTYPE_PPS, true
+	case "prop":
+		return legacypb.POOLTYPE_PROP, true
+	case "solo":
+		return legacypb.POOLTYPE_SOLO, true
+	default:
+		return 0, false
+	}
+}
+
 // resolveSubmitNodes parses cfg.submitNodesRaw into a deduplicated
 // address list that ALWAYS includes the primary node-grpc-address
 // first (see this binary's doc comment: the multi-node submit set is
@@ -623,6 +707,28 @@ func main() {
 	}
 	if cfg.poolID <= 0 {
 		logger.Fatalf("LEAF_DIRECT_POOL_ID (or -pool-id) is required and must be a positive integer, got %d -- an unset/zero pool_id would defeat the entire purpose of pool-source tracking", cfg.poolID)
+	}
+
+	// Legacy-mode validation: when -legacy-mode=false (the default),
+	// all four legacy-* flags/env vars below are ignored entirely -- no
+	// validation, no effect. When true, all four are REQUIRED, erroring
+	// out at startup exactly like the required-flag validation above.
+	var legacyPoolType legacypb.POOLTYPE
+	if cfg.legacyMode {
+		if strings.TrimSpace(cfg.legacyBackendURL) == "" {
+			logger.Fatal("LEAF_DIRECT_LEGACY_BACKEND_URL (or -legacy-backend-url) is required when -legacy-mode=true")
+		}
+		if cfg.legacyAuthKey == "" {
+			logger.Fatal("LEAF_DIRECT_LEGACY_AUTH_KEY (or -legacy-auth-key) is required when -legacy-mode=true")
+		}
+		var lok bool
+		legacyPoolType, lok = legacyPoolTypeFromString(cfg.legacyPoolType)
+		if !lok {
+			logger.Fatalf("LEAF_DIRECT_LEGACY_POOL_TYPE (or -legacy-pool-type) is required and must be one of pplns|pps|prop|solo when -legacy-mode=true, got %q", cfg.legacyPoolType)
+		}
+		if cfg.legacyPoolID <= 0 {
+			logger.Fatalf("LEAF_DIRECT_LEGACY_POOL_ID (or -legacy-pool-id) is required and must be a positive integer when -legacy-mode=true, got %d", cfg.legacyPoolID)
+		}
 	}
 
 	ports, err := resolvePorts(cfg)
@@ -725,16 +831,35 @@ func main() {
 	}
 
 	// Real backend transport -- the genuinely new wiring point vs.
-	// leaf-solo (see this binary's own doc comment).
-	backendTransport, err := transport.NewHTTPProtobufTransport(transport.HTTPProtobufTransportConfig{
-		BaseURL: cfg.backendBaseURL, AuthHeaderName: cfg.backendAuthHeader, AuthHeaderValue: cfg.backendAuthValue,
-		ShareTimeout: cfg.backendShareTimeout, BlockTimeout: cfg.backendBlockTimeout,
-	})
-	if err != nil {
-		logger.Fatalf("failed to construct backend transport: %v", err)
+	// leaf-solo (see this binary's own doc comment). backendTransport is
+	// explicitly typed as the transport.ShareTransport interface (not a
+	// concrete type) so either real implementation can be constructed
+	// here without changing any downstream call site (direct.ServerConfig
+	// .Transport is already declared as this same interface type).
+	var backendTransport transport.ShareTransport
+	if cfg.legacyMode {
+		legacyTr, err := legacytransport.New(legacytransport.Config{
+			BackendBaseURL: cfg.legacyBackendURL, AuthKey: cfg.legacyAuthKey,
+			LegacyPoolType: legacyPoolType, LegacyPoolID: int32(cfg.legacyPoolID),
+			ShareTimeout: cfg.backendShareTimeout, BlockTimeout: cfg.backendBlockTimeout,
+		})
+		if err != nil {
+			logger.Fatalf("failed to construct legacy backend transport: %v", err)
+		}
+		backendTransport = legacyTr
+		logger.Printf("LEGACY MODE ENABLED: forwarding validated shares/blocks to legacy nodejs-pool-sxmr backend at %s/leafApi (legacy pool-type=%s legacy pool-id=%d)", cfg.legacyBackendURL, cfg.legacyPoolType, cfg.legacyPoolID)
+	} else {
+		httpTr, err := transport.NewHTTPProtobufTransport(transport.HTTPProtobufTransportConfig{
+			BaseURL: cfg.backendBaseURL, AuthHeaderName: cfg.backendAuthHeader, AuthHeaderValue: cfg.backendAuthValue,
+			ShareTimeout: cfg.backendShareTimeout, BlockTimeout: cfg.backendBlockTimeout,
+		})
+		if err != nil {
+			logger.Fatalf("failed to construct backend transport: %v", err)
+		}
+		backendTransport = httpTr
+		logger.Printf("forwarding validated shares/blocks to backend at %s", cfg.backendBaseURL)
 	}
 	defer func() { _ = backendTransport.Close() }()
-	logger.Printf("forwarding validated shares/blocks to backend at %s", cfg.backendBaseURL)
 
 	// Real direct parallel multi-node GRPC block submission -- Tari
 	// only (MultiNodeSubmitter's blockSubmitClient interface is

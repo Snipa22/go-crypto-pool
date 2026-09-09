@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	legacypb "github.com/Snipa22/go-crypto-pool/internal/legacyproto"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -42,6 +43,34 @@ func TestPoolTypeFromString(t *testing.T) {
 		got, ok := poolTypeFromString(c.in)
 		if got != c.want || ok != c.wantOK {
 			t.Errorf("poolTypeFromString(%q) = (%v, %v), want (%v, %v)", c.in, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+// TestLegacyPoolTypeFromString mirrors TestPoolTypeFromString exactly,
+// for the separate legacy-mode -legacy-pool-type parse helper (see that
+// flag's doc comment for why it is deliberately a distinct flag/parser
+// from -pool-type).
+func TestLegacyPoolTypeFromString(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   legacypb.POOLTYPE
+		wantOK bool
+	}{
+		{"pplns", legacypb.POOLTYPE_PPLNS, true},
+		{"PPLNS", legacypb.POOLTYPE_PPLNS, true},
+		{"pps", legacypb.POOLTYPE_PPS, true},
+		{"prop", legacypb.POOLTYPE_PROP, true},
+		{"solo", legacypb.POOLTYPE_SOLO, true},
+		{" solo ", legacypb.POOLTYPE_SOLO, true},
+		{"", 0, false},
+		{"bogus", 0, false},
+		{"unspecified", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := legacyPoolTypeFromString(c.in)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("legacyPoolTypeFromString(%q) = (%v, %v), want (%v, %v)", c.in, got, ok, c.want, c.wantOK)
 		}
 	}
 }
@@ -389,6 +418,157 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			check: func(t *testing.T, cfg config) {
 				if cfg.backendShareTimeout != 300*time.Second {
 					t.Errorf("backendShareTimeout = %v, want flag value %v (flag must win full precedence)", cfg.backendShareTimeout, 300*time.Second)
+				}
+			},
+		},
+
+		// -- bool field: legacy-mode -----------------------------------------
+		{
+			name: "legacy-mode/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyMode != false {
+					t.Errorf("legacyMode = %v, want hardcoded default %v", cfg.legacyMode, false)
+				}
+			},
+		},
+		{
+			name: "legacy-mode/file-only",
+			toml: `legacy_mode = true`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyMode != true {
+					t.Errorf("legacyMode = %v, want file value %v", cfg.legacyMode, true)
+				}
+			},
+		},
+		{
+			name: "legacy-mode/env-only",
+			env:  map[string]string{"LEAF_DIRECT_LEGACY_MODE": "false"},
+			toml: `legacy_mode = true`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyMode != false {
+					t.Errorf("legacyMode = %v, want env value %v (env must beat file)", cfg.legacyMode, false)
+				}
+			},
+		},
+		{
+			name: "legacy-mode/flag-only",
+			args: []string{"-legacy-mode=true"},
+			toml: `legacy_mode = false`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyMode != true {
+					t.Errorf("legacyMode = %v, want flag value %v (flag must beat env absence and file)", cfg.legacyMode, true)
+				}
+			},
+		},
+
+		// -- string field: legacy-backend-url --------------------------------
+		{
+			name: "legacy-backend-url/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyBackendURL != "" {
+					t.Errorf("legacyBackendURL = %q, want hardcoded default %q", cfg.legacyBackendURL, "")
+				}
+			},
+		},
+		{
+			name: "legacy-backend-url/file-only",
+			toml: `legacy_backend_url = "https://legacy.example.com:4443"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyBackendURL != "https://legacy.example.com:4443" {
+					t.Errorf("legacyBackendURL = %q, want file value", cfg.legacyBackendURL)
+				}
+			},
+		},
+		{
+			name: "legacy-backend-url/env-only",
+			env:  map[string]string{"LEAF_DIRECT_LEGACY_BACKEND_URL": "https://env.example.com:4443"},
+			toml: `legacy_backend_url = "https://legacy.example.com:4443"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyBackendURL != "https://env.example.com:4443" {
+					t.Errorf("legacyBackendURL = %q, want env value (env must beat file)", cfg.legacyBackendURL)
+				}
+			},
+		},
+		{
+			name: "legacy-backend-url/flag-only",
+			args: []string{"-legacy-backend-url=https://flag.example.com:4443"},
+			toml: `legacy_backend_url = "https://legacy.example.com:4443"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyBackendURL != "https://flag.example.com:4443" {
+					t.Errorf("legacyBackendURL = %q, want flag value (flag must beat env absence and file)", cfg.legacyBackendURL)
+				}
+			},
+		},
+
+		// -- int field: legacy-pool-id ---------------------------------------
+		{
+			name: "legacy-pool-id/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyPoolID != 0 {
+					t.Errorf("legacyPoolID = %d, want hardcoded default %d", cfg.legacyPoolID, 0)
+				}
+			},
+		},
+		{
+			name: "legacy-pool-id/file-only",
+			toml: `legacy_pool_id = 3`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyPoolID != 3 {
+					t.Errorf("legacyPoolID = %d, want file value %d", cfg.legacyPoolID, 3)
+				}
+			},
+		},
+		{
+			name: "legacy-pool-id/env-only",
+			env:  map[string]string{"LEAF_DIRECT_LEGACY_POOL_ID": "4"},
+			toml: `legacy_pool_id = 3`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyPoolID != 4 {
+					t.Errorf("legacyPoolID = %d, want env value %d (env must beat file)", cfg.legacyPoolID, 4)
+				}
+			},
+		},
+		{
+			name: "legacy-pool-id/flag-only",
+			args: []string{"-legacy-pool-id=8"},
+			toml: `legacy_pool_id = 3`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyPoolID != 8 {
+					t.Errorf("legacyPoolID = %d, want flag value %d (flag must beat env absence and file)", cfg.legacyPoolID, 8)
+				}
+			},
+		},
+
+		// -- string field: legacy-pool-type ----------------------------------
+		{
+			name: "legacy-pool-type/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyPoolType != "" {
+					t.Errorf("legacyPoolType = %q, want hardcoded default %q", cfg.legacyPoolType, "")
+				}
+			},
+		},
+		{
+			name: "legacy-pool-type/flag-env-file-all-set",
+			args: []string{"-legacy-pool-type=solo"},
+			env:  map[string]string{"LEAF_DIRECT_LEGACY_POOL_TYPE": "pps"},
+			toml: `legacy_pool_type = "pplns"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyPoolType != "solo" {
+					t.Errorf("legacyPoolType = %q, want flag value %q (flag must win full precedence)", cfg.legacyPoolType, "solo")
+				}
+			},
+		},
+
+		// -- string field: legacy-auth-key -----------------------------------
+		{
+			name: "legacy-auth-key/flag-env-file-all-set",
+			args: []string{"-legacy-auth-key=flag-secret"},
+			env:  map[string]string{"LEAF_DIRECT_LEGACY_AUTH_KEY": "env-secret"},
+			toml: `legacy_auth_key = "file-secret"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyAuthKey != "flag-secret" {
+					t.Errorf("legacyAuthKey = %q, want flag value (flag must win full precedence)", cfg.legacyAuthKey)
 				}
 			},
 		},

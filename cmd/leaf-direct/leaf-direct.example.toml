@@ -172,3 +172,44 @@ template_relay_subject = ""
 # Empty (default) disables this entirely -- a complete no-op. Ignored for
 # coin=tari. (default: "")
 monero_zmq_url = ""
+
+# Opt-in, default-off legacy nodejs-pool-sxmr /leafApi wire-protocol mode:
+# when true, leaf-direct forwards validated shares/blocks to a legacy
+# nodejs-pool-sxmr backend (internal/leaflib/legacytransport) instead of the
+# normal HTTP+Protobuf backend transport above. Requires legacy_backend_url/
+# legacy_auth_key/legacy_pool_type/legacy_pool_id to all be set below.
+# Disabled by default -- zero behavior change for existing deployments.
+# (default: false)
+legacy_mode = false
+
+# Legacy nodejs-pool-sxmr backend base URL (e.g.
+# "https://schwifty37.snipanet.com:4443") -- the transport appends /leafApi
+# itself. No scheme is assumed; the real target very likely terminates TLS
+# externally in front of the Node process's plain app.listen(8000), so https
+# is the expected common case. REQUIRED when legacy_mode=true, ignored
+# otherwise. (default: "")
+legacy_backend_url = ""
+
+# Real legacy WSData.key secret (a plain string field checked server-side,
+# NOT an HTTP header). Never logged. REQUIRED when legacy_mode=true, ignored
+# otherwise. (default: "")
+legacy_auth_key = ""
+
+# Legacy backend payout-model value stamped onto every share/block
+# forwarded in legacy mode: pplns|pps|prop|solo. Deliberately SEPARATE from
+# pool_type above -- the legacy backend is a genuinely different deployment
+# that may use a different payout model value. OPEN DESIGN QUESTION: confirm
+# with Alex whether legacy-mode pool-type/pool-id should ever be allowed to
+# just mirror pool_type/pool_id above, or whether they must always be
+# independently configured like this; defaulting to independent config here
+# as the safer assumption. REQUIRED when legacy_mode=true, ignored
+# otherwise. (default: "")
+legacy_pool_type = ""
+
+# Legacy backend pool-server-source identifier stamped onto every
+# share/block forwarded in legacy mode, must be > 0. Deliberately SEPARATE
+# from pool_id above -- same OPEN DESIGN QUESTION/rationale as
+# legacy_pool_type above; confirm with Alex. REQUIRED when legacy_mode=true,
+# ignored otherwise. (default: 0)
+legacy_pool_id = 0
+
