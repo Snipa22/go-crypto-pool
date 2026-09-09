@@ -769,7 +769,7 @@ func main() {
 		ConnectionManager: cm, JobManager: jobManager, Node: node, Validators: validators,
 		Network: networkFromString(cfg.network), Logger: logger, Vardiff: vardiffCfg,
 		Transport: backendTransport, MultiSubmit: multiSubmit, Relay: blockRelay,
-		Algo: algoFromString(cfg.algo), PoolType: poolType, PoolID: int32(cfg.poolID),
+		Algo: resolveAlgo(cfg), PoolType: poolType, PoolID: int32(cfg.poolID),
 	})
 	defer server.Shutdown()
 
