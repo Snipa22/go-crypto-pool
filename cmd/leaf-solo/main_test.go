@@ -62,7 +62,10 @@ func runPrecedenceCase(t *testing.T, tc precedenceCase) {
 // hardcoded-default precedence order end-to-end (real TOML decode via
 // cfgfile.Decode, not a fake), across one string field (network), one bool
 // field (trust-enabled), one int field (vardiff-target-time) and one
-// duration field (idle-timeout), per the brief's explicit requirement.
+// duration field (idle-timeout), per the brief's explicit requirement, plus
+// a dedicated block for the one field with a special-cased precedence rule,
+// starting-difficulty (see that block's own comment below for why it gets
+// more than the single representative case every other field above does).
 func TestLoadConfigPrecedence(t *testing.T) {
 	cases := []precedenceCase{
 		// -- string field: network ---------------------------------------
@@ -261,6 +264,86 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			check: func(t *testing.T, cfg config) {
 				if cfg.idleTimeout != 300*time.Second {
 					t.Errorf("idleTimeout = %v, want flag value %v (flag must win full precedence)", cfg.idleTimeout, 300*time.Second)
+				}
+			},
+		},
+
+		// -- uint64 field with a special-cased precedence rule:
+		// starting-difficulty. Unlike every other field above, the
+		// underlying flag is fed by envOrUint64Fallback with TWO env var
+		// names (LEAF_SOLO_STARTING_DIFFICULTY primary, legacy
+		// LEAF_SOLO_DIFFICULTY fallback -- see loadConfig's own comment),
+		// and applyConfigFile's ShouldApplyFile check ORs in the legacy
+		// var explicitly (see applyConfigFile's "startingDifficultySrc"
+		// comment) so a config-file value must not override an explicit
+		// setting of EITHER env var. This gets its own dedicated block
+		// (rather than the single representative-per-type case above)
+		// specifically to exercise that hand-rolled OR logic end-to-end.
+		{
+			name: "starting-difficulty/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.startingDifficulty != 10000 {
+					t.Errorf("startingDifficulty = %d, want hardcoded default %d", cfg.startingDifficulty, 10000)
+				}
+			},
+		},
+		{
+			name: "starting-difficulty/file-only",
+			toml: `starting_difficulty = 20000`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.startingDifficulty != 20000 {
+					t.Errorf("startingDifficulty = %d, want file value %d", cfg.startingDifficulty, 20000)
+				}
+			},
+		},
+		{
+			name: "starting-difficulty/primary-env-only",
+			env:  map[string]string{"LEAF_SOLO_STARTING_DIFFICULTY": "30000"},
+			toml: `starting_difficulty = 20000`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.startingDifficulty != 30000 {
+					t.Errorf("startingDifficulty = %d, want primary env value %d (env must beat file)", cfg.startingDifficulty, 30000)
+				}
+			},
+		},
+		{
+			name: "starting-difficulty/legacy-env-only",
+			env:  map[string]string{"LEAF_SOLO_DIFFICULTY": "40000"},
+			toml: `starting_difficulty = 20000`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.startingDifficulty != 40000 {
+					t.Errorf("startingDifficulty = %d, want legacy env value %d (legacy LEAF_SOLO_DIFFICULTY must also beat file, per the OR'd Source check)", cfg.startingDifficulty, 40000)
+				}
+			},
+		},
+		{
+			name: "starting-difficulty/primary-env-beats-legacy-env",
+			env:  map[string]string{"LEAF_SOLO_STARTING_DIFFICULTY": "30000", "LEAF_SOLO_DIFFICULTY": "40000"},
+			toml: `starting_difficulty = 20000`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.startingDifficulty != 30000 {
+					t.Errorf("startingDifficulty = %d, want primary env value %d (envOrUint64Fallback checks the primary var first)", cfg.startingDifficulty, 30000)
+				}
+			},
+		},
+		{
+			name: "starting-difficulty/flag-only",
+			args: []string{"-starting-difficulty=50000"},
+			toml: `starting_difficulty = 20000`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.startingDifficulty != 50000 {
+					t.Errorf("startingDifficulty = %d, want flag value %d (flag must beat env absence and file)", cfg.startingDifficulty, 50000)
+				}
+			},
+		},
+		{
+			name: "starting-difficulty/flag-beats-legacy-env-and-file",
+			args: []string{"-starting-difficulty=50000"},
+			env:  map[string]string{"LEAF_SOLO_DIFFICULTY": "40000"},
+			toml: `starting_difficulty = 20000`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.startingDifficulty != 50000 {
+					t.Errorf("startingDifficulty = %d, want flag value %d (flag must win full precedence over legacy env + file)", cfg.startingDifficulty, 50000)
 				}
 			},
 		},
