@@ -108,38 +108,40 @@ func loadConfig() (config, error) {
 	flag.BoolVar(&cfg.upstreamInsecure, "upstream-tls-insecure-skip-verify", envOrBool("LEAF_PROXY_UPSTREAM_TLS_INSECURE_SKIP_VERIFY", false), "skip TLS certificate verification for the upstream pool (testing only). Env: LEAF_PROXY_UPSTREAM_TLS_INSECURE_SKIP_VERIFY")
 	flag.StringVar(&cfg.upstreamLogin, "upstream-login", envOr("LEAF_PROXY_UPSTREAM_LOGIN", ""), "real XMR payout address to log in to the upstream pool with. Env: LEAF_PROXY_UPSTREAM_LOGIN")
 	flag.StringVar(&cfg.upstreamPass, "upstream-pass", envOr("LEAF_PROXY_UPSTREAM_PASS", "go-crypto-pool-leaf-proxy"), "real upstream pool worker identifier/password. Env: LEAF_PROXY_UPSTREAM_PASS")
-	// Default agent string deliberately does NOT contain the literal
+	// Default agent string deliberately DOES contain the literal
 	// substring "xmr-node-proxy". Confirmed from the real pool-server
 	// source (nodejs-pool-sxmr's lib/pool.js: `if (agent &&
 	// agent.includes("xmr-node-proxy")) { this.proxy = true; }`, a
 	// plain substring check, not an exact-version match), that
 	// substring is what gates a real pool granting the "advanced
-	// xmr-node-proxy client" protocol extension. Live-confirmed
-	// against pool.supportxmr.com this session: an agent string
-	// containing that substring (e.g. the legacy "xmr-node-proxy/0.0.3")
-	// flips the pool into publishing ONLY a raw, untrimmed
-	// blocktemplate_blob field (arbitrarily large, varying with
-	// mempool tx count), with no ordinary "blob" field at all -- this
-	// is what previously caused leaf-proxy to relay an oversized blob
-	// to downstream xmrig miners (login error code: 4).
+	// xmr-node-proxy client" protocol extension -- which, in turn, is
+	// what makes a real pool (confirmed against
+	// pool.supportxmr.com) publish client_nonce_offset/
+	// client_pool_offset on its jobs at all.
 	//
-	// UPDATED (real blocktemplate_blob->hashing-blob conversion fix):
-	// internal/leaflib/proxy's applyJob now has a real conversion
+	// REVERSED (this pass, live production incident): this used to
+	// deliberately AVOID that substring, because at the time the
+	// advanced dialect meant a raw, untrimmed, arbitrarily-large
+	// blocktemplate_blob field (no ordinary "blob" field at all),
+	// which overflowed downstream xmrig's login buffer (error code:
+	// 4). internal/leaflib/proxy's applyJob now has a real conversion
 	// path for blocktemplate_blob (go-xmr-lib/support's
 	// ParseBlockFromTemplateBlob + GetBlockHashingBlob -- see that
-	// package's upstream.go doc comment), so this agent-string
-	// avoidance is no longer the ONLY safety mechanism against the
-	// advanced dialect: it is now safe even if a pool grants it
-	// regardless of what agent string this leaf sends. The DEFAULT is
-	// deliberately left unchanged anyway (defense-in-depth / least
-	// surprise -- there is no clear reason to now deliberately court
-	// the advanced dialect by default when the ordinary "blob"
-	// dialect is simpler and already fully supported). Keep this
-	// configurable -- an operator who explicitly wants the advanced
-	// dialect (e.g. to exercise reserved_offset/worker-nonce
-	// partitioning against a pool that only publishes it under that
-	// dialect) can still opt in via this flag/env var.
-	flag.StringVar(&cfg.upstreamAgent, "upstream-agent", envOr("LEAF_PROXY_UPSTREAM_AGENT", "go-crypto-pool-leaf-proxy/1.0"), "mining-client agent string sent on upstream login -- defaults to a plain, ordinary-client identifier that does NOT contain the literal substring \"xmr-node-proxy\" (see this flag's doc comment); a pool granting the advanced xmr-node-proxy-client dialect (e.g. because this contains that substring) is now safely handled via a real blocktemplate_blob->hashing-blob conversion path, so this is a defense-in-depth default rather than a hard safety requirement. Env: LEAF_PROXY_UPSTREAM_AGENT")
+	// package's upstream.go doc comment), which made receiving that
+	// raw blob safe -- but NOT opting into the advanced dialect
+	// turned out to be its own, worse hazard: without
+	// client_nonce_offset/client_pool_offset, every downstream miner
+	// behind this leaf gets a byte-identical blob, so independent
+	// miners routinely submit the exact same (job_id, nonce, result)
+	// triple at low share difficulty. The upstream pool flags that as
+	// a duplicate share, and enough of those within
+	// nodejs-pool-sxmr's banThreshold/banPercent window got this
+	// leaf's public IP banned for "using an invalid mining protocol"
+	// in production. This flag/env var remains configurable -- an
+	// operator who genuinely needs the ordinary, non-advanced dialect
+	// instead can opt out by setting this to an agent string that
+	// does NOT contain "xmr-node-proxy".
+	flag.StringVar(&cfg.upstreamAgent, "upstream-agent", envOr("LEAF_PROXY_UPSTREAM_AGENT", "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0"), "mining-client agent string sent on upstream login -- defaults to an identifier containing the literal substring \"xmr-node-proxy\" (see this flag's doc comment) so the upstream pool grants the advanced xmr-node-proxy-client dialect and publishes client_nonce_offset/client_pool_offset, which this leaf needs to give downstream miners non-colliding blobs; the resulting raw blocktemplate_blob is safely handled via a real blocktemplate_blob->hashing-blob conversion path. Env: LEAF_PROXY_UPSTREAM_AGENT")
 
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_PROXY_LISTEN_ADDRESS", ":5555"), "downstream miner-facing TCP listen address. Env: LEAF_PROXY_LISTEN_ADDRESS")
 	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_PROXY_STARTING_DIFFICULTY", 10000), "starting downstream share difficulty; vardiff adjusts it from here. Env: LEAF_PROXY_STARTING_DIFFICULTY")

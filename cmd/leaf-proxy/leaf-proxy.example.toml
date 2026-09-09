@@ -27,13 +27,15 @@ upstream_login = ""
 # Real upstream pool worker identifier/password. (default: "go-crypto-pool-leaf-proxy")
 upstream_pass = "go-crypto-pool-leaf-proxy"
 
-# Mining-client agent string sent on upstream login -- MUST NOT contain the
-# literal substring "xmr-node-proxy": that substring opts this leaf into a
-# pool's incompatible "advanced xmr-node-proxy client" protocol dialect (a
-# raw, untrimmed blocktemplate_blob this leaf has no convert_blob-style
-# reduction step for) instead of the ordinary, correctly-sized "blob" field.
-# (default: "go-crypto-pool-leaf-proxy/1.0")
-upstream_agent = "go-crypto-pool-leaf-proxy/1.0"
+# Mining-client agent string sent on upstream login -- deliberately DOES
+# contain the literal substring "xmr-node-proxy": that substring is what
+# opts this leaf into a pool's "advanced xmr-node-proxy client" protocol
+# dialect, which is required to receive client_nonce_offset/
+# client_pool_offset on jobs (needed so downstream miners behind this leaf
+# get non-colliding blobs). The dialect's raw, untrimmed
+# blocktemplate_blob is safely handled via a real conversion step.
+# (default: "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0")
+upstream_agent = "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0"
 
 
 # Downstream miner-facing TCP listen address. (default: ":5555")
