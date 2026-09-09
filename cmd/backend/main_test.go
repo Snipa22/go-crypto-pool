@@ -97,8 +97,10 @@ func runPrecedenceCase(t *testing.T, tc precedenceCase) {
 
 // TestLoadConfigPrecedence proves the real flag > env > config-file >
 // hardcoded-default precedence order end-to-end (real TOML decode via
-// cfgfile.Decode, not a fake), across one string field (db-dsn), one int64
-// field (unlocker-tari-maturity), one duration field
+// cfgfile.Decode, not a fake), across two string fields (db-dsn and
+// jwt-secret -- the latter added specifically because it is the
+// authapi-required secret documented in this file's package doc comment),
+// one int64 field (unlocker-tari-maturity), one duration field
 // (unlocker-poll-interval), and one float64 field (payout-pps-fee-percent,
 // substituted for a bool field per the brief's instruction -- backend
 // genuinely has no bool-typed setting among its current env vars) per the
@@ -303,6 +305,56 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			check: func(t *testing.T, cfg config) {
 				if cfg.payoutPPSFeePercent != 3.5 {
 					t.Errorf("payoutPPSFeePercent = %v, want flag value %v (flag must win full precedence)", cfg.payoutPPSFeePercent, 3.5)
+				}
+			},
+		},
+
+		// -- string field: jwt-secret --------------------------------------
+		{
+			name: "jwt-secret/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.jwtSecret != "" {
+					t.Errorf("jwtSecret = %q, want hardcoded default %q", cfg.jwtSecret, "")
+				}
+			},
+		},
+		{
+			name: "jwt-secret/file-only",
+			toml: `jwt_secret = "file-secret"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.jwtSecret != "file-secret" {
+					t.Errorf("jwtSecret = %q, want file value %q", cfg.jwtSecret, "file-secret")
+				}
+			},
+		},
+		{
+			name: "jwt-secret/env-only",
+			env:  map[string]string{"GCPOOL_JWT_SECRET": "env-secret"},
+			toml: `jwt_secret = "file-secret"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.jwtSecret != "env-secret" {
+					t.Errorf("jwtSecret = %q, want env value %q (env must beat file)", cfg.jwtSecret, "env-secret")
+				}
+			},
+		},
+		{
+			name: "jwt-secret/flag-only",
+			args: []string{"-jwt-secret=flag-secret"},
+			toml: `jwt_secret = "file-secret"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.jwtSecret != "flag-secret" {
+					t.Errorf("jwtSecret = %q, want flag value %q (flag must beat env absence and file)", cfg.jwtSecret, "flag-secret")
+				}
+			},
+		},
+		{
+			name: "jwt-secret/flag-env-file-all-set",
+			args: []string{"-jwt-secret=flag-secret"},
+			env:  map[string]string{"GCPOOL_JWT_SECRET": "env-secret"},
+			toml: `jwt_secret = "file-secret"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.jwtSecret != "flag-secret" {
+					t.Errorf("jwtSecret = %q, want flag value %q (flag must win full precedence)", cfg.jwtSecret, "flag-secret")
 				}
 			},
 		},
