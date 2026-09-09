@@ -156,7 +156,7 @@ func TestHandleHashrate_OK(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	wantHS := float64(1000) * hashesPerDifficultyUnit / 100
+	wantHS := float64(1000) / 100
 	if resp.EstimatedHashrateHS != wantHS {
 		t.Errorf("estimated hashrate = %v, want %v", resp.EstimatedHashrateHS, wantHS)
 	}
@@ -253,7 +253,7 @@ func TestHandleHashrateSources_OK(t *testing.T) {
 	if resp.Sources[0].PoolID != 1 || resp.Sources[0].SharesSum != 700 {
 		t.Errorf("unexpected source[0]: %+v", resp.Sources[0])
 	}
-	wantHS := float64(700) * hashesPerDifficultyUnit / 100
+	wantHS := float64(700) / 100
 	if resp.Sources[0].EstimatedHashrateHS != wantHS {
 		t.Errorf("estimated hashrate = %v, want %v", resp.Sources[0].EstimatedHashrateHS, wantHS)
 	}
@@ -277,7 +277,7 @@ func TestEstimateHashrateHS(t *testing.T) {
 	if got := EstimateHashrateHS(-5, 100); got != 0 {
 		t.Errorf("negative shares should give 0 hashrate, got %v", got)
 	}
-	want := float64(100) * hashesPerDifficultyUnit / 10
+	want := float64(100) / 10
 	if got := EstimateHashrateHS(100, 10); got != want {
 		t.Errorf("got %v, want %v", got, want)
 	}

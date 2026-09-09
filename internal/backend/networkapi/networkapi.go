@@ -20,7 +20,7 @@
 //
 //   - GET /api/v1/network/stats?algo=<ALGO>&network=<NETWORK>[&window=<seconds>]
 //     Returns a whole-pool (every miner, not just one payment
-//     address) difficulty*2^32/elapsed-time hashrate estimate over
+//     address) difficulty/elapsed-time hashrate estimate over
 //     the trailing window (see EstimateHashrateHS, mirroring
 //     statsapi's exact formula/convention), plus a lifetime blocks-
 //     found count and the most recently found block's height/time
@@ -43,12 +43,6 @@ import (
 	"strconv"
 	"time"
 )
-
-// hashesPerDifficultyUnit mirrors statsapi's own constant of the same
-// name/purpose -- see that package's doc comment for why this is
-// duplicated rather than imported (independent package dependency
-// graphs, same underlying industry-standard approximation).
-const hashesPerDifficultyUnit = 4294967296 // 2^32
 
 // DefaultWindowSeconds/MaxWindowSeconds mirror statsapi's identically
 // named constants -- same rationale, kept independent per this
@@ -166,12 +160,15 @@ func parseWindowSeconds(raw string) (int64, error) {
 }
 
 // EstimateHashrateHS mirrors statsapi.EstimateHashrateHS exactly --
-// see that function's doc comment for the formula/caveats.
+// see that function's doc comment for the formula/caveats. sharesSum
+// is divided by windowSeconds directly, with no additional
+// hashes-per-difficulty-unit multiplier (see statsapi's fix history
+// for why an earlier `* 2^32` multiplier here was wrong).
 func EstimateHashrateHS(sharesSum int64, windowSeconds int64) float64 {
 	if sharesSum <= 0 || windowSeconds <= 0 {
 		return 0
 	}
-	return float64(sharesSum) * hashesPerDifficultyUnit / float64(windowSeconds)
+	return float64(sharesSum) / float64(windowSeconds)
 }
 
 // portResponseRow is the JSON shape one PortRecord serializes to.

@@ -25,7 +25,7 @@
 //
 //   - GET /api/v1/stats/hashrate?payment_address=<addr>&algo=<ALGO>
 //     [&network=<NETWORK>][&payment_id=<id>][&window=<seconds>]
-//     Returns a difficulty*2^32/elapsed-time hashrate estimate (see
+//     Returns a difficulty/elapsed-time hashrate estimate (see
 //     EstimateHashrateHS's doc comment) computed from the real
 //     `shares` rows accepted for that address in the trailing window
 //     (default DefaultWindowSeconds). algo is REQUIRED here (shares
@@ -73,17 +73,6 @@ import (
 
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
-
-// hashesPerDifficultyUnit mirrors internal/leaflib.EstimateHashrateHz's
-// exact constant/convention (2^32 hash attempts per expected accepted
-// share at difficulty 1) so a miner sees the same hashrate figure
-// whether it's read off a leaf's live per-session stats page or this
-// backend's DB-query-based endpoint. Kept as an independent constant
-// (rather than importing internal/leaflib, which is the miner-facing
-// ingestion side's own package tree) to keep this package's
-// dependency graph pointed only at internal/backend/*, matching every
-// other backend subpackage's import discipline.
-const hashesPerDifficultyUnit = 4294967296 // 2^32
 
 // DefaultWindowSeconds is the hashrate lookback window used when a
 // request omits the optional window query parameter. 600s (10
@@ -216,24 +205,26 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/stats/hashrate/sources", h.handleHashrateSources)
 }
 
-// EstimateHashrateHS applies the standard difficulty*2^32/elapsed-time
+// EstimateHashrateHS applies the standard difficulty/elapsed-time
 // hashrate approximation to a difficulty-weighted share sum (see
 // db.ShareStats.SharesSum's doc comment for why the `shares` column IS
-// that difficulty-weighted sum) over a window of the given length.
-// This is the exact same formula/constant as
-// internal/leaflib.EstimateHashrateHz, just driven by a DB-queried
-// window sum instead of a live in-memory per-session accumulator — see
-// that function's doc comment for the real caveats (an
-// industry-standard approximation, not a cryptographically exact hash
-// count; genuinely algo-specific real per-attempt cost is not
-// modeled). Returns 0 for a zero/negative window or a zero share sum,
-// rather than dividing by (or reporting against) a meaningless
-// denominator.
+// that difficulty-weighted sum) over a window of the given length:
+// sharesSum divided by the window, in seconds. This is the exact same
+// formula as internal/leaflib.EstimateHashrateHz, just driven by a
+// DB-queried window sum instead of a live in-memory per-session
+// accumulator — sharesSum is already a real, direct sum of
+// per-accepted-share difficulty values, so no additional
+// hashes-per-difficulty-unit multiplier is applied (see that
+// function's doc comment and fix history for why an earlier version
+// of this formula's `* 2^32` multiplier was wrong: it inflated the
+// reported figure by ~4.3 billion x). Returns 0 for a zero/negative
+// window or a zero share sum, rather than dividing by (or reporting
+// against) a meaningless denominator.
 func EstimateHashrateHS(sharesSum int64, windowSeconds int64) float64 {
 	if sharesSum <= 0 || windowSeconds <= 0 {
 		return 0
 	}
-	return float64(sharesSum) * hashesPerDifficultyUnit / float64(windowSeconds)
+	return float64(sharesSum) / float64(windowSeconds)
 }
 
 // networkDBString mirrors internal/backend/api's own private
