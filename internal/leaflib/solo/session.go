@@ -680,7 +680,32 @@ func (s *Session) handleSubmit(req Request) {
 			s.writeShareResponse(req.ID, false, "monero (rxm) submit requires a claimed result hash in \"result\"")
 			return
 		}
-		blob, blobErr := MoneroHashingBlobForSubmit(job, nonce)
+		// XNP-PROXY SUBMIT FIX: a real XNP-class multi-tier proxy
+		// submit carries workerNonce/poolNonce params (protocol.go's
+		// SubmitRequest.WorkerNonce/PoolNonce doc comment has the
+		// full real-wire citation) that MUST be patched into the raw
+		// template before re-deriving the verification hashing blob
+		// — MoneroHashingBlobForSubmit alone only ever patches the
+		// plain nonce into the ALREADY-CONVERTED hashing blob, so a
+		// proxy's real worker/pool nonce patches were silently
+		// dropped, guaranteeing a hash mismatch (and therefore a
+		// reject) on every single submit from that client class. The
+		// mere PRESENCE of both wire fields is the real, sufficient
+		// signal here (an ordinary xmrig-class client has no code
+		// path that would ever send them) — this is deliberately NOT
+		// additionally gated on IsXNPProxyAgent(agent): requiring
+		// both conditions would risk a genuinely proxy-shaped client
+		// whose login agent string doesn't happen to match that
+		// substring check still getting silently mis-handled.
+		var (
+			blob    []byte
+			blobErr error
+		)
+		if submit.WorkerNonce != nil && submit.PoolNonce != nil {
+			blob, blobErr = MoneroHashingBlobForXNPSubmit(job, nonce, *submit.WorkerNonce, *submit.PoolNonce)
+		} else {
+			blob, blobErr = MoneroHashingBlobForSubmit(job, nonce)
+		}
 		if blobErr != nil {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("failed to build monero randomx verification blob: %v", blobErr))
 			return

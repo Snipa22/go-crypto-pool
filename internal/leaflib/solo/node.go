@@ -23,6 +23,7 @@ import (
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/nodeGRPC"
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+	"github.com/Snipa22/go-xmr-lib/support"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -167,6 +168,14 @@ func TariPowDataFromJob(job *Job) []byte {
 // callers can distinguish "not applicable" from "applicable but
 // malformed" exactly like TariPowDataFromJob's nil-vs-error contract
 // for Tari's RXT.
+//
+// This is the ORDINARY xmrig-class miner path ONLY: it patches the
+// plain miner nonce alone. An XNP-class multi-tier proxy submit ALSO
+// carries workerNonce/poolNonce params that must be patched into the
+// raw template BEFORE the plain nonce is applied — see this
+// function's counterpart, MoneroHashingBlobForXNPSubmit, below.
+// session.go's/direct's handleSubmit picks between the two based on
+// whether the submit's WorkerNonce/PoolNonce fields are present.
 func MoneroHashingBlobForSubmit(job *Job, nonce uint64) ([]byte, error) {
 	if job == nil {
 		return nil, fmt.Errorf("solo: MoneroHashingBlobForSubmit: nil job")
@@ -188,6 +197,177 @@ func MoneroHashingBlobForSubmit(job *Job, nonce uint64) ([]byte, error) {
 	binary.LittleEndian.PutUint32(nonceBuf[:], uint32(nonce))
 	copy(blob[nonceOffset:nonceOffset+4], nonceBuf[:])
 	return blob, nil
+}
+
+// xnpConvertTemplateBlobTimeout bounds how long
+// convertRawTemplateBlobToHashingBlob will wait for
+// support.ParseBlockFromTemplateBlob + support.GetBlockHashingBlob to
+// complete before giving up and returning an error. This is the SAME
+// timeout value and the SAME rationale as
+// internal/leaflib/proxy/upstream.go's own
+// convertTemplateBlobTimeout — see that constant's doc comment for
+// the full explanation (a real, well-formed template parses in
+// low-single-digit milliseconds; this is a generous multiple of that).
+const xnpConvertTemplateBlobTimeout = 2 * time.Second
+
+// convertRawTemplateBlobToHashingBlob converts a raw hex
+// blocktemplate_blob into the real, correctly-sized RandomX hashing
+// blob via go-xmr-lib/support's ParseBlockFromTemplateBlob +
+// GetBlockHashingBlob, wrapped in BOTH a panic-recovery net AND a
+// hard wall-clock timeout.
+//
+// THIS IS A DELIBERATE, IMPORT-CYCLE-DRIVEN DUPLICATE of
+// internal/leaflib/proxy/upstream.go's convertTemplateBlobToHashingBlob
+// — read THAT function's full doc comment for the complete citation
+// of the genuine, confirmed go-xmr-lib v0.2.5 bug this timeout guards
+// against (serialization.ConstructTXExtra's tx_extra tag-byte switch
+// has no default case and can spin forever on malformed input, not
+// just panic) and for the real panic-based failure modes the recover
+// below guards against (corrupt/truncated length-prefixed fields
+// consumed via direct slicing rather than a bounds-checked read).
+//
+// This package (internal/leaflib/solo) cannot import
+// internal/leaflib/proxy to reuse that function directly:
+// internal/leaflib/proxy already imports internal/leaflib/solo
+// (protocol.go, session.go, for the shared XNP-proxy detection/job
+// types), so solo importing proxy back would create a real import
+// cycle. Duplicating this small wrapper locally is the correct
+// choice here — see this task's own brief for the explicit
+// import-cycle check this duplication was verified against. DO NOT
+// "clean up" this apparent duplication by having one call the other,
+// or by hoisting it to a shared package, without re-checking that
+// cycle first.
+func convertRawTemplateBlobToHashingBlob(blobHex string) ([]byte, error) {
+	type outcome struct {
+		blob []byte
+		err  error
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		var out outcome
+		defer func() {
+			if r := recover(); r != nil {
+				out = outcome{nil, fmt.Errorf("solo: recovered from a panic while parsing/converting a blocktemplate_blob (malformed or truncated input): %v", r)}
+			}
+			ch <- out
+		}()
+		parsedBlock, perr := support.ParseBlockFromTemplateBlob(blobHex)
+		if perr != nil {
+			out = outcome{nil, perr}
+			return
+		}
+		hashingBlob, perr := support.GetBlockHashingBlob(parsedBlock)
+		out = outcome{hashingBlob, perr}
+	}()
+	select {
+	case out := <-ch:
+		return out.blob, out.err
+	case <-time.After(xnpConvertTemplateBlobTimeout):
+		return nil, fmt.Errorf("solo: parsing/converting a blocktemplate_blob did not complete within %s -- likely triggered the known go-xmr-lib v0.2.5 ConstructTXExtra infinite-loop bug on malformed tx_extra data (see proxy/upstream.go's convertTemplateBlobToHashingBlob doc comment); giving up and treating this as a failed conversion rather than blocking forever", xnpConvertTemplateBlobTimeout)
+	}
+}
+
+// patchMoneroXNPReservedOffsets returns a FRESH COPY of raw with
+// poolNonce written BIG-ENDIAN at raw[reservedOffset+8:] and
+// workerNonce written BIG-ENDIAN at raw[reservedOffset+12:] — the
+// exact byte-level offset math MoneroHashingBlobForXNPSubmit needs,
+// factored out into its own small, directly-testable function (see
+// node_test.go) so the offset/bounds-checking logic can be verified
+// against a synthetic buffer without needing a genuinely
+// library-parseable Monero block for every test case. raw itself is
+// never mutated. Returns a clear error (never panics) if
+// reservedOffset+16 does not fit within len(raw) — covers both the
+// +8 and +12 four-byte writes.
+func patchMoneroXNPReservedOffsets(raw []byte, reservedOffset int, workerNonce, poolNonce uint32) ([]byte, error) {
+	if reservedOffset+16 > len(raw) {
+		return nil, fmt.Errorf("reserved_offset %d + 16 exceeds raw template blob length %d", reservedOffset, len(raw))
+	}
+	buf := make([]byte, len(raw))
+	copy(buf, raw)
+	binary.BigEndian.PutUint32(buf[reservedOffset+8:], poolNonce)
+	binary.BigEndian.PutUint32(buf[reservedOffset+12:], workerNonce)
+	return buf, nil
+}
+
+// MoneroHashingBlobForXNPSubmit is MoneroHashingBlobForSubmit's
+// XNP-proxy-aware counterpart: in addition to patching the plain
+// miner nonce, it ALSO patches workerNonce/poolNonce into a fresh
+// copy of job.RawTemplateBlob at the real reserved_offset+12/
+// reserved_offset+8 byte locations (mirroring lib/pool.js's
+// processShare + lib/coins/xmr.js's BlockTemplate.clientNonceLocation/
+// clientPoolLocation exactly — see protocol.go's SubmitRequest.
+// WorkerNonce/PoolNonce doc comment, and this package's
+// IsXNPProxyAgent/ReservedOffset doc comments, for the full
+// XNP-proxy job-delivery rationale this submit-side logic completes),
+// then re-derives the real RandomX hashing blob from that patched raw
+// template via go-xmr-lib/support's ParseBlockFromTemplateBlob +
+// GetBlockHashingBlob (the same real conversion path
+// internal/leaflib/proxy's upstream.go already uses for this exact
+// raw-blob-to-hashing-blob problem — see convertRawTemplateBlobToHashingBlob
+// above for why this package duplicates rather than reuses that
+// helper).
+//
+// Requires job.RawTemplateBlob to be non-empty and job.ReservedOffset
+// to be greater than 0 (a real Monero reserved_size/reserve_size is
+// never 0 when reservation is in use in this codebase — see
+// monero_node.go's GetBlockTemplate, which always requests
+// reserve_size: 60): an XNP submit against a job that never got a
+// reservation is a real, reportable misconfiguration, not something
+// to silently paper over.
+//
+// job.RawTemplateBlob is copied before any writes — the shared job's
+// own slice is never mutated, matching MoneroHashingBlobForSubmit's
+// own discipline for HashingBlob.
+//
+// BIG-ENDIAN — this is deliberately a DIFFERENT byte order than this
+// same function's own plain-nonce patch below (which stays
+// little-endian, matching MoneroHashingBlobForSubmit/
+// BuildCandidateBlock's existing convention for the real Monero
+// block-header nonce field). Do NOT "fix" this to match: workerNonce/
+// poolNonce are patched via writeUInt32BE in the real reference
+// (lib/pool.js processShare, quoted in full on protocol.go's
+// SubmitRequest.WorkerNonce/PoolNonce doc comment) — a genuinely
+// different wire convention for a genuinely different field, not an
+// inconsistency to reconcile.
+func MoneroHashingBlobForXNPSubmit(job *Job, nonce uint64, workerNonce, poolNonce uint32) ([]byte, error) {
+	if job == nil {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForXNPSubmit: nil job")
+	}
+	if len(job.RawTemplateBlob) == 0 {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForXNPSubmit: job.RawTemplateBlob is empty -- an XNP-proxy submit against a job with no raw template is a real misconfiguration, not silently ignorable")
+	}
+	if job.ReservedOffset <= 0 {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForXNPSubmit: job.ReservedOffset is %d (must be > 0) -- an XNP-proxy submit against a job that never got a real reservation is a real misconfiguration, not silently ignorable", job.ReservedOffset)
+	}
+
+	buf, err := patchMoneroXNPReservedOffsets(job.RawTemplateBlob, job.ReservedOffset, workerNonce, poolNonce)
+	if err != nil {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForXNPSubmit: %w", err)
+	}
+
+	hashingBlob, err := convertRawTemplateBlobToHashingBlob(hex.EncodeToString(buf))
+	if err != nil {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForXNPSubmit: re-deriving hashing blob from nonce-patched raw blocktemplate_blob: %w", err)
+	}
+
+	// Re-parse the nonce offset in the FRESHLY re-derived hashing
+	// blob rather than assuming it's identical to job.TemplateData's
+	// cached NonceOffset -- see this function's doc comment (and
+	// GetBlockTemplate's own defensive header-prefix comparison,
+	// monero_node.go) for why re-parsing keeps this function
+	// self-contained and correct even if that invariant ever changes
+	// upstream.
+	nonceOffset, err := parseMoneroBlockHeaderNonceOffset(hashingBlob)
+	if err != nil {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForXNPSubmit: parsing nonce offset from re-derived hashing blob: %w", err)
+	}
+	if nonceOffset+4 > len(hashingBlob) {
+		return nil, fmt.Errorf("solo: MoneroHashingBlobForXNPSubmit: nonce offset %d + 4 exceeds re-derived hashing blob length %d", nonceOffset, len(hashingBlob))
+	}
+	var nonceBuf [4]byte
+	binary.LittleEndian.PutUint32(nonceBuf[:], uint32(nonce))
+	copy(hashingBlob[nonceOffset:nonceOffset+4], nonceBuf[:])
+	return hashingBlob, nil
 }
 
 // GRPCNodeClient is the production NodeClient, backed by

@@ -3,8 +3,14 @@ package solo
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/Snipa22/go-xmr-lib/support"
+
+	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
 // TestGRPCNodeClientBuildCoinbaseExtraContainsConfiguredTag verifies
@@ -71,5 +77,242 @@ func TestNormalizeCoinbaseExtraTagAcceptsExactMaxLength(t *testing.T) {
 	got := NormalizeCoinbaseExtraTag(exact, "supportxtm-sha3x")
 	if len(got) != MaxCoinbaseExtraTagLen {
 		t.Errorf("len(got) = %d, want %d (exact-length input must not be truncated further)", len(got), MaxCoinbaseExtraTagLen)
+	}
+}
+
+// --- MoneroHashingBlobForXNPSubmit / patchMoneroXNPReservedOffsets
+// regression tests (XNP-proxy submit fix: RXM submits from an
+// XNP-class multi-tier proxy carry workerNonce/poolNonce params that
+// must be patched into the raw template before re-deriving the
+// verification hashing blob -- see node.go's doc comments on both
+// functions for the full rationale) ---
+
+// xnpFixtureRawTemplateBlob/xnpFixtureReservedOffset/
+// xnpFixtureHashingBlobLen are a real, go-xmr-lib-verified raw Monero
+// blocktemplate_blob fixture (go-xmr-lib@v0.2.5's own
+// support/block_test.go "offsetData"/"offsetDataReservedOffset"/
+// "offsetDataHashingBlobLen" constants, duplicated here the same way
+// internal/leaflib/proxy/upstream_applyjob_test.go already duplicates
+// them -- see that file's own doc comment for the full,
+// independently-verified provenance: a real 60-byte tx_extra nonce
+// region starting at absolute byte offset 130, confirmed by parsing,
+// patching, and re-parsing with go-xmr-lib/support's own real
+// primitives, not hand-counted). offset 130 comfortably fits both the
+// +8 (poolNonce, absolute 138) and +12 (workerNonce, absolute 142)
+// writes this fix performs.
+const (
+	xnpFixtureRawTemplateBlob = "0e0ed286da8006ecdc1aab3033cf1716c52f13f9d8ae0051615a2453643de94643b550d543becd0000000002abc78b0101ffefc68b0101fcfcf0d4b422025014bb4a1eade6622fd781cb1063381cad396efa69719b41aa28b4fce8c7ad4b5f019ce1dc670456b24a5e03c2d9058a2df10fec779e2579753b1847b74ee644f16b023c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000051399a1bc46a846474f5b33db24eae173a26393b976054ee14f9feefe99925233802867097564c9db7a36af5bb5ed33ab46e63092bd8d32cef121608c3258edd55562812e21cc7e3ac73045745a72f7d74581d9a0849d6f30e8b2923171253e864f4e9ddea3acb5bc755f1c4a878130a70c26297540bc0b7a57affb6b35c1f03d8dbd54ece8457531f8cba15bb74516779c01193e212050423020e45aa2c15dcb"
+	xnpFixtureReservedOffset  = 130
+	xnpFixtureHashingBlobLen  = 76
+)
+
+// TestPatchMoneroXNPReservedOffsets_LandsAtCorrectByteOffsets is
+// required test (a): confirms the real offset math
+// (reservedOffset+8/reservedOffset+12) actually lands the two
+// big-endian uint32 values at the right byte positions in a
+// synthetic buffer -- asserting on the raw bytes directly, not just
+// "no error".
+func TestPatchMoneroXNPReservedOffsets_LandsAtCorrectByteOffsets(t *testing.T) {
+	const reservedOffset = 10
+	raw := bytes.Repeat([]byte{0xEE}, reservedOffset+16+4) // headroom past the +12+4 write
+	orig := append([]byte(nil), raw...)
+
+	const workerNonce = 0xAABBCCDD
+	const poolNonce = 0x11223344
+
+	got, err := patchMoneroXNPReservedOffsets(raw, reservedOffset, workerNonce, poolNonce)
+	if err != nil {
+		t.Fatalf("patchMoneroXNPReservedOffsets: %v", err)
+	}
+
+	wantPool := make([]byte, 4)
+	binary.BigEndian.PutUint32(wantPool, poolNonce)
+	if !bytes.Equal(got[reservedOffset+8:reservedOffset+12], wantPool) {
+		t.Errorf("poolNonce bytes at [reservedOffset+8:reservedOffset+12] = %x, want %x (big-endian %d)", got[reservedOffset+8:reservedOffset+12], wantPool, poolNonce)
+	}
+	wantWorker := make([]byte, 4)
+	binary.BigEndian.PutUint32(wantWorker, workerNonce)
+	if !bytes.Equal(got[reservedOffset+12:reservedOffset+16], wantWorker) {
+		t.Errorf("workerNonce bytes at [reservedOffset+12:reservedOffset+16] = %x, want %x (big-endian %d)", got[reservedOffset+12:reservedOffset+16], wantWorker, workerNonce)
+	}
+
+	// Everything outside the two patched 4-byte windows must be
+	// untouched.
+	if !bytes.Equal(got[:reservedOffset+8], orig[:reservedOffset+8]) {
+		t.Errorf("bytes before the patched region were modified")
+	}
+	if !bytes.Equal(got[reservedOffset+16:], orig[reservedOffset+16:]) {
+		t.Errorf("bytes after the patched region were modified")
+	}
+
+	// raw itself must be untouched -- patchMoneroXNPReservedOffsets
+	// must return a copy, never mutate its input.
+	if !bytes.Equal(raw, orig) {
+		t.Fatalf("patchMoneroXNPReservedOffsets mutated its input raw buffer -- must operate on a copy")
+	}
+}
+
+// TestPatchMoneroXNPReservedOffsets_TooShortReturnsError is part of
+// required test (b): a buffer too short for reservedOffset+16 must
+// return a clear error, not panic.
+func TestPatchMoneroXNPReservedOffsets_TooShortReturnsError(t *testing.T) {
+	const reservedOffset = 10
+	raw := make([]byte, reservedOffset+15) // one byte short of the required +16
+
+	if _, err := patchMoneroXNPReservedOffsets(raw, reservedOffset, 1, 2); err == nil {
+		t.Fatal("expected an error for a too-short buffer, got nil")
+	}
+}
+
+// TestMoneroHashingBlobForXNPSubmit_NilJob confirms the nil-job guard
+// mirrors MoneroHashingBlobForSubmit's own.
+func TestMoneroHashingBlobForXNPSubmit_NilJob(t *testing.T) {
+	if _, err := MoneroHashingBlobForXNPSubmit(nil, 0, 1, 2); err == nil {
+		t.Fatal("expected an error for a nil job, got nil")
+	}
+}
+
+// TestMoneroHashingBlobForXNPSubmit_EmptyRawTemplateBlob is required
+// test (c) (first half): a job with an empty RawTemplateBlob must
+// return a clear error, not panic, even with a plausible
+// ReservedOffset.
+func TestMoneroHashingBlobForXNPSubmit_EmptyRawTemplateBlob(t *testing.T) {
+	job := &Job{Algo: poolpb.Algo_ALGO_RXM, ReservedOffset: 130, RawTemplateBlob: nil}
+	_, err := MoneroHashingBlobForXNPSubmit(job, 0, 1, 2)
+	if err == nil {
+		t.Fatal("expected an error for an empty RawTemplateBlob, got nil")
+	}
+	if !strings.Contains(err.Error(), "RawTemplateBlob is empty") {
+		t.Errorf("error = %v, want it to mention the empty RawTemplateBlob", err)
+	}
+}
+
+// TestMoneroHashingBlobForXNPSubmit_ZeroReservedOffset is required
+// test (c) (second half): a job with ReservedOffset == 0 (job.go's
+// documented "not populated"/zero-value convention) must return a
+// clear error, not panic, even with a real, non-empty
+// RawTemplateBlob.
+func TestMoneroHashingBlobForXNPSubmit_ZeroReservedOffset(t *testing.T) {
+	rawBlob, err := hex.DecodeString(xnpFixtureRawTemplateBlob)
+	if err != nil {
+		t.Fatalf("decoding fixture hex: %v", err)
+	}
+	job := &Job{Algo: poolpb.Algo_ALGO_RXM, ReservedOffset: 0, RawTemplateBlob: rawBlob}
+	_, err = MoneroHashingBlobForXNPSubmit(job, 0, 1, 2)
+	if err == nil {
+		t.Fatal("expected an error for ReservedOffset == 0, got nil")
+	}
+	if !strings.Contains(err.Error(), "ReservedOffset") {
+		t.Errorf("error = %v, want it to mention ReservedOffset", err)
+	}
+}
+
+// TestMoneroHashingBlobForXNPSubmit_TooShortRawTemplateBlob is
+// required test (b) (second half): a job whose RawTemplateBlob is too
+// short for ReservedOffset+16 must return a clear error, not panic.
+func TestMoneroHashingBlobForXNPSubmit_TooShortRawTemplateBlob(t *testing.T) {
+	job := &Job{
+		Algo:            poolpb.Algo_ALGO_RXM,
+		ReservedOffset:  70,
+		RawTemplateBlob: make([]byte, 76), // real production repro shape: offset=179 blob_len=76 (see job.go's ReservedOffsetUsable doc comment) -- 70+16=86 > 76
+	}
+	if _, err := MoneroHashingBlobForXNPSubmit(job, 0, 1, 2); err == nil {
+		t.Fatal("expected an error for a too-short RawTemplateBlob, got nil")
+	}
+}
+
+// TestMoneroHashingBlobForXNPSubmit_RoundTripsWithRealFixture is
+// required test (d): patches a real, go-xmr-lib-verified raw
+// blocktemplate_blob's real reserved-offset region via
+// MoneroHashingBlobForXNPSubmit, confirms it succeeds and produces a
+// hashing blob of the expected real length, AND independently
+// confirms (by separately patching a copy the exact same way and
+// re-parsing it with go-xmr-lib/support's own real
+// ParseBlockFromTemplateBlob) that the two values actually landed at
+// the expected coinbase tx_extra locations -- go-xmr-lib's
+// serialization.Transaction.Extra.Nonce is a real, inspectable public
+// field (confirmed via that library's own API), so this checks it
+// directly rather than merely trusting no error occurred.
+func TestMoneroHashingBlobForXNPSubmit_RoundTripsWithRealFixture(t *testing.T) {
+	rawBlob, err := hex.DecodeString(xnpFixtureRawTemplateBlob)
+	if err != nil {
+		t.Fatalf("decoding fixture hex: %v", err)
+	}
+
+	const workerNonce = 0xDEADBEEF
+	const poolNonce = 0xC0FFEE01
+
+	job := &Job{
+		Algo:            poolpb.Algo_ALGO_RXM,
+		ReservedOffset:  xnpFixtureReservedOffset,
+		RawTemplateBlob: rawBlob,
+		VmKey:           []byte("test-monero-seed-hash-32-bytes!"),
+	}
+
+	hashingBlob, err := MoneroHashingBlobForXNPSubmit(job, 0x818d1a00, workerNonce, poolNonce)
+	if err != nil {
+		t.Fatalf("MoneroHashingBlobForXNPSubmit: %v", err)
+	}
+	if len(hashingBlob) != xnpFixtureHashingBlobLen {
+		t.Errorf("len(hashingBlob) = %d, want %d (the real, correctly-sized RandomX hashing blob for this fixture)", len(hashingBlob), xnpFixtureHashingBlobLen)
+	}
+
+	// job.RawTemplateBlob itself must be untouched.
+	rawBlobAfter, err := hex.DecodeString(xnpFixtureRawTemplateBlob)
+	if err != nil {
+		t.Fatalf("decoding fixture hex: %v", err)
+	}
+	if !bytes.Equal(job.RawTemplateBlob, rawBlobAfter) {
+		t.Fatalf("MoneroHashingBlobForXNPSubmit mutated job.RawTemplateBlob -- must operate on a copy")
+	}
+
+	// Independent round-trip: patch a separate copy the exact same
+	// way and re-parse it directly with go-xmr-lib/support, then
+	// inspect the parsed coinbase's real tx_extra nonce field to
+	// confirm the two values genuinely landed where expected --
+	// not just that MoneroHashingBlobForXNPSubmit claimed success.
+	patched, err := patchMoneroXNPReservedOffsets(rawBlob, xnpFixtureReservedOffset, workerNonce, poolNonce)
+	if err != nil {
+		t.Fatalf("patchMoneroXNPReservedOffsets: %v", err)
+	}
+	parsedBlock, err := support.ParseBlockFromTemplateBlob(hex.EncodeToString(patched))
+	if err != nil {
+		t.Fatalf("support.ParseBlockFromTemplateBlob on the independently-patched blob: %v", err)
+	}
+	extraNonce := parsedBlock.MinerTxn.Extra.Nonce
+	if len(extraNonce) < 16 {
+		t.Fatalf("parsed coinbase tx_extra nonce region is only %d bytes, want at least 16", len(extraNonce))
+	}
+	// poolNonce lives at absolute reservedOffset+8, i.e. relative
+	// byte 8 within Extra.Nonce (which itself starts at
+	// reservedOffset); workerNonce at relative byte 12.
+	if got := binary.BigEndian.Uint32(extraNonce[8:12]); got != poolNonce {
+		t.Errorf("parsed coinbase tx_extra poolNonce = %#x, want %#x", got, poolNonce)
+	}
+	if got := binary.BigEndian.Uint32(extraNonce[12:16]); got != workerNonce {
+		t.Errorf("parsed coinbase tx_extra workerNonce = %#x, want %#x", got, workerNonce)
+	}
+
+	parsedHashingBlob, err := support.GetBlockHashingBlob(parsedBlock)
+	if err != nil {
+		t.Fatalf("support.GetBlockHashingBlob on the independently-patched blob: %v", err)
+	}
+	if len(parsedHashingBlob) != xnpFixtureHashingBlobLen {
+		t.Errorf("independently-derived hashing blob length = %d, want %d", len(parsedHashingBlob), xnpFixtureHashingBlobLen)
+	}
+
+	// The plain miner nonce (0x818d1a00, little-endian, matching this
+	// package's own real xmrig production capture -- see
+	// session_test.go's xmrigCaptureNonce) must also have been
+	// applied to the FINAL returned hashing blob, at whatever offset
+	// parseMoneroBlockHeaderNonceOffset finds for it.
+	nonceOffset, err := parseMoneroBlockHeaderNonceOffset(hashingBlob)
+	if err != nil {
+		t.Fatalf("parseMoneroBlockHeaderNonceOffset on the returned hashing blob: %v", err)
+	}
+	wantNonce := make([]byte, 4)
+	binary.LittleEndian.PutUint32(wantNonce, 0x818d1a00)
+	if !bytes.Equal(hashingBlob[nonceOffset:nonceOffset+4], wantNonce) {
+		t.Errorf("plain nonce bytes at the header nonce offset = %x, want %x (little-endian 0x818d1a00)", hashingBlob[nonceOffset:nonceOffset+4], wantNonce)
 	}
 }

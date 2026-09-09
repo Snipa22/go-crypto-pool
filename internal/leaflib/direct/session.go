@@ -404,7 +404,27 @@ func (s *Session) handleSubmit(req solo.Request) {
 			s.writeShareResponse(req.ID, false, "monero (rxm) submit requires a claimed result hash in \"result\"")
 			return
 		}
-		blob, blobErr := solo.MoneroHashingBlobForSubmit(job, nonce)
+		// XNP-PROXY SUBMIT FIX: mirrors solo.Session's own identical
+		// ALGO_RXM handling exactly (see that method's doc comment
+		// for the full rationale) -- a real XNP-class multi-tier
+		// proxy submit carries workerNonce/poolNonce params that
+		// must be patched into the raw template before re-deriving
+		// the verification hashing blob, or every submit from that
+		// client class hashes the wrong bytes and is guaranteed to
+		// be rejected. Gated on the wire fields' mere presence, NOT
+		// additionally on solo.IsXNPProxyAgent(agent) -- see
+		// solo.Session's own doc comment for why requiring both would
+		// risk mis-handling a genuinely proxy-shaped client whose
+		// agent string doesn't happen to match that substring check.
+		var (
+			blob    []byte
+			blobErr error
+		)
+		if submit.WorkerNonce != nil && submit.PoolNonce != nil {
+			blob, blobErr = solo.MoneroHashingBlobForXNPSubmit(job, nonce, *submit.WorkerNonce, *submit.PoolNonce)
+		} else {
+			blob, blobErr = solo.MoneroHashingBlobForSubmit(job, nonce)
+		}
 		if blobErr != nil {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("failed to build monero randomx verification blob: %v", blobErr))
 			return
