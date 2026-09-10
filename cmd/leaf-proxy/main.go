@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/proxy"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
@@ -111,6 +112,20 @@ type config struct {
 	// exactly (see solo.Server.SetHideRemoteAddress's doc comment
 	// -- proxy.Server has an identical method). Defaults to false.
 	hideRemoteAddress bool
+
+	// addressFlagsFile / addressFlagsPollInterval configure the real,
+	// manual ban enforcement described in
+	// internal/leaflib/addressflags's package doc comment. Mirrors
+	// cmd/leaf-solo's identical flag pair exactly: addressFlagsFile
+	// empty (the default) disables the feature entirely --
+	// leaf-proxy has no go-crypto-pool backend to poll instead (see
+	// this binary's own doc comment: it emulates an advanced mining
+	// CLIENT to an upstream Monero-family POOL, not a backend
+	// connection this repo controls), so a local, operator-
+	// maintained JSON file is the only real Source available to it,
+	// exactly like leaf-solo.
+	addressFlagsFile         string
+	addressFlagsPollInterval time.Duration
 
 	// configFile is the optional path to a TOML file providing
 	// defaults for any flag above that the operator did not set
@@ -187,6 +202,9 @@ func loadConfig() (config, error) {
 	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOrBool("LEAF_PROXY_HIDE_REMOTE_ADDRESS", false), "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_PROXY_HIDE_REMOTE_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_PROXY_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_PROXY_MAX_ADDRESS_LABELS")
 
+	flag.StringVar(&cfg.addressFlagsFile, "address-flags-file", envOr("LEAF_PROXY_ADDRESS_FLAGS_FILE", ""), "path to a local, operator-maintained JSON file of manually banned payment addresses (see internal/leaflib/addressflags.FileSource's doc comment for the file format). Empty (default) disables the feature entirely -- leaf-proxy has no go-crypto-pool backend to poll instead. Env: LEAF_PROXY_ADDRESS_FLAGS_FILE")
+	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_PROXY_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often -address-flags-file is re-read. Ignored if -address-flags-file is unset. Env: LEAF_PROXY_ADDRESS_FLAGS_POLL_INTERVAL")
+
 	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_PROXY_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-proxy.example.toml. Env: LEAF_PROXY_CONFIG_FILE")
 
 	flag.Parse()
@@ -235,6 +253,9 @@ type fileConfig struct {
 	MetricsListenAddress *string `toml:"metrics_listen_address"`
 	MaxAddressLabels     *int    `toml:"max_address_labels"`
 	HideRemoteAddress    *bool   `toml:"hide_remote_address"`
+
+	AddressFlagsFile                *string `toml:"address_flags_file"`
+	AddressFlagsPollIntervalSeconds *int    `toml:"address_flags_poll_interval_seconds"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -298,6 +319,12 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.metricsListenAddress, fc.MetricsListenAddress, visited, "metrics-listen-address", "LEAF_PROXY_METRICS_LISTEN_ADDRESS")
 	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_PROXY_MAX_ADDRESS_LABELS")
 	cfgfile.ApplyBool(&cfg.hideRemoteAddress, fc.HideRemoteAddress, visited, "hide-remote-address", "LEAF_PROXY_HIDE_REMOTE_ADDRESS")
+
+	cfgfile.ApplyString(&cfg.addressFlagsFile, fc.AddressFlagsFile, visited, "address-flags-file", "LEAF_PROXY_ADDRESS_FLAGS_FILE")
+	if fc.AddressFlagsPollIntervalSeconds != nil {
+		d := time.Duration(*fc.AddressFlagsPollIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.addressFlagsPollInterval, &d, visited, "address-flags-poll-interval", "LEAF_PROXY_ADDRESS_FLAGS_POLL_INTERVAL")
+	}
 
 	return nil
 }
@@ -414,6 +441,19 @@ func main() {
 
 	server := proxy.NewServer(cm, jobManager, rxValidator, upstream, logger, vardiffCfg, cfg.jobMaxAge)
 	defer server.Shutdown()
+
+	// Real, manual ban enforcement (see internal/leaflib/addressflags's
+	// package doc comment). Disabled (server.addressFlags stays nil)
+	// unless -address-flags-file/LEAF_PROXY_ADDRESS_FLAGS_FILE is set
+	// -- leaf-proxy has no go-crypto-pool backend to poll instead, so
+	// a local file is the only real Source, mirroring cmd/leaf-solo's
+	// identical wiring exactly.
+	if cfg.addressFlagsFile != "" {
+		flagsCache := addressflags.NewCache(addressflags.NewFileSource(cfg.addressFlagsFile), cfg.addressFlagsPollInterval, logger)
+		flagsCache.Start(ctx)
+		server.EnableAddressFlags(flagsCache)
+		logger.Printf("manual ban enforcement ENABLED, polling %s every %s", cfg.addressFlagsFile, cfg.addressFlagsPollInterval)
+	}
 
 	// Real Prometheus /metrics + basic stats HTML page, exactly
 	// mirroring cmd/leaf-solo/main.go's already-working

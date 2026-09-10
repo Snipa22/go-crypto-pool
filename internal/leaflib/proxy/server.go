@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/proxy/metrics"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 )
 
 // UpstreamHealth is an OPTIONAL capability a Server's real
@@ -111,6 +113,34 @@ type Server struct {
 	// identical field exactly — see that doc comment. Defaults to
 	// false; set via SetHideRemoteAddress.
 	hideRemoteAddress bool
+
+	// addressFlags is nil unless EnableAddressFlags has been called --
+	// mirrors internal/leaflib/solo/server.go's/
+	// internal/leaflib/direct/server.go's identical field exactly (see
+	// that field's doc comment for the full rationale). nil means
+	// every login/submit is treated as unflagged, identical to this
+	// feature not existing at all. leaf-proxy has no backend
+	// connection of its own (same as leaf-solo -- see cmd/leaf-proxy's
+	// doc comment: it emulates an advanced mining CLIENT to an
+	// upstream pool, it does not have an upstream go-crypto-pool
+	// backend), so cmd/leaf-proxy wires this via
+	// addressflags.FileSource, mirroring cmd/leaf-solo's identical
+	// wiring exactly. Consulted by session.go's handleLogin (ban
+	// rejection) and handleSubmit (mid-session ban re-check).
+	addressFlags *addressflags.Cache
+
+	// randomxPool is the bounded, server-wide worker pool session.go's
+	// handleSubmit dispatches the real, expensive local RandomX
+	// re-validation (ShareValidator.ValidateBlobSeedResult) onto for a
+	// genuine upstream-forward candidate, so that call never blocks
+	// Session.Run's read loop -- mirrors
+	// internal/leaflib/direct/server.go's identical field exactly
+	// (leaf-direct also reuses solo's exported AsyncValidationPool
+	// type directly rather than duplicating it -- see
+	// internal/leaflib/solo/asyncvalidation.go's package doc comment
+	// for the full production-incident rationale this class of fix
+	// addresses). Always non-nil (constructed in NewServer).
+	randomxPool *solo.AsyncValidationPool
 }
 
 // NewServer constructs a Server. cm must already be configured with
@@ -139,6 +169,7 @@ func NewServer(cm *leaflib.ConnectionManager, jobs *JobManager, validator ShareV
 		jobMaxAge:        jobMaxAge,
 		sessions:         make(map[uint64]*Session),
 		maxAddressLabels: metrics.DefaultMaxAddressLabels,
+		randomxPool:      solo.NewAsyncValidationPool(solo.AsyncValidationWorkers, solo.AsyncValidationQueueSize),
 	}
 	s.unsubscribe = jobs.Subscribe(s.repushAllSessions)
 	return s
@@ -168,6 +199,15 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 // identical method exactly — see that doc comment.
 func (s *Server) SetHideRemoteAddress(hide bool) {
 	s.hideRemoteAddress = hide
+}
+
+// EnableAddressFlags mirrors solo.Server's/direct.Server's own
+// identical method exactly -- see that method's doc comment. cache
+// should already have had Start called on it (see cmd/leaf-proxy's
+// wiring) so it is serving a real, already-polled snapshot by the
+// time the first downstream miner connection arrives.
+func (s *Server) EnableAddressFlags(cache *addressflags.Cache) {
+	s.addressFlags = cache
 }
 
 // MetricsHandler returns the Prometheus /metrics HTTP handler if
@@ -359,11 +399,17 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficul
 	session.Run(mc.Context())
 }
 
-// Shutdown unsubscribes from upstream job updates. It does not close
-// the ConnectionManager or listener — callers own those lifecycles.
+// Shutdown unsubscribes from upstream job updates and stops this
+// Server's RandomX re-validation async worker pool (see
+// solo.AsyncValidationPool.Stop -- blocks until every in-flight
+// re-validation finishes). It does not close the ConnectionManager or
+// listener — callers own those lifecycles.
 func (s *Server) Shutdown() {
 	if s.unsubscribe != nil {
 		s.unsubscribe()
+	}
+	if s.randomxPool != nil {
+		s.randomxPool.Stop()
 	}
 }
 
