@@ -112,3 +112,14 @@ max_address_labels = 0
 # Omit the "Remote address" column from the stats HTML page entirely --
 # recommended for public-facing deployments. (default: false)
 hide_remote_address = false
+
+# Path to a local, operator-maintained JSON file of manually banned payment
+# addresses (see internal/leaflib/addressflags.FileSource's doc comment for
+# the file format). Empty (default) disables the feature entirely --
+# leaf-proxy has no go-crypto-pool backend to poll instead. (default: "")
+address_flags_file = ""
+
+# How often address_flags_file is re-read. Ignored if address_flags_file is
+# unset, in seconds. (default: 30)
+address_flags_poll_interval_seconds = 30
+

@@ -317,6 +317,25 @@ func (s *Session) handleLogin(req Request) {
 		return
 	}
 
+	// REAL enforcement point for the manual ban system -- mirrors
+	// solo.Session's/direct.Session's own identical handleLogin
+	// check exactly (see internal/leaflib/addressflags's package doc
+	// comment for the full rationale). Checked and rejected BEFORE
+	// the address is stored/loggedIn is flipped and BEFORE any job is
+	// fetched -- a banned address never becomes this session's
+	// payout address for any purpose, and never receives a job
+	// template. Nil s.server.addressFlags (the default -- see
+	// EnableAddressFlags' doc comment) means every address is
+	// treated as unflagged, identical to this feature not existing
+	// at all.
+	if s.server.addressFlags != nil {
+		if flags := s.server.addressFlags.Get(login.Login); flags.Banned {
+			s.server.logger.Printf("proxy: rejecting login for banned address %s (session %s)", login.Login, s.sessionID)
+			s.writeGeneralResponse(req.ID, "this address is banned from this pool", "")
+			return
+		}
+	}
+
 	worker := login.Pass
 	if login.RigID != "" {
 		worker = login.RigID
@@ -388,7 +407,7 @@ func (s *Session) handleGetJob(req Request) {
 // producing exactly the observed "several rejects, all in the same
 // millisecond, against one stale job_id" pattern. Fixed by reordering
 // so the expensive call only runs for a genuine upstream-forward
-// candidate; see step 7 below and its own comment for the exact new
+// candidate; see step 9 below and its own comment for the exact new
 // rule. Ordering also cross-checked against XNP's own real reference
 // implementation (xmr-node-proxy's lib/xmr.js, processShare): XNP
 // derives hashDiff from the CLAIMED result first (no real hash
@@ -409,7 +428,18 @@ func (s *Session) handleGetJob(req Request) {
 //     which another session's job_id could even be looked up here.
 //  2. Real per-job expiry (job max age), independent of upstream
 //     template invalidation.
-//  3. REAL PRODUCTION BUG FIX (this session, confirmed live log
+//  3. REAL ban re-check at submit time (not just login time) —
+//     mirrors solo.Session's/direct.Session's own identical addition
+//     exactly (see solo/session.go's handleSubmit doc comment for the
+//     full rationale). Checked against the address actually stored on
+//     this session, before any real validation work. Ordered here,
+//     immediately after job-ownership/expiry and before the
+//     generation-staleness check below, matching solo/direct's own
+//     stated "job-ownership/expiry checks first, then this ban
+//     re-check, then everything else" convention literally — this
+//     check has no dependency on upstream generation state, so it
+//     costs nothing to run first.
+//  4. REAL PRODUCTION BUG FIX (this session, confirmed live log
 //     evidence of "upstream submit failed... share does not meet
 //     configured difficulty or is cryptographically invalid" tens of
 //     seconds after a real upstream reconnect): upstream-template
@@ -425,16 +455,20 @@ func (s *Session) handleGetJob(req Request) {
 //     that has already discarded the old session/job state and would
 //     only reject it anyway. Fails OPEN (this check is skipped
 //     entirely) when the concrete upstream doesn't implement
-//     UpstreamGenerationSource at all.
-//  4. Decode the miner's claimed 4-byte nonce (real Monero-family
+//     UpstreamGenerationSource at all. If a submit is BOTH from a
+//     banned address AND against a stale generation, step 3 above
+//     already rejected it first (either reason is independently
+//     sufficient — see TestHandleSubmit_BannedAddressAndStaleGeneration_BothReject
+//     in session_test.go).
+//  5. Decode the miner's claimed 4-byte nonce (real Monero-family
 //     wire convention: 8 hex chars — CONFIRMED DIFFERENT from Tari
 //     SHA3X/C29's 8-BYTE/16-hex-char nonce already used elsewhere in
 //     this codebase) and write it into this job's own
 //     worker-nonce-partitioned blob at the real block_header nonce
 //     offset (blockheader.go) — this constructs the actual bytes a
 //     real RandomX hash would be computed over.
-//  5. Real per-job used-nonce tracking (replay rejection).
-//  6. Real difficulty DERIVATION from the miner's already-received,
+//  6. Real per-job used-nonce tracking (replay rejection).
+//  7. Real difficulty DERIVATION from the miner's already-received,
 //     UNVERIFIED claimed hash (difficulty.go's littleEndianDifficulty,
 //     the same well-known CryptoNote/RandomX target/difficulty
 //     relationship already used for Tari's RXT elsewhere in this
@@ -442,13 +476,13 @@ func (s *Session) handleGetJob(req Request) {
 //     already sent in submit.Result; it requires NO RandomX call at
 //     all, and is what determines whether the expensive real
 //     verification below is even worth running.
-//  7. Reject outright, with NO RandomX call spent, if that claimed
+//  8. Reject outright, with NO RandomX call spent, if that claimed
 //     difficulty doesn't even meet this session's own
 //     configured/vardiff share difficulty (job.StaticDifficulty): a
 //     share that fails its own requested-difficulty check is rejected
 //     on that basis alone, regardless of whether the underlying PoW
 //     would even be valid.
-//  8. THE CORE LEAF-PROXY BEHAVIOR, and the exact gate this fix
+//  9. THE CORE LEAF-PROXY BEHAVIOR, and the exact gate this fix
 //     restores: the real, expensive local RandomX re-validation via
 //     the already-merged RandomXValidator (s.server.validator) is
 //     called ONLY when the claimed difficulty ALSO meets or exceeds
@@ -499,15 +533,62 @@ func (s *Session) handleSubmit(req Request) {
 		}
 	}
 
+	// REAL ban re-check at submit time, not just login time -- mirrors
+	// solo.Session's/direct.Session's own identical addition exactly
+	// (see solo/session.go's handleSubmit doc comment for the full
+	// rationale: a session can log in before an address is banned, or
+	// get banned mid-session by an operator; login-time-only
+	// enforcement would let an already-connected botnet keep
+	// submitting shares indefinitely after being banned). Checked
+	// against the address ACTUALLY stored on this session
+	// (s.address), not whatever the miner claims now. Runs BEFORE any
+	// real validation work (nonce decode, blob construction,
+	// difficulty derivation, the real RandomX re-validation call) --
+	// mirrors solo/direct's exact ordering: job-ownership/expiry
+	// checks first, then this ban re-check, then everything else
+	// (including the stale-generation check immediately below --
+	// deliberately placed second: this check has no dependency on
+	// the upstream template's generation at all, and checking a
+	// locally-known ban state before consulting the upstream client's
+	// generation counter is strictly cheaper and matches solo/direct's
+	// own "ban re-check right after job-ownership/expiry" ordering
+	// literally, without needing any exception for this leaf).
+	//
+	// Ordering note (both real, both-legitimate fixes; see this
+	// repo's rebase reconciliation for #85/f2bfa0b): if a submit is
+	// BOTH from a now-banned address AND against a stale upstream
+	// template generation, THIS check wins and its rejection message
+	// is what the miner sees -- see
+	// TestHandleSubmit_BannedAddressAndStaleGeneration_BothReject in
+	// session_test.go, which pins this down explicitly. Either
+	// rejection reason is independently sufficient; the ban check is
+	// ordered first only because it was already the established
+	// solo/direct convention this leaf mirrors, not because either
+	// fix's own rationale requires it ahead of the other.
+	if s.server.addressFlags != nil {
+		if flags := s.server.addressFlags.Get(s.address.Load().(string)); flags.Banned {
+			s.server.logger.Printf("proxy: rejecting submit for now-banned address %s (session %s)", s.address.Load(), s.sessionID)
+			s.writeShareResponse(req.ID, false, "this address is banned from this pool")
+			return
+		}
+	}
+
 	// REAL PRODUCTION BUG FIX: reject a submit whose Job was minted
 	// against an upstream-connection generation that has since been
 	// superseded by a real reconnect (upstream.go's reconnectLoop) —
-	// see this function's own doc comment (step 3) and
+	// see this function's own doc comment (step 4) and
 	// server.go's UpstreamGenerationSource doc comment for the full
 	// rationale. Fails OPEN (skips this check entirely, matching
 	// pre-fix behavior exactly) when the concrete upstream doesn't
 	// implement UpstreamGenerationSource at all -- this must never
-	// become a hard requirement of UpstreamSubmitter itself.
+	// become a hard requirement of UpstreamSubmitter itself. Checked
+	// here, after the ban re-check above but still well before any
+	// nonce/difficulty/RandomX-validation work below and before ever
+	// contacting upstream (this fix's own explicit ordering
+	// requirement), and — critically — before the async randomxPool
+	// dispatch further down: a stale-generation submit is rejected
+	// SYNCHRONOUSLY on this read loop, never handed to the async
+	// pool needlessly.
 	if gs, ok := s.server.upstream.(UpstreamGenerationSource); ok {
 		if current := gs.CurrentGeneration(); job.TemplateGeneration < current {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("job's upstream template generation is stale (this leaf's upstream connection has reconnected since this job was issued) -- job_id %s", submit.JobID))
@@ -546,7 +627,7 @@ func (s *Session) handleSubmit(req Request) {
 	// UNVERIFIED claimed hash — no RandomX call required at all, and
 	// what determines whether the expensive real verification below
 	// is even worth running (see this function's own doc comment,
-	// steps 5-7, and randomx_puregolang.go's documented contract).
+	// steps 7-9, and randomx_puregolang.go's documented contract).
 	claimedHash, err := hex.DecodeString(submit.Result)
 	if err != nil {
 		s.writeShareResponse(req.ID, false, "claimed result is not valid hex")
@@ -596,36 +677,84 @@ func (s *Session) handleSubmit(req Request) {
 	// silently downgraded to a local-only credit: it claimed to meet
 	// the upstream target, and this leaf could not itself confirm
 	// that claim.
-	valid, err := s.server.validator.ValidateBlobSeedResult(context.Background(), fullBlob, job.SeedHash, submit.Result)
-	if err != nil {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
-		return
-	}
-	if !valid {
-		s.writeShareResponse(req.ID, false, "share is not a cryptographically valid RandomX proof for this job")
-		return
+	//
+	// PERFORMANCE FIX: this ~258ms pure-Go RandomX re-validation call
+	// used to run INLINE, synchronously, right here in Session.Run's
+	// read loop -- see internal/leaflib/solo/asyncvalidation.go's
+	// package doc comment for the full production incident this same
+	// class of bug caused for leaf-solo/leaf-direct's own
+	// network-backed RandomXValidator (~4ms+/call there; pure-Go
+	// RandomX here is ~258ms/call, an even larger stall). A slow
+	// validation on one downstream session's genuine upstream-forward
+	// candidate would otherwise block that SAME session's read loop
+	// from ever reading its next submitted line until the call
+	// returned. finishSubmit captures everything from here to the
+	// end of this method -- including the real upstream forward via
+	// s.server.upstream.SubmitShare, leaf-proxy's own genuinely
+	// different post-validation behavior vs. solo/direct (neither of
+	// which have an upstream to forward to) -- so the forward call
+	// happens on the SAME worker goroutine as its own validation,
+	// strictly after it completes, never lost or reordered relative
+	// to other submits from this session (each closure carries its
+	// own captured req.ID/job/diff/nonceHex, and s.server.upstream is
+	// safe for concurrent use across sessions/goroutines -- see
+	// UpstreamClient's own doc comment).
+	//
+	// Dispatched onto s.server.randomxPool -- the SAME
+	// internal/leaflib/solo.AsyncValidationPool type solo/direct
+	// already use (reused directly, not reimplemented -- see
+	// server.go's randomxPool field doc comment), a small, bounded,
+	// server-wide worker pool. Every piece of per-session/per-job
+	// mutable state finishSubmit touches is already safe under
+	// genuine concurrent execution: job.MarkNonceUsed already ran
+	// synchronously above, before dispatch; s.shareCount/
+	// s.blockCount/s.hashesAccumulated are atomic; Job's own fields
+	// (UpstreamJobID/WorkerNonce/PoolNonce/Height/ID/StaticDifficulty)
+	// are never mutated after issuance; s.mc.Write is already
+	// synchronized onto the connection's single writer goroutine
+	// (connection.go). Nothing here needed a NEW lock.
+	finishSubmit := func() {
+		valid, err := s.server.validator.ValidateBlobSeedResult(context.Background(), fullBlob, job.SeedHash, submit.Result)
+		if err != nil {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+			return
+		}
+		if !valid {
+			s.writeShareResponse(req.ID, false, "share is not a cryptographically valid RandomX proof for this job")
+			return
+		}
+
+		// Real, cryptographically re-validated genuine upstream-forward
+		// candidate: local credit (this is the vardiff accept-history
+		// signal too — same shape as leaf-solo's
+		// s.hashesAccumulated.Add(job.StaticDifficulty)), then forward it
+		// upstream for real, via the real pool submit RPC -- still on
+		// this same worker goroutine, off the read loop, so it can
+		// never get lost or reordered relative to validation itself.
+		s.shareCount.Add(1)
+		s.hashesAccumulated.Add(job.StaticDifficulty)
+		s.server.recordShareDecision(true)
+		accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce)
+		if err != nil {
+			s.server.logger.Printf("proxy: upstream submit failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
+			s.server.recordBlock(false)
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("upstream submit failed: %v", err))
+			return
+		}
+
+		s.blockCount.Add(1)
+		s.server.logger.Printf("proxy: share forwarded upstream by session %s (address %s) at height %d, upstream job %s, diff %d, accepted=%v", s.sessionID, s.address.Load(), job.Height, job.UpstreamJobID, diff, accepted)
+		s.server.recordBlock(true)
+		s.writeShareResponse(req.ID, true, "")
 	}
 
-	// Real, cryptographically re-validated genuine upstream-forward
-	// candidate: local credit (this is the vardiff accept-history
-	// signal too — same shape as leaf-solo's
-	// s.hashesAccumulated.Add(job.StaticDifficulty)), then forward it
-	// upstream for real, via the real pool submit RPC.
-	s.shareCount.Add(1)
-	s.hashesAccumulated.Add(job.StaticDifficulty)
-	s.server.recordShareDecision(true)
-	accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce)
-	if err != nil {
-		s.server.logger.Printf("proxy: upstream submit failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
-		s.server.recordBlock(false)
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("upstream submit failed: %v", err))
-		return
+	if ok := s.server.randomxPool.Submit(finishSubmit); !ok {
+		// Pool already stopped (server shutting down) -- respond with
+		// a real rejection rather than leaving this submit unanswered
+		// (mirrors solo.Session's/direct.Session's identical
+		// dispatch-failure handling exactly).
+		s.writeShareResponse(req.ID, false, "pool is shutting down, please reconnect")
 	}
-
-	s.blockCount.Add(1)
-	s.server.logger.Printf("proxy: share forwarded upstream by session %s (address %s) at height %d, upstream job %s, diff %d, accepted=%v", s.sessionID, s.address.Load(), job.Height, job.UpstreamJobID, diff, accepted)
-	s.server.recordBlock(true)
-	s.writeShareResponse(req.ID, true, "")
 }
 
 func (s *Session) recordJob(job *Job) {

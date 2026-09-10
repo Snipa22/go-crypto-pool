@@ -18,6 +18,7 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 )
 
 // --- test fixtures -----------------------------------------------------
@@ -913,5 +914,115 @@ func TestSession_GenerationCheck_FailsOpenWhenUpstreamHasNoGenerationCapability(
 	}
 	if h.validator.callCount() != 1 {
 		t.Fatalf("expected exactly 1 real RandomX re-validation call, got %d", h.validator.callCount())
+	}
+}
+
+// TestHandleSubmit_BannedAddressAndStaleGeneration_BothReject is the
+// real interaction test for the PR #85 rebase reconciliation of two
+// independent, both-legitimate handleSubmit fixes: 49ae357's
+// submit-time address-ban re-check and f2bfa0b's upstream-template
+// generation-staleness check. Both checks are placed back-to-back in
+// handleSubmit (ban re-check first, then generation staleness -- see
+// that function's own doc comment for the full ordering rationale),
+// so a submit that is BOTH from a now-banned address AND against a
+// now-stale upstream template generation must be rejected -- and,
+// since either reason is independently sufficient, this test pins
+// down which rejection message actually wins: the ban re-check, since
+// it is checked first. This is a deliberate, documented choice (see
+// session.go's handleSubmit doc comment), not an accident -- this
+// test exists specifically so a future reordering of these two checks
+// cannot silently change which rejection reason a real miner sees
+// without a test noticing.
+func TestHandleSubmit_BannedAddressAndStaleGeneration_BothReject(t *testing.T) {
+	addr := "banned-and-stale-generation"
+	tmpl := &WorkerTemplate{
+		Blob:              fakeBlob(76, 50),
+		ReservedOffset:    50,
+		ClientNonceOffset: -1,
+		PoolOffset:        -1,
+		SeedHash:          []byte("test-seed-hash-32-bytes-exactly!"),
+		Height:            123,
+		JobID:             "upstream-job-1",
+		TargetDiff:        1_000_000,
+		Difficulty:        1000,
+		Generation:        1,
+	}
+	source := newFakeTemplateSource(tmpl)
+	jm := NewJobManager(source, nil)
+	validator := &fakeValidator{accept: true}
+	upstream := &fakeUpstreamWithGeneration{}
+	upstream.accept = true
+	upstream.generation.Store(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{IdleTimeout: 30 * time.Second})
+	server := NewServer(cm, jm, validator, upstream, log.New(nil2Writer{}, "", 0), leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+
+	// Address-flags cache, starting unbanned so login succeeds --
+	// mirrors addressflags_enforcement_test.go's mid-session-ban
+	// pattern exactly.
+	src := &fakeAddressFlagsSource{flags: map[string]addressflags.Flags{}}
+	cache := addressflags.NewCache(src, 20*time.Millisecond, nil)
+	cache.Start(ctx)
+	server.EnableAddressFlags(cache)
+
+	serverConn, clientConn := net.Pipe()
+	go server.handleConn(ctx, serverConn, 1000)
+	t.Cleanup(func() { _ = clientConn.Close() })
+	c := &testClient{t: t, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
+
+	loginResp := c.login(t, addr)
+	if loginResp.Result.Status != "OK" {
+		t.Fatalf("setup: expected login to succeed while unbanned, got status=%q", loginResp.Result.Status)
+	}
+	jobID := loginResp.Result.Job.JobID
+
+	// Simulate BOTH real conditions becoming true at once, mirroring
+	// each fix's own individual test exactly: (1) a real upstream
+	// reconnect advances the upstream client's own generation past
+	// this already-issued job's TemplateGeneration (1), and (2) an
+	// operator bans this address mid-session.
+	upstream.generation.Store(2)
+	src.set(addr, addressflags.Flags{Banned: true})
+	waitForCachePoll(t, cache, addr, true)
+
+	// A genuine would-be upstream-forward-candidate submit against
+	// the SAME (now-stale AND now-banned) job/address.
+	claimedHash := hashForDifficulty(2_000_000) // above the 1,000,000 upstream block target
+	submitParams, err := json.Marshal(SubmitRequest{ID: loginResp.Result.ID, JobID: jobID, Nonce: nonceHexAt(1), Result: claimedHash})
+	if err != nil {
+		t.Fatalf("marshal submit params: %v", err)
+	}
+	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
+	resp := c.recvShareResponse()
+
+	if resp.Result != nil {
+		t.Fatal("expected a submit that is BOTH from a banned address AND against a stale generation to be rejected, got accepted")
+	}
+	if resp.Error == nil || resp.Error.Message == "" {
+		t.Fatal("expected a non-empty rejection message")
+	}
+
+	// THE pinned-down behavior: the ban re-check is ordered first in
+	// handleSubmit (see that function's own doc comment), so its
+	// rejection message is the one a real miner sees here -- NOT the
+	// generation-staleness message. This is deliberate and
+	// documented, not accidental.
+	const wantMessage = "this address is banned from this pool"
+	if resp.Error.Message != wantMessage {
+		t.Fatalf("expected the ban re-check's rejection message %q to win over the generation-staleness message, got %q", wantMessage, resp.Error.Message)
+	}
+
+	// Neither the expensive real RandomX re-validation nor the
+	// upstream forward call must ever have been invoked -- the
+	// submit is rejected before either check's own downstream work
+	// (nonce decode, blob construction, difficulty derivation,
+	// async-pool dispatch) ever runs.
+	if upstream.callCount() != 0 {
+		t.Fatalf("a submit rejected for being banned/stale must never reach the upstream pool, got %d calls", upstream.callCount())
+	}
+	if validator.callCount() != 0 {
+		t.Fatalf("a submit rejected for being banned/stale must never reach the real RandomX re-validation call, got %d calls", validator.callCount())
 	}
 }
