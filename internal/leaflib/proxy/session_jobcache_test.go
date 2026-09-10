@@ -44,9 +44,7 @@ func TestSession_CurrentJob_CacheHitOnRepeatedGetJob_ThenInvalidatesOnRealTempla
 	}
 
 	historyLen := func() int {
-		sess.jobsMu.Lock()
-		defer sess.jobsMu.Unlock()
-		return len(sess.jobList)
+		return sess.jobs.Len()
 	}
 
 	// Baseline: login itself already goes through currentJob and
@@ -308,22 +306,21 @@ func TestSession_CurrentJob_ReusingCachedJobDoesNotCorruptJobLogOrLastDelivered(
 	_ = sess.jobPayload(job)
 	_ = sess.jobPayload(job)
 
-	// jobLog/jobList: the job must be present exactly once, not
-	// duplicated.
-	sess.jobsMu.Lock()
-	count := 0
-	for _, id := range sess.jobList {
-		if id == job.ID {
-			count++
-		}
+	// jobLog/jobList (now leaflib.JobHistory): the job must be present
+	// exactly once, not duplicated -- JobHistory.Own confirms
+	// presence, and its own internal dedup-on-insert (Record) is what
+	// keeps re-recording the identical job.ID from growing the
+	// bounded history, so asserting the history length stayed exactly
+	// 1 across the three redundant jobPayload calls above proves the
+	// same "appears exactly once" property the original count-based
+	// assertion did.
+	historyLenAfter := sess.jobs.Len()
+	gotJob, inLog := sess.jobs.Own(job.ID)
+	if historyLenAfter != 1 {
+		t.Fatalf("expected job history to contain exactly 1 entry after repeated re-delivery of the same job.ID, got %d", historyLenAfter)
 	}
-	_, inLog := sess.jobLog[job.ID]
-	sess.jobsMu.Unlock()
-	if count != 1 {
-		t.Fatalf("expected job.ID to appear exactly once in jobList after repeated re-delivery, appeared %d times", count)
-	}
-	if !inLog {
-		t.Fatal("expected job.ID to still be present in jobLog after repeated re-delivery")
+	if !inLog || gotJob != job {
+		t.Fatal("expected job.ID to still be present in the job history after repeated re-delivery")
 	}
 
 	// lastDeliveredJobID/lastDeliveredDifficulty: still exactly this

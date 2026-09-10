@@ -3,7 +3,6 @@ package solo
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -777,45 +777,22 @@ func syntheticTipDedupHash(algo, network string, height uint64) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// jobIDFromBlockHash derives the real miner-facing job_id from a raw
-// block hash — ported exactly from go-tari-sha3x-solo-stratum's
-// minerTracking.GetJobJSON: fmt.Sprintf("%x", blockHash)[0:16], i.e.
-// the first 16 HEX CHARACTERS (8 bytes' worth) of the hex-encoded raw
-// hash, not the first 16 raw bytes.
+// jobIDFromBlockHash, newRandomHexID, and newSessionXN are now thin
+// wrappers over internal/leaflib's identically named exported
+// functions (EXTRACTED there so internal/leaflib/direct — which used
+// to hand-derive a byte-for-byte duplicate of each of these in its
+// own wireutil.go — can reuse the exact same real implementations;
+// see leaflib/wireutil.go's doc comment for the full rationale). See
+// each leaflib function's own doc comment for the full ported
+// provenance; unchanged behavior, just relocated.
 func jobIDFromBlockHash(blockHash []byte) (string, error) {
-	full := hex.EncodeToString(blockHash)
-	if len(full) < 16 {
-		return "", fmt.Errorf("block hash too short to derive a job id: got %d hex chars, need at least 16 (raw hash %d bytes)", len(full), len(blockHash))
-	}
-	return full[:16], nil
+	return leaflib.JobIDFromBlockHash(blockHash)
 }
 
-// newRandomHexID returns 8 cryptographically-random bytes, hex-encoded.
-// Used for the per-connection session/login "id" the wire protocol
-// hands a miner (LoginResult.ID in protocol.go) — unrelated to a job's
-// real, block-hash-derived job_id (jobIDFromBlockHash above).
 func newRandomHexID() (string, error) {
-	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf), nil
+	return leaflib.NewRandomHexID()
 }
 
-// newSessionXN returns a fresh per-session extranonce (xn): 2
-// cryptographically-random bytes, hex-encoded to a 4-character string
-// — ported exactly from go-tari-sha3x-solo-stratum's miner.go
-// connection-init (`buf := make([]byte, 8); binary.LittleEndian.
-// PutUint64(buf, rand.Uint64()); m.xn = fmt.Sprintf("%x", buf[0:2])`):
-// same size (2 bytes / 4 hex chars) and same "generated once per
-// connection at accept time, not per-job" timing, just sourced from
-// crypto/rand instead of math/rand since this package already uses
-// crypto/rand for newRandomHexID above and there's no reason to pull in
-// a second, weaker RNG for an adjacent purpose.
 func newSessionXN() (string, error) {
-	buf := make([]byte, 2)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf), nil
+	return leaflib.NewSessionXN()
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -54,7 +55,7 @@ func asLegacy(p JobPayload) legacyJobPayload {
 // s.agent). agent mirrors what handleLogin already stores via
 // s.agent.Store(login.Agent) at real login time.
 func newXNPTestSession(agent string, xn string) *Session {
-	s := &Session{xn: xn, jobLog: make(map[string]*Job)}
+	s := &Session{xn: xn, jobs: leaflib.NewJobHistory[*Job](0)}
 	s.agent.Store(agent)
 	return s
 }

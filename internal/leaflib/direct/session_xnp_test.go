@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -42,7 +43,7 @@ func asLegacy(p solo.JobPayload) legacyJobPayload {
 // sufficient to exercise jobPayload in isolation — mirrors
 // solo package's own identical helper (protocol_xnp_test.go).
 func newXNPTestSession(agent string, xn string) *Session {
-	s := &Session{xn: xn, jobLog: make(map[string]*solo.Job)}
+	s := &Session{xn: xn, jobs: leaflib.NewJobHistory[*solo.Job](0)}
 	s.agent.Store(agent)
 	return s
 }
@@ -209,10 +210,10 @@ func TestDirectJobPayloadXNPProxyShapeRXT(t *testing.T) {
 		t.Errorf("ClientPoolOffset = %v, want nil (RXT has no real reserved-coinbase-area concept)", *got.ClientPoolOffset)
 	}
 	if got.ClientNonceOffset == nil {
-		t.Fatalf("ClientNonceOffset is nil, want a pointer to %d (rxtXmrigNonceOffset)", rxtXmrigNonceOffset)
+		t.Fatalf("ClientNonceOffset is nil, want a pointer to %d (leaflib.RXTXmrigNonceOffset)", leaflib.RXTXmrigNonceOffset)
 	}
-	if *got.ClientNonceOffset != rxtXmrigNonceOffset {
-		t.Errorf("ClientNonceOffset = %d, want %d (rxtXmrigNonceOffset)", *got.ClientNonceOffset, rxtXmrigNonceOffset)
+	if *got.ClientNonceOffset != leaflib.RXTXmrigNonceOffset {
+		t.Errorf("ClientNonceOffset = %d, want %d (leaflib.RXTXmrigNonceOffset)", *got.ClientNonceOffset, leaflib.RXTXmrigNonceOffset)
 	}
 	if got.BlocktemplateBlob == nil {
 		t.Fatalf("BlocktemplateBlob is nil, want a non-nil hex string equal to Blob")
@@ -222,7 +223,7 @@ func TestDirectJobPayloadXNPProxyShapeRXT(t *testing.T) {
 	}
 
 	t.Logf("leaf-direct RXT proxy-shape OK — client_nonce_offset=%d (want %d), reserved_offset=nil, client_pool_offset=nil, blocktemplate_blob==blob (%d hex chars)",
-		*got.ClientNonceOffset, rxtXmrigNonceOffset, len(*got.BlocktemplateBlob))
+		*got.ClientNonceOffset, leaflib.RXTXmrigNonceOffset, len(*got.BlocktemplateBlob))
 }
 
 // TestDirectJobPayloadXNPCaseSensitivity mirrors solo's

@@ -4,6 +4,8 @@ package proxy
 import (
 	"encoding/hex"
 	"testing"
+
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
 
 // TestEndToEnd_DownstreamWireBlobNeverExceedsXMRigMaxBlobSize is
@@ -48,8 +50,7 @@ func TestEndToEnd_DownstreamWireBlobNeverExceedsXMRigMaxBlobSize(t *testing.T) {
 			}
 
 			sess := &Session{
-				jobLog:         make(map[string]*Job),
-				jobHistorySize: defaultProxySessionJobHistorySize,
+				jobs: leaflib.NewJobHistory[*Job](defaultProxySessionJobHistorySize),
 			}
 			payload := sess.jobPayload(job)
 
