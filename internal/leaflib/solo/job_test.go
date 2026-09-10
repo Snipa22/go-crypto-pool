@@ -416,6 +416,42 @@ func TestJobMarkNonceUsedIsConcurrencySafe(t *testing.T) {
 	}
 }
 
+// TestJobMarkNonceUsedCapsDistinctNonceGrowth is the required Fix 11
+// test (DISPATCH_BRIEF.md 2026-09-10): once maxTrackedNoncesPerJob
+// distinct nonces have been recorded against one Job, a genuinely NEW
+// nonce beyond the cap must be rejected (never grow the map further),
+// while a REPLAY of an already-tracked nonce must still be correctly
+// caught as a replay, not silently allowed through.
+func TestJobMarkNonceUsedCapsDistinctNonceGrowth(t *testing.T) {
+	job := &Job{ID: "deadbeefdeadbeef"}
+
+	for i := uint64(0); i < maxTrackedNoncesPerJob; i++ {
+		if !job.MarkNonceUsed(i) {
+			t.Fatalf("nonce %d (below the cap) must be reported as newly recorded", i)
+		}
+	}
+	if got := len(job.usedNonces); got != maxTrackedNoncesPerJob {
+		t.Fatalf("expected exactly %d tracked nonces at the cap, got %d", maxTrackedNoncesPerJob, got)
+	}
+
+	// A genuinely NEW nonce beyond the cap must be rejected -- and,
+	// critically, must NOT have grown the map any further.
+	if job.MarkNonceUsed(maxTrackedNoncesPerJob) {
+		t.Fatal("a genuinely new nonce beyond the cap must be rejected, not newly recorded")
+	}
+	if got := len(job.usedNonces); got != maxTrackedNoncesPerJob {
+		t.Fatalf("expected the tracked-nonce count to stay bounded at %d after a beyond-cap rejection, got %d", maxTrackedNoncesPerJob, got)
+	}
+
+	// A REPLAY of an already-tracked nonce (recorded before the cap
+	// was ever reached) must still be correctly caught as a replay
+	// even after the cap has been hit -- not silently allowed
+	// through.
+	if job.MarkNonceUsed(0) {
+		t.Fatal("a replay of an already-tracked nonce must still be rejected once the cap has been reached, not silently allowed through")
+	}
+}
+
 // TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate confirms
 // the genMu double-check-locking pattern: many goroutines racing to be
 // the FIRST requester of a brand new xn must all observe the same

@@ -206,6 +206,17 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 	}
 	m := metrics.New(version, maxAddressLabels)
 	m.SetSnapshotSource(s.sessionSnapshots)
+	// Fix 9 (DISPATCH_BRIEF.md 2026-09-10): mirrors solo/direct's
+	// identical async-pool wiring exactly -- read s.randomxPool at
+	// CALL time (not captured here), since SetRandomXWorkerPoolSize
+	// may replace it before Serve begins.
+	m.SetAsyncPoolSource(func() metrics.AsyncPoolStats {
+		return metrics.AsyncPoolStats{
+			QueueDepth:         s.randomxPool.QueueDepth(),
+			InFlightWorkers:    s.randomxPool.InFlightWorkers(),
+			SubmitBlockedTotal: s.randomxPool.SubmitBlockedTotal(),
+		}
+	})
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	return m
@@ -319,6 +330,41 @@ func (s *Server) recordConnectionError(category string) {
 	s.metrics.ConnectionErrorsTotal.WithLabelValues(category).Inc()
 }
 
+// recordShare is the Fix 9 (DISPATCH_BRIEF.md 2026-09-10) real
+// accept/reject counter hook, mirroring solo.Server.recordShare/
+// direct.Server.recordShare exactly -- called from session.go's
+// writeShareResponse for EVERY submit outcome (share or block,
+// accepted or rejected), the single response-writing choke point
+// every real branch in handleSubmit already flows through. Distinct
+// from recordShareDecision above (local-credit vs upstream-forward);
+// this tracks whether the submit was accepted at all.
+func (s *Server) recordShare(accepted bool) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.SharesTotal.WithLabelValues(resultLabel(accepted)).Inc()
+}
+
+// recordBanRejection is the Fix 9 real counter hook for the two
+// address-ban enforcement points (handleLogin's login-time check,
+// handleSubmit's mid-session submit-time re-check) that were
+// previously log-only -- see metrics.BanRejectionPhaseLogin/
+// BanRejectionPhaseSubmit's doc comment.
+func (s *Server) recordBanRejection(phase string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.BanRejectionsTotal.WithLabelValues(phase).Inc()
+}
+
+// resultLabel mirrors solo.Server's own identical helper exactly.
+func resultLabel(accepted bool) string {
+	if accepted {
+		return metrics.ResultAccepted
+	}
+	return metrics.ResultRejected
+}
+
 // repushAllSessions regenerates and pushes a fresh job to every
 // currently-connected, logged-in downstream session, AT THAT
 // SESSION'S OWN CURRENT VARDIFF DIFFICULTY — mirrors
@@ -379,7 +425,18 @@ func (s *Server) repushAllSessions() {
 	}
 }
 
-func (s *Server) recordBlock(_ bool) {}
+// recordBlock is the Fix 9 (DISPATCH_BRIEF.md 2026-09-10) real
+// block-found counter hook, mirroring solo.Server.recordBlock/
+// direct.Server.recordBlock exactly -- previously a no-op stub.
+// Called from session.go's handleSubmit at its two real
+// block-level-forward outcomes (upstream submit error/rejection vs.
+// a real accepted result).
+func (s *Server) recordBlock(accepted bool) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.BlocksTotal.WithLabelValues(resultLabel(accepted)).Inc()
+}
 
 // Serve accepts downstream miner connections on ln until ctx is
 // cancelled or ln is closed, stamping every session accepted on ln

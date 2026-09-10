@@ -164,6 +164,67 @@ func (f *fakeShareTransport) blockCount() int {
 	return len(f.blocks)
 }
 
+// shareAt/blockAt are the safe, mutex-guarded accessors for a
+// specific recorded share/block -- required as of Fix 12
+// (DISPATCH_BRIEF.md 2026-09-10): forwardShare/forwardBlock now run
+// on a separate forwardPool worker goroutine (see session.go's own
+// doc comment on that dispatch), so a test indexing h.transport.
+// shares[0]/blocks[0] directly (bypassing f.mu) races against that
+// goroutine's own still-in-progress append under `go test -race`
+// unless it goes through these accessors instead, AFTER first
+// confirming via waitForShareCount/waitForBlockCount that the entry
+// genuinely exists.
+func (f *fakeShareTransport) shareAt(i int) *poolpb.Share {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.shares[i]
+}
+
+func (f *fakeShareTransport) blockAt(i int) *poolpb.Block {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.blocks[i]
+}
+
+// waitForShareCount/waitForBlockCount poll fakeShareTransport until it
+// reports the real, expected count or the test times out -- required
+// as of Fix 12 (DISPATCH_BRIEF.md 2026-09-10): forwardShare/
+// forwardBlock are now dispatched onto Server.forwardPool (a separate
+// async worker pool, see session.go's own doc comment on that
+// dispatch) rather than run inline/synchronously before the wire
+// response is written, so a test can no longer assume the forward has
+// already landed the instant it has received/parsed the miner-facing
+// response. Mirrors this package's own addressflags_enforcement_test.go
+// waitForDirectCachePoll's identical "poll a real background
+// mechanism until it converges, don't race a fixed sleep" pattern.
+func waitForShareCount(t *testing.T, tr *fakeShareTransport, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := tr.shareCount(); got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fakeShareTransport.shareCount() never reached %d within the test deadline, got %d", want, tr.shareCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForBlockCount(t *testing.T, tr *fakeShareTransport, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := tr.blockCount(); got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fakeShareTransport.blockCount() never reached %d within the test deadline, got %d", want, tr.blockCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func (f *fakeShareTransport) Close() error { return nil }
 
 // fakeAcceptingBlockClient is a blockSubmitClient test double that
@@ -654,10 +715,8 @@ func TestDirectSessionSHA3XShareCarriesNonZeroTimestamp(t *testing.T) {
 	if !resp.Result {
 		t.Fatalf("expected the share to be accepted, got %#v", resp)
 	}
-	if h.transport.shareCount() != 1 {
-		t.Fatalf("expected exactly 1 share forwarded to the backend transport, got %d", h.transport.shareCount())
-	}
-	ts := h.transport.shares[0].GetTimestamp()
+	waitForShareCount(t, h.transport, 1)
+	ts := h.transport.shareAt(0).GetTimestamp()
 	if ts == 0 {
 		t.Fatal("BUG REGRESSION: SHA3X Share.Timestamp is 0 — the real submission time was never stamped")
 	}
@@ -732,10 +791,8 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 	// skip the Timestamp assertion (nothing to check) but require the
 	// rejection reason to be the real validator, not a wiring bug.
 	if resp.Result {
-		if h.transport.shareCount() != 1 {
-			t.Fatalf("expected exactly 1 share forwarded to the backend transport, got %d", h.transport.shareCount())
-		}
-		ts := h.transport.shares[0].GetTimestamp()
+		waitForShareCount(t, h.transport, 1)
+		ts := h.transport.shareAt(0).GetTimestamp()
 		if ts == 0 {
 			t.Fatal("BUG REGRESSION: C29 Share.Timestamp is 0 — the real submission time was never stamped")
 		}
@@ -813,10 +870,8 @@ func TestDirectSessionRXTShareCarriesNonZeroTimestamp(t *testing.T) {
 	if resp.Result == nil {
 		t.Fatalf("expected a genuinely correct RXT share to be ACCEPTED, got rejected: %v", resp.Error)
 	}
-	if h.transport.shareCount() != 1 {
-		t.Fatalf("expected exactly 1 share forwarded to the backend transport, got %d", h.transport.shareCount())
-	}
-	ts := h.transport.shares[0].GetTimestamp()
+	waitForShareCount(t, h.transport, 1)
+	ts := h.transport.shareAt(0).GetTimestamp()
 	if ts == 0 {
 		t.Fatal("BUG REGRESSION: RXT Share.Timestamp is 0 — the real submission time was never stamped")
 	}
@@ -935,16 +990,14 @@ func TestDirectSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 	if h.submit.calls.Load() != 0 {
 		t.Errorf("MultiSubmit.SubmitBlock should not have been called, got %d calls", h.submit.calls.Load())
 	}
-	if h.transport.shareCount() != 1 {
-		t.Errorf("expected exactly 1 share forwarded to the backend transport, got %d", h.transport.shareCount())
-	}
+	waitForShareCount(t, h.transport, 1)
 	if h.transport.blockCount() != 0 {
 		t.Errorf("expected 0 blocks forwarded to the backend transport, got %d", h.transport.blockCount())
 	}
-	if got := h.transport.shares[0].GetPoolType(); got != poolpb.PoolType_POOL_TYPE_SOLO {
+	if got := h.transport.shareAt(0).GetPoolType(); got != poolpb.PoolType_POOL_TYPE_SOLO {
 		t.Errorf("forwarded share must carry the server's configured PoolType (SOLO), got %v", got)
 	}
-	if got := h.transport.shares[0].GetPoolId(); got != 42 {
+	if got := h.transport.shareAt(0).GetPoolId(); got != 42 {
 		t.Errorf("forwarded share must carry the server's configured PoolID (42), got %v", got)
 	}
 }
@@ -976,14 +1029,12 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	if h.submit.calls.Load() != 1 {
 		t.Errorf("expected exactly 1 MultiSubmit.SubmitBlock call, got %d", h.submit.calls.Load())
 	}
-	if h.transport.shareCount() != 1 {
-		t.Errorf("expected the block-finding submit to ALSO forward a share, got %d", h.transport.shareCount())
-	}
-	// forwardBlock runs on the session's handling goroutine AFTER the
-	// wire response has already been flushed (see handleSubmit's own
-	// ordering), so the test's own read of the response can race the
-	// session goroutine's subsequent forwardBlock call — poll briefly
-	// rather than asserting immediately.
+	// forwardShare/forwardBlock now run on Server.forwardPool's own
+	// worker goroutine (Fix 12, DISPATCH_BRIEF.md 2026-09-10), AFTER
+	// the wire response has already been flushed -- so the test's
+	// own read of the response can race those forward calls; poll
+	// briefly rather than asserting immediately.
+	waitForShareCount(t, h.transport, 1)
 	deadline := time.Now().Add(2 * time.Second)
 	for h.transport.blockCount() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -991,10 +1042,10 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	if h.transport.blockCount() != 1 {
 		t.Errorf("expected exactly 1 block forwarded to the backend transport, got %d", h.transport.blockCount())
 	}
-	if got := h.transport.shares[0].GetPoolType(); got != poolpb.PoolType_POOL_TYPE_SOLO {
+	if got := h.transport.shareAt(0).GetPoolType(); got != poolpb.PoolType_POOL_TYPE_SOLO {
 		t.Errorf("forwarded block-finding share must carry the server's configured PoolType (SOLO), got %v", got)
 	}
-	if got := h.transport.shares[0].GetPoolId(); got != 42 {
+	if got := h.transport.shareAt(0).GetPoolId(); got != 42 {
 		t.Errorf("forwarded block-finding share must carry the server's configured PoolID (42), got %v", got)
 	}
 	h.transport.mu.Lock()

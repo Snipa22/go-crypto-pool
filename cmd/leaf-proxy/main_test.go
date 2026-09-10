@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
 
 // precedenceCase drives one subtest of TestLoadConfigPrecedence. toml, if
@@ -262,6 +264,48 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			check: func(t *testing.T, cfg config) {
 				if cfg.jobMaxAge != 300*time.Second {
 					t.Errorf("jobMaxAge = %v, want flag value %v (flag must win full precedence)", cfg.jobMaxAge, 300*time.Second)
+				}
+			},
+		},
+
+		// -- int field: max-connections (Fix 13, DISPATCH_BRIEF.md
+		// 2026-09-10 -- the default changed from 0 (unlimited) to a
+		// real, generous-but-bounded leaflib.DefaultLeafMaxConnections;
+		// this block proves the new default AND that an operator can
+		// still explicitly opt back into 0/unlimited via flag or env,
+		// exactly as before this fix).
+		{
+			name: "max-connections/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.maxConnections != leaflib.DefaultLeafMaxConnections {
+					t.Errorf("maxConnections = %d, want the new hardcoded default %d", cfg.maxConnections, leaflib.DefaultLeafMaxConnections)
+				}
+			},
+		},
+		{
+			name: "max-connections/flag-explicit-zero-still-means-unlimited",
+			args: []string{"-max-connections=0"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.maxConnections != 0 {
+					t.Errorf("maxConnections = %d, want 0 -- an operator explicitly setting 0 must still get unlimited, the default-value change must not remove this override", cfg.maxConnections)
+				}
+			},
+		},
+		{
+			name: "max-connections/env-explicit-zero-still-means-unlimited",
+			env:  map[string]string{"LEAF_PROXY_MAX_CONNECTIONS": "0"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.maxConnections != 0 {
+					t.Errorf("maxConnections = %d, want 0 -- an operator explicitly setting env=0 must still get unlimited", cfg.maxConnections)
+				}
+			},
+		},
+		{
+			name: "max-connections/flag-custom-value",
+			args: []string{"-max-connections=500"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.maxConnections != 500 {
+					t.Errorf("maxConnections = %d, want flag value 500 (flag must still override the new default)", cfg.maxConnections)
 				}
 			},
 		},

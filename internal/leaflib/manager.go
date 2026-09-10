@@ -39,6 +39,35 @@ func (g *DefaultGate) ShouldAccept(_ net.Addr) bool {
 	return g.manager.Count() < g.manager.maxConnections
 }
 
+// DefaultLeafMaxConnections is Fix 13's (DISPATCH_BRIEF.md
+// 2026-09-10) real, generous-but-bounded default for each leaf
+// binary's own -max-connections/LEAF_*_MAX_CONNECTIONS flag --
+// leaf-solo, leaf-direct, and leaf-proxy's own cmd/ packages all
+// reference this single constant (rather than duplicating the
+// literal three times) so the chosen default can never silently
+// drift between them. This is purely a DEFAULT-value change: this
+// package's own "0 or negative means unlimited" ManagerConfig.
+// MaxConnections/DefaultGate contract (see both their doc comments
+// above) is completely unchanged -- an operator who explicitly wants
+// unlimited connections can still pass 0 via their leaf's own flag/
+// env var exactly as before this fix.
+//
+// 10000 is chosen as a round, generous-but-bounded number for real
+// production mining-pool connection volumes: this repo's own
+// codebase has no other existing hint of an expected miner-count
+// ceiling per leaf process (no prior default, no documented
+// operational scale target), so this default is deliberately a
+// simple, memorable round number well above what any single leaf
+// process is realistically expected to serve on its own (a pool
+// operator running enough miners to approach this on ONE leaf
+// process would already be expected to run multiple leaf instances/
+// ports for other operational reasons), while still being a REAL,
+// finite bound -- the actual bug this fix closes (defaulting to
+// unlimited, i.e. zero built-in protection against an unbounded
+// connection flood, on all three binaries) is closed regardless of
+// the exact number chosen, as long as it is finite and generous.
+const DefaultLeafMaxConnections = 10000
+
 // ManagerConfig configures a ConnectionManager.
 type ManagerConfig struct {
 	// MaxConnections caps the number of simultaneously-registered

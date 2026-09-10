@@ -80,7 +80,18 @@ type UpstreamClient struct {
 	cm   *leaflib.ConnectionManager
 	mc   *leaflib.ManagedConnection
 
-	sessionID string // the pool's own assigned session id, from the login response
+	// sessionID is the pool's own assigned session id, from the
+	// login response. An atomic.Pointer[string] (matching the
+	// codebase's existing convention for other single-value mutable
+	// state that is written by one path and read concurrently by
+	// others -- e.g. template/generation/connected below) rather
+	// than a plain string, because login() writes it on every
+	// (re)connect generation while SubmitShare/sendKeepalive read it
+	// concurrently from other goroutines (a downstream submit, or
+	// the 30s heartbeat ticker) -- a real, confirmed data race
+	// (Finding 3) under `go test -race` before this fix. See
+	// sessionID()/setSessionID() below.
+	sessionID atomic.Pointer[string]
 
 	sendID atomic.Int64
 
@@ -475,7 +486,24 @@ func (uc *UpstreamClient) Close() error {
 
 // SessionID returns the pool-assigned session id from the login
 // response.
-func (uc *UpstreamClient) SessionID() string { return uc.sessionID }
+func (uc *UpstreamClient) SessionID() string { return uc.sessionIDLoad() }
+
+// sessionIDLoad is the internal atomic read helper for uc.sessionID
+// (see its doc comment) -- returns "" if no session id has been
+// assigned yet (before the first successful login).
+func (uc *UpstreamClient) sessionIDLoad() string {
+	if p := uc.sessionID.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// sessionIDStore is the internal atomic write helper for
+// uc.sessionID (see its doc comment) -- called by login() on every
+// (re)connect generation.
+func (uc *UpstreamClient) sessionIDStore(id string) {
+	uc.sessionID.Store(&id)
+}
 
 // CurrentTemplate returns the most recently received upstream job as
 // a *WorkerTemplate, or nil if no job has been received yet.
@@ -538,7 +566,29 @@ func (uc *UpstreamClient) nextID() int {
 // `this.sendLog[rawSend.id] = rawSend` bookkeeping (there, used to
 // remember which METHOD an id was for; here, the caller already knows
 // what it's waiting for, so the channel alone is enough).
+//
+// FIXED (real data race, Finding 3): this used to read uc.mc directly
+// and unsynchronized, racing dialAndLogin's cmMu-guarded reassignment
+// of uc.mc during a reconnect (a submit/keepalive send concurrently
+// in flight against the OLD mc while dialAndLogin swaps in a NEW one
+// -- confirmed via `go test -race`, see
+// TestUpstreamClient_Send_RacesReconnect_NoDataRace). Snapshotting mc
+// under cmMu here, at the very top, mirrors the exact locking pattern
+// dialAndLogin/Close already use for the same field (see cmMu's own
+// doc comment) rather than inventing a new lock. A send that
+// snapshots the pre-reconnect mc and then writes to it after a
+// reconnect has already swapped in a new one is not a NEW bug this
+// introduces -- mc.Write on an already-superseded (but not yet
+// garbage) ManagedConnection just fails cleanly (the old connection is
+// closed by dialAndLogin's login-failure path or was already dead,
+// which is WHY a reconnect happened in the first place), the same
+// outcome this call already handled via its ordinary error return
+// before this fix.
 func (uc *UpstreamClient) send(ctx context.Context, req Request) (UpstreamResponse, error) {
+	uc.cmMu.Lock()
+	mc := uc.mc
+	uc.cmMu.Unlock()
+
 	ch := make(chan UpstreamResponse, 1)
 	uc.pendingMu.Lock()
 	uc.pending[req.ID] = ch
@@ -554,7 +604,10 @@ func (uc *UpstreamClient) send(ctx context.Context, req Request) (UpstreamRespon
 		return UpstreamResponse{}, fmt.Errorf("proxy: marshaling upstream request: %w", err)
 	}
 	buf = append(buf, '\n')
-	if err := uc.mc.Write(buf); err != nil {
+	if mc == nil {
+		return UpstreamResponse{}, errors.New("proxy: no upstream connection established yet")
+	}
+	if err := mc.Write(buf); err != nil {
 		return UpstreamResponse{}, fmt.Errorf("proxy: writing to upstream pool: %w", err)
 	}
 
@@ -597,7 +650,7 @@ func (uc *UpstreamClient) login(ctx context.Context) (UpstreamLoginResult, error
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
 		return UpstreamLoginResult{}, fmt.Errorf("proxy: decoding upstream login result: %w", err)
 	}
-	uc.sessionID = result.ID
+	uc.sessionIDStore(result.ID)
 	uc.applyJob(result.Job)
 	return result, nil
 }
@@ -620,7 +673,7 @@ func (uc *UpstreamClient) SubmitShare(ctx context.Context, jobID, nonceHex, resu
 		Result:      resultHex,
 		WorkerNonce: workerNonce,
 		PoolNonce:   poolNonce,
-		ID:          uc.sessionID,
+		ID:          uc.sessionIDLoad(),
 	})
 	if err != nil {
 		return false, err
@@ -661,8 +714,8 @@ func (uc *UpstreamClient) SubmitShare(ctx context.Context, jobID, nonceHex, resu
 // meaning it is.
 func (uc *UpstreamClient) sendKeepalive(ctx context.Context) error {
 	var params json.RawMessage
-	if uc.sessionID != "" {
-		p, err := json.Marshal(UpstreamKeepaliveParams{ID: uc.sessionID})
+	if sid := uc.sessionIDLoad(); sid != "" {
+		p, err := json.Marshal(UpstreamKeepaliveParams{ID: sid})
 		if err != nil {
 			uc.logger.Printf("proxy: upstream keepalive failed: %v", err)
 			return err

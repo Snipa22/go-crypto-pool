@@ -635,18 +635,52 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// GENUINE DIFFERENCE FROM leaf-solo: every validated share (not
 		// just block-level finds) is forwarded to the real backend over
 		// transport.ShareTransport — this is leaf-direct's whole reason
-		// for existing (see this package's doc comment). Forwarding
-		// happens synchronously here but with a bounded context timeout
-		// so a slow/unreachable backend degrades the miner's wire
-		// response latency rather than the process hanging indefinitely;
-		// a transport failure is logged and does NOT flip an otherwise
-		// cryptographically-valid share into a wire-level rejection (the
-		// miner did real, valid work regardless of whether the backend
-		// happened to be reachable at that instant — mirrors leaf-solo's
-		// own "SubmitBlock error still counts vardiff progress, still
-		// tells the miner their PoW was rejected only for the pool's own
-		// infra reasons" philosophy, generalized to shares).
-		s.forwardShare(share)
+		// for existing (see this package's doc comment).
+		//
+		// Fix 12 (DISPATCH_BRIEF.md 2026-09-10): dispatched onto
+		// s.server.forwardPool -- a SEPARATE, dedicated bounded worker
+		// pool from s.server.randomxPool (see forwardPool's own doc
+		// comment) -- rather than run inline here. For an RXT/RXM
+		// submit, "here" is already one of randomxPool's own small,
+		// fixed worker goroutines (this whole finishSubmit closure is
+		// dispatched there just above handleSubmit's own DISPATCH
+		// comment) -- running forwardShare's up-to-5s backend call
+		// synchronously on that SAME goroutine used to tie up one of
+		// randomxPool's limited workers for the whole span, degrading
+		// process-wide RXT/RXM validation throughput for every OTHER
+		// session's shares while this one waited on a slow-but-
+		// responding backend. Dispatching onto forwardPool instead
+		// means this leaf's wire response to the miner (below) no
+		// longer even waits on the backend round-trip at all, and a
+		// slow backend can only ever saturate forwardPool's own
+		// bounded capacity, never randomxPool's. A transport failure
+		// is still logged only (forwardShare's own doc comment) and
+		// still never flips an otherwise cryptographically-valid share
+		// into a wire-level rejection -- the miner did real, valid
+		// work regardless of whether the backend happened to be
+		// reachable, or whether this dispatch even ran before the
+		// pool was possibly stopped during a graceful shutdown race
+		// (logged, not fatal, if so).
+		//
+		// TrySubmit, deliberately NOT Submit: this closure is already
+		// running ON one of randomxPool's own worker goroutines (see
+		// above) -- Submit's real backpressure-via-blocking contract
+		// would let a genuinely saturated forwardPool block THIS
+		// randomxPool worker, reproducing the exact cross-pool
+		// resource contention this fix exists to eliminate, just one
+		// level removed (confirmed via this package's own
+		// TestDirectForwardShare_SlowBackendDoesNotStarveSharedValidationPool,
+		// which deadlocked under Submit here before being fixed to
+		// use TrySubmit). TrySubmit's "drop and log rather than
+		// block" contract is correct here: forwardPool's queue is
+		// already generously sized for any realistic burst -- a
+		// dropped forward only happens under a genuinely pathological,
+		// sustained backend stall, and losing one backend-accounting
+		// forward is far preferable to ever blocking real RandomX
+		// validation throughput for other sessions.
+		if ok := s.server.forwardPool.TrySubmit(func() { s.forwardShare(share) }); !ok {
+			s.server.logger.Printf("direct: forward pool saturated or unavailable, dropping share forward to backend for session %s", s.sessionID)
+		}
 
 		if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
 			s.hashesAccumulated.Add(job.StaticDifficulty)
@@ -728,7 +762,17 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// visibility — the backend does not need per-node dispatch detail,
 		// only that a block was found and submitted, see
 		// transport.ShareTransport.SubmitBlock's doc comment).
-		s.forwardBlock(share, job, blockHashHex)
+		//
+		// Fix 12 (DISPATCH_BRIEF.md 2026-09-10): dispatched onto
+		// s.server.forwardPool exactly like forwardShare above (see
+		// that call site's own doc comment for the full rationale,
+		// including why this uses TrySubmit rather than Submit) --
+		// forwardBlock's own timeout is even longer (10s), so leaving
+		// it inline here would tie up a randomxPool worker for an
+		// even longer span on the (rare, but real) block-find path.
+		if ok := s.server.forwardPool.TrySubmit(func() { s.forwardBlock(share, job, blockHashHex) }); !ok {
+			s.server.logger.Printf("direct: forward pool saturated or unavailable, dropping block forward to backend for session %s", s.sessionID)
+		}
 
 		go s.server.jobManager.InvalidateAll()
 	}

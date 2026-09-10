@@ -203,6 +203,22 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 	}
 	m := metrics.New(version, maxAddressLabels)
 	m.SetSnapshotSource(s.sessionSnapshots)
+	// Fix 9 (DISPATCH_BRIEF.md 2026-09-10): wire the shared
+	// AsyncValidationPool's live stats into the new
+	// leaf_async_validation_* metrics -- read s.randomxPool at CALL
+	// time (not captured as a local variable here), since
+	// SetRandomXWorkerPoolSize (below) may replace it with a freshly
+	// constructed pool before Serve begins accepting connections;
+	// reading the field fresh on every scrape keeps this correct
+	// regardless of call order between EnableMetrics and
+	// SetRandomXWorkerPoolSize.
+	m.SetAsyncPoolSource(func() metrics.AsyncPoolStats {
+		return metrics.AsyncPoolStats{
+			QueueDepth:         s.randomxPool.QueueDepth(),
+			InFlightWorkers:    s.randomxPool.InFlightWorkers(),
+			SubmitBlockedTotal: s.randomxPool.SubmitBlockedTotal(),
+		}
+	})
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	// Wire the real XNP-reservation-unavailable counter into this

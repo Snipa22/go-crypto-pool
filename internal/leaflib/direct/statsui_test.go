@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 )
@@ -233,16 +234,28 @@ func TestServerStats_ReflectsRealBackendTransportHealth(t *testing.T) {
 	if !resp.Result {
 		t.Fatalf("expected the setup submit to be accepted, got %#v", resp)
 	}
-	if h.transport.shareCount() != 1 {
-		t.Fatalf("expected exactly 1 share forwarded, got %d", h.transport.shareCount())
-	}
+	waitForShareCount(t, h.transport, 1)
 
-	st = h.server.Stats()
+	// forwardShare's recordTransportSuccess call (the actual bookkeeping
+	// hook Stats().BackendHealthy/BackendLastErrorKind reflect) runs a
+	// moment AFTER the mock transport's own SubmitShare append that
+	// waitForShareCount just confirmed -- both on the same forwardPool
+	// worker goroutine, but with no further synchronization the test
+	// goroutine can observe directly, so poll briefly here too rather
+	// than assuming it has already happened.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st = h.server.Stats()
+		if st.BackendLastErrorKind == "share" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("BackendLastErrorKind never became %q within the test deadline, got %q", "share", st.BackendLastErrorKind)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if !st.BackendHealthy {
 		t.Errorf("expected BackendHealthy=true after a real successful forward, got false")
-	}
-	if st.BackendLastErrorKind != "share" {
-		t.Errorf("BackendLastErrorKind (last-activity kind) = %q, want %q", st.BackendLastErrorKind, "share")
 	}
 	if st.BackendLastCheckedAt.IsZero() {
 		t.Errorf("expected a non-zero BackendLastCheckedAt after a real forward")

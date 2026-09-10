@@ -149,7 +149,49 @@ type Server struct {
 	// it reuses solo's exported AsyncValidationPool rather than
 	// duplicating the type.
 	randomxPool *solo.AsyncValidationPool
+
+	// forwardPool is Fix 12's (DISPATCH_BRIEF.md 2026-09-10) own
+	// SEPARATE, dedicated worker pool for session.go's
+	// forwardShare/forwardBlock backend-transport calls -- see those
+	// methods' own doc comments and defaultForwardPoolWorkers' doc
+	// comment for the full rationale. Deliberately NOT the same
+	// randomxPool instance above: forwardShare/forwardBlock used to
+	// run INSIDE finishSubmit, i.e. ON randomxPool's own worker
+	// goroutines for RXT/RXM submits -- a slow-but-responding backend
+	// (up to forwardShare's 5s/forwardBlock's 10s timeout) tied up
+	// one of randomxPool's small, fixed number of workers for that
+	// entire span, degrading process-wide RXT/RXM validation
+	// throughput for every OTHER session's shares while it waited.
+	// Dispatching these calls onto this leaf pool instead means a
+	// slow backend can only ever saturate ITS OWN bounded pool, never
+	// borrow capacity from (or block) real RandomX validation.
+	// Reuses solo.AsyncValidationPool's exact same generic
+	// closure-dispatching implementation (it has nothing
+	// RandomX-specific in its actual mechanics, only in its doc
+	// comments -- see that type's own doc comment) rather than
+	// hand-rolling a second bounded-queue-plus-fixed-workers type for
+	// what is structurally the identical shape.
+	forwardPool *solo.AsyncValidationPool
 }
+
+// defaultForwardPoolWorkers/defaultForwardPoolQueueSize size Fix 12's
+// forwardPool (DISPATCH_BRIEF.md 2026-09-10). Unlike randomxPool
+// (CPU-bound RandomX hashing, sized to runtime.NumCPU() -- see
+// solo/asyncvalidation.go), backend-forward calls are I/O-bound
+// (a single outbound HTTP round-trip each, transport.ShareTransport),
+// so scaling with host CPU count has no real justification here --
+// what matters is bounding how many concurrent in-flight backend
+// calls this leaf will ever make, independent of how many CPU cores
+// happen to be available. 16 is a generous-but-bounded fixed
+// concurrency limit for outbound HTTP calls to one backend (well
+// beyond what a single backend endpoint needs to stay responsive
+// under this leaf's own realistic accepted-share rate, while still
+// bounding worst-case concurrent backend load to a small, fixed
+// number regardless of miner count). AsyncValidationQueueSize (256)
+// is reused unchanged for the queue bound, matching this codebase's
+// existing "generous headroom for a burst, real backpressure once
+// genuinely full" convention (see that constant's own doc comment).
+const defaultForwardPoolWorkers = 16
 
 // ServerConfig configures a Server.
 type ServerConfig struct {
@@ -252,6 +294,11 @@ func NewServer(cfg ServerConfig) *Server {
 		// SetRandomXWorkerPoolSize (see cmd/leaf-direct's
 		// -randomx-workers flag) before Serve begins.
 		randomxPool: solo.NewAsyncValidationPool(0, solo.AsyncValidationQueueSize),
+		// Fix 12 (DISPATCH_BRIEF.md 2026-09-10): a separate, dedicated
+		// pool for forwardShare/forwardBlock -- see forwardPool's own
+		// doc comment and defaultForwardPoolWorkers' doc comment for
+		// the full rationale/sizing.
+		forwardPool: solo.NewAsyncValidationPool(defaultForwardPoolWorkers, solo.AsyncValidationQueueSize),
 	}
 	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {
@@ -277,6 +324,17 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetr
 	}
 	m := directmetrics.New(version, maxAddressLabels)
 	m.SetSnapshotSource(s.sessionSnapshots)
+	// Fix 9 (DISPATCH_BRIEF.md 2026-09-10): mirrors
+	// solo.Server.EnableMetrics' identical async-pool wiring exactly
+	// -- read s.randomxPool at CALL time (not captured here), since
+	// SetRandomXWorkerPoolSize may replace it before Serve begins.
+	m.SetAsyncPoolSource(func() directmetrics.AsyncPoolStats {
+		return directmetrics.AsyncPoolStats{
+			QueueDepth:         s.randomxPool.QueueDepth(),
+			InFlightWorkers:    s.randomxPool.InFlightWorkers(),
+			SubmitBlockedTotal: s.randomxPool.SubmitBlockedTotal(),
+		}
+	})
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	// Wire the real XNP-reservation-unavailable counter into this
@@ -301,6 +359,21 @@ func (s *Server) SetHideRemoteAddress(hide bool) {
 func (s *Server) SetRandomXWorkerPoolSize(workers, queueSize int) {
 	s.randomxPool.Stop()
 	s.randomxPool = solo.NewAsyncValidationPool(workers, queueSize)
+}
+
+// SetForwardPoolSize replaces this Server's forwardPool (Fix 12,
+// DISPATCH_BRIEF.md 2026-09-10) with a freshly constructed one sized
+// to workers/queueSize -- mirrors SetRandomXWorkerPoolSize's exact
+// same "stop the old one, construct a fresh one" pattern and
+// pre-Serve-only calling convention. workers<=0 falls back to
+// solo.DefaultAsyncValidationWorkers() (runtime.NumCPU()) via
+// NewAsyncValidationPool's own fallback -- an operator who wants
+// forwardPool's own, genuinely different (I/O-bound, not CPU-bound)
+// sizing rationale honored instead should pass a positive workers
+// value explicitly (see defaultForwardPoolWorkers' doc comment).
+func (s *Server) SetForwardPoolSize(workers, queueSize int) {
+	s.forwardPool.Stop()
+	s.forwardPool = solo.NewAsyncValidationPool(workers, queueSize)
 }
 
 // SetInvalidShareGuardConfig mirrors solo.Server's own identical
@@ -632,5 +705,8 @@ func (s *Server) Shutdown() {
 	}
 	if s.randomxPool != nil {
 		s.randomxPool.Stop()
+	}
+	if s.forwardPool != nil {
+		s.forwardPool.Stop()
 	}
 }

@@ -144,6 +144,16 @@ type Job struct {
 // MarkNonceUsed records nonce as spent against this job and reports
 // whether it was newly recorded (true) or already used (false — a
 // replay that must be rejected without being credited again).
+//
+// Fix 11 (DISPATCH_BRIEF.md 2026-09-10): capped at
+// maxTrackedNoncesPerJob distinct entries -- see that constant's own
+// doc comment for the reasoning. A REPLAY of an already-tracked nonce
+// is always still detected correctly (the "already seen" check below
+// runs BEFORE the cap check, so an already-tracked entry never stops
+// being recognized once the cap is reached) -- only genuinely NEW
+// nonces beyond the cap are rejected (also via a false return, i.e.
+// treated identically to a replay by every existing caller: neither
+// case is worth crediting).
 func (j *Job) MarkNonceUsed(nonce uint32) (firstUse bool) {
 	j.nonceMu.Lock()
 	defer j.nonceMu.Unlock()
@@ -153,9 +163,34 @@ func (j *Job) MarkNonceUsed(nonce uint32) (firstUse bool) {
 	if _, seen := j.usedNonces[nonce]; seen {
 		return false
 	}
+	if len(j.usedNonces) >= maxTrackedNoncesPerJob {
+		return false
+	}
 	j.usedNonces[nonce] = struct{}{}
 	return true
 }
+
+// maxTrackedNoncesPerJob bounds how many distinct nonce values
+// MarkNonceUsed will ever track for a single Job (Fix 11,
+// DISPATCH_BRIEF.md 2026-09-10). Without this bound, a hostile miner
+// submitting an unbounded stream of distinct (but otherwise
+// cheaply-constructed) nonce values against one job -- each one
+// passing this cheap pre-check regardless of whether the underlying
+// share is genuine -- could grow this map without limit for that
+// job's lifetime, since nothing else in this leaf's own job-lifecycle
+// bounds it (a Job's own lifetime is governed by upstream template
+// churn/session job-history size, not this map).
+//
+// 100,000 is chosen as generous-but-bounded: a real, honest miner
+// submits, at most, a small multiple of its own real hash rate over
+// the time a single upstream job stays current (typically single-
+// digit to low-tens-of-seconds before a fresh upstream template
+// supersedes it -- see upstream.go's applyJob) -- nowhere close to
+// six figures of DISTINCT nonces against ONE job. At ~4 bytes/key
+// plus Go map overhead, 100,000 entries is a small, fixed memory
+// bound (a few MB at most) regardless of how long any one job is
+// somehow kept alive.
+const maxTrackedNoncesPerJob = 100_000
 
 // ErrNoUpstreamTemplate is returned by JobManager.NextJob when the
 // upstream client has not yet received a job from the real pool
