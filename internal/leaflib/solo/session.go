@@ -9,15 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo/metrics"
@@ -92,10 +89,14 @@ type Session struct {
 	// data structure to read from at all. See ownJob/recordJob below
 	// and handleSubmit's ownership check, which now runs BEFORE the
 	// xn-prefix check and applies uniformly to every algo.
-	jobsMu         sync.Mutex
-	jobList        []string        // oldest-first job_ids this session has actually been issued
-	jobLog         map[string]*Job // job_id -> *Job, mirrors jobList
-	jobHistorySize int             // bound on len(jobList); see newSession/defaultSessionJobHistorySize
+	// jobs is the shared, extracted implementation of the bounded
+	// per-session job-ownership history described above
+	// (internal/leaflib.JobHistory — see that type's doc comment for
+	// the full rationale this ports unchanged, just relocated so
+	// internal/leaflib/proxy's own identical bookkeeping — ported
+	// there from the start, not re-derived by hand — shares this same
+	// real implementation too).
+	jobs *leaflib.JobHistory[*Job]
 
 	// shareCount/blockCount are local diagnostic counters only - solo
 	// mode has no share table and no backend to forward to (see
@@ -202,10 +203,7 @@ func (s *Session) alreadyDelivered(job *Job) bool {
 		return false
 	}
 	lastID, _ := s.lastDeliveredJobID.Load().(string)
-	if lastID == "" || lastID != job.ID {
-		return false
-	}
-	return s.lastDeliveredDifficulty.Load() == job.StaticDifficulty
+	return leaflib.AlreadyDelivered(job.ID, job.StaticDifficulty, lastID, s.lastDeliveredDifficulty.Load())
 }
 
 // defaultSessionJobHistorySize is the default bound on how many of a
@@ -239,7 +237,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		xn = "0000"
 		server.logger.Printf("solo: failed to generate session xn, falling back to %q: %v", xn, err)
 	}
-	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now(), jobLog: make(map[string]*Job), jobHistorySize: defaultSessionJobHistorySize}
+	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*Job](defaultSessionJobHistorySize)}
 	s.address.Store("")
 	s.worker.Store("")
 	s.agent.Store("")
@@ -1080,25 +1078,7 @@ func (s *Session) recordJob(job *Job) {
 	if job == nil {
 		return
 	}
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	if s.jobLog == nil {
-		s.jobLog = make(map[string]*Job)
-	}
-	if _, exists := s.jobLog[job.ID]; !exists {
-		s.jobList = append(s.jobList, job.ID)
-	}
-	s.jobLog[job.ID] = job
-
-	size := s.jobHistorySize
-	if size <= 0 {
-		size = defaultSessionJobHistorySize
-	}
-	for len(s.jobList) > size {
-		oldest := s.jobList[0]
-		s.jobList = s.jobList[1:]
-		delete(s.jobLog, oldest)
-	}
+	s.jobs.Record(job.ID, job)
 }
 
 // ownJob returns the Job matching id ONLY IF it was actually issued to
@@ -1107,40 +1087,21 @@ func (s *Session) recordJob(job *Job) {
 // boundary handleSubmit gates on: there is no code path by which
 // another session's job_id can appear in this map.
 func (s *Session) ownJob(id string) (*Job, bool) {
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	job, ok := s.jobLog[id]
-	return job, ok
+	return s.jobs.Own(id)
 }
 
-// writeGeneralResponse dispatches on this session's configured algo:
-// ALGO_C29 and ALGO_SHA3X get the legacy bare-bool/bare-string shape (both
-// are lolMiner/graxil-class clients requiring this dialect — SHA3X's real
-// reference implementation is go-tari-sha3x-solo-stratum's
-// subsystems/messages/minerStructs.go MinerRPCShareResponse/MinerRPCResponse,
-// bare bool Result / bare string Error just like C29's
-// go-tari-c29-solo-stratum), while ALGO_RXT/ALGO_RXM (genuinely xmrig-family
-// clients) keep the PR #56 object/null shape.
+// writeGeneralResponse and writeShareResponse now delegate the actual
+// algo-conditional wire-shape dispatch to
+// leaflib.WriteGeneralResponse/WriteShareResponse (see leaflib/
+// wireshape.go's doc comment for the full rationale: this exact logic
+// used to be hand-copied between this file and direct/session.go's
+// own identical methods, and is the real cause of the repeated
+// wire-shape production incidents this dispatch's DISPATCH_BRIEF
+// cites — see commits b3c8716, 0339d81, 0253b57).
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
-	if algo := s.server.jobManager.Algo(); algo == poolpb.Algo_ALGO_C29 || algo == poolpb.Algo_ALGO_SHA3X {
-		s.writeJSON(LegacyErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
-		return
-	}
-	var rpcErr *RPCError
-	if errMsg != "" {
-		rpcErr = &RPCError{Code: -1, Message: errMsg}
-	}
-	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
+	leaflib.WriteGeneralResponse(s.writeJSON, leaflib.IsLegacyWireAlgo(s.server.jobManager.Algo()), id, errMsg, result)
 }
 
-// writeShareResponse dispatches on this session's configured algo, same
-// rationale as writeGeneralResponse above: ALGO_C29 and ALGO_SHA3X get the
-// legacy bare-bool/bare-string shape (both are lolMiner/graxil-class
-// clients requiring this dialect — SHA3X's real reference implementation
-// is go-tari-sha3x-solo-stratum's subsystems/messages/minerStructs.go
-// MinerRPCShareResponse/MinerRPCResponse, bare bool Result / bare string
-// Error just like C29's go-tari-c29-solo-stratum), while ALGO_RXT/ALGO_RXM
-// (genuinely xmrig-family clients) keep the PR #56 object/null shape.
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// Every submit outcome (share or block, accepted or rejected)
 	// flows through this single response-writing helper, so hooking
@@ -1149,42 +1110,19 @@ func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// branch point exactly once, uniformly labeled by result, without
 	// touching any of the actual accept/reject decision logic above.
 	s.server.recordShare(accepted)
-	if algo := s.server.jobManager.Algo(); algo == poolpb.Algo_ALGO_C29 || algo == poolpb.Algo_ALGO_SHA3X {
-		s.writeJSON(LegacyShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
-		return
-	}
-	var rpcErr *RPCError
-	var result *ShareResult
-	if accepted {
-		result = &ShareResult{Status: "OK"}
-	} else {
-		rpcErr = &RPCError{Code: -1, Message: errMsg}
-	}
-	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
+	leaflib.WriteShareResponse(s.writeJSON, leaflib.IsLegacyWireAlgo(s.server.jobManager.Algo()), id, accepted, errMsg)
 }
 
 func (s *Session) writeJSON(v any) {
-	buf, err := json.Marshal(v)
-	if err != nil {
-		s.server.logger.Printf("solo: failed to marshal response for session %s: %v", s.sessionID, err)
-		return
-	}
-	buf = append(buf, '\n')
-	if err := s.mc.Write(buf); err != nil {
-		// Connection is going away; nothing more to do here, Run's
-		// scanner loop will observe the resulting read error/EOF and
-		// exit, and the caller closes mc.
-		_ = err
-	}
+	leaflib.WriteJSON(s.mc, s.server.logger, "solo", s.sessionID, v)
 }
 
 // pushJob sends an unsolicited real "job" push (protocol.go's JobPush)
-// for a newly-(re)generated Job specific to this session's own xn.
+// for a newly-(re)generated Job specific to this session's own xn —
+// delegating the actual "only push to a logged-in session" gate to
+// leaflib.PushJob (see that function's doc comment).
 func (s *Session) pushJob(job *Job) {
-	if !s.loggedIn.Load() {
-		return
-	}
-	s.writeJSON(JobPush{JsonRPC: "2.0", Method: "job", Params: s.jobPayload(job)})
+	leaflib.PushJob(s.writeJSON, s.loggedIn.Load(), func() any { return s.jobPayload(job) })
 }
 
 // jobPayload builds the real wire job object (protocol.go's JobPayload)
@@ -1372,135 +1310,37 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	return payload
 }
 
-// algoWireName maps a Job's stamped poolpb.Algo onto the real wire
-// "algo" label real miner software expects — confirmed against both
-// reference implementations' MinerJobJSON.Algo: go-tari-sha3x-solo-stratum
-// literally hardcodes "sha3x", go-tari-c29-solo-stratum's GetJobJSON sets
-// "C29" (mixed case in that repo, but this is a case-insensitive label
-// miners key off, not consensus data — lowercased here for consistency
-// with the SHA3X label and this package's own login/getjob "algo": []
-// string convention, which is already lowercase). ALGO_UNSPECIFIED (a
-// legacy/never-should-happen Job) falls back to "sha3x" for defensive
-// backward compatibility, matching JobManagerConfig.Algo's own default.
+// algoWireName, diffToTargetHex, safeInt64, cloneBlockWithNonce, and
+// cloneBlockWithC29Proof are now thin wrappers over
+// internal/leaflib's identically named exported symbols (EXTRACTED
+// there so internal/leaflib/direct — which used to hand-derive a
+// byte-for-byte duplicate of every one of these in its own
+// wireutil.go — can reuse the exact same real implementations; see
+// leaflib/wireutil.go's doc comment for the full rationale). See
+// each leaflib function's own doc comment for the full ported
+// provenance; unchanged behavior, just relocated.
 func algoWireName(algo poolpb.Algo) string {
-	switch algo {
-	case poolpb.Algo_ALGO_C29:
-		return "c29"
-	case poolpb.Algo_ALGO_RXT:
-		// RXT (Tari's own "RandomXT") is algorithmically plain
-		// RandomX under the hood — same hash function as Monero's
-		// rx/0, just with Tari's own block/nonce/blob layout. Real
-		// RandomX-family miners (XMRig et al.) have no concept of an
-		// algorithm called "rxt": they only dispatch on their own
-		// fixed algo-name set (rx/0, rx/wow, ...), exactly the set
-		// they advertise in their own login "algo" capability array.
-		// Confirmed live in production: XMRig 6.25.0 against the RXT
-		// leaf-solo port reported real ~90kh/s hashrate but zero
-		// accepted shares because the job was labeled "rxt", a string
-		// absent from XMRig's own algo dispatch table (its login
-		// advertised rx/0, rx/wow, etc., never rxt). "RandomXT" is a
-		// Tari-protocol-internal name and must never leak onto the
-		// miner-facing wire — exactly the same principle already
-		// applied to ALGO_RXM below. NOT "rxt" — that's this repo's
-		// own internal poolpb.Algo protobuf enum name (and the
-		// operator-facing -algo=rxt CLI flag value), neither of which
-		// changes; only this wire label does.
-		return "rx/0"
-	case poolpb.Algo_ALGO_RXM:
-		// "rx/0" is the real wire algo string a real Monero-family
-		// miner (XMRig et al.) actually expects/recognizes — confirmed
-		// earlier this session from real pool-server source
-		// (nodejs-pool-sxmr's lib/pool.js), and already used
-		// identically by leaf-proxy's own real Monero wiring. NOT
-		// "rxm" — that's this repo's own internal poolpb.Algo protobuf
-		// enum name, which must never leak onto the miner-facing wire.
-		return "rx/0"
-	default:
-		return "sha3x"
-	}
+	return leaflib.AlgoWireName(algo)
 }
 
-// diffToTargetHex ports go-tari-sha3x-solo-stratum's
-// minerTracking.MinerJob.diffToTarget + GetJobJSON's subsequent
-// encoding exactly: target = uint64(2^64-1) / difficulty, then that
-// resulting uint64 is written out as 8 raw bytes in LITTLE-ENDIAN
-// order, then hex-encoded as a string. A difficulty of 0 would be a
-// division by zero in the reference's own formula too (it has no
-// guard); since go-crypto-pool always stamps jobs with a non-zero
-// leaf-configured StaticDifficulty (LEAF_SOLO_DIFFICULTY) in normal
-// operation, treat an explicit 0 as 1 here purely to avoid a runtime
-// panic on a misconfiguration rather than changing the real formula.
 func diffToTargetHex(difficulty uint64) string {
-	if difficulty == 0 {
-		difficulty = 1
-	}
-	target := uint64(math.MaxUint64) / difficulty
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, target)
-	return hex.EncodeToString(buf)
+	return leaflib.DiffToTargetHex(difficulty)
 }
 
-// safeInt64 converts a uint64 to int64 by clamping to math.MaxInt64
-// rather than allowing a silent two's-complement wraparound. This
-// matters here specifically because poolpb.Share.BlockDiff is int64 on
-// the wire, while JobManagerConfig.StaticDifficulty (and any future
-// vardiff-derived difficulty) is uint64 -- a naive int64(x) conversion
-// of a uint64 value at or above 1<<63 wraps to a NEGATIVE int64, which
-// would make validator.SHA3XValidator's `share.GetBlockDiff() > 0` guard
-// evaluate false and SILENTLY SKIP the difficulty check entirely,
-// accepting any cryptographically-valid-but-arbitrarily-easy share as
-// if it met the configured difficulty. Found via a real failing test
-// (TestSessionSubmitCryptographicallyInvalid used math.MaxUint64 as a
-// deliberately-impossible-to-meet difficulty and got a false accept)
-// during independent re-verification of this package -- clamping here
-// is the fix, not a workaround in the test.
 func safeInt64(v uint64) int64 {
-	if v > math.MaxInt64 {
-		return math.MaxInt64
-	}
-	return int64(v)
+	return leaflib.SafeInt64(v)
 }
 
-// cloneBlockWithNonce returns a deep copy of block (via proto.Clone, to
-// avoid copying protobuf's internal sync.Mutex-bearing MessageState by
-// value) with Header.Nonce set to nonce, so the shared job template
-// isn't mutated by a (potentially losing) submission race between
-// miners on the same job.
 func cloneBlockWithNonce(block *tari_generated.Block, nonce uint64) *tari_generated.Block {
-	if block == nil {
-		return nil
-	}
-	blockCopy := proto.Clone(block).(*tari_generated.Block)
-	if blockCopy.Header == nil {
-		blockCopy.Header = &tari_generated.BlockHeader{}
-	}
-	blockCopy.Header.Nonce = nonce
-	return blockCopy
+	return leaflib.CloneBlockWithNonce(block, nonce)
 }
 
-// cloneBlockWithC29Proof is cloneBlockWithNonce's C29 counterpart: in
-// addition to stamping Header.Nonce, it also stamps
-// Header.Pow.PowData with the real, edge-packed submitted cycle —
-// ported exactly from go-tari-c29-solo-stratum's SubmitJob
-// (`job.BlockResult.Block.Header.Pow.PowData = packedData`, where
-// packedData is the SAME edgePacking(cycle, 29) output also used for
-// the difficulty hash — see validator.C29EdgePacking/C29Difficulty).
-// SHA3X has no equivalent supplemental pow_data (see
-// tari_generated.ProofOfWork's doc comment: "for Sha3x, this would be
-// empty"), which is why cloneBlockWithNonce above doesn't touch
-// Header.Pow at all.
+// cloneBlockWithC29Proof delegates to leaflib.CloneBlockWithC29Proof,
+// passing this package's own c29SubmitEdgeBits constant and
+// validator.C29EdgePacking explicitly (leaflib's version is
+// parameterized on both, matching internal/leaflib/direct's own
+// pre-extraction call shape exactly, since leaflib cannot import this
+// package's unexported c29SubmitEdgeBits constant directly).
 func cloneBlockWithC29Proof(block *tari_generated.Block, nonce uint64, cycle []uint64) *tari_generated.Block {
-	if block == nil {
-		return nil
-	}
-	blockCopy := proto.Clone(block).(*tari_generated.Block)
-	if blockCopy.Header == nil {
-		blockCopy.Header = &tari_generated.BlockHeader{}
-	}
-	blockCopy.Header.Nonce = nonce
-	if blockCopy.Header.Pow == nil {
-		blockCopy.Header.Pow = &tari_generated.ProofOfWork{}
-	}
-	blockCopy.Header.Pow.PowData = validator.C29EdgePacking(cycle, c29SubmitEdgeBits)
-	return blockCopy
+	return leaflib.CloneBlockWithC29Proof(block, nonce, cycle, c29SubmitEdgeBits, validator.C29EdgePacking)
 }

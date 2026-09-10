@@ -10,6 +10,7 @@ import (
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 	tarilib "github.com/Snipa22/go-tari-lib/nodeGRPC"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -110,7 +111,7 @@ func (c *NodeClient) GetBlockTemplate(_ context.Context, payoutAddress string, a
 // out so tests can exercise the exact tag-inclusion logic without a
 // real GRPC connection (see node_test.go).
 func (c *NodeClient) buildCoinbaseExtra() []byte {
-	nonceBuf := randomNonceBuf()
+	nonceBuf := leaflib.RandomNonceBuf()
 	coinbaseExtra := make([]byte, 0, len(c.coinbaseExtraTag)+len(nonceBuf))
 	coinbaseExtra = append(coinbaseExtra, c.coinbaseExtraTag...)
 	coinbaseExtra = append(coinbaseExtra, nonceBuf...)
@@ -124,7 +125,7 @@ func tariJobFromResult(result *tari_generated.GetNewBlockResult, algo poolpb.Alg
 	if result == nil || result.GetBlock() == nil || result.GetBlock().GetHeader() == nil {
 		return nil, fmt.Errorf("direct: GetBlockTemplate returned an incomplete result")
 	}
-	id, err := jobIDFromBlockHash(result.GetBlockHash())
+	id, err := leaflib.JobIDFromBlockHash(result.GetBlockHash())
 	if err != nil {
 		return nil, fmt.Errorf("direct: deriving job id from block hash: %w", err)
 	}
@@ -178,20 +179,20 @@ func tariBuildCandidateBlock(job *solo.Job, nonce uint64, proof solo.SubmitProof
 		if err != nil {
 			return 0, nil, err
 		}
-		return diff, cloneBlockWithC29Proof(result.GetBlock(), nonce, proof.Cycle, c29SubmitEdgeBits, validator.C29EdgePacking), nil
+		return diff, leaflib.CloneBlockWithC29Proof(result.GetBlock(), nonce, proof.Cycle, c29SubmitEdgeBits, validator.C29EdgePacking), nil
 	case poolpb.Algo_ALGO_RXT:
 		hashBytes, hexErr := hex.DecodeString(proof.ResultHex)
 		if hexErr != nil {
 			return 0, nil, fmt.Errorf("direct: rxt claimed result hash is not valid hex: %w", hexErr)
 		}
-		diff, err = rxtLittleEndianDifficulty(hashBytes)
+		diff, err = leaflib.RXTLittleEndianDifficulty(hashBytes)
 		if err != nil {
 			return 0, nil, err
 		}
-		return diff, cloneBlockWithNonce(result.GetBlock(), nonce), nil
+		return diff, leaflib.CloneBlockWithNonce(result.GetBlock(), nonce), nil
 	default:
 		diff = validator.SHA3XHeaderDiff(nonce, job.Header)
-		return diff, cloneBlockWithNonce(result.GetBlock(), nonce), nil
+		return diff, leaflib.CloneBlockWithNonce(result.GetBlock(), nonce), nil
 	}
 }
 

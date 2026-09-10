@@ -488,7 +488,7 @@ func (s *Server) submitBlockDirect(ctx context.Context, block *tari_generated.Bl
 // see relay.BlockMessage's doc comment on why this is a plain string,
 // not a poolpb.Algo import).
 func (s *Server) currentAlgoLabel() string {
-	return algoWireName(s.algo)
+	return leaflib.AlgoWireName(s.algo)
 }
 
 func networkLabel(n poolpb.Network) string {

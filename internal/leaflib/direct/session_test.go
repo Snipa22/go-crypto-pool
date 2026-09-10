@@ -464,7 +464,7 @@ func TestDirectInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T
 	if push.Params.JobID != baselineJobID {
 		t.Fatalf("BUG: job.ID changed across a pure difficulty retarget (got %q, want unchanged %q)", push.Params.JobID, baselineJobID)
 	}
-	wantTarget := diffToTargetHex(newDiff)
+	wantTarget := leaflib.DiffToTargetHex(newDiff)
 	if push.Params.Target != wantTarget {
 		t.Fatalf("BUG: a real vardiff-driven target update was dropped -- push.Params.Target = %q, want %q", push.Params.Target, wantTarget)
 	}
@@ -788,7 +788,7 @@ func TestDirectSessionRXTShareCarriesNonZeroTimestamp(t *testing.T) {
 	nonce := binary.BigEndian.Uint64(nonceBytes)
 
 	powData := solo.TariPowDataFromJob(job)
-	blob := createTariMiningBlob(job.Header, nonce, rxtPowAlgoByte, powData)
+	blob := leaflib.CreateTariMiningBlob(job.Header, nonce, leaflib.RXTPowAlgoByte, powData)
 
 	realHashHex := realDaemonHashHex(t, serviceURL, job.VmKey, blob)
 
@@ -1373,15 +1373,15 @@ func TestDirectSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
 // the internal poolpb.Algo enum name "rxt" — real RandomX-family
 // miners (XMRig et al.) have no concept of an algorithm called "rxt".
 func TestAlgoWireNameRXTMapsToRX0(t *testing.T) {
-	if got := algoWireName(poolpb.Algo_ALGO_RXT); got != "rx/0" {
-		t.Fatalf("algoWireName(ALGO_RXT) = %q, want %q", got, "rx/0")
+	if got := leaflib.AlgoWireName(poolpb.Algo_ALGO_RXT); got != "rx/0" {
+		t.Fatalf("AlgoWireName(ALGO_RXT) = %q, want %q", got, "rx/0")
 	}
 }
 
 // TestAlgoWireNameRXMStillMapsToRX0 guards against regressing the
 // already-correct RXM mapping while fixing RXT above.
 func TestAlgoWireNameRXMStillMapsToRX0(t *testing.T) {
-	if got := algoWireName(poolpb.Algo_ALGO_RXM); got != "rx/0" {
-		t.Fatalf("algoWireName(ALGO_RXM) = %q, want %q", got, "rx/0")
+	if got := leaflib.AlgoWireName(poolpb.Algo_ALGO_RXM); got != "rx/0" {
+		t.Fatalf("AlgoWireName(ALGO_RXM) = %q, want %q", got, "rx/0")
 	}
 }

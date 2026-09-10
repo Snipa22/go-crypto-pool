@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"strings"
 	"sync"
@@ -18,7 +17,6 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/proxy/metrics"
-	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 )
 
 // ShareValidator is the real local-RandomX-re-validation dependency
@@ -104,10 +102,12 @@ type Session struct {
 	// other session's or any shared/global map. See
 	// internal/leaflib/solo/session.go's Session type doc comment for
 	// the full rationale this mirrors.
-	jobsMu         sync.Mutex
-	jobList        []string
-	jobLog         map[string]*Job
-	jobHistorySize int
+	// jobs is the shared, extracted implementation of the bounded
+	// per-session job-ownership history (internal/leaflib.JobHistory)
+	// -- mirrors solo.Session's/direct.Session's own identical field
+	// exactly. See internal/leaflib/solo/session.go's Session type
+	// doc comment for the full rationale this mirrors.
+	jobs *leaflib.JobHistory[*Job]
 
 	shareCount atomic.Uint64
 	blockCount atomic.Uint64
@@ -129,11 +129,12 @@ type Session struct {
 
 	// jobCacheMu/cachedJob back currentJob's per-session job-caching
 	// discipline -- see that method's doc comment for the exact rule.
-	// Deliberately a SEPARATE lock from jobsMu (jobList/jobLog): a
-	// cache hit under currentJob's own critical section must not need
-	// to also take jobsMu (which recordJob/ownJob already serialize
-	// independently), and vice versa -- keeping these independent
-	// avoids any lock-ordering coupling between the two mechanisms.
+	// Deliberately a SEPARATE lock from jobs' own internal mutex
+	// (leaflib.JobHistory): a cache hit under currentJob's own
+	// critical section must not need to also take jobs' lock (which
+	// recordJob/ownJob already serialize independently through it),
+	// and vice versa -- keeping these independent avoids any
+	// lock-ordering coupling between the two mechanisms.
 	jobCacheMu sync.Mutex
 	cachedJob  *Job
 }
@@ -150,10 +151,7 @@ func (s *Session) alreadyDelivered(job *Job) bool {
 		return false
 	}
 	lastID, _ := s.lastDeliveredJobID.Load().(string)
-	if lastID == "" || lastID != job.ID {
-		return false
-	}
-	return s.lastDeliveredDifficulty.Load() == job.StaticDifficulty
+	return leaflib.AlreadyDelivered(job.ID, job.StaticDifficulty, lastID, s.lastDeliveredDifficulty.Load())
 }
 
 // currentJob is the real per-session job-caching choke point every
@@ -235,12 +233,11 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		id = "0000000000000000"
 	}
 	s := &Session{
-		mc:             mc,
-		server:         server,
-		sessionID:      id,
-		connectedAt:    time.Now(),
-		jobLog:         make(map[string]*Job),
-		jobHistorySize: defaultProxySessionJobHistorySize,
+		mc:          mc,
+		server:      server,
+		sessionID:   id,
+		connectedAt: time.Now(),
+		jobs:        leaflib.NewJobHistory[*Job](defaultProxySessionJobHistorySize),
 	}
 	s.address.Store("")
 	s.worker.Store("")
@@ -602,77 +599,37 @@ func (s *Session) recordJob(job *Job) {
 	if job == nil {
 		return
 	}
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	if s.jobLog == nil {
-		s.jobLog = make(map[string]*Job)
-	}
-	if _, exists := s.jobLog[job.ID]; !exists {
-		s.jobList = append(s.jobList, job.ID)
-	}
-	s.jobLog[job.ID] = job
-
-	size := s.jobHistorySize
-	if size <= 0 {
-		size = defaultProxySessionJobHistorySize
-	}
-	for len(s.jobList) > size {
-		oldest := s.jobList[0]
-		s.jobList = s.jobList[1:]
-		delete(s.jobLog, oldest)
-	}
+	s.jobs.Record(job.ID, job)
 }
 
 // ownJob returns the Job matching id ONLY IF it was actually issued
 // to THIS session — see the Session type's job-ownership doc comment.
 func (s *Session) ownJob(id string) (*Job, bool) {
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	job, ok := s.jobLog[id]
-	return job, ok
+	return s.jobs.Own(id)
 }
 
+// writeGeneralResponse/writeShareResponse always use the object/null
+// wire shape (leaflib.IsLegacyWireAlgo's "legacy" branch is for
+// ALGO_C29/ALGO_SHA3X only, and leaf-proxy speaks nothing but
+// Monero-family RandomX — see this package's doc comment), so legacy
+// is hardcoded false here — mirrors solo.Session's/direct.Session's
+// own delegation to leaflib.WriteGeneralResponse/WriteShareResponse
+// exactly (see leaflib/wireshape.go's doc comment), just with no real
+// algo branch to make for this leaf mode.
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
-	// NOTE: ErrorResponse here is a type alias (= solo.ErrorResponse,
-	// see protocol.go) — not a separate struct copy — so it picked up
-	// solo's object-or-null error wire-shape fix automatically; this
-	// construction site still needed updating to match (see
-	// fix/shareresponse-error-result-wire-shape).
-	var rpcErr *solo.RPCError
-	if errMsg != "" {
-		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
-	}
-	s.writeJSON(ErrorResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
+	leaflib.WriteGeneralResponse(s.writeJSON, false, id, errMsg, result)
 }
 
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
-	var rpcErr *solo.RPCError
-	var result *solo.ShareResult
-	if accepted {
-		result = &solo.ShareResult{Status: "OK"}
-	} else {
-		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
-	}
-	s.writeJSON(ShareResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
+	leaflib.WriteShareResponse(s.writeJSON, false, id, accepted, errMsg)
 }
 
 func (s *Session) writeJSON(v any) {
-	buf, err := json.Marshal(v)
-	if err != nil {
-		s.server.logger.Printf("proxy: failed to marshal response for session %s: %v", s.sessionID, err)
-		return
-	}
-	buf = append(buf, '\n')
-	if err := s.mc.Write(buf); err != nil {
-		_ = err
-	}
+	leaflib.WriteJSON(s.mc, s.server.logger, "proxy", s.sessionID, v)
 }
 
 func (s *Session) pushJob(job *Job) {
-	if !s.loggedIn.Load() {
-		return
-	}
-	s.writeJSON(JobPush{JsonRPC: "2.0", Method: "job", Params: s.jobPayload(job)})
+	leaflib.PushJob(s.writeJSON, s.loggedIn.Load(), func() any { return s.jobPayload(job) })
 }
 
 // jobPayload builds the real wire job object for job, and — the
@@ -704,28 +661,10 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 		Blob:   hex.EncodeToString(job.Blob),
 		Height: job.Height,
 		JobID:  job.ID,
-		Target: diffToTargetHex(job.StaticDifficulty),
+		Target: leaflib.DiffToTargetHex(job.StaticDifficulty),
 	}
 	if len(job.SeedHash) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.SeedHash)
 	}
 	return payload
-}
-
-// diffToTargetHex mirrors internal/leaflib/solo/session.go's
-// identically-named helper (the standard, well-known Monero-family
-// target encoding: target = 2^64-1 / difficulty, written as 8 raw
-// little-endian bytes, hex-encoded) — this is a ~6-line pure-formula
-// helper, independently implemented here rather than cross-package
-// extracted, since the task's explicit shared-infra reuse targets are
-// ConnectionManager/protocol wire types/the vardiff algorithm, not
-// this trivial, universally-known encoding.
-func diffToTargetHex(difficulty uint64) string {
-	if difficulty == 0 {
-		difficulty = 1
-	}
-	target := uint64(math.MaxUint64) / difficulty
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, target)
-	return hex.EncodeToString(buf)
 }

@@ -13,7 +13,6 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -77,10 +76,11 @@ type Session struct {
 	// type doc comment for the full rationale. Ported here verbatim
 	// because it is a real, structural security property every leaf
 	// mode must have, not something specific to solo mode.
-	jobsMu         sync.Mutex
-	jobList        []string
-	jobLog         map[string]*solo.Job
-	jobHistorySize int
+	// jobs is the shared, extracted implementation of the bounded
+	// per-session job-ownership history -- mirrors solo.Session's own
+	// identical field exactly (internal/leaflib.JobHistory; see that
+	// type's doc comment for the full rationale this ports unchanged).
+	jobs *leaflib.JobHistory[*solo.Job]
 
 	shareCount atomic.Uint64
 	blockCount atomic.Uint64
@@ -108,23 +108,19 @@ func (s *Session) alreadyDelivered(job *solo.Job) bool {
 		return false
 	}
 	lastID, _ := s.lastDeliveredJobID.Load().(string)
-	if lastID == "" || lastID != job.ID {
-		return false
-	}
-	return s.lastDeliveredDifficulty.Load() == job.StaticDifficulty
+	return leaflib.AlreadyDelivered(job.ID, job.StaticDifficulty, lastID, s.lastDeliveredDifficulty.Load())
 }
 
 func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64) *Session {
-	id, _ := newRandomHexID()
-	xn, err := newSessionXN()
+	id, _ := leaflib.NewRandomHexID()
+	xn, err := leaflib.NewSessionXN()
 	if err != nil {
 		xn = "0000"
 		server.logger.Printf("direct: failed to generate session xn, falling back to %q: %v", xn, err)
 	}
 	s := &Session{
 		mc: mc, server: server, sessionID: id, xn: xn,
-		connectedAt: time.Now(), jobLog: make(map[string]*solo.Job),
-		jobHistorySize: defaultSessionJobHistorySize,
+		connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*solo.Job](defaultSessionJobHistorySize),
 	}
 	s.address.Store("")
 	s.worker.Store("")
@@ -431,7 +427,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 		share = &poolpb.Share{
 			Algo: poolpb.Algo_ALGO_RXM, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
-			BlockDiff: safeInt64(job.StaticDifficulty), Shares: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
@@ -446,7 +442,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		nonce = binary.BigEndian.Uint64(nonceBytes)
 		share = &poolpb.Share{
 			Algo: poolpb.Algo_ALGO_C29, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
-			BlockDiff: safeInt64(job.StaticDifficulty), Shares: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_C29Proof{C29Proof: &poolpb.C29Proof{
@@ -478,10 +474,10 @@ func (s *Session) handleSubmit(req solo.Request) {
 		if pd := solo.TariPowDataFromJob(job); pd != nil {
 			powData = pd
 		}
-		blob := createTariMiningBlob(job.Header, nonce, rxtPowAlgoByte, powData)
+		blob := leaflib.CreateTariMiningBlob(job.Header, nonce, leaflib.RXTPowAlgoByte, powData)
 		share = &poolpb.Share{
 			Algo: poolpb.Algo_ALGO_RXT, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
-			BlockDiff: safeInt64(job.StaticDifficulty), Shares: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
@@ -492,7 +488,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		nonce = binary.LittleEndian.Uint64(nonceBytes)
 		share = &poolpb.Share{
 			Algo: poolpb.Algo_ALGO_SHA3X, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
-			BlockDiff: safeInt64(job.StaticDifficulty), Shares: safeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_Sha3XProof{Sha3XProof: &poolpb.SHA3XProof{
@@ -760,99 +756,37 @@ func (s *Session) recordJob(job *solo.Job) {
 	if job == nil {
 		return
 	}
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	if s.jobLog == nil {
-		s.jobLog = make(map[string]*solo.Job)
-	}
-	if _, exists := s.jobLog[job.ID]; !exists {
-		s.jobList = append(s.jobList, job.ID)
-	}
-	s.jobLog[job.ID] = job
-
-	size := s.jobHistorySize
-	if size <= 0 {
-		size = defaultSessionJobHistorySize
-	}
-	for len(s.jobList) > size {
-		oldest := s.jobList[0]
-		s.jobList = s.jobList[1:]
-		delete(s.jobLog, oldest)
-	}
+	s.jobs.Record(job.ID, job)
 }
 
 func (s *Session) ownJob(id string) (*solo.Job, bool) {
-	s.jobsMu.Lock()
-	defer s.jobsMu.Unlock()
-	job, ok := s.jobLog[id]
-	return job, ok
+	return s.jobs.Own(id)
 }
 
-// writeGeneralResponse dispatches on this session's configured algo, mirroring
-// solo.Session's own writeGeneralResponse exactly (see that function's doc
-// comment for the full rationale): ALGO_C29 and ALGO_SHA3X get the legacy
-// bare-bool/bare-string shape (both are lolMiner/graxil-class clients
-// requiring this dialect — SHA3X's real reference implementation is
-// go-tari-sha3x-solo-stratum's subsystems/messages/minerStructs.go
-// MinerRPCShareResponse/MinerRPCResponse, bare bool Result / bare string
-// Error just like C29's go-tari-c29-solo-stratum), while ALGO_RXT/ALGO_RXM
-// (genuinely xmrig-family clients) keep the PR #56 object/null
-// solo.ErrorResponse shape.
+// writeGeneralResponse and writeShareResponse now delegate the actual
+// algo-conditional wire-shape dispatch to
+// leaflib.WriteGeneralResponse/WriteShareResponse -- mirrors
+// solo.Session's own identical delegation exactly (see
+// leaflib/wireshape.go's doc comment for the full rationale: this
+// exact logic used to be hand-copied between this file and
+// solo/session.go's own identical methods, and is the real cause of
+// the repeated wire-shape production incidents this dispatch's
+// DISPATCH_BRIEF cites -- see commits b3c8716, 0339d81, 0253b57).
 func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
-	if algo := s.server.algo; algo == poolpb.Algo_ALGO_C29 || algo == poolpb.Algo_ALGO_SHA3X {
-		s.writeJSON(solo.LegacyErrorResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: result})
-		return
-	}
-	var rpcErr *solo.RPCError
-	if errMsg != "" {
-		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
-	}
-	s.writeJSON(solo.ErrorResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
+	leaflib.WriteGeneralResponse(s.writeJSON, leaflib.IsLegacyWireAlgo(s.server.algo), id, errMsg, result)
 }
 
-// writeShareResponse dispatches on this session's configured algo, mirroring
-// solo.Session's own writeShareResponse exactly: ALGO_C29 and ALGO_SHA3X get
-// the legacy bare-bool/bare-string shape (both are lolMiner/graxil-class
-// clients requiring this dialect — SHA3X's real reference implementation is
-// go-tari-sha3x-solo-stratum's subsystems/messages/minerStructs.go
-// MinerRPCShareResponse/MinerRPCResponse, bare bool Result / bare string
-// Error just like C29's go-tari-c29-solo-stratum, see protocol.go's
-// LegacyShareResponse doc comment in the solo package), while ALGO_RXT/
-// ALGO_RXM (genuinely xmrig-family clients) keep the confirmed-working
-// object/null solo.ShareResponse shape from PR #56.
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	s.server.recordShare(accepted)
-	if algo := s.server.algo; algo == poolpb.Algo_ALGO_C29 || algo == poolpb.Algo_ALGO_SHA3X {
-		s.writeJSON(solo.LegacyShareResponse{ID: id, JsonRPC: "2.0", Error: errMsg, Result: accepted})
-		return
-	}
-	var rpcErr *solo.RPCError
-	var result *solo.ShareResult
-	if accepted {
-		result = &solo.ShareResult{Status: "OK"}
-	} else {
-		rpcErr = &solo.RPCError{Code: -1, Message: errMsg}
-	}
-	s.writeJSON(solo.ShareResponse{ID: id, JsonRPC: "2.0", Error: rpcErr, Result: result})
+	leaflib.WriteShareResponse(s.writeJSON, leaflib.IsLegacyWireAlgo(s.server.algo), id, accepted, errMsg)
 }
 
 func (s *Session) writeJSON(v any) {
-	buf, err := json.Marshal(v)
-	if err != nil {
-		s.server.logger.Printf("direct: failed to marshal response for session %s: %v", s.sessionID, err)
-		return
-	}
-	buf = append(buf, '\n')
-	if err := s.mc.Write(buf); err != nil {
-		_ = err
-	}
+	leaflib.WriteJSON(s.mc, s.server.logger, "direct", s.sessionID, v)
 }
 
 func (s *Session) pushJob(job *solo.Job) {
-	if !s.loggedIn.Load() {
-		return
-	}
-	s.writeJSON(solo.JobPush{JsonRPC: "2.0", Method: "job", Params: s.jobPayload(job)})
+	leaflib.PushJob(s.writeJSON, s.loggedIn.Load(), func() any { return s.jobPayload(job) })
 }
 
 func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
@@ -863,22 +797,22 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	s.lastDeliveredJobID.Store(job.ID)
 	s.lastDeliveredDifficulty.Store(job.StaticDifficulty)
 	payload := solo.JobPayload{
-		Algo:   algoWireName(job.Algo),
+		Algo:   leaflib.AlgoWireName(job.Algo),
 		Blob:   hex.EncodeToString(job.Header),
 		Height: job.Height,
 		JobID:  job.ID,
-		Target: diffToTargetHex(job.StaticDifficulty),
+		Target: leaflib.DiffToTargetHex(job.StaticDifficulty),
 	}
 	// RXT-only (bug fix): mirrors solo.Session's own jobPayload fix
 	// exactly — see that file's doc comment on this same fix for the
 	// full rationale (job.Header is a bare 32-byte hash, not a
 	// minable blob; real RandomX clients need the real 76-byte
-	// createTariMiningBlob shape). rxtPowAlgoByte/createTariMiningBlob
+	// createTariMiningBlob shape). leaflib.RXTPowAlgoByte/createTariMiningBlob
 	// are this package's own wireutil.go mirrors of solo's identical
 	// unexported helpers; solo.TariPowDataFromJob is the shared,
 	// exported escape hatch both packages already use.
 	if job.Algo == poolpb.Algo_ALGO_RXT {
-		blob := createTariMiningBlob(job.Header, 0, rxtPowAlgoByte, solo.TariPowDataFromJob(job))
+		blob := leaflib.CreateTariMiningBlob(job.Header, 0, leaflib.RXTPowAlgoByte, solo.TariPowDataFromJob(job))
 		payload.Blob = hex.EncodeToString(blob)
 	}
 	// xn nonce-partitioning is a SHA3X/C29 convention only. RXT/RXM
@@ -939,7 +873,7 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 			}
 		case poolpb.Algo_ALGO_RXT:
 			blobHex := payload.Blob
-			clientNonceOffset := rxtXmrigNonceOffset
+			clientNonceOffset := leaflib.RXTXmrigNonceOffset
 			payload.BlocktemplateBlob = &blobHex
 			payload.ClientNonceOffset = &clientNonceOffset
 		}
