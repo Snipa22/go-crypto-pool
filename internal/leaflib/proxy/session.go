@@ -137,6 +137,16 @@ type Session struct {
 	// lock-ordering coupling between the two mechanisms.
 	jobCacheMu sync.Mutex
 	cachedJob  *Job
+
+	// invalidShareGuard mirrors solo.Session's own identical field
+	// exactly — see leaflib.InvalidShareGuard's doc comment for the
+	// full DISPATCH_BRIEF.md 2026-09-10 Fix 2b rationale. leaf-proxy
+	// has no trust.go-equivalent mechanism of its own to piggyback
+	// this onto (unlike solo/direct, which already had
+	// s.trust.RecordOutcome for their own RXT/RXM rejections) -- this
+	// is the FIRST such abuse-accounting mechanism wired into this
+	// package.
+	invalidShareGuard *leaflib.InvalidShareGuard
 }
 
 // alreadyDelivered mirrors solo.Session's/direct.Session's own
@@ -242,6 +252,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	s.address.Store("")
 	s.worker.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
+	s.invalidShareGuard = leaflib.NewInvalidShareGuard(server.invalidShareGuardConfig)
 	return s
 }
 
@@ -720,9 +731,27 @@ func (s *Session) handleSubmit(req Request) {
 			return
 		}
 		if !valid {
+			// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b):
+			// a fabricated above-(upstream-)target claim that fails
+			// this real re-validation is the actual DoS vector
+			// Finding 2 identified for this leaf too -- track it
+			// against this session's own leaflib.InvalidShareGuard
+			// (see that type's doc comment) and disconnect once it
+			// exceeds its configured consecutive-invalid-share
+			// threshold, so it can no longer keep flooding
+			// s.server.randomxPool with garbage. leaf-proxy had NO
+			// equivalent accounting mechanism at all before this fix
+			// (unlike solo/direct's pre-existing s.trust.RecordOutcome
+			// for their own RXT/RXM rejections).
+			disconnect := s.invalidShareGuard.RecordOutcome(false)
 			s.writeShareResponse(req.ID, false, "share is not a cryptographically valid RandomX proof for this job")
+			if disconnect {
+				s.server.logger.Printf("proxy: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
+				s.mc.Close("exceeded consecutive invalid-share threshold")
+			}
 			return
 		}
+		s.invalidShareGuard.RecordOutcome(true)
 
 		// Real, cryptographically re-validated genuine upstream-forward
 		// candidate: local credit (this is the vardiff accept-history

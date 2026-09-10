@@ -59,12 +59,6 @@ type Session struct {
 	// whose miner sent no "agent" field.
 	agent atomic.Value // string
 
-	// trust is nil unless server.trustConfig.Enabled at newSession
-	// time — see trust.go's MinerTrust. Captured once per session
-	// (mirroring the real reference's per-Miner, per-connection trust
-	// object, which never persists across a reconnect).
-	trust *MinerTrust
-
 	// --- SECURITY FIX: per-session job ownership (jobList/jobLog) ---
 	//
 	// Ported from go-tari-sha3x-solo-stratum's minerStruct
@@ -187,6 +181,18 @@ type Session struct {
 	// the miner needs to receive.
 	lastDeliveredJobID      atomic.Value // string
 	lastDeliveredDifficulty atomic.Uint64
+
+	// invalidShareGuard tracks this session's own running count of
+	// CONSECUTIVE real-validation failures for RXT/RXM block-find
+	// candidates (finishSubmit's `!valid` branch) and reports once a
+	// configurable threshold is reached — see
+	// leaflib.InvalidShareGuard's own doc comment for the full
+	// DoS-mitigation rationale (DISPATCH_BRIEF.md, 2026-09-10, Fix
+	// 2b). Constructed once per session, at newSession time, from
+	// server.invalidShareGuardConfig; nil-safe (see
+	// InvalidShareGuard.RecordOutcome) so this field is never nil in
+	// practice but would be harmless if it somehow were.
+	invalidShareGuard *leaflib.InvalidShareGuard
 }
 
 // alreadyDelivered reports whether job is identical (same job.ID AND
@@ -242,9 +248,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	s.worker.Store("")
 	s.agent.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
-	if server.trustConfig.Enabled {
-		s.trust = NewMinerTrust(server.trustConfig)
-	}
+	s.invalidShareGuard = leaflib.NewInvalidShareGuard(server.invalidShareGuardConfig)
 	return s
 }
 
@@ -493,15 +497,19 @@ const (
 // computation over bytes the miner already sent on the wire and does
 // NOT confirm the claim is cryptographically genuine (a lying miner
 // can claim any hash value here) — see handleSubmit's own doc comment
-// for why that is fine for the ordinary-share branch (nothing at that
-// difficulty level was ever cryptographically re-verified server-side
-// for RXT/RXM even before this change either: validator.
-// RandomXValidator.Validate checks hash EQUALITY against the miner's
-// claim, not difficulty, so a real per-share difficulty floor was
-// never actually enforced here) and why it is NOT fine for the
-// block-find branch, which still runs the real v.Validate call before
-// ever trusting this number enough to call BuildCandidateBlock/
-// SubmitBlock.
+// for the accurate, corrected framing of why that is acceptable for
+// the ordinary-share branch (DISPATCH_BRIEF.md, 2026-09-10, Fix 4:
+// the framing this comment used to carry here — "safe because a
+// difficulty floor was the only thing missing" — was itself
+// misleading and has been corrected at that doc comment; it is NOT
+// safe merely because no floor was enforced, it is accepted because
+// solo mode has no share table/backend/payouts riding on this value)
+// and why cheaply computing it here is NOT a substitute for the
+// block-find branch's real v.Validate call, which is a genuine,
+// daemon-confirmed hash-equality/authenticity check this pure
+// computation can never provide — see handleSubmit's doc comment for
+// why that distinction matters before ever trusting this number
+// enough to call BuildCandidateBlock/SubmitBlock.
 //
 // Returns an error for malformed hex or an all-zero hash (division by
 // zero has no sound difficulty) — handleSubmit treats either as an
@@ -971,8 +979,7 @@ func (s *Session) handleSubmit(req Request) {
 	// (above, always run synchronously in the read loop, before
 	// dispatch — its own nonceMu makes it safe regardless) already ran;
 	// s.shareCount/s.blockCount/s.hashesAccumulated are atomic.Uint64;
-	// s.trust (MinerTrust) documents itself as "safe for concurrent use"
-	// and has its own internal mutex; s.server.node.BuildCandidateBlock
+	// s.server.node.BuildCandidateBlock
 	// only READS job fields and returns a fresh proto.Clone'd candidate
 	// (node.go/monero_node.go — never mutates the shared job template);
 	// s.mc.Write is already synchronized onto the connection's single
@@ -986,47 +993,46 @@ func (s *Session) handleSubmit(req Request) {
 			return
 		}
 
-		// Real, legacy-ported trusted-miner validation skip (see
-		// trust.go) — only ever considered for RXT/RXM, the two
-		// RandomX-family algos where full validation is a real,
-		// service-backed RandomX hash genuinely expensive to compute at
-		// scale; SHA3X/C29 are cheap local computation with no analogous
-		// mechanism in the reference and are always fully validated
-		// regardless of s.trust. ShouldSkipValidation itself already
-		// returns false for a nil/disabled s.trust, so this is safe to
-		// call unconditionally.
-		var valid bool
-		skipped := IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
-		if skipped {
-			// Trusted share: the miner's own claimed result is taken on
-			// faith, no real RandomX hash is computed — ported exactly
-			// from the reference's `hash = new Buffer(resultHash, 'hex')`
-			// branch (see trust.go's doc comment). This is, by
-			// definition, "valid" for the purpose of crediting the share;
-			// RecordOutcome below is still called with the real,
-			// eventual accept/reject outcome once BuildCandidateBlock's
-			// own difficulty check runs against the miner's claimed
-			// result, exactly like the reference calls handleMinerData
-			// unconditionally regardless of which processShare branch
-			// ran.
-			valid = true
-		} else {
-			valid, err = v.Validate(context.Background(), share)
-			if err != nil && err != validator.ErrWrongProofType {
-				s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
-				return
-			}
-		}
-		if !valid {
-			if IsRandomXFamily(job.Algo) {
-				s.trust.RecordOutcome(false)
-			}
-			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
+		// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 5): the
+		// trusted-miner probabilistic validation-skip mechanism
+		// (trust.go's MinerTrust) has been removed from solo's own
+		// submit path entirely — see this method's own doc comment
+		// below (the DISPATCH_BRIEF block preceding this closure's
+		// dispatch site) for the full removal rationale. finishSubmit
+		// is now ONLY ever reached for a genuine block-find candidate
+		// (see that same doc comment), so it always runs the real,
+		// daemon-backed v.Validate call unconditionally — there is no
+		// skip path left to gate.
+		valid, err := v.Validate(context.Background(), share)
+		if err != nil && err != validator.ErrWrongProofType {
+			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
 			return
 		}
-		if IsRandomXFamily(job.Algo) {
-			s.trust.RecordOutcome(true)
+		if !valid {
+			// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b):
+			// a fabricated above-target claim that fails this real,
+			// daemon-confirmed validation is the actual DoS vector
+			// Finding 2 identified — a hostile session can keep
+			// submitting bogus block-find-level claims, each one
+			// costing a real dispatch through s.server.randomxPool
+			// (and the real randomx-service round-trip inside it),
+			// with zero consequence to the submitting session
+			// otherwise. leaflib.InvalidShareGuard tracks consecutive
+			// invalid outcomes exactly like this per session; once
+			// disconnect is true, this session has exceeded its
+			// configured threshold and is closed here so it can no
+			// longer keep flooding this shared pool (see
+			// InvalidShareGuard's own doc comment for the full
+			// rationale and internal/leaflib's shared implementation).
+			disconnect := s.invalidShareGuard.RecordOutcome(false)
+			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
+			if disconnect {
+				s.server.logger.Printf("solo: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
+				s.mc.Close("exceeded consecutive invalid-share threshold")
+			}
+			return
 		}
+		s.invalidShareGuard.RecordOutcome(true)
 
 		// Valid share (met the configured static share difficulty). This is
 		// local diagnostic/hashrate-estimation signal only — solo mode has
@@ -1125,25 +1131,35 @@ func (s *Session) handleSubmit(req Request) {
 	// takes:
 	//
 	//   - Below job.NetworkTargetDifficulty (the overwhelming majority
-	//     of real submits): an ordinary sub-block share. Credited on
-	//     the miner's own claim, exactly like ShouldSkipValidation's
-	//     pre-existing "trusted share" branch inside finishSubmit
-	//     already did for a trusted miner — the real, synchronous
-	//     randomx-service HTTP round-trip (validator.RandomXValidator.
-	//     Validate, ~4ms+ per call — see asyncvalidation.go's package
-	//     doc comment for the full 2026-08-30 production-incident
-	//     history that call's cost originally caused) is never made at
-	//     all, and this submit never touches s.server.randomxPool
-	//     either — it is handled entirely, synchronously, right here in
-	//     Session.Run's read loop, the same way SHA3X/C29 always have
-	//     been. This is safe: no per-share difficulty floor was ever
-	//     cryptographically enforced server-side for RXT/RXM even
-	//     before this change (validator.RandomXValidator.Validate
-	//     checks claimed-vs-actual hash EQUALITY, not difficulty — see
-	//     claimedRandomXFamilyDifficulty's own doc comment) — the only
-	//     thing that changes here is WHEN a real hash-equality check
-	//     happens for this class of share, not whether one ever
-	//     independently re-derived and gated on this specific value.
+	//     of real submits): an ordinary sub-block share, CREDITED ON
+	//     THE MINER'S OWN CLAIM, WITH NO CRYPTOGRAPHIC AUTHENTICITY
+	//     CHECK OF ANY KIND — the real, synchronous randomx-service
+	//     HTTP round-trip (validator.RandomXValidator.Validate, ~4ms+
+	//     per call — see asyncvalidation.go's package doc comment for
+	//     the full 2026-08-30 production-incident history that call's
+	//     cost originally caused) is never made at all, and this
+	//     submit never touches s.server.randomxPool either — it is
+	//     handled entirely, synchronously, right here in Session.Run's
+	//     read loop, the same way SHA3X/C29 always have been.
+	//     CORRECTED SAFETY RATIONALE (DISPATCH_BRIEF.md, 2026-09-10,
+	//     Fix 4 — this comment previously framed this as "safe because
+	//     no per-share difficulty floor was ever cryptographically
+	//     enforced anyway", which was misleading: hash-equality
+	//     validation against a daemon-recomputed hash WAS a real
+	//     per-share authenticity/anti-fabrication check, and it simply
+	//     no longer runs here at all). This is accepted specifically
+	//     because solo mode has no share table, no backend, and no
+	//     payouts riding on this value — it is hashrate/vardiff
+	//     stats only (see cmd/leaf-solo's own doc comment) — NOT
+	//     because a missing difficulty floor made it a non-issue.
+	//     HARDENING FIX (Fix 1): a claimed difficulty BELOW this job's
+	//     own StaticDifficulty is now rejected outright rather than
+	//     credited (see the floor check below) — as Alex put it, "as
+	//     long as the difficulty of the hash is OVER the difficulty of
+	//     the job, it's fine, because we send the job diff back
+	//     upstream". This is a garbage-in filter on the claimed value,
+	//     not a cryptographic check — it does not and cannot restore
+	//     the authenticity guarantee described above.
 	//   - At or above job.NetworkTargetDifficulty (a genuine block-find
 	//     candidate, expected to be extremely rare): the real,
 	//     expensive validator round-trip — and everything downstream of
@@ -1153,36 +1169,31 @@ func (s *Session) handleSubmit(req Request) {
 	//     claim (a claimed hash that numerically crosses the target but
 	//     does not match what the daemon actually computes) is still
 	//     caught and rejected by finishSubmit's own existing
-	//     `!valid` branch below — never silently credited as a block
-	//     find, and never silently downgraded to an ordinary accepted
-	//     share either.
+	//     `!valid` branch — never silently credited as a block find,
+	//     and never silently downgraded to an ordinary accepted share
+	//     either. A repeated run of such failures from the same
+	//     session now also trips leaflib.InvalidShareGuard and
+	//     disconnects it (Fix 2b) — see finishSubmit's own `!valid`
+	//     branch above.
 	//
-	// TRUST-INTERACTION NOTE (flagged explicitly per this task's own
-	// instruction not to silently paper over this, rather than changed):
-	// s.trust's ShouldSkipValidation/RecordOutcome are still wired into
-	// finishSubmit exactly as before, unmodified — but finishSubmit is
-	// now ONLY ever reached at this narrower, block-find-level call
-	// site. For the overwhelming majority of ordinary shares that never
-	// reach finishSubmit anymore, trust is simply never consulted,
-	// which changes nothing observable (an ordinary share's credit
-	// never depended on trust's coin-flip outcome before this change
-	// either — ShouldSkipValidation only ever decided whether THAT
-	// call's real Validate was skipped, not whether the share itself
-	// was credited). What DOES change in character: if a sufficiently
-	// "trusted" miner's coin-flip happens to land on skip AT EXACTLY
-	// the moment it submits a genuine block-find-level claim, that
-	// claim is now taken fully on faith with NO real cryptographic
-	// confirmation before BuildCandidateBlock/SubmitBlock run against
-	// it. This exact risk already existed before this change too (trust
-	// was already consulted ahead of the old code's own
-	// diff/NetworkTargetDifficulty comparison, so a trusted miner could
-	// already skip validation on what turned out to be a block-level
-	// submit) — this change does not introduce it — but it is now
-	// concentrated EXCLUSIVELY at the one call site where the stakes (a
-	// real candidate-block submission, or crediting a block find that
-	// was never real) are highest, rather than diluted across every
-	// RXT/RXM submit. Left exactly as-is per this task's explicit
-	// instruction; noted here instead of silently working around it.
+	// TRUST REMOVED (DISPATCH_BRIEF.md, 2026-09-10, Fix 5): trust.go's
+	// MinerTrust skip mechanism used to be wired into finishSubmit
+	// here. Post the block-find-only change above, finishSubmit is
+	// only ever reached at this one narrow, rare, block-find-level
+	// call site — the trust-ramp's own gating (requiring
+	// Threshold consecutive real, fully-validated accepted shares
+	// before any skip is even considered) could never realistically
+	// ramp in against a call site this infrequent, making the whole
+	// mechanism unreachable dead weight for solo specifically. It has
+	// been removed from solo's Session/Server entirely (no more
+	// s.trust field, no more Server.trustConfig/EnableTrust, no more
+	// -trust-* flags in cmd/leaf-solo) — every genuine block-find
+	// candidate now always runs the real v.Validate call
+	// unconditionally, with no skip path at all. trust.go's
+	// MinerTrust/TrustConfig types themselves are NOT deleted (still
+	// exported from this package) because internal/leaflib/direct
+	// still wires them in for real — see direct/server.go's EnableTrust
+	// doc comment for direct's own, still-live risk/tradeoff framing.
 	//
 	// ASYNCVALIDATION.GO RELEVANCE (explicit conclusion, per this
 	// task's own instruction to state one): the bounded worker pool is
@@ -1205,7 +1216,8 @@ func (s *Session) handleSubmit(req Request) {
 	// simplification of asyncvalidation.go itself, which remains
 	// shared, unmodified, production infrastructure (also used by
 	// leaf-direct and leaf-proxy — see asyncvalidation.go's own doc
-	// comment).
+	// comment). Its default worker count is now runtime.NumCPU(), not
+	// a hardcoded 8 — see asyncvalidation.go's own doc comment (Fix 2a).
 	if IsRandomXFamily(job.Algo) {
 		claimedDiff, err := claimedRandomXFamilyDifficulty(job.Algo, submit.Result)
 		if err != nil {
@@ -1221,6 +1233,28 @@ func (s *Session) handleSubmit(req Request) {
 		if job.NetworkTargetDifficulty == 0 || claimedDiff < job.NetworkTargetDifficulty {
 			// Ordinary sub-block share: no real validator call, no
 			// async dispatch — see this block's own doc comment above.
+			//
+			// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 1
+			// [CRITICAL — Finding 1]): reject outright if the miner's
+			// own claimed difficulty doesn't even meet THIS job's own
+			// configured StaticDifficulty — Alex's exact framing: "as
+			// long as the difficulty of the hash is OVER the
+			// difficulty of the job, it's fine, because we send the
+			// job diff back upstream." Before this check, any
+			// claimedDiff (including a trivially low one) below
+			// job.NetworkTargetDifficulty was credited as a full,
+			// job.StaticDifficulty-weighted accepted share, silently
+			// inflating this session's own hashrate/vardiff stats
+			// with claims that don't even meet its own assigned
+			// difficulty. This is a garbage-in filter on the claimed
+			// value only (no daemon round-trip here either way, so no
+			// new async-pool load) — see this block's own doc comment
+			// above for why it does not restore cryptographic
+			// authenticity.
+			if claimedDiff < job.StaticDifficulty {
+				s.writeShareResponse(req.ID, false, "share does not meet the job's configured difficulty")
+				return
+			}
 			s.shareCount.Add(1)
 			s.hashesAccumulated.Add(job.StaticDifficulty)
 			s.writeShareResponse(req.ID, true, "")

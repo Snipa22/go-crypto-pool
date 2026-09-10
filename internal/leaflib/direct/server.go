@@ -88,8 +88,23 @@ type Server struct {
 	// RandomX-validation-skip mechanism for RXT/RXM shares (see
 	// solo/trust.go). Zero-value TrustConfig{} (Enabled: false) is
 	// the default — every share is always fully validated unless a
-	// caller explicitly opts in via EnableTrust.
+	// caller explicitly opts in via EnableTrust. UNLIKE solo (which
+	// removed this mechanism entirely -- DISPATCH_BRIEF.md,
+	// 2026-09-10, Fix 5 -- it was unreachable dead weight there post
+	// solo's block-find-only validation change), leaf-direct still
+	// validates EVERY RXT/RXM submit for real, so a ramped trust
+	// state here is a genuinely live, real-money-relevant tradeoff:
+	// see EnableTrust's own doc comment below for the explicit risk
+	// framing an operator enabling this on leaf-direct should
+	// understand before doing so.
 	trustConfig solo.TrustConfig
+
+	// invalidShareGuardConfig mirrors solo.Server's own identical
+	// field exactly -- see leaflib.InvalidShareGuard's doc comment
+	// for the full DISPATCH_BRIEF.md 2026-09-10 Fix 2b rationale.
+	// Defaults to leaflib.DefaultInvalidShareGuardConfig() (enabled)
+	// in NewServer; overridable via SetInvalidShareGuardConfig.
+	invalidShareGuardConfig leaflib.InvalidShareGuardConfig
 
 	// addressFlags mirrors solo.Server's own identical field exactly
 	// -- see that field's doc comment. leaf-direct's Cache is fed by
@@ -227,7 +242,16 @@ func NewServer(cfg ServerConfig) *Server {
 		validators:       cfg.Validators, network: cfg.Network, logger: logger,
 		transport: cfg.Transport, multiSubmit: cfg.MultiSubmit, relay: cfg.Relay, algo: cfg.Algo,
 		poolType: cfg.PoolType, poolID: cfg.PoolID,
-		randomxPool: solo.NewAsyncValidationPool(solo.AsyncValidationWorkers, solo.AsyncValidationQueueSize),
+		invalidShareGuardConfig: leaflib.DefaultInvalidShareGuardConfig(),
+		// workers=0 lets NewAsyncValidationPool apply its own default
+		// (DefaultAsyncValidationWorkers() == runtime.NumCPU(), NOT a
+		// hardcoded literal -- see solo/asyncvalidation.go's doc
+		// comment and Alex's explicit direction in
+		// DISPATCH_BRIEF.md, 2026-09-10). An operator wanting a
+		// different fixed count can override via
+		// SetRandomXWorkerPoolSize (see cmd/leaf-direct's
+		// -randomx-workers flag) before Serve begins.
+		randomxPool: solo.NewAsyncValidationPool(0, solo.AsyncValidationQueueSize),
 	}
 	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {
@@ -272,13 +296,59 @@ func (s *Server) SetHideRemoteAddress(hide bool) {
 	s.hideRemoteAddress = hide
 }
 
+// SetRandomXWorkerPoolSize mirrors solo.Server's own identical
+// method exactly — see that method's doc comment.
+func (s *Server) SetRandomXWorkerPoolSize(workers, queueSize int) {
+	s.randomxPool.Stop()
+	s.randomxPool = solo.NewAsyncValidationPool(workers, queueSize)
+}
+
+// SetInvalidShareGuardConfig mirrors solo.Server's own identical
+// method exactly — see that method's doc comment and
+// leaflib.InvalidShareGuard's package-level doc comment.
+func (s *Server) SetInvalidShareGuardConfig(cfg leaflib.InvalidShareGuardConfig) {
+	s.invalidShareGuardConfig = cfg.Normalized()
+	s.invalidShareGuardConfig.Enabled = cfg.Enabled
+}
+
 // EnableTrust opts this server into the real, legacy-ported
 // probabilistic RandomX-validation-skip mechanism for RXT/RXM shares
 // (see solo/trust.go's doc comment for the full reference algorithm
 // and citation) — mirrors solo.Server's own identical EnableTrust
-// exactly. Must be called before serving any connections to take
-// effect for them — sessions capture s.trustConfig once, at
-// newSession time.
+// exactly (solo's own copy has since been removed entirely — see
+// solo.Session.handleSubmit's DISPATCH_BRIEF doc comment,
+// 2026-09-10, Fix 5 — but leaf-direct's is NOT vestigial: unlike
+// solo, which only validates an RXT/RXM share for real at the rare
+// block-find level, leaf-direct's own handleSubmit runs v.Validate
+// for EVERY RXT/RXM submit, so this mechanism is a genuinely live,
+// frequently-consulted skip here).
+//
+// REAL-MONEY RISK, SPELLED OUT EXPLICITLY (DISPATCH_BRIEF.md,
+// 2026-09-10, Fix 5 — documentation-only; no behavior change to this
+// method or trustConfig's wiring): unlike solo (no share table, no
+// backend, no payouts — see solo's own corrected comment, Fix 4), a
+// leaf-direct share that skips real validation here still reaches
+// s.transport.SubmitShare and the real backend's payout accounting,
+// entirely on the miner's own claimed value, with NO cryptographic
+// re-check on this leaf. Combined with Fix 1's difficulty-floor
+// check (session.go's handleSubmit, post-validate/post-skip) this is
+// a materially SAFER combination than before this dispatch (a
+// trusted-but-fabricated claim can no longer also slip under this
+// job's own StaticDifficulty floor uncaught), but it is still a
+// deliberate trust-for-throughput tradeoff, not a free feature: a
+// sufficiently ramped-in, then-compromised or malicious miner can
+// still have some fraction of its claims credited (and forwarded to
+// the backend) without ever being cryptographically re-checked by
+// THIS leaf, bounded only by TrustConfig.Min/256 in the steady state
+// (see solo/trust.go's own doc comment for that exact, known,
+// intentionally-not-"fixed" tradeoff). An operator enabling
+// -trust-enabled on leaf-direct (see cmd/leaf-direct's own flag help
+// text) should understand this is trading a real, if bounded,
+// authenticity gap for reduced randomx-service load — not assume it
+// is a strictly free optimization the way it might appear to be on
+// leaf-solo (where it no longer even exists). Must be called before
+// serving any connections to take effect for them — sessions capture
+// s.trustConfig once, at newSession time.
 func (s *Server) EnableTrust(cfg solo.TrustConfig) {
 	s.trustConfig = cfg.Normalized()
 	s.trustConfig.Enabled = cfg.Enabled

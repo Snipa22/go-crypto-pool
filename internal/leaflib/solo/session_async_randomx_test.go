@@ -268,12 +268,14 @@ func TestSessionRandomXConcurrentSubmitsDoNotSerializeOnReadLoop(t *testing.T) {
 	elapsed := time.Since(start)
 
 	// Fully sequential (the pre-fix bug) would take >= numShares*delay =
-	// 24*40ms = 960ms. A bounded worker pool with AsyncValidationWorkers
-	// (8) workers should take roughly ceil(24/8)*40ms = 120ms plus
-	// scheduling overhead. Assert well under half the fully-serial bound
-	// -- generous enough to avoid CI flakiness while still being a real,
-	// meaningful regression guard against reintroducing full
-	// serialization.
+	// 24*40ms = 960ms. A bounded worker pool with
+	// DefaultAsyncValidationWorkers() (runtime.NumCPU(), NOT a fixed
+	// literal — see asyncvalidation.go's doc comment) workers should
+	// take roughly ceil(24/numCPU)*40ms, comfortably under this
+	// bound on any real multi-core test runner. Assert well under
+	// half the fully-serial bound -- generous enough to avoid CI
+	// flakiness while still being a real, meaningful regression guard
+	// against reintroducing full serialization.
 	serialBound := time.Duration(numShares) * delay
 	if elapsed >= serialBound/2 {
 		t.Fatalf("elapsed %v is not meaningfully less than the fully-serial bound %v -- read loop may be blocking on each validation again (the exact bug this fix addresses)", elapsed, serialBound)

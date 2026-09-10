@@ -141,6 +141,13 @@ type Server struct {
 	// for the full production-incident rationale this class of fix
 	// addresses). Always non-nil (constructed in NewServer).
 	randomxPool *solo.AsyncValidationPool
+
+	// invalidShareGuardConfig mirrors solo.Server's own identical
+	// field exactly -- see leaflib.InvalidShareGuard's doc comment
+	// for the full DISPATCH_BRIEF.md 2026-09-10 Fix 2b rationale.
+	// Defaults to leaflib.DefaultInvalidShareGuardConfig() (enabled)
+	// in NewServer; overridable via SetInvalidShareGuardConfig.
+	invalidShareGuardConfig leaflib.InvalidShareGuardConfig
 }
 
 // NewServer constructs a Server. cm must already be configured with
@@ -160,16 +167,25 @@ func NewServer(cm *leaflib.ConnectionManager, jobs *JobManager, validator ShareV
 		logger = log.Default()
 	}
 	s := &Server{
-		cm:               cm,
-		jobs:             jobs,
-		validator:        validator,
-		upstream:         upstream,
-		logger:           logger,
-		vardiff:          vardiff.Normalized(),
-		jobMaxAge:        jobMaxAge,
-		sessions:         make(map[uint64]*Session),
-		maxAddressLabels: metrics.DefaultMaxAddressLabels,
-		randomxPool:      solo.NewAsyncValidationPool(solo.AsyncValidationWorkers, solo.AsyncValidationQueueSize),
+		cm:                      cm,
+		jobs:                    jobs,
+		validator:               validator,
+		upstream:                upstream,
+		logger:                  logger,
+		vardiff:                 vardiff.Normalized(),
+		jobMaxAge:               jobMaxAge,
+		sessions:                make(map[uint64]*Session),
+		maxAddressLabels:        metrics.DefaultMaxAddressLabels,
+		invalidShareGuardConfig: leaflib.DefaultInvalidShareGuardConfig(),
+		// workers=0 lets NewAsyncValidationPool apply its own default
+		// (DefaultAsyncValidationWorkers() == runtime.NumCPU(), NOT a
+		// hardcoded literal -- see solo/asyncvalidation.go's doc
+		// comment and Alex's explicit direction in
+		// DISPATCH_BRIEF.md, 2026-09-10). An operator wanting a
+		// different fixed count can override via
+		// SetRandomXWorkerPoolSize (see cmd/leaf-proxy's
+		// -randomx-workers flag) before Serve begins.
+		randomxPool: solo.NewAsyncValidationPool(0, solo.AsyncValidationQueueSize),
 	}
 	s.unsubscribe = jobs.Subscribe(s.repushAllSessions)
 	return s
@@ -199,6 +215,21 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 // identical method exactly — see that doc comment.
 func (s *Server) SetHideRemoteAddress(hide bool) {
 	s.hideRemoteAddress = hide
+}
+
+// SetRandomXWorkerPoolSize mirrors solo.Server's own identical
+// method exactly — see that method's doc comment.
+func (s *Server) SetRandomXWorkerPoolSize(workers, queueSize int) {
+	s.randomxPool.Stop()
+	s.randomxPool = solo.NewAsyncValidationPool(workers, queueSize)
+}
+
+// SetInvalidShareGuardConfig mirrors solo.Server's own identical
+// method exactly — see that method's doc comment and
+// leaflib.InvalidShareGuard's package-level doc comment.
+func (s *Server) SetInvalidShareGuardConfig(cfg leaflib.InvalidShareGuardConfig) {
+	s.invalidShareGuardConfig = cfg.Normalized()
+	s.invalidShareGuardConfig.Enabled = cfg.Enabled
 }
 
 // EnableAddressFlags mirrors solo.Server's/direct.Server's own

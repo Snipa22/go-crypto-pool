@@ -34,24 +34,36 @@ monerod_url = ""
 # mechanism for RXT/RXM shares. Disabled by default -- every share is always
 # fully, cryptographically validated. Has no effect for SHA3X/C29.
 # (default: false)
-trust_enabled = false
+#
+# REMOVED (DISPATCH_BRIEF.md, 2026-09-10, Fix 5): this mechanism has been
+# removed from leaf-solo entirely -- post the block-find-only RXT/RXM
+# validation change, it was unreachable dead weight here (real validation,
+# the only thing this mechanism could ever skip, now only ever runs at the
+# rare block-find level). These trust_* keys are IGNORED if still present in
+# an existing config file; direct.EnableTrust still exists for leaf-direct,
+# where this mechanism remains a real, live tradeoff. Left commented out
+# here for documentation/history only.
+# trust_enabled = false
+# trust_threshold = 0
+# trust_penalty = 0
+# trust_change = 0
+# trust_min = 0
 
-# Real trust-ramp threshold gate -- 0/unset uses the documented default (10).
-# (default: 0)
-trust_threshold = 0
+# RandomX-family (RXT/RXM) async validation worker pool size (see
+# internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented
+# default, runtime.NumCPU() -- NOT a hardcoded literal. (default: 0)
+randomx_workers = 0
 
-# Real trust-ramp penalty gate, re-armed after any rejected share -- 0/unset
-# uses the documented default (30). (default: 0)
-trust_penalty = 0
+# Disconnect a session after too many CONSECUTIVE real RandomX-family
+# (RXT/RXM) block-find-level validation failures (see
+# internal/leaflib.InvalidShareGuard) -- a security-hardening default,
+# enabled unless explicitly turned off. (default: true)
+invalid_share_disconnect_enabled = true
 
-# Real per-accepted-share probability decrement -- 0/unset uses the
-# documented default (1). (default: 0)
-trust_change = 0
-
-# Real probability floor, ensuring full validation never stops occurring
-# entirely once ramped in -- 0/unset uses the documented default (20).
-# (default: 0)
-trust_min = 0
+# Consecutive-invalid-share threshold before a session is disconnected (see
+# invalid_share_disconnect_enabled above). 0/unset uses the documented
+# default (20). (default: 0)
+invalid_share_disconnect_threshold = 0
 
 # Which single mining algorithm this leaf-solo process serves: sha3x
 # (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/

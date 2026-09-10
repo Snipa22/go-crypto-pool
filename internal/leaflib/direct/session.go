@@ -71,6 +71,11 @@ type Session struct {
 	// time — see solo.MinerTrust and solo/trust.go's doc comment.
 	trust *solo.MinerTrust
 
+	// invalidShareGuard mirrors solo.Session's own identical field
+	// exactly — see leaflib.InvalidShareGuard's doc comment for the
+	// full DISPATCH_BRIEF.md 2026-09-10 Fix 2b rationale.
+	invalidShareGuard *leaflib.InvalidShareGuard
+
 	// --- per-session job ownership, mirroring solo.Session's own
 	// SECURITY FIX (PR #14) exactly: see solo/session.go's Session
 	// type doc comment for the full rationale. Ported here verbatim
@@ -129,6 +134,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	if server.trustConfig.Enabled {
 		s.trust = solo.NewMinerTrust(server.trustConfig)
 	}
+	s.invalidShareGuard = leaflib.NewInvalidShareGuard(server.invalidShareGuardConfig)
 	return s
 }
 
@@ -533,7 +539,11 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// solo.Session's own identical handleSubmit gating exactly (see
 		// solo/trust.go's doc comment). Only RXT/RXM ever consider a
 		// skip; SHA3X/C29 are always fully validated regardless of
-		// s.trust's state.
+		// s.trust's state. UNLIKE solo (which removed this mechanism
+		// entirely -- DISPATCH_BRIEF.md, 2026-09-10, Fix 5), it stays
+		// fully wired here — see Server.EnableTrust's doc comment for
+		// the explicit real-money risk framing an operator enabling it
+		// on leaf-direct should understand.
 		var valid bool
 		skipped := solo.IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
 		if skipped {
@@ -546,14 +556,30 @@ func (s *Session) handleSubmit(req solo.Request) {
 			}
 		}
 		if !valid {
+			// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b):
+			// a fabricated above-target claim that fails this real
+			// validation is the actual DoS vector Finding 2
+			// identified -- track it against this session's own
+			// leaflib.InvalidShareGuard (see that type's doc comment)
+			// and disconnect once it exceeds its configured
+			// consecutive-invalid-share threshold, so it can no
+			// longer keep flooding s.server.randomxPool with garbage.
+			// Only ever consulted for RandomX-family submits -- the
+			// same scope as s.trust immediately above -- since
+			// SHA3X/C29 never touch that shared async pool at all
+			// (see this method's own dispatch decision at the bottom
+			// of handleSubmit).
+			disconnect := false
 			if solo.IsRandomXFamily(job.Algo) {
 				s.trust.RecordOutcome(false)
+				disconnect = s.invalidShareGuard.RecordOutcome(false)
 			}
 			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
+			if disconnect {
+				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
+				s.mc.Close("exceeded consecutive invalid-share threshold")
+			}
 			return
-		}
-		if solo.IsRandomXFamily(job.Algo) {
-			s.trust.RecordOutcome(true)
 		}
 
 		s.shareCount.Add(1)
@@ -562,6 +588,48 @@ func (s *Session) handleSubmit(req solo.Request) {
 		if err != nil {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
 			return
+		}
+
+		// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 1
+		// [CRITICAL — Finding 1]): reject/don't-forward if this
+		// share's REAL derived difficulty doesn't meet this job's own
+		// configured StaticDifficulty — Alex's exact framing: "as
+		// long as the difficulty of the hash is OVER the difficulty
+		// of the job, it's fine, because we send the job diff back
+		// upstream." diff here is NOT the miner's raw unconfirmed
+		// claim: it is BuildCandidateBlock's own real derivation
+		// (node.go's tariBuildCandidateBlock/rxtLittleEndianDifficulty
+		// for RXT, monero_node.go's moneroDifficultyFromHash for RXM)
+		// computed from the SAME submit.Result hex the validator call
+		// above just confirmed matches the daemon's own real,
+		// independently-recomputed hash (v.Validate's hash-EQUALITY
+		// check) -- so this is deriving the REAL difficulty, not
+		// merely re-checking an unconfirmed claim, for the ordinary
+		// (non-skipped) validation path. For the trust-skipped path
+		// (skipped == true above), submit.Result was never
+		// cryptographically confirmed at all, so this check is only
+		// ever a claimed-value floor there -- see Server.EnableTrust's
+		// doc comment for the full, explicit real-money risk framing
+		// of combining trust-skip with this floor check. Either way,
+		// this is checked BEFORE forwardShare (below) ever reaches the
+		// real backend/payout accounting, unlike the pre-fix behavior
+		// this closure used to have (validated on hash-equality alone,
+		// then forwarded unconditionally at s.server.transport's
+		// StaticDifficulty-weighted credit regardless of REAL derived
+		// difficulty).
+		if solo.IsRandomXFamily(job.Algo) && diff < job.StaticDifficulty {
+			disconnect := s.invalidShareGuard.RecordOutcome(false)
+			s.trust.RecordOutcome(false)
+			s.writeShareResponse(req.ID, false, "share does not meet the job's configured difficulty")
+			if disconnect {
+				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
+				s.mc.Close("exceeded consecutive invalid-share threshold")
+			}
+			return
+		}
+		if solo.IsRandomXFamily(job.Algo) {
+			s.trust.RecordOutcome(true)
+			s.invalidShareGuard.RecordOutcome(true)
 		}
 
 		// GENUINE DIFFERENCE FROM leaf-solo: every validated share (not

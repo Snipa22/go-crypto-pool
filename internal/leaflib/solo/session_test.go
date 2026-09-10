@@ -1188,10 +1188,31 @@ func TestSessionC29NonceByteOrderIsBigEndianNotLittleEndian(t *testing.T) {
 // go-tari-sha3x-solo-stratum's miners are expected to follow
 // (session.go's handleSubmit checks strings.HasPrefix on the hex
 // string, not on the decoded bytes' numeric value).
+//
+// BUG FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 6): n is now encoded
+// BIG-ENDIAN, not little-endian. With a little-endian encoding, xn's
+// overwrite of the leading hex characters clobbers the LOW-order
+// bytes of n -- exactly the bytes a small increment (e.g. `n+1` in a
+// retry loop) changes -- so two calls with genuinely different,
+// small-delta n values could silently produce the BYTE-IDENTICAL
+// final nonce hex once xn is overlaid, defeating any caller that
+// increments n across retries against the SAME job_id expecting a
+// genuinely distinct nonce each time (this exact bug caused
+// intermittent "duplicate nonce" flakes in
+// direct/trust_integration_test.go's identical LE helper -- see that
+// package's directXNPrefixedNonceHex/directXNPrefixedNonceHexBigEndian
+// doc comments). Big-endian encoding puts n's low-order bytes at the
+// END of the hex string, outside xn's overwritten prefix, so small
+// increments always produce a genuinely distinct final nonce
+// regardless of xn's length. No existing caller in this file depends
+// on the specific byte-order this helper picks (each call site cares
+// only about wire acceptance/rejection and the xn-prefix match, never
+// the decoded numeric value), so this is a safe, non-behavior-
+// changing-for-existing-tests fix.
 func xnPrefixedNonceHex(xn string, n uint64) string {
 	buf := make([]byte, 8)
 	for i := 0; i < 8; i++ {
-		buf[i] = byte(n >> (8 * i))
+		buf[7-i] = byte(n >> (8 * i))
 	}
 	full := hex.EncodeToString(buf)
 	return xn + full[len(xn):]
