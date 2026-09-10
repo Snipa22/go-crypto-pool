@@ -464,6 +464,68 @@ const (
 	c29SubmitCycleSize = 42
 )
 
+// claimedRandomXFamilyDifficulty derives the difficulty implied by an
+// RXT/RXM miner's own CLAIMED result hash (submit.Result) using the
+// SAME real, algo-appropriate, already-existing formula
+// BuildCandidateBlock's own NodeClient implementations use to derive
+// a share's real difficulty AFTER real validation
+// (rxtLittleEndianDifficulty for ALGO_RXT — tariBuildCandidateBlock,
+// node.go; moneroDifficultyFromHash for ALGO_RXM —
+// MoneroNodeClient.BuildCandidateBlock, monero_node.go). Reusing
+// those exact, already-real-source-confirmed functions here (rather
+// than leaf-proxy's own littleEndianDifficulty, proxy/difficulty.go —
+// mathematically identical for the Monero case, per that function's
+// own doc comment, but never verified against RXT's own real Tari
+// Rust formula, since proxy never handles RXT at all) guarantees this
+// pre-validation estimate is byte-for-byte the same value
+// BuildCandidateBlock would derive once a claim is confirmed real,
+// for both algos this leaf actually serves — see this repo's
+// DISPATCH_BRIEF.md (2026-09-10) for the explicit instruction to
+// verify this rather than assuming proxy's formula transfers.
+//
+// DISPATCH_BRIEF (2026-09-10, Alex): this is what lets handleSubmit
+// decide "is this an ordinary sub-block share, or a genuine block-
+// find candidate" WITHOUT paying for a real, synchronous
+// randomx-service HTTP round-trip on every single submit — mirroring
+// leaf-proxy's own identical cheap-derivation-before-expensive-
+// verification shape (internal/leaflib/proxy/session.go's
+// handleSubmit, step 7 of its own doc comment). It is a pure
+// computation over bytes the miner already sent on the wire and does
+// NOT confirm the claim is cryptographically genuine (a lying miner
+// can claim any hash value here) — see handleSubmit's own doc comment
+// for why that is fine for the ordinary-share branch (nothing at that
+// difficulty level was ever cryptographically re-verified server-side
+// for RXT/RXM even before this change either: validator.
+// RandomXValidator.Validate checks hash EQUALITY against the miner's
+// claim, not difficulty, so a real per-share difficulty floor was
+// never actually enforced here) and why it is NOT fine for the
+// block-find branch, which still runs the real v.Validate call before
+// ever trusting this number enough to call BuildCandidateBlock/
+// SubmitBlock.
+//
+// Returns an error for malformed hex or an all-zero hash (division by
+// zero has no sound difficulty) — handleSubmit treats either as an
+// outright reject, matching how a malformed/all-zero claimed hash was
+// always eventually rejected before this change too (Validate's own
+// hex-decode-failure branch already returned (false, nil); a
+// genuinely all-zero real RandomX hash has never been observed in
+// practice and would previously have still failed BuildCandidateBlock's
+// own identical zero-hash guard once Validate happened to pass).
+func claimedRandomXFamilyDifficulty(algo poolpb.Algo, resultHex string) (uint64, error) {
+	hashBytes, err := hex.DecodeString(resultHex)
+	if err != nil {
+		return 0, fmt.Errorf("claimed result hash is not valid hex: %w", err)
+	}
+	switch algo {
+	case poolpb.Algo_ALGO_RXT:
+		return rxtLittleEndianDifficulty(hashBytes)
+	case poolpb.Algo_ALGO_RXM:
+		return moneroDifficultyFromHash(hashBytes)
+	default:
+		return 0, fmt.Errorf("claimedRandomXFamilyDifficulty: algo %v is not a RandomX-family algo", algo)
+	}
+}
+
 // handleSubmit implements the real "submit" method. Underlying logic
 // (SHA3XValidator.Validate, block-target comparison, SubmitBlock,
 // shareCount/blockCount bookkeeping) is unchanged from the previous
@@ -868,6 +930,17 @@ func (s *Session) handleSubmit(req Request) {
 	// unchanged behavior) or dispatched to asyncvalidation.go's bounded,
 	// server-wide worker pool (RXT/RXM — see the dispatch below).
 	//
+	// UPDATE (DISPATCH_BRIEF, 2026-09-10): for RXT/RXM, finishSubmit is
+	// no longer reached for EVERY submitted share — only for the rare
+	// one whose claimed result already crosses job.NetworkTargetDifficulty
+	// (a genuine block-find candidate). An ordinary sub-block RXT/RXM
+	// share is now credited earlier, inline, without ever calling
+	// finishSubmit or touching the real validator/async pool at all —
+	// see the dispatch decision below finishSubmit's own definition for
+	// the full rationale. finishSubmit's own body is otherwise
+	// unchanged: it is still exactly what SHA3X/C29 always run, and
+	// still exactly what an RXT/RXM block-find candidate needs to run.
+	//
 	// RESPONSE-ORDERING NOTE (verified against the real xmrig source,
 	// github.com/xmrig/xmrig, src/base/net/stratum/Client.cpp): a real
 	// xmrig client matches a submit's response to its own request purely
@@ -1032,18 +1105,130 @@ func (s *Session) handleSubmit(req Request) {
 		go s.server.jobManager.InvalidateAll()
 	}
 
-	// DISPATCH: only RXT/RXM (the two algos whose validator makes a real
-	// network round-trip — see asyncvalidation.go's doc comment) go
-	// through the bounded async pool. SHA3X/C29 keep running finishSubmit
-	// INLINE, synchronously, in the read loop exactly as before this
-	// fix — a deliberate choice, not an oversight: their validators
-	// (SHA3XValidator/C29Validator) are cheap in-process CPU hashes with
-	// no analogous network-latency bottleneck, so there is no throughput
-	// problem to fix for them, and keeping their code path completely
-	// unchanged eliminates any regression risk to already-working
-	// behavior for a benefit (a handful of microseconds of dispatch
-	// overhead) that doesn't exist for them.
+	// DISPATCH_BRIEF (2026-09-10, Alex's explicit direction): leaf-solo
+	// only actually needs to cryptographically validate an RXT/RXM
+	// share for real when it is about to submit a candidate block to
+	// the daemon — the same model leaf-proxy already uses (see
+	// internal/leaflib/proxy/session.go's handleSubmit doc comment: an
+	// ordinary sub-block share is credited on the miner's own claimed
+	// result with no real crypto check at all; the real, expensive
+	// verification runs ONLY for the rare submit whose claimed result
+	// numerically crosses the pool's own block-level target). SHA3X/C29
+	// are cheap local CPU hashes with no external daemon dependency and
+	// are completely unaffected by this — finishSubmit still always
+	// runs INLINE for them below, exactly as before this change.
+	//
+	// For ALGO_RXT/ALGO_RXM, claimedRandomXFamilyDifficulty (above)
+	// derives the miner's claimed difficulty from its own submitted
+	// result hash alone — a cheap, pure-CPU computation, no network
+	// I/O — and that alone now decides which of two paths this submit
+	// takes:
+	//
+	//   - Below job.NetworkTargetDifficulty (the overwhelming majority
+	//     of real submits): an ordinary sub-block share. Credited on
+	//     the miner's own claim, exactly like ShouldSkipValidation's
+	//     pre-existing "trusted share" branch inside finishSubmit
+	//     already did for a trusted miner — the real, synchronous
+	//     randomx-service HTTP round-trip (validator.RandomXValidator.
+	//     Validate, ~4ms+ per call — see asyncvalidation.go's package
+	//     doc comment for the full 2026-08-30 production-incident
+	//     history that call's cost originally caused) is never made at
+	//     all, and this submit never touches s.server.randomxPool
+	//     either — it is handled entirely, synchronously, right here in
+	//     Session.Run's read loop, the same way SHA3X/C29 always have
+	//     been. This is safe: no per-share difficulty floor was ever
+	//     cryptographically enforced server-side for RXT/RXM even
+	//     before this change (validator.RandomXValidator.Validate
+	//     checks claimed-vs-actual hash EQUALITY, not difficulty — see
+	//     claimedRandomXFamilyDifficulty's own doc comment) — the only
+	//     thing that changes here is WHEN a real hash-equality check
+	//     happens for this class of share, not whether one ever
+	//     independently re-derived and gated on this specific value.
+	//   - At or above job.NetworkTargetDifficulty (a genuine block-find
+	//     candidate, expected to be extremely rare): the real,
+	//     expensive validator round-trip — and everything downstream of
+	//     it (BuildCandidateBlock/SubmitBlock) — still runs, dispatched
+	//     onto s.server.randomxPool exactly as before this change (see
+	//     asyncvalidation.go). A real, malformed, or outright FALSE
+	//     claim (a claimed hash that numerically crosses the target but
+	//     does not match what the daemon actually computes) is still
+	//     caught and rejected by finishSubmit's own existing
+	//     `!valid` branch below — never silently credited as a block
+	//     find, and never silently downgraded to an ordinary accepted
+	//     share either.
+	//
+	// TRUST-INTERACTION NOTE (flagged explicitly per this task's own
+	// instruction not to silently paper over this, rather than changed):
+	// s.trust's ShouldSkipValidation/RecordOutcome are still wired into
+	// finishSubmit exactly as before, unmodified — but finishSubmit is
+	// now ONLY ever reached at this narrower, block-find-level call
+	// site. For the overwhelming majority of ordinary shares that never
+	// reach finishSubmit anymore, trust is simply never consulted,
+	// which changes nothing observable (an ordinary share's credit
+	// never depended on trust's coin-flip outcome before this change
+	// either — ShouldSkipValidation only ever decided whether THAT
+	// call's real Validate was skipped, not whether the share itself
+	// was credited). What DOES change in character: if a sufficiently
+	// "trusted" miner's coin-flip happens to land on skip AT EXACTLY
+	// the moment it submits a genuine block-find-level claim, that
+	// claim is now taken fully on faith with NO real cryptographic
+	// confirmation before BuildCandidateBlock/SubmitBlock run against
+	// it. This exact risk already existed before this change too (trust
+	// was already consulted ahead of the old code's own
+	// diff/NetworkTargetDifficulty comparison, so a trusted miner could
+	// already skip validation on what turned out to be a block-level
+	// submit) — this change does not introduce it — but it is now
+	// concentrated EXCLUSIVELY at the one call site where the stakes (a
+	// real candidate-block submission, or crediting a block find that
+	// was never real) are highest, rather than diluted across every
+	// RXT/RXM submit. Left exactly as-is per this task's explicit
+	// instruction; noted here instead of silently working around it.
+	//
+	// ASYNCVALIDATION.GO RELEVANCE (explicit conclusion, per this
+	// task's own instruction to state one): the bounded worker pool is
+	// NOT vestigial and is kept exactly as-is. A genuine block-find
+	// submit still pays the same real, synchronous ~4ms+
+	// randomx-service HTTP round-trip that motivated asyncvalidation.go
+	// in the first place, and a real block-race — several concurrent
+	// RXT/RXM sessions independently crossing job.NetworkTargetDifficulty
+	// within the same short window — could still, in principle, produce
+	// more than one such submit close together; running those inline
+	// would reintroduce exactly the read-loop-blocking bug
+	// asyncvalidation.go exists to prevent, just at a much lower
+	// frequency. What DID change is WHEN this leaf's own dispatch
+	// decision (this `if` below) fires: previously every single
+	// RXT/RXM submit was dispatched through the pool; now only the rare
+	// submit whose claimed result already crosses the block-level
+	// target is — i.e. solo's own dispatch frequency now matches
+	// leaf-proxy's own already-narrow dispatch trigger (proxy only ever
+	// dispatches its own genuine upstream-forward candidates), not a
+	// simplification of asyncvalidation.go itself, which remains
+	// shared, unmodified, production infrastructure (also used by
+	// leaf-direct and leaf-proxy — see asyncvalidation.go's own doc
+	// comment).
 	if IsRandomXFamily(job.Algo) {
+		claimedDiff, err := claimedRandomXFamilyDifficulty(job.Algo, submit.Result)
+		if err != nil {
+			// Malformed hex, or a degenerate all-zero claimed hash —
+			// see claimedRandomXFamilyDifficulty's own doc comment for
+			// why this is treated as an outright reject, matching how
+			// either case was already eventually rejected before this
+			// change (Validate's own hex-decode-failure branch, or
+			// BuildCandidateBlock's own zero-hash guard).
+			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
+			return
+		}
+		if job.NetworkTargetDifficulty == 0 || claimedDiff < job.NetworkTargetDifficulty {
+			// Ordinary sub-block share: no real validator call, no
+			// async dispatch — see this block's own doc comment above.
+			s.shareCount.Add(1)
+			s.hashesAccumulated.Add(job.StaticDifficulty)
+			s.writeShareResponse(req.ID, true, "")
+			return
+		}
+		// Genuine block-find candidate: the real, expensive path,
+		// still dispatched off the read loop exactly as before this
+		// change (see asyncvalidation.go).
 		if ok := s.server.randomxPool.Submit(finishSubmit); !ok {
 			// Pool already stopped (server shutting down) — respond
 			// with a real rejection rather than leaving this submit

@@ -107,14 +107,28 @@ func TestSessionRXTTrustedShareSkipsRealRandomXValidation(t *testing.T) {
 	forceTrustReady(sess.trust)
 
 	badNonce := xnPrefixedNonceHex(xn, 0xdeadbeef)
-	// A non-zero, non-degenerate 32-byte hex "result" -- content is
-	// irrelevant to whether the skip happens (that's the whole
-	// point: a trusted share takes the miner's claim on faith without
-	// ever computing/comparing a real hash), but it must not be the
-	// literal all-zero value BuildCandidateBlock's own real
-	// downstream difficulty math correctly treats as a degenerate,
-	// unusable hash (division-by-zero guard, unrelated to this test).
-	fakeResult := strings.Repeat("ab", 32)
+	// DISPATCH_BRIEF (2026-09-10) UPDATE: solo now only ever consults
+	// s.trust / calls the real validator for an RXT/RXM submit whose
+	// CLAIMED result already crosses job.NetworkTargetDifficulty (a
+	// genuine block-find candidate) -- see session.go's handleSubmit
+	// doc comment. An "ab"-repeated claimed hash (this test's previous
+	// fixture) derives to a claimed difficulty of essentially 1 (see
+	// rxt_test.go's own "all 0xFF hash -> very LOW difficulty" vector;
+	// 0xAB-repeated is in the same "hash is numerically large, so
+	// derived difficulty is tiny" regime), which is an ORDINARY
+	// sub-block share under the new model and would never reach
+	// finishSubmit/s.trust at all, defeating this test's whole point.
+	// This fixture instead encodes a claimed hash that is numerically
+	// TINY when read little-endian (mostly zero, with a single low
+	// nonzero byte so it is not the literal, degenerate all-zero value
+	// claimedRandomXFamilyDifficulty correctly treats as an error) --
+	// its derived difficulty is astronomically larger than
+	// networkTargetDiff (1<<62), making this submit a genuine
+	// block-find candidate that DOES reach finishSubmit and DOES
+	// consult s.trust, exactly what this test needs to prove trust-skip
+	// genuinely avoids the real daemon round-trip at the one call site
+	// that still makes one.
+	fakeResult := "01" + strings.Repeat("00", 31)
 	submitAndExpectSkip := func() (accepted bool, errMsg string) {
 		h.send(Request{ID: 70, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			ID:     sessionID,
