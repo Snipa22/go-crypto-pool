@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"net"
 	"sync"
 	"testing"
@@ -20,17 +21,46 @@ import (
 // numerically LARGE when interpreted little-endian (matching
 // rxtLittleEndianDifficulty's own real interpretation), so
 // diff = U256::MAX/hash comes out SMALL -- well below the huge
-// networkTargetDiff (1<<62) these tests configure. That keeps every
-// accepted share on the ordinary "accepted, below block difficulty" wire
-// response path instead of the block-find path (which would additionally
-// trigger SubmitBlock/InvalidateAll/an unsolicited job re-push per share,
-// polluting these tests' expected response stream with extra, unrelated
-// wire messages). idx varies the low byte only (least-significant in
-// little-endian), which is also what these tests' fake validators key
-// accept/reject and delay decisions off of via resultHex's first hex byte.
+// networkTargetDiff (1<<62) these tests configure, keeping the resulting
+// share an ORDINARY sub-block share (see DISPATCH_BRIEF.md: as of this
+// change, solo only calls the real validator / dispatches to
+// s.server.randomxPool at all for a submit whose claimed result crosses
+// job.NetworkTargetDifficulty -- an ordinary share like this is credited
+// entirely synchronously, inline, in Session.Run's own read loop, and
+// never touches the validator or the pool). idx varies the low byte
+// only (least-significant in little-endian), which is also what these
+// tests' fake validators key accept/reject and delay decisions off of
+// via resultHex's first hex byte.
 func largeResultHash(idx int) []byte {
 	h := bytes.Repeat([]byte{0xFF}, 32)
 	h[0] = byte(idx)
+	return h
+}
+
+// blockFindResultHash returns a 32-byte claimed RandomX result hash that
+// is numerically TINY when interpreted little-endian, so
+// diff = U256::MAX/hash comes out ASTRONOMICALLY LARGE -- comfortably
+// above any networkTargetDiff these tests configure (including the
+// 1<<62 most of them use), making every share built from this a genuine
+// BLOCK-FIND CANDIDATE under the new validate-only-at-block-find model
+// (DISPATCH_BRIEF.md): it DOES call the real validator and IS dispatched
+// through s.server.randomxPool, exactly like a real block find would be.
+//
+// h[2]=1 is a fixed "salt" byte that keeps the little-endian numeric
+// value (idx + 1*65536, at most 65791) safely non-zero regardless of
+// idx (idx=0 alone would otherwise encode the degenerate all-zero hash,
+// which claimedRandomXFamilyDifficulty correctly treats as an error, not
+// as "extremely high difficulty") while staying tiny enough that the
+// resulting difficulty (roughly 2^256/65536, vastly larger than any
+// realistic uint64 target) reliably crosses every target these tests
+// use. h[0]=idx is preserved so these tests' existing per-share fake
+// validator hooks (which key accept/reject/delay decisions off
+// resultHex's first hex byte, unchanged from largeResultHash's own
+// convention) keep working identically.
+func blockFindResultHash(idx int) []byte {
+	h := make([]byte, 32)
+	h[0] = byte(idx)
+	h[2] = 1
 	return h
 }
 
@@ -148,6 +178,38 @@ func rxtLoginAndGetJobID(t *testing.T, h *testHarness, addr string) string {
 	return resp.Result.Job.JobID
 }
 
+// recvShareResponseSkippingJobPushes is recvShareResponse's tolerant
+// counterpart, needed by this file's tests since blockFindResultHash
+// (above): a genuine block find asynchronously invalidates and
+// re-pushes a fresh job to this SAME session shortly after its own
+// share response is written (session.go's finishSubmit: `go
+// s.server.jobManager.InvalidateAll()`), which can legitimately
+// interleave an unsolicited "job" push line into this connection's read
+// stream at any point after that share's own response -- and this
+// file's own concurrency tests deliberately drive MANY block-find
+// candidates through the SAME session, so several such pushes can
+// arrive interleaved with still-pending share responses. Skip any such
+// push (identified by its own distinct "method":"job" wire shape, never
+// present on a genuine ShareResponse) rather than misinterpreting it as
+// a bogus, all-zero-value share response.
+func (h *testHarness) recvShareResponseSkippingJobPushes() ShareResponse {
+	h.t.Helper()
+	for {
+		raw := h.recvRaw()
+		var probe struct {
+			Method string `json:"method"`
+		}
+		if err := json.Unmarshal(raw, &probe); err == nil && probe.Method == "job" {
+			continue
+		}
+		var resp ShareResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			h.t.Fatalf("unmarshal share response: %v", err)
+		}
+		return resp
+	}
+}
+
 // TestSessionRandomXConcurrentSubmitsDoNotSerializeOnReadLoop is the
 // primary regression test for the production bottleneck this fix
 // addresses: many RXT shares submitted back-to-back on the SAME session,
@@ -158,12 +220,24 @@ func rxtLoginAndGetJobID(t *testing.T, h *testHarness, addr string) string {
 // each validation exactly like the pre-fix bug. It also asserts
 // peakConcurrent > 1, direct proof genuine concurrent dispatch happened
 // (not just that the code compiles).
+//
+// DISPATCH_BRIEF (2026-09-10) UPDATE: solo now only dispatches an
+// RXT/RXM submit through the real validator/s.server.randomxPool at all
+// when its claimed result crosses job.NetworkTargetDifficulty (a
+// genuine block-find candidate) -- an ordinary sub-block share never
+// reaches the validator or the pool anymore (see
+// TestSessionRandomXOrdinaryShareNeverCallsValidator below). This test
+// now deliberately uses blockFindResultHash (not largeResultHash) so
+// every one of its shares IS such a candidate, keeping it a genuine
+// regression guard for the pool's own concurrent-dispatch behavior at
+// the (now much narrower, but still real) call site that still needs
+// it.
 func TestSessionRandomXConcurrentSubmitsDoNotSerializeOnReadLoop(t *testing.T) {
 	const numShares = 24
 	const delay = 40 * time.Millisecond
 
 	v := &fakeDelayedRandomXValidator{delay: delay}
-	h := newRXTTestHarnessWithValidator(t, 1, 1<<62, v) // diff=1, huge target: every share accepted, non-block
+	h := newRXTTestHarnessWithValidator(t, 1, 1<<62, v) // diff=1, huge target -- but every share here is a block-find candidate (blockFindResultHash)
 	jobID := rxtLoginAndGetJobID(t, h, "randomx-concurrency")
 
 	start := time.Now()
@@ -171,7 +245,7 @@ func TestSessionRandomXConcurrentSubmitsDoNotSerializeOnReadLoop(t *testing.T) {
 		nonce := make([]byte, 4)
 		nonce[0] = byte(i)
 		nonce[1] = byte(i >> 8)
-		result := largeResultHash(i)
+		result := blockFindResultHash(i)
 		h.send(Request{ID: i + 100, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			JobID: jobID, Nonce: hex.EncodeToString(nonce), Result: hex.EncodeToString(result),
 		})})
@@ -179,7 +253,7 @@ func TestSessionRandomXConcurrentSubmitsDoNotSerializeOnReadLoop(t *testing.T) {
 
 	seen := make(map[int]bool, numShares)
 	for i := 0; i < numShares; i++ {
-		resp := h.recvShareResponse()
+		resp := h.recvShareResponseSkippingJobPushes()
 		if resp.ID < 100 || resp.ID >= 100+numShares {
 			t.Fatalf("got response with unexpected id %d", resp.ID)
 		}
@@ -270,7 +344,7 @@ func TestSessionRandomXConcurrentSubmitsRespondByOwnID(t *testing.T) {
 		},
 		// Deterministic accept/reject purely from the low byte of the
 		// claimed result hash (which encodes the submit index, see
-		// largeResultHash), so this test can verify EACH response's
+		// blockFindResultHash), so this test can verify EACH response's
 		// accept/reject decision belongs to its own id regardless of
 		// arrival order.
 		validFunc: func(resultHex string) bool {
@@ -288,7 +362,7 @@ func TestSessionRandomXConcurrentSubmitsRespondByOwnID(t *testing.T) {
 		nonce := make([]byte, 4)
 		nonce[0] = byte(i)
 		nonce[1] = byte(i >> 8)
-		result := largeResultHash(i)
+		result := blockFindResultHash(i)
 		h.send(Request{ID: baseID + i, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			JobID: jobID, Nonce: hex.EncodeToString(nonce), Result: hex.EncodeToString(result),
 		})})
@@ -296,7 +370,7 @@ func TestSessionRandomXConcurrentSubmitsRespondByOwnID(t *testing.T) {
 
 	gotArrivalOrder := make([]int, 0, numShares)
 	for i := 0; i < numShares; i++ {
-		resp := h.recvShareResponse()
+		resp := h.recvShareResponseSkippingJobPushes()
 		idx := resp.ID - baseID
 		if idx < 0 || idx >= numShares {
 			t.Fatalf("response id %d out of expected range", resp.ID)
@@ -336,7 +410,11 @@ func TestSessionRandomXConcurrentSubmitsRespondByOwnID(t *testing.T) {
 // original is rejected deterministically (not double-credited), proving
 // job.MarkNonceUsed's synchronous, pre-dispatch placement in handleSubmit
 // still correctly gates duplicates even though the REST of submit
-// processing is now concurrent.
+// processing is now concurrent. Uses blockFindResultHash (not
+// largeResultHash) so every share here is a genuine block-find
+// candidate and actually reaches the concurrent validator/pool dispatch
+// path this test means to exercise (DISPATCH_BRIEF.md: an ordinary
+// sub-block share no longer touches either).
 func TestSessionRandomXConcurrentSubmitsRaceSafeCountersAndDedup(t *testing.T) {
 	const numShares = 30
 	v := &fakeDelayedRandomXValidator{delay: 5 * time.Millisecond}
@@ -354,7 +432,7 @@ func TestSessionRandomXConcurrentSubmitsRaceSafeCountersAndDedup(t *testing.T) {
 		nonce := make([]byte, 4)
 		nonce[0] = byte(i)
 		nonce[1] = byte(i >> 8)
-		result := largeResultHash(i)
+		result := blockFindResultHash(i)
 		h.send(Request{ID: i + 500, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			JobID: jobID, Nonce: hex.EncodeToString(nonce), Result: hex.EncodeToString(result),
 		})})
@@ -367,13 +445,13 @@ func TestSessionRandomXConcurrentSubmitsRaceSafeCountersAndDedup(t *testing.T) {
 	dupNonce := make([]byte, 4)
 	dupNonce[0] = 0
 	h.send(Request{ID: 999, Method: "submit", Params: mustJSON(t, SubmitRequest{
-		JobID: jobID, Nonce: hex.EncodeToString(dupNonce), Result: hex.EncodeToString(largeResultHash(0)),
+		JobID: jobID, Nonce: hex.EncodeToString(dupNonce), Result: hex.EncodeToString(blockFindResultHash(0)),
 	})})
 
 	acceptedIDs := make(map[int]bool)
 	var dupResp *ShareResponse
 	for i := 0; i < numShares+1; i++ {
-		resp := h.recvShareResponse()
+		resp := h.recvShareResponseSkippingJobPushes()
 		if resp.ID == 999 {
 			r := resp
 			dupResp = &r
@@ -405,3 +483,104 @@ var (
 	_ validator.AlgoValidator = (*fakeDelayedRandomXValidator)(nil)
 	_ validator.AlgoValidator = (*fakeVariableDelayValidator)(nil)
 )
+
+// --- DISPATCH_BRIEF.md (2026-09-10) required tests: "validate only at
+// block-find" ---
+
+// TestSessionRandomXOrdinaryShareNeverCallsValidator is DISPATCH_BRIEF
+// required test (a): an ordinary sub-block RXT share (claimed result
+// does NOT numerically cross job.NetworkTargetDifficulty) must be
+// credited WITHOUT any call to the injected fake validator at all --
+// asserted directly via the fake validator's own call counter, mirroring
+// how leaf-proxy's own tests assert "validator not called for
+// local-only shares" (internal/leaflib/proxy/session_test.go's
+// "below block target -> local only, no upstream call" convention).
+func TestSessionRandomXOrdinaryShareNeverCallsValidator(t *testing.T) {
+	v := &fakeDelayedRandomXValidator{}
+	h := newRXTTestHarnessWithValidator(t, 1, 1<<62, v) // huge target
+	jobID := rxtLoginAndGetJobID(t, h, "ordinary-share-skips-validator")
+
+	nonce := make([]byte, 4)
+	nonce[0] = 1
+	h.send(Request{ID: 600, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		JobID: jobID, Nonce: hex.EncodeToString(nonce), Result: hex.EncodeToString(largeResultHash(1)), // tiny claimed diff, well below the huge target
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Error != nil {
+		t.Fatalf("expected an ordinary sub-block share to be accepted, got error: %v", resp.Error.Message)
+	}
+	if resp.Result == nil || resp.Result.Status != "OK" {
+		t.Fatalf("expected result status OK, got %#v", resp.Result)
+	}
+	if calls, _ := v.snapshot(); calls != 0 {
+		t.Fatalf("validator was called %d times for an ordinary sub-block share, want 0 -- solo must only cryptographically validate RXT/RXM at block-find level (DISPATCH_BRIEF.md)", calls)
+	}
+	if h.node.submitCalls.Load() != 0 {
+		t.Fatalf("SubmitBlock was called %d times for an ordinary sub-block share, want 0", h.node.submitCalls.Load())
+	}
+}
+
+// TestSessionRandomXBlockFindCallsValidatorExactlyOnceBeforeSubmitBlock
+// is DISPATCH_BRIEF required test (b): a share whose claimed result
+// crosses the block target DOES trigger exactly one real validator call,
+// and that call happens before SubmitBlock (proven here by the validator
+// succeeding and SubmitBlock then genuinely being reached and called
+// exactly once too -- if the ordering were reversed or validation were
+// skipped, either count would be wrong).
+func TestSessionRandomXBlockFindCallsValidatorExactlyOnceBeforeSubmitBlock(t *testing.T) {
+	v := &fakeDelayedRandomXValidator{} // validFunc nil -> always valid
+	h := newRXTTestHarnessWithValidator(t, 1, 1<<62, v)
+	jobID := rxtLoginAndGetJobID(t, h, "block-find-validates-once")
+
+	nonce := make([]byte, 4)
+	nonce[0] = 7
+	h.send(Request{ID: 601, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		JobID: jobID, Nonce: hex.EncodeToString(nonce), Result: hex.EncodeToString(blockFindResultHash(7)), // astronomically high claimed diff, crosses the huge target
+	})})
+	resp := h.recvShareResponseSkippingJobPushes()
+
+	if resp.Error != nil {
+		t.Fatalf("expected a genuine block-find candidate with a real, matching claimed hash to be accepted, got error: %v", resp.Error.Message)
+	}
+	if calls, _ := v.snapshot(); calls != 1 {
+		t.Fatalf("validator was called %d times for a block-find candidate, want exactly 1", calls)
+	}
+	if h.node.submitCalls.Load() != 1 {
+		t.Fatalf("SubmitBlock was called %d times, want exactly 1", h.node.submitCalls.Load())
+	}
+}
+
+// TestSessionRandomXBlockFindFalseClaimIsRejectedNotCredited is
+// DISPATCH_BRIEF required test (c): a share that FALSELY claims to
+// cross the block target (blockFindResultHash) but fails real validation
+// (the fake validator here always reports invalid) must be rejected
+// outright -- never silently credited as a block find (SubmitBlock must
+// not be called) and never silently downgraded to an ordinary accepted
+// share either (the wire response must still be a rejection, not
+// result:true).
+func TestSessionRandomXBlockFindFalseClaimIsRejectedNotCredited(t *testing.T) {
+	v := &fakeDelayedRandomXValidator{validFunc: func(string) bool { return false }}
+	h := newRXTTestHarnessWithValidator(t, 1, 1<<62, v)
+	jobID := rxtLoginAndGetJobID(t, h, "block-find-false-claim")
+
+	nonce := make([]byte, 4)
+	nonce[0] = 9
+	h.send(Request{ID: 602, Method: "submit", Params: mustJSON(t, SubmitRequest{
+		JobID: jobID, Nonce: hex.EncodeToString(nonce), Result: hex.EncodeToString(blockFindResultHash(9)), // claims to cross the target, but the daemon disagrees
+	})})
+	resp := h.recvShareResponse()
+
+	if resp.Result != nil {
+		t.Fatal("a false block-find claim that fails real validation must not be accepted (neither as a block find nor silently as an ordinary share)")
+	}
+	if resp.Error == nil {
+		t.Fatal("expected a rejection for a false block-find claim")
+	}
+	if calls, _ := v.snapshot(); calls != 1 {
+		t.Fatalf("validator was called %d times, want exactly 1 -- a block-crossing claim must still be really checked", calls)
+	}
+	if h.node.submitCalls.Load() != 0 {
+		t.Fatalf("SubmitBlock was called %d times for a claim that failed real validation, want 0", h.node.submitCalls.Load())
+	}
+}
