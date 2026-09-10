@@ -116,6 +116,17 @@ type Session struct {
 	currentDifficulty atomic.Uint64
 	hashesAccumulated atomic.Uint64
 
+	// forcedMinDifficulty is this session's own operator-forced
+	// difficulty floor (0 = none) -- mirrors solo.Session's identical
+	// field exactly (see internal/leaflib/solo/session.go's doc
+	// comment for the full rationale). Captured from
+	// addressflags.Cache.Get at login time (handleLogin below) and
+	// never mutated afterward for the lifetime of the connection;
+	// consulted by maybeRetarget (vardiff.go) on every retarget tick
+	// so it can never be undercut, exactly like solo's own
+	// maybeRetarget.
+	forcedMinDifficulty atomic.Uint64
+
 	// lastDeliveredJobID/lastDeliveredDifficulty mirror
 	// solo.Session's/direct.Session's own identical fields exactly --
 	// see internal/leaflib/solo/session.go's Session type doc comment
@@ -237,6 +248,17 @@ func (s *Session) currentJob(difficulty uint64) (*Job, error) {
 
 const defaultProxySessionJobHistorySize = 8
 
+// maxProxyLoginLen bounds the downstream login string's length (Fix
+// 8, DISPATCH_BRIEF.md 2026-09-10) -- mirrors solo's
+// maxLoginAddressLen exactly (internal/leaflib/solo/address.go),
+// chosen for the same reason: a generous multiple of any real
+// Tari/Monero wallet address's actual length (well under 200 bytes
+// even in their longest real encodings), while still bounding the
+// practical exposure of an arbitrary/adversarial login string
+// becoming session state, a ban-cache lookup key, a Prometheus label
+// value, or stats-HTML content.
+const maxProxyLoginLen = 512
+
 func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64) *Session {
 	id, err := newRandomHexID()
 	if err != nil {
@@ -328,6 +350,29 @@ func (s *Session) handleLogin(req Request) {
 		return
 	}
 
+	// Fix 8 (DISPATCH_BRIEF.md 2026-09-10): impose a sane maximum
+	// length on the downstream login string BEFORE it becomes
+	// session state, a ban-cache lookup key
+	// (s.server.addressFlags.Get below), a Prometheus label value
+	// (metrics recorded against this session's address), or
+	// stats-HTML content. Unlike solo/direct (session.go's
+	// ValidateAddressForAlgo), leaf-proxy does not itself decode
+	// this string as a Tari/Monero address -- it is forwarded
+	// as-is to whichever real upstream pool this leaf is configured
+	// against, and that upstream's own real address format is not
+	// necessarily known here -- so this is deliberately just a
+	// length bound, not a format/charset validator (see
+	// maxProxyLoginLen's own doc comment for why 512 is a safe,
+	// generous choice). Checked as early as possible, right after
+	// the "non-empty" check above and before any other use of the
+	// string, so an oversized login is rejected with a clean error
+	// response rather than ever touching a map/label/cache.
+	if len(login.Login) > maxProxyLoginLen {
+		s.server.logger.Printf("proxy: rejecting login with an oversized login string (%d bytes, max %d) from session %s", len(login.Login), maxProxyLoginLen, s.sessionID)
+		s.writeGeneralResponse(req.ID, "invalid address provided: too long", "")
+		return
+	}
+
 	// REAL enforcement point for the manual ban system -- mirrors
 	// solo.Session's/direct.Session's own identical handleLogin
 	// check exactly (see internal/leaflib/addressflags's package doc
@@ -339,12 +384,23 @@ func (s *Session) handleLogin(req Request) {
 	// EnableAddressFlags' doc comment) means every address is
 	// treated as unflagged, identical to this feature not existing
 	// at all.
+	// Fix 7 (DISPATCH_BRIEF.md 2026-09-10): the floor half of the
+	// addressflags pattern -- mirrors solo.Session's identical
+	// handleLogin capture exactly (see internal/leaflib/solo/
+	// session.go's handleLogin doc comment for the full rationale).
+	// Captured BEFORE the address/loggedIn are stored, alongside the
+	// ban check above, so a forced floor is known before this
+	// session's very first job is ever fetched.
+	var forcedFloor uint64
 	if s.server.addressFlags != nil {
-		if flags := s.server.addressFlags.Get(login.Login); flags.Banned {
+		flags := s.server.addressFlags.Get(login.Login)
+		if flags.Banned {
 			s.server.logger.Printf("proxy: rejecting login for banned address %s (session %s)", login.Login, s.sessionID)
+			s.server.recordBanRejection(metrics.BanRejectionPhaseLogin)
 			s.writeGeneralResponse(req.ID, "this address is banned from this pool", "")
 			return
 		}
+		forcedFloor = flags.ForcedMinDifficulty
 	}
 
 	worker := login.Pass
@@ -358,6 +414,19 @@ func (s *Session) handleLogin(req Request) {
 	s.address.Store(login.Login)
 	s.worker.Store(worker)
 	s.loggedIn.Store(true)
+
+	// A forced minimum difficulty always wins over the port tier's
+	// own configured starting difficulty -- mirrors solo.Session's
+	// identical handleLogin logic exactly (see that function's doc
+	// comment for the full rationale).
+	startDiff := s.currentDifficulty.Load()
+	if forcedFloor > 0 {
+		s.forcedMinDifficulty.Store(forcedFloor)
+		if forcedFloor > startDiff {
+			startDiff = forcedFloor
+			s.currentDifficulty.Store(startDiff)
+		}
+	}
 
 	job, err := s.currentJob(s.currentDifficulty.Load())
 	if err != nil {
@@ -579,6 +648,7 @@ func (s *Session) handleSubmit(req Request) {
 	if s.server.addressFlags != nil {
 		if flags := s.server.addressFlags.Get(s.address.Load().(string)); flags.Banned {
 			s.server.logger.Printf("proxy: rejecting submit for now-banned address %s (session %s)", s.address.Load(), s.sessionID)
+			s.server.recordBanRejection(metrics.BanRejectionPhaseSubmit)
 			s.writeShareResponse(req.ID, false, "this address is banned from this pool")
 			return
 		}
@@ -763,6 +833,35 @@ func (s *Session) handleSubmit(req Request) {
 		s.shareCount.Add(1)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.server.recordShareDecision(true)
+
+		// Fix 10 (DISPATCH_BRIEF.md 2026-09-10): the pre-dispatch
+		// CurrentGeneration() check above (before this closure was
+		// ever queued onto s.server.randomxPool) only guards against
+		// a generation that had ALREADY advanced at the moment this
+		// submit was first read. If the upstream connection
+		// reconnects WHILE this candidate sits in the pool's bounded
+		// queue (real, possible: real RandomX re-validation above
+		// takes ~258ms, and the queue itself can hold up to
+		// AsyncValidationQueueSize entries under load), the
+		// generation check above is now stale by the time we get
+		// here -- a real TOCTOU gap between "checked" and "used".
+		// Re-check immediately before the real upstream forward
+		// call, using the SAME UpstreamGenerationSource capability
+		// (fails open identically when the concrete upstream doesn't
+		// implement it, matching the pre-dispatch check's own
+		// fail-open contract exactly) -- if the generation has
+		// advanced since job was issued, reject LOCALLY rather than
+		// wasting a real round-trip against a dead/superseded
+		// upstream session (see UpstreamGenerationSource's own doc
+		// comment for why that costs this leaf's invalid-share/ban
+		// ratio upstream).
+		if gs, ok := s.server.upstream.(UpstreamGenerationSource); ok {
+			if current := gs.CurrentGeneration(); job.TemplateGeneration < current {
+				s.writeShareResponse(req.ID, false, fmt.Sprintf("job's upstream template generation went stale while queued for validation (this leaf's upstream connection reconnected) -- job_id %s", submit.JobID))
+				return
+			}
+		}
+
 		accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce)
 		if err != nil {
 			s.server.logger.Printf("proxy: upstream submit failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
@@ -812,6 +911,12 @@ func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 }
 
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
+	// Fix 9 (DISPATCH_BRIEF.md 2026-09-10): every submit outcome
+	// (share or block, accepted or rejected) flows through this
+	// single response-writing helper -- mirrors solo.Session's/
+	// direct.Session's own identical recordShare hook exactly (see
+	// solo/session.go's writeShareResponse doc comment).
+	s.server.recordShare(accepted)
 	leaflib.WriteShareResponse(s.writeJSON, false, id, accepted, errMsg)
 }
 

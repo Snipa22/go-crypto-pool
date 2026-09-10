@@ -51,6 +51,28 @@ const (
 	DecisionUpstreamForward = "upstream_forward"
 )
 
+// Result label values for SharesTotal/BlocksTotal -- Fix 9
+// (DISPATCH_BRIEF.md 2026-09-10): distinct from ShareDecisionsTotal
+// above (which tracks WHERE a share was credited, local vs
+// upstream-forwarded) -- these track WHETHER a submit was ultimately
+// accepted or rejected at all, mirroring solo/direct's identical
+// ResultAccepted/ResultRejected convention exactly (see
+// internal/leaflib/solo/metrics.ResultAccepted).
+const (
+	ResultAccepted = "accepted"
+	ResultRejected = "rejected"
+)
+
+// BanRejectionPhase label values for BanRejectionsTotal -- Fix 9
+// (DISPATCH_BRIEF.md 2026-09-10): a rejection can happen at either of
+// two real call sites (session.go's handleLogin ban check, or
+// handleSubmit's mid-session ban re-check) -- labeled separately so
+// an operator can tell which is actually firing.
+const (
+	BanRejectionPhaseLogin  = "login"
+	BanRejectionPhaseSubmit = "submit"
+)
+
 // Connection-error categories for ConnectionErrorsTotal -- the same
 // fixed, bounded category set internal/leaflib/solo/metrics defines,
 // duplicated here as small string constants (not the surrounding
@@ -95,6 +117,22 @@ type SessionSnapshot struct {
 // /metrics scrape, so it must be cheap and non-blocking.
 type SnapshotFunc func() []SessionSnapshot
 
+// AsyncPoolStats/AsyncPoolStatsFunc mirror solo/metrics's own
+// identical types exactly (Fix 9, DISPATCH_BRIEF.md 2026-09-10) --
+// leaf-proxy shares the exact same solo.AsyncValidationPool
+// implementation (see server.go's randomxPool field) leaf-direct
+// does, so its own metrics package needs the exact same
+// snapshot-derived shape -- decoupled from *solo.AsyncValidationPool
+// itself for the same import-cycle-avoidance reason SessionSnapshot
+// is decoupled from proxy.Session (see this package's doc comment).
+type AsyncPoolStats struct {
+	QueueDepth         int
+	InFlightWorkers    int64
+	SubmitBlockedTotal uint64
+}
+
+type AsyncPoolStatsFunc func() AsyncPoolStats
+
 // Metrics holds every Prometheus collector leaf-proxy registers, plus
 // the registry they live in. Constructed via New; safe for concurrent
 // use.
@@ -104,6 +142,20 @@ type Metrics struct {
 	// ShareDecisionsTotal is leaf-proxy's own real local-credit vs
 	// upstream-forward split -- see this package's doc comment.
 	ShareDecisionsTotal *prometheus.CounterVec
+
+	// SharesTotal/BlocksTotal are the Fix 9 (DISPATCH_BRIEF.md
+	// 2026-09-10) real accept/reject counters, mirroring solo/
+	// direct's identical SharesTotal/BlocksTotal exactly (result
+	// label only, not by miner address) -- distinct from
+	// ShareDecisionsTotal above (see ResultAccepted's own doc
+	// comment for the exact distinction).
+	SharesTotal *prometheus.CounterVec
+	BlocksTotal *prometheus.CounterVec
+
+	// BanRejectionsTotal is the Fix 9 real counter for the address-
+	// ban enforcement points that were previously log-only -- see
+	// BanRejectionPhaseLogin/BanRejectionPhaseSubmit's doc comment.
+	BanRejectionsTotal *prometheus.CounterVec
 
 	// UpstreamConnected is 1 when the single upstream pool
 	// connection is currently up, 0 when it is down/reconnecting.
@@ -121,6 +173,7 @@ type Metrics struct {
 
 	maxAddressLabels int
 	snapshot         SnapshotFunc
+	asyncPoolStats   AsyncPoolStatsFunc
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -139,6 +192,21 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Name: "leaf_proxy_share_decisions_total",
 		Help: "Total number of downstream submits, by the real decision this leaf-proxy made: local_credit (below the upstream pool's requested share difficulty) or upstream_forward (met/exceeded it, forwarded via a real upstream submit RPC).",
 	}, []string{"decision"})
+
+	m.SharesTotal = shared.RegisterCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_proxy_shares_total",
+		Help: "Total number of shares submitted to this leaf-proxy instance, by result (accepted/rejected). Not labeled by miner address. Distinct from leaf_proxy_share_decisions_total (which tracks local-credit vs upstream-forward, not accept/reject).",
+	}, []string{"result"})
+
+	m.BlocksTotal = shared.RegisterCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_proxy_blocks_total",
+		Help: "Total number of genuine block-level finds forwarded upstream by this leaf-proxy instance, by result (accepted/rejected by the real upstream pool).",
+	}, []string{"result"})
+
+	m.BanRejectionsTotal = shared.RegisterCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_proxy_ban_rejections_total",
+		Help: "Total number of downstream login/submit attempts rejected because the address-flags cache reports the address as banned, by phase (login/submit).",
+	}, []string{"phase"})
 
 	m.UpstreamConnected = shared.RegisterGauge(reg, prometheus.GaugeOpts{
 		Name: "leaf_proxy_upstream_connected",
@@ -176,6 +244,12 @@ func (m *Metrics) SetSnapshotSource(fn SnapshotFunc) {
 	m.snapshot = fn
 }
 
+// SetAsyncPoolSource mirrors solo/metrics's own identical method
+// exactly -- see AsyncPoolStats' doc comment.
+func (m *Metrics) SetAsyncPoolSource(fn AsyncPoolStatsFunc) {
+	m.asyncPoolStats = fn
+}
+
 // Handler returns the standard Prometheus text-exposition HTTP handler
 // scoped to this Metrics' private registry.
 func (m *Metrics) Handler() http.Handler {
@@ -209,6 +283,30 @@ var (
 		"leaf_proxy_miners_by_address",
 		"Current number of connected downstream sessions per mining/payout address (live snapshot, capped cardinality -- overflow addresses are aggregated into address=\"other\").",
 		[]string{"address"}, nil,
+	)
+
+	// asyncPool*Desc mirrors solo/metrics's own identical Desc vars
+	// exactly, INCLUDING the deliberately mode-agnostic
+	// "leaf_async_validation_*" naming (not "leaf_proxy_*") -- see
+	// that package's doc comment on these vars for why: this is the
+	// exact same shared solo.AsyncValidationPool component leaf-solo
+	// and leaf-direct also use, and each leaf mode's own private
+	// registry never collides with the others' (one leaf mode per
+	// process).
+	asyncPoolQueueDepthDesc = prometheus.NewDesc(
+		"leaf_async_validation_queue_depth",
+		"Current number of RandomX-family (RXT/RXM) share-validation closures sitting in the shared AsyncValidationPool's bounded queue, waiting for a free worker.",
+		nil, nil,
+	)
+	asyncPoolInFlightWorkersDesc = prometheus.NewDesc(
+		"leaf_async_validation_in_flight_workers",
+		"Current number of the shared AsyncValidationPool's fixed worker goroutines actively running a validation closure right now.",
+		nil, nil,
+	)
+	asyncPoolSubmitBlockedTotalDesc = prometheus.NewDesc(
+		"leaf_async_validation_submit_blocked_total",
+		"Total number of Submit calls to the shared AsyncValidationPool that could not take the fast, non-blocking path (queue full and every worker busy) -- the real saturation signal for Finding 2's bounded-queue/NumCPU-workers fix.",
+		nil, nil,
 	)
 )
 
@@ -266,5 +364,12 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	}
 	if other > 0 {
 		ch <- prometheus.MustNewConstMetric(minersByAddressDesc, prometheus.GaugeValue, float64(other), OtherAddressLabel)
+	}
+
+	if m.asyncPoolStats != nil {
+		stats := m.asyncPoolStats()
+		ch <- prometheus.MustNewConstMetric(asyncPoolQueueDepthDesc, prometheus.GaugeValue, float64(stats.QueueDepth))
+		ch <- prometheus.MustNewConstMetric(asyncPoolInFlightWorkersDesc, prometheus.GaugeValue, float64(stats.InFlightWorkers))
+		ch <- prometheus.MustNewConstMetric(asyncPoolSubmitBlockedTotalDesc, prometheus.CounterValue, float64(stats.SubmitBlockedTotal))
 	}
 }

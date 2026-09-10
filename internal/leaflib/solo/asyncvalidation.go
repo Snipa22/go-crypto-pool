@@ -4,6 +4,7 @@ package solo
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 // PERFORMANCE FIX (Alex, live production incident, 2026-08-30): Session.Run's
@@ -117,6 +118,35 @@ type AsyncValidationPool struct {
 	done    chan struct{}
 	wg      sync.WaitGroup
 	workers int
+
+	// inFlight/submitBlockedTotal are Fix 9's real observability
+	// instrumentation (DISPATCH_BRIEF.md 2026-09-10): this pool is
+	// shared across all three leaf modes (solo/direct/proxy all
+	// construct one via NewAsyncValidationPool -- see this file's
+	// own doc comment on "WHY SERVER-SCOPED"), and until this fix it
+	// exposed NO metrics at all -- an operator had no way to alert
+	// on the exact saturation condition Finding 2's own fix (the
+	// bounded queue/NumCPU workers above) was designed around,
+	// short of inferring it indirectly from share-response latency.
+	//
+	// Deliberately kept Prometheus-agnostic here (plain atomics, no
+	// prometheus import in this package): each leaf mode's own
+	// metrics package (solo/metrics, direct/metrics, proxy/metrics)
+	// already has its OWN, genuinely different registration
+	// convention (private lowercase registerGauge/registerCounter
+	// helpers for solo/direct vs. the shared
+	// internal/leaflib/metrics package's exported RegisterGauge/
+	// RegisterCounter for proxy -- see those packages' own doc
+	// comments) -- this pool has no business picking one of those
+	// conventions over the others. Instead it exposes plain getter
+	// methods (QueueDepth/InFlightWorkers/SubmitBlockedTotal below)
+	// that ANY of the three metrics packages can poll generically at
+	// scrape time, exactly mirroring the existing SnapshotFunc/
+	// Collect "recomputed live at scrape time" pattern each of those
+	// packages already uses for their own per-session snapshot
+	// metrics -- see e.g. solo/metrics.Metrics.Collect.
+	inFlight           atomic.Int64
+	submitBlockedTotal atomic.Uint64
 }
 
 // NewAsyncValidationPool starts workers goroutines immediately, each ready
@@ -157,6 +187,43 @@ func (p *AsyncValidationPool) Workers() int {
 	return p.workers
 }
 
+// QueueDepth returns the current number of closures sitting in this
+// pool's bounded queue, waiting for a free worker -- a live gauge
+// value (len of a channel), NOT a cumulative counter. See this
+// type's own doc comment (inFlight/submitBlockedTotal) for why this
+// is exposed as a plain getter rather than tied to any one leaf
+// mode's own metrics-registration convention.
+func (p *AsyncValidationPool) QueueDepth() int {
+	return len(p.jobs)
+}
+
+// QueueCapacity returns this pool's fixed queue capacity (the
+// queueSize NewAsyncValidationPool was constructed with, post its own
+// <=0 fallback) -- useful alongside QueueDepth for an operator to
+// compute a saturation ratio (depth/capacity) without this package
+// needing to expose that ratio itself.
+func (p *AsyncValidationPool) QueueCapacity() int {
+	return cap(p.jobs)
+}
+
+// InFlightWorkers returns how many of this pool's fixed worker
+// goroutines are, at this exact instant, actually running a
+// dispatched validation closure (as opposed to idle, blocked on
+// <-p.jobs) -- a live gauge value bounded by Workers().
+func (p *AsyncValidationPool) InFlightWorkers() int64 {
+	return p.inFlight.Load()
+}
+
+// SubmitBlockedTotal returns the real, monotonically-increasing count
+// of Submit calls that could NOT take the fast, non-blocking path
+// (see Submit's own doc comment) -- i.e. how many times a caller
+// actually had to wait for queue room/a free worker. This is the
+// direct signal for the saturation condition Finding 2's fix (the
+// bounded queue + NumCPU workers) was designed to bound.
+func (p *AsyncValidationPool) SubmitBlockedTotal() uint64 {
+	return p.submitBlockedTotal.Load()
+}
+
 func (p *AsyncValidationPool) worker() {
 	defer p.wg.Done()
 	for {
@@ -172,7 +239,16 @@ func (p *AsyncValidationPool) worker() {
 			// silently (and eventually starve the pool one worker at
 			// a time under adversarial input); recover it, log it,
 			// and keep this worker alive to keep draining the queue.
+			//
+			// inFlight brackets the ENTIRE dispatched call (not just
+			// runProtected's recover span) so InFlightWorkers()
+			// accurately reflects "how many of this pool's fixed
+			// workers are currently busy running a real validation
+			// closure right now" for the whole time fn actually
+			// occupies this worker goroutine.
+			p.inFlight.Add(1)
 			p.runProtected(fn)
+			p.inFlight.Add(-1)
 		case <-p.done:
 			return
 		}
@@ -210,11 +286,68 @@ func (p *AsyncValidationPool) runProtected(fn func()) {
 // is free yet -- see this file's package doc comment for why that never
 // blocks Session.Run's own read loop in practice (Submit is always called
 // from a goroutine already dispatched off that loop).
+//
+// FIX 9 (DISPATCH_BRIEF.md 2026-09-10): submitBlockedTotal counts every
+// time this call could NOT take the fast, non-blocking path below (i.e.
+// the queue was genuinely full and every worker was busy at that
+// instant) -- this is the real, direct signal for the saturation
+// condition Finding 2's fix was designed to bound, as opposed to
+// QueueDepth alone (which can legitimately sit near-full under bursty
+// but healthy load without ever actually blocking a caller). The
+// non-blocking probe (the first select, with its own default case)
+// is purely an instrumentation split of the exact same underlying
+// channel operation -- it does not change Submit's blocking behavior
+// or return semantics at all: if the fast path's default fires, the
+// second select below still performs the identical blocking send this
+// function always has.
 func (p *AsyncValidationPool) Submit(fn func()) bool {
 	select {
 	case p.jobs <- fn:
 		return true
 	case <-p.done:
+		return false
+	default:
+	}
+	p.submitBlockedTotal.Add(1)
+	select {
+	case p.jobs <- fn:
+		return true
+	case <-p.done:
+		return false
+	}
+}
+
+// TrySubmit is Submit's NON-BLOCKING-ONLY counterpart: it takes ONLY
+// the fast path (this exact same underlying channel operation, see
+// Submit's own doc comment) and returns false immediately -- WITHOUT
+// ever blocking the caller -- if the queue is genuinely full/every
+// worker busy, or the pool has been stopped. fn is never run in that
+// case (identical "not run and never will be" contract as Submit's
+// false return).
+//
+// Fix 12 (DISPATCH_BRIEF.md 2026-09-10): this exists specifically for
+// a caller that is ITSELF already running on one of a DIFFERENT
+// AsyncValidationPool's own worker goroutines (direct/session.go's
+// finishSubmit, running on Server.randomxPool, dispatching
+// forwardShare/forwardBlock onto the separate Server.forwardPool) --
+// using ordinary, potentially-blocking Submit there would let a
+// saturated forwardPool block a randomxPool worker, reproducing
+// EXACTLY the cross-pool resource contention Fix 12 exists to
+// eliminate, just one level removed. TrySubmit's "drop rather than
+// block" contract is the correct choice there: forwardPool's queue is
+// already generously sized for any realistic burst (see
+// AsyncValidationQueueSize's own doc comment) -- a TrySubmit failure
+// there only occurs under a genuinely pathological, sustained backend
+// stall, in which case dropping (and logging) that one forward is far
+// preferable to ever blocking real RandomX validation throughput for
+// other sessions.
+func (p *AsyncValidationPool) TrySubmit(fn func()) bool {
+	select {
+	case p.jobs <- fn:
+		return true
+	case <-p.done:
+		return false
+	default:
 		return false
 	}
 }

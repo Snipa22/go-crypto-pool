@@ -165,3 +165,100 @@ func TestAddressCardinalityCap_OverflowGoesToOtherBucket(t *testing.T) {
 		t.Errorf("expected other bucket count 46, got:\n%s", body)
 	}
 }
+
+// TestSharesTotal_IncrementAndRender is the required Fix 9 test
+// (DISPATCH_BRIEF.md 2026-09-10): SharesTotal actually increments
+// and renders, labeled by result, distinct from ShareDecisionsTotal.
+func TestSharesTotal_IncrementAndRender(t *testing.T) {
+	m := New("dev", 0)
+	m.SharesTotal.WithLabelValues(ResultAccepted).Inc()
+	m.SharesTotal.WithLabelValues(ResultAccepted).Inc()
+	m.SharesTotal.WithLabelValues(ResultRejected).Inc()
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		`leaf_proxy_shares_total{result="accepted"} 2`,
+		`leaf_proxy_shares_total{result="rejected"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+}
+
+// TestBlocksTotal_IncrementAndRender is the required Fix 9 test: the
+// previously-no-op recordBlock's real backing counter actually
+// increments and renders.
+func TestBlocksTotal_IncrementAndRender(t *testing.T) {
+	m := New("dev", 0)
+	m.BlocksTotal.WithLabelValues(ResultAccepted).Inc()
+	m.BlocksTotal.WithLabelValues(ResultRejected).Inc()
+	m.BlocksTotal.WithLabelValues(ResultRejected).Inc()
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		`leaf_proxy_blocks_total{result="accepted"} 1`,
+		`leaf_proxy_blocks_total{result="rejected"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+}
+
+// TestBanRejectionsTotal_LabeledByPhase is the required Fix 9 test:
+// the previously log-only ban-rejection points now increment a real
+// counter, labeled by which phase (login/submit) rejected.
+func TestBanRejectionsTotal_LabeledByPhase(t *testing.T) {
+	m := New("dev", 0)
+	m.BanRejectionsTotal.WithLabelValues(BanRejectionPhaseLogin).Inc()
+	m.BanRejectionsTotal.WithLabelValues(BanRejectionPhaseLogin).Inc()
+	m.BanRejectionsTotal.WithLabelValues(BanRejectionPhaseSubmit).Inc()
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		`leaf_proxy_ban_rejections_total{phase="login"} 2`,
+		`leaf_proxy_ban_rejections_total{phase="submit"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+}
+
+// TestAsyncPoolMetrics_SnapshotDerived is the required Fix 9 test:
+// the shared AsyncValidationPool's queue-depth/in-flight-workers/
+// submit-blocked-total metrics are recomputed from a real
+// AsyncPoolStatsFunc at scrape time, exactly like the existing
+// per-session snapshot metrics.
+func TestAsyncPoolMetrics_SnapshotDerived(t *testing.T) {
+	m := New("dev", 0)
+	m.SetAsyncPoolSource(func() AsyncPoolStats {
+		return AsyncPoolStats{QueueDepth: 7, InFlightWorkers: 3, SubmitBlockedTotal: 42}
+	})
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		"leaf_async_validation_queue_depth 7",
+		"leaf_async_validation_in_flight_workers 3",
+		"leaf_async_validation_submit_blocked_total 42",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+}
+
+// TestAsyncPoolMetrics_NoSourceIsAbsent is the non-regression
+// complement: without SetAsyncPoolSource ever being called (mirrors
+// SetSnapshotSource's own "nil -> zeros" convention, but here the
+// metric is entirely absent rather than zero, since there is no
+// meaningful zero-value default for a pool that doesn't exist),
+// Collect must not panic and must not emit these series at all.
+func TestAsyncPoolMetrics_NoSourceIsAbsent(t *testing.T) {
+	m := New("dev", 0)
+	body := scrape(t, m)
+	if strings.Contains(body, "leaf_async_validation_queue_depth") {
+		t.Errorf("expected no leaf_async_validation_queue_depth series without a source, got:\n%s", body)
+	}
+}

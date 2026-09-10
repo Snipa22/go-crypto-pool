@@ -84,9 +84,7 @@ func TestDirectSessionRXTAtStaticDifficultyFloorIsAccepted(t *testing.T) {
 	if resp.Result == nil {
 		t.Fatal("expected a claim exactly meeting the static difficulty floor to be accepted")
 	}
-	if tr.shareCount() != 1 {
-		t.Errorf("forwardShare should have been called exactly once, got %d calls", tr.shareCount())
-	}
+	waitForShareCount(t, tr, 1)
 }
 
 // TestDirectSessionRXTRepeatedFabricatedClaimsGetDisconnected is the

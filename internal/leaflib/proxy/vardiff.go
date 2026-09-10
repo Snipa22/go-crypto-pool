@@ -44,7 +44,19 @@ func (s *Session) maybeRetarget() {
 	curDiff := s.currentDifficulty.Load()
 	hashes := s.hashesAccumulated.Load()
 
-	newDiff, changed := leaflib.ComputeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, cfg.MinDifficulty, cfg.MaxDifficulty)
+	// Fix 7 (DISPATCH_BRIEF.md 2026-09-10): an operator-forced
+	// minimum difficulty (see session.go's handleLogin and
+	// internal/leaflib/addressflags's package doc comment) must
+	// never be undercut by a vardiff retarget for the lifetime of
+	// this connection -- mirrors solo.Session.maybeRetarget's
+	// identical floor-raising logic exactly. 0 (the overwhelmingly
+	// common case) is a complete no-op.
+	minDiff := cfg.MinDifficulty
+	if floor := s.forcedMinDifficulty.Load(); floor > minDiff {
+		minDiff = floor
+	}
+
+	newDiff, changed := leaflib.ComputeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, minDiff, cfg.MaxDifficulty)
 	if !changed {
 		return
 	}

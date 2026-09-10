@@ -216,3 +216,35 @@ type fakeAddr string
 
 func (f fakeAddr) Network() string { return "test" }
 func (f fakeAddr) String() string  { return string(f) }
+
+// TestAsyncPoolMetrics_SnapshotDerived is the required Fix 9 test
+// (DISPATCH_BRIEF.md 2026-09-10): the shared AsyncValidationPool's
+// queue-depth/in-flight-workers/submit-blocked-total metrics are
+// recomputed from a real AsyncPoolStatsFunc at scrape time.
+func TestAsyncPoolMetrics_SnapshotDerived(t *testing.T) {
+	m := New("dev", 0)
+	m.SetAsyncPoolSource(func() AsyncPoolStats {
+		return AsyncPoolStats{QueueDepth: 9, InFlightWorkers: 4, SubmitBlockedTotal: 11}
+	})
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		"leaf_async_validation_queue_depth 9",
+		"leaf_async_validation_in_flight_workers 4",
+		"leaf_async_validation_submit_blocked_total 11",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+}
+
+// TestAsyncPoolMetrics_NoSourceIsAbsent mirrors proxy/metrics's own
+// identical non-regression check exactly.
+func TestAsyncPoolMetrics_NoSourceIsAbsent(t *testing.T) {
+	m := New("dev", 0)
+	body := scrape(t, m)
+	if strings.Contains(body, "leaf_async_validation_queue_depth") {
+		t.Errorf("expected no leaf_async_validation_queue_depth series without a source, got:\n%s", body)
+	}
+}

@@ -44,6 +44,19 @@ type SessionSnapshot struct {
 
 type SnapshotFunc func() []SessionSnapshot
 
+// AsyncPoolStats/AsyncPoolStatsFunc mirror solo/metrics's own
+// identical types exactly (Fix 9, DISPATCH_BRIEF.md 2026-09-10) --
+// leaf-direct shares the exact same solo.AsyncValidationPool
+// implementation (see server.go's randomxPool field), so its own
+// metrics package needs the exact same snapshot-derived shape.
+type AsyncPoolStats struct {
+	QueueDepth         int
+	InFlightWorkers    int64
+	SubmitBlockedTotal uint64
+}
+
+type AsyncPoolStatsFunc func() AsyncPoolStats
+
 // Metrics holds every Prometheus collector leaf-direct registers.
 type Metrics struct {
 	registry *prometheus.Registry
@@ -70,6 +83,7 @@ type Metrics struct {
 
 	maxAddressLabels int
 	snapshot         SnapshotFunc
+	asyncPoolStats   AsyncPoolStatsFunc
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry.
@@ -122,6 +136,12 @@ func (m *Metrics) SetSnapshotSource(fn SnapshotFunc) {
 	m.snapshot = fn
 }
 
+// SetAsyncPoolSource mirrors solo/metrics's own identical method
+// exactly -- see AsyncPoolStats' doc comment.
+func (m *Metrics) SetAsyncPoolSource(fn AsyncPoolStatsFunc) {
+	m.asyncPoolStats = fn
+}
+
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
@@ -151,6 +171,29 @@ var (
 		"leaf_direct_miner_hashrate_hash_per_second",
 		"Real, per-address SUM of currently-connected sessions' estimated hashrate in hashes/second (see leaflib.EstimateHashrateHz's doc comment for the difficulty/time estimation formula). Same capped cardinality as leaf_direct_miners_by_address; overflow aggregated into address=\"other\".",
 		[]string{"address"}, nil,
+	)
+
+	// asyncPool*Desc mirrors solo/metrics's own identical Desc vars
+	// exactly, INCLUDING the deliberately mode-agnostic
+	// "leaf_async_validation_*" naming (not "leaf_direct_*") -- see
+	// that package's doc comment on these vars for why: this is the
+	// exact same shared solo.AsyncValidationPool component, and each
+	// leaf mode's own private registry never collides with the
+	// others' (one leaf mode per process).
+	asyncPoolQueueDepthDesc = prometheus.NewDesc(
+		"leaf_async_validation_queue_depth",
+		"Current number of RandomX-family (RXT/RXM) share-validation closures sitting in the shared AsyncValidationPool's bounded queue, waiting for a free worker.",
+		nil, nil,
+	)
+	asyncPoolInFlightWorkersDesc = prometheus.NewDesc(
+		"leaf_async_validation_in_flight_workers",
+		"Current number of the shared AsyncValidationPool's fixed worker goroutines actively running a validation closure right now.",
+		nil, nil,
+	)
+	asyncPoolSubmitBlockedTotalDesc = prometheus.NewDesc(
+		"leaf_async_validation_submit_blocked_total",
+		"Total number of Submit calls to the shared AsyncValidationPool that could not take the fast, non-blocking path (queue full and every worker busy) -- the real saturation signal for Finding 2's bounded-queue/NumCPU-workers fix.",
+		nil, nil,
 	)
 )
 
@@ -200,6 +243,13 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	}
 	if otherRate > 0 {
 		ch <- prometheus.MustNewConstMetric(minerHashrateByAddressDesc, prometheus.GaugeValue, otherRate, OtherAddressLabel)
+	}
+
+	if m.asyncPoolStats != nil {
+		stats := m.asyncPoolStats()
+		ch <- prometheus.MustNewConstMetric(asyncPoolQueueDepthDesc, prometheus.GaugeValue, float64(stats.QueueDepth))
+		ch <- prometheus.MustNewConstMetric(asyncPoolInFlightWorkersDesc, prometheus.GaugeValue, float64(stats.InFlightWorkers))
+		ch <- prometheus.MustNewConstMetric(asyncPoolSubmitBlockedTotalDesc, prometheus.CounterValue, float64(stats.SubmitBlockedTotal))
 	}
 }
 

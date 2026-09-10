@@ -224,6 +224,16 @@ type Job struct {
 // whether it was newly recorded (true) or already used (false, i.e.
 // this is a replay that must be rejected without being credited
 // again).
+//
+// Fix 11 (DISPATCH_BRIEF.md 2026-09-10): capped at
+// maxTrackedNoncesPerJob distinct entries -- see that constant's own
+// doc comment for the reasoning. A REPLAY of an already-tracked nonce
+// is always still detected correctly (the "already seen" check below
+// runs BEFORE the cap check, so an already-tracked entry never stops
+// being recognized once the cap is reached) -- only genuinely NEW
+// nonces beyond the cap are rejected (also via a false return, i.e.
+// treated identically to a replay by every existing caller: neither
+// case is worth crediting).
 func (j *Job) MarkNonceUsed(nonce uint64) (firstUse bool) {
 	j.nonceMu.Lock()
 	defer j.nonceMu.Unlock()
@@ -233,9 +243,21 @@ func (j *Job) MarkNonceUsed(nonce uint64) (firstUse bool) {
 	if _, seen := j.usedNonces[nonce]; seen {
 		return false
 	}
+	if len(j.usedNonces) >= maxTrackedNoncesPerJob {
+		return false
+	}
 	j.usedNonces[nonce] = struct{}{}
 	return true
 }
+
+// maxTrackedNoncesPerJob mirrors internal/leaflib/proxy/job.go's
+// identical constant exactly -- see that constant's own doc comment
+// for the full reasoning (Fix 11, DISPATCH_BRIEF.md 2026-09-10). The
+// same 100,000-entry bound applies here: leaf-solo's own per-xn Job
+// (see this type's doc comment: every xn gets its own distinct Job)
+// has the exact same unbounded-map-growth exposure this fix closes
+// for leaf-proxy.
+const maxTrackedNoncesPerJob = 100_000
 
 // JobManagerConfig configures a JobManager.
 type JobManagerConfig struct {

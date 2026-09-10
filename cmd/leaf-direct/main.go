@@ -280,7 +280,7 @@ func loadConfig() (config, error) {
 	flag.DurationVar(&cfg.tipPollInterval, "tip-poll-interval", envOrDuration("LEAF_DIRECT_TIP_POLL_INTERVAL", 5*time.Second), "chain-tip poll interval. Env: LEAF_DIRECT_TIP_POLL_INTERVAL")
 	flag.DurationVar(&cfg.jobMaxAge, "job-max-age", envOrDuration("LEAF_DIRECT_JOB_MAX_AGE", 6*time.Minute), "real per-job expiry threshold, independent of tip-invalidation. Env: LEAF_DIRECT_JOB_MAX_AGE")
 
-	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_DIRECT_MAX_CONNECTIONS", 0), "max concurrent miner connections, 0 = unlimited. Env: LEAF_DIRECT_MAX_CONNECTIONS")
+	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_DIRECT_MAX_CONNECTIONS", leaflib.DefaultLeafMaxConnections), "max concurrent miner connections, 0 = unlimited. Env: LEAF_DIRECT_MAX_CONNECTIONS")
 	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", envOrDuration("LEAF_DIRECT_IDLE_TIMEOUT", 2*time.Minute), "rolling per-connection idle timeout. Env: LEAF_DIRECT_IDLE_TIMEOUT")
 
 	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_DIRECT_METRICS_LISTEN_ADDRESS", "127.0.0.1:9601"), "HTTP listen address for /metrics. Defaults to loopback-only (127.0.0.1) -- an operator must explicitly set this to a wildcard/public address to expose it publicly. Empty disables it. Env: LEAF_DIRECT_METRICS_LISTEN_ADDRESS")
