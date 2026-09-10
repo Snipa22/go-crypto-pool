@@ -118,52 +118,52 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			},
 		},
 
-		// -- bool field: trust-enabled ------------------------------------
+		// -- bool field: invalid-share-disconnect-enabled -----------------
 		{
-			name: "trust-enabled/default",
+			name: "invalid-share-disconnect-enabled/default",
 			check: func(t *testing.T, cfg config) {
-				if cfg.trustEnabled != false {
-					t.Errorf("trustEnabled = %v, want hardcoded default %v", cfg.trustEnabled, false)
+				if cfg.invalidShareDisconnectEnabled != true {
+					t.Errorf("invalidShareDisconnectEnabled = %v, want hardcoded default %v", cfg.invalidShareDisconnectEnabled, true)
 				}
 			},
 		},
 		{
-			name: "trust-enabled/file-only",
-			toml: `trust_enabled = true`,
+			name: "invalid-share-disconnect-enabled/file-only",
+			toml: `invalid_share_disconnect_enabled = false`,
 			check: func(t *testing.T, cfg config) {
-				if cfg.trustEnabled != true {
-					t.Errorf("trustEnabled = %v, want file value %v", cfg.trustEnabled, true)
+				if cfg.invalidShareDisconnectEnabled != false {
+					t.Errorf("invalidShareDisconnectEnabled = %v, want file value %v", cfg.invalidShareDisconnectEnabled, false)
 				}
 			},
 		},
 		{
-			name: "trust-enabled/env-only",
-			env:  map[string]string{"LEAF_SOLO_TRUST_ENABLED": "false"},
-			toml: `trust_enabled = true`,
+			name: "invalid-share-disconnect-enabled/env-only",
+			env:  map[string]string{"LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED": "false"},
+			toml: `invalid_share_disconnect_enabled = true`,
 			check: func(t *testing.T, cfg config) {
-				if cfg.trustEnabled != false {
-					t.Errorf("trustEnabled = %v, want env value %v (env must beat file)", cfg.trustEnabled, false)
+				if cfg.invalidShareDisconnectEnabled != false {
+					t.Errorf("invalidShareDisconnectEnabled = %v, want env value %v (env must beat file)", cfg.invalidShareDisconnectEnabled, false)
 				}
 			},
 		},
 		{
-			name: "trust-enabled/flag-only",
-			args: []string{"-trust-enabled=true"},
-			toml: `trust_enabled = false`,
+			name: "invalid-share-disconnect-enabled/flag-only",
+			args: []string{"-invalid-share-disconnect-enabled=false"},
+			toml: `invalid_share_disconnect_enabled = true`,
 			check: func(t *testing.T, cfg config) {
-				if cfg.trustEnabled != true {
-					t.Errorf("trustEnabled = %v, want flag value %v (flag must beat env absence and file)", cfg.trustEnabled, true)
+				if cfg.invalidShareDisconnectEnabled != false {
+					t.Errorf("invalidShareDisconnectEnabled = %v, want flag value %v (flag must beat env absence and file)", cfg.invalidShareDisconnectEnabled, false)
 				}
 			},
 		},
 		{
-			name: "trust-enabled/flag-env-file-all-set",
-			args: []string{"-trust-enabled=true"},
-			env:  map[string]string{"LEAF_SOLO_TRUST_ENABLED": "false"},
-			toml: `trust_enabled = true`,
+			name: "invalid-share-disconnect-enabled/flag-env-file-all-set",
+			args: []string{"-invalid-share-disconnect-enabled=false"},
+			env:  map[string]string{"LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED": "true"},
+			toml: `invalid_share_disconnect_enabled = false`,
 			check: func(t *testing.T, cfg config) {
-				if cfg.trustEnabled != true {
-					t.Errorf("trustEnabled = %v, want flag value %v (flag must win full precedence over env=false)", cfg.trustEnabled, true)
+				if cfg.invalidShareDisconnectEnabled != false {
+					t.Errorf("invalidShareDisconnectEnabled = %v, want flag value %v (flag must win full precedence over env=true)", cfg.invalidShareDisconnectEnabled, false)
 				}
 			},
 		},

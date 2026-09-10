@@ -94,7 +94,26 @@ func TestDirectSessionRXTTrustedShareSkipsRealRandomXValidation(t *testing.T) {
 	}
 	forceDirectTrustReady(sess.trust)
 
-	badNonce := directXNPrefixedNonceHex(xn, 0xdeadbeef)
+	// BUG FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 6): use the
+	// BIG-ENDIAN nonce-hex helper, not the little-endian one, for this
+	// retry loop's nonce generation. directXNPrefixedNonceHex (LE)
+	// packs n little-endian and then overwrites the LEADING hex
+	// characters with xn -- for a little-endian encoding, those
+	// leading characters are n's LOW-order bytes, exactly the bytes a
+	// small per-attempt increment (n+1, n+2, ...) changes. Every
+	// "retry" below therefore ended up submitting the byte-identical
+	// final nonce post-xn-overwrite, which (since job.MarkNonceUsed
+	// already ran on attempt 0, unconditionally, before any
+	// validation/skip decision) made every subsequent attempt hit a
+	// spurious "duplicate nonce" rejection instead of the real
+	// randomx-service-unreachable connectivity error this loop
+	// actually expects and checks for -- an intermittent flake
+	// whenever attempt 0's trust coin-flip happened to land on "run
+	// real validation" instead of "skip". directXNPrefixedNonceHexBigEndian
+	// puts n's low-order bytes at the END of the hex string, outside
+	// xn's overwritten prefix, so each attempt's increment always
+	// produces a genuinely distinct nonce.
+	badNonce := directXNPrefixedNonceHexBigEndian(xn, 0xdeadbeef)
 	fakeResult := strings.Repeat("ab", 32)
 
 	var accepted bool
@@ -119,7 +138,7 @@ func TestDirectSessionRXTTrustedShareSkipsRealRandomXValidation(t *testing.T) {
 			t.Fatalf("unexpected non-connectivity failure on attempt %d: %q", attempt, lastErr)
 		}
 		forceDirectTrustReady(sess.trust)
-		badNonce = directXNPrefixedNonceHex(xn, uint64(0xdeadbeef+attempt+1))
+		badNonce = directXNPrefixedNonceHexBigEndian(xn, uint64(0xdeadbeef+attempt+1))
 	}
 	if !accepted {
 		t.Fatalf("expected at least one trusted-share skip to succeed within 20 attempts against an unreachable daemon; last error: %q", lastErr)

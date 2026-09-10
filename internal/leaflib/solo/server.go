@@ -48,12 +48,17 @@ type Server struct {
 	// (zero fields replaced by sane defaults) once, in NewServer.
 	vardiff VardiffConfig
 
-	// trustConfig gates the real, legacy-ported probabilistic
-	// RandomX-validation-skip mechanism for RXT/RXM shares (see
-	// trust.go). Zero-value TrustConfig{} (Enabled: false) is the
-	// default — every share is always fully validated unless a
-	// caller explicitly opts in via EnableTrust.
-	trustConfig TrustConfig
+	// invalidShareGuardConfig configures the shared, per-session
+	// consecutive-invalid-share disconnect mechanism (see
+	// leaflib.InvalidShareGuard's doc comment for the full
+	// DISPATCH_BRIEF.md 2026-09-10 Fix 2b rationale). Defaults to
+	// leaflib.DefaultInvalidShareGuardConfig() (enabled) in NewServer
+	// — unlike EnableTrust, this is a security-hardening default
+	// that protects a deployment out of the box, not an opt-in
+	// throughput tradeoff — but remains fully overridable (including
+	// disabling it entirely) via SetInvalidShareGuardConfig before
+	// Serve begins accepting connections.
+	invalidShareGuardConfig leaflib.InvalidShareGuardConfig
 
 	// addressFlags is nil unless EnableAddressFlags has been called
 	// -- the real, manual ban/forced-minimum-difficulty enforcement
@@ -63,7 +68,7 @@ type Server struct {
 	// regardless of what the backend's address_flags table (or a
 	// leaf-solo operator's local flags file) says -- the same "opt-in,
 	// no surprise behavior change for a caller that never wires this"
-	// story EnableTrust/EnableMetrics already have. Consulted by
+	// story EnableMetrics already has. Consulted by
 	// session.go's handleLogin (ban rejection + starting-difficulty
 	// floor) and vardiff.go's maybeRetarget (retarget floor).
 	addressFlags *addressflags.Cache
@@ -131,19 +136,56 @@ func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeC
 		logger = log.Default()
 	}
 	s := &Server{
-		cm:               cm,
-		jobManager:       jobManager,
-		node:             node,
-		validators:       validators,
-		network:          network,
-		logger:           logger,
-		vardiff:          vardiff.Normalized(),
-		sessions:         make(map[uint64]*Session),
-		maxAddressLabels: metrics.DefaultMaxAddressLabels,
-		randomxPool:      NewAsyncValidationPool(AsyncValidationWorkers, AsyncValidationQueueSize),
+		cm:                      cm,
+		jobManager:              jobManager,
+		node:                    node,
+		validators:              validators,
+		network:                 network,
+		logger:                  logger,
+		vardiff:                 vardiff.Normalized(),
+		sessions:                make(map[uint64]*Session),
+		maxAddressLabels:        metrics.DefaultMaxAddressLabels,
+		invalidShareGuardConfig: leaflib.DefaultInvalidShareGuardConfig(),
+		// workers=0 lets NewAsyncValidationPool apply its own default
+		// (DefaultAsyncValidationWorkers() == runtime.NumCPU(), NOT a
+		// hardcoded literal -- see asyncvalidation.go's doc comment
+		// and Alex's explicit direction in DISPATCH_BRIEF.md,
+		// 2026-09-10). An operator wanting a different fixed count
+		// can override via SetRandomXWorkerPoolSize (see
+		// cmd/leaf-solo's -randomx-workers flag) before Serve begins.
+		randomxPool: NewAsyncValidationPool(0, AsyncValidationQueueSize),
 	}
 	s.unsubscribe = jobManager.Subscribe(s.invalidateAndRepushJobs)
 	return s
+}
+
+// SetRandomXWorkerPoolSize replaces this Server's randomxPool with a
+// freshly constructed one sized to workers/queueSize -- see
+// NewAsyncValidationPool's own doc comment for the <=0 fallback
+// behavior (workers<=0 uses DefaultAsyncValidationWorkers(), i.e.
+// runtime.NumCPU(), NOT a hardcoded literal -- DISPATCH_BRIEF.md,
+// 2026-09-10, Fix 2a). Must be called before Serve begins accepting
+// connections (mirrors EnableAddressFlags's identical "opt-in,
+// pre-Serve" convention) -- the pool NewServer already
+// constructed has never been given any work yet at this point in
+// normal startup sequencing, so stopping it here is instant and
+// drops nothing.
+func (s *Server) SetRandomXWorkerPoolSize(workers, queueSize int) {
+	s.randomxPool.Stop()
+	s.randomxPool = NewAsyncValidationPool(workers, queueSize)
+}
+
+// SetInvalidShareGuardConfig overrides this Server's default
+// leaflib.InvalidShareGuardConfig (see that field's own doc comment
+// and leaflib.InvalidShareGuard's package-level doc comment for the
+// full DISPATCH_BRIEF.md 2026-09-10 Fix 2b rationale). Must be called
+// before Serve begins accepting connections -- sessions capture
+// s.invalidShareGuardConfig once, at newSession time. Passing
+// InvalidShareGuardConfig{Enabled: false} disables the mechanism
+// entirely.
+func (s *Server) SetInvalidShareGuardConfig(cfg leaflib.InvalidShareGuardConfig) {
+	s.invalidShareGuardConfig = cfg.Normalized()
+	s.invalidShareGuardConfig.Enabled = cfg.Enabled
 }
 
 // EnableMetrics constructs a *metrics.Metrics wired to this Server's
@@ -181,24 +223,6 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 // connections; StatsHTMLHandler reads it fresh on every request.
 func (s *Server) SetHideRemoteAddress(hide bool) {
 	s.hideRemoteAddress = hide
-}
-
-// EnableTrust opts this server into the real, legacy-ported
-// probabilistic RandomX-validation-skip mechanism for RXT/RXM shares
-// (see trust.go's doc comment for the full reference algorithm and
-// citation). Must be called before serving any connections to take
-// effect for them — sessions capture s.trustConfig once, at
-// newSession time. Calling this is optional; a Server that never
-// calls it always fully validates every share, identical to this
-// mechanism not existing at all.
-func (s *Server) EnableTrust(cfg TrustConfig) {
-	s.trustConfig = cfg.Normalized()
-	// Normalized leaves Enabled untouched by design (see
-	// TrustConfig.Normalized's doc comment) — re-apply the caller's
-	// actual Enabled value explicitly since Normalized's return value
-	// above already preserved it correctly; this call is here only
-	// for clarity that Enabled is a deliberate, unmodified pass-through.
-	s.trustConfig.Enabled = cfg.Enabled
 }
 
 // EnableAddressFlags opts this server into the real, manual ban/

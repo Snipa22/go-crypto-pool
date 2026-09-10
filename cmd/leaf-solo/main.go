@@ -46,6 +46,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,21 +91,28 @@ type config struct {
 	// REQUIRED when coin=monero -- see main's own validation.
 	monerodURL string
 
-	// trustEnabled/trustThreshold/trustPenalty/trustChange/trustMin
-	// configure the real, legacy-ported probabilistic
-	// RandomX-validation-skip mechanism for RXT/RXM shares (see
-	// internal/leaflib/solo/trust.go's doc comment for the full
-	// reference algorithm and citation). Disabled by default (every
-	// share always fully validated, identical to this mechanism not
-	// existing). Only ever consulted for RXT/RXM jobs; a SHA3X/C29
-	// leaf-solo process can enable this flag with zero effect, since
-	// isRandomXFamily gates it at the actual submit-handling call
-	// site, not here.
-	trustEnabled   bool
-	trustThreshold int
-	trustPenalty   int
-	trustChange    int
-	trustMin       int
+	// randomxWorkers overrides the RandomX-family (RXT/RXM) async
+	// validation worker pool's size (see
+	// internal/leaflib/solo/asyncvalidation.go's doc comment). 0
+	// (the default) means "use DefaultAsyncValidationWorkers()
+	// (runtime.NumCPU())" -- see DISPATCH_BRIEF.md, 2026-09-10, Fix
+	// 2a: this used to be a hardcoded literal 8 with no operator
+	// override at all.
+	randomxWorkers int
+
+	// invalidShareDisconnectEnabled/invalidShareDisconnectThreshold
+	// configure leaflib.InvalidShareGuard (see that type's doc
+	// comment for the full DISPATCH_BRIEF.md 2026-09-10 Fix 2b
+	// rationale): a session whose real RandomX-family block-find-
+	// level validation fails this many times CONSECUTIVELY is
+	// disconnected. Enabled by DEFAULT (unlike trust, this is a
+	// security-hardening default, not an opt-in throughput
+	// tradeoff) -- an operator can disable it entirely via
+	// -invalid-share-disconnect-enabled=false. Threshold 0/unset
+	// uses the documented default (see
+	// leaflib.DefaultInvalidShareGuardConfig).
+	invalidShareDisconnectEnabled   bool
+	invalidShareDisconnectThreshold int
 
 	// algo selects which SINGLE mining algorithm this leaf-solo
 	// process serves: "sha3x" (default), "c29", or "rxt" -- for
@@ -230,11 +238,9 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_SOLO_NETWORK", "testnet"), "network tag for share/diagnostic records: mainnet|testnet. Env: LEAF_SOLO_NETWORK")
 	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_SOLO_COIN", "tari"), "which coin/PoW family this leaf-solo process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_SOLO_COIN")
 	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_SOLO_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081), no trailing slash or /json_rpc suffix required. REQUIRED when -coin=monero; ignored for -coin=tari. Env: LEAF_SOLO_MONEROD_URL")
-	flag.BoolVar(&cfg.trustEnabled, "trust-enabled", envOr("LEAF_SOLO_TRUST_ENABLED", "false") == "true", "enable the real, legacy-ported probabilistic RandomX-validation-skip mechanism for RXT/RXM shares (see internal/leaflib/solo/trust.go). Disabled by default -- every share is always fully, cryptographically validated. Has no effect for SHA3X/C29. Env: LEAF_SOLO_TRUST_ENABLED (\"true\" to enable)")
-	flag.IntVar(&cfg.trustThreshold, "trust-threshold", envOrInt("LEAF_SOLO_TRUST_THRESHOLD", 0), "real trust-ramp threshold gate (see trust.go's TrustConfig.Threshold) -- 0/unset uses the documented default (10). Env: LEAF_SOLO_TRUST_THRESHOLD")
-	flag.IntVar(&cfg.trustPenalty, "trust-penalty", envOrInt("LEAF_SOLO_TRUST_PENALTY", 0), "real trust-ramp penalty gate, re-armed after any rejected share (see trust.go's TrustConfig.Penalty) -- 0/unset uses the documented default (30). Env: LEAF_SOLO_TRUST_PENALTY")
-	flag.IntVar(&cfg.trustChange, "trust-change", envOrInt("LEAF_SOLO_TRUST_CHANGE", 0), "real per-accepted-share probability decrement (see trust.go's TrustConfig.Change) -- 0/unset uses the documented default (1). Env: LEAF_SOLO_TRUST_CHANGE")
-	flag.IntVar(&cfg.trustMin, "trust-min", envOrInt("LEAF_SOLO_TRUST_MIN", 0), "real probability floor, ensuring full validation never stops occurring entirely once ramped in (see trust.go's TrustConfig.Min) -- 0/unset uses the documented default (20). Env: LEAF_SOLO_TRUST_MIN")
+	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_SOLO_RANDOMX_WORKERS", 0), "RandomX-family (RXT/RXM) async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_SOLO_RANDOMX_WORKERS")
+	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a session after too many CONSECUTIVE real RandomX-family (RXT/RXM) block-find-level validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
+	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_SOLO_ALGO")
 	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_SOLO_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (consulted for -algo=rxt, and for -coin=monero's real RandomX/rx validation -- both share the same real randomx-service-backed RandomXValidator). Env: LEAF_SOLO_RANDOMX_SERVICE_URL")
 	flag.StringVar(&cfg.coinbaseExtraTag, "coinbase-extra-tag", envOr("LEAF_SOLO_COINBASE_EXTRA_TAG", ""), "coinbase-extra ownership tag appended to every fetched Tari block template (identifies this leaf's found blocks on-chain). Left unset (the default), a per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 / supportxtm-rxt / supportxtm-rxm, based on -algo/-coin -- see resolveCoinbaseExtraTag. When set, this value is used verbatim, overriding the per-algo default. Truncated to solo.MaxCoinbaseExtraTagLen bytes if longer. Env: LEAF_SOLO_COINBASE_EXTRA_TAG")
@@ -306,11 +312,9 @@ type fileConfig struct {
 	Coin            *string `toml:"coin"`
 	MonerodURL      *string `toml:"monerod_url"`
 
-	TrustEnabled   *bool `toml:"trust_enabled"`
-	TrustThreshold *int  `toml:"trust_threshold"`
-	TrustPenalty   *int  `toml:"trust_penalty"`
-	TrustChange    *int  `toml:"trust_change"`
-	TrustMin       *int  `toml:"trust_min"`
+	RandomXWorkers                  *int  `toml:"randomx_workers"`
+	InvalidShareDisconnectEnabled   *bool `toml:"invalid_share_disconnect_enabled"`
+	InvalidShareDisconnectThreshold *int  `toml:"invalid_share_disconnect_threshold"`
 
 	Algo              *string `toml:"algo"`
 	RandomXServiceURL *string `toml:"randomx_service_url"`
@@ -369,11 +373,9 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.coin, fc.Coin, visited, "coin", "LEAF_SOLO_COIN")
 	cfgfile.ApplyString(&cfg.monerodURL, fc.MonerodURL, visited, "monerod-url", "LEAF_SOLO_MONEROD_URL")
 
-	cfgfile.ApplyBool(&cfg.trustEnabled, fc.TrustEnabled, visited, "trust-enabled", "LEAF_SOLO_TRUST_ENABLED")
-	cfgfile.ApplyInt(&cfg.trustThreshold, fc.TrustThreshold, visited, "trust-threshold", "LEAF_SOLO_TRUST_THRESHOLD")
-	cfgfile.ApplyInt(&cfg.trustPenalty, fc.TrustPenalty, visited, "trust-penalty", "LEAF_SOLO_TRUST_PENALTY")
-	cfgfile.ApplyInt(&cfg.trustChange, fc.TrustChange, visited, "trust-change", "LEAF_SOLO_TRUST_CHANGE")
-	cfgfile.ApplyInt(&cfg.trustMin, fc.TrustMin, visited, "trust-min", "LEAF_SOLO_TRUST_MIN")
+	cfgfile.ApplyInt(&cfg.randomxWorkers, fc.RandomXWorkers, visited, "randomx-workers", "LEAF_SOLO_RANDOMX_WORKERS")
+	cfgfile.ApplyBool(&cfg.invalidShareDisconnectEnabled, fc.InvalidShareDisconnectEnabled, visited, "invalid-share-disconnect-enabled", "LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED")
+	cfgfile.ApplyInt(&cfg.invalidShareDisconnectThreshold, fc.InvalidShareDisconnectThreshold, visited, "invalid-share-disconnect-threshold", "LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD")
 
 	cfgfile.ApplyString(&cfg.algo, fc.Algo, visited, "algo", "LEAF_SOLO_ALGO")
 	cfgfile.ApplyString(&cfg.randomXServiceURL, fc.RandomXServiceURL, visited, "randomx-service-url", "LEAF_SOLO_RANDOMX_SERVICE_URL")
@@ -837,16 +839,31 @@ func main() {
 	server := solo.NewServer(cm, jobManager, node, validators, networkFromString(cfg.network), logger, vardiffCfg)
 	defer server.Shutdown()
 
-	if cfg.trustEnabled {
-		trustCfg := solo.TrustConfig{
-			Enabled:   true,
-			Threshold: cfg.trustThreshold,
-			Penalty:   cfg.trustPenalty,
-			Change:    cfg.trustChange,
-			Min:       cfg.trustMin,
-		}
-		server.EnableTrust(trustCfg)
-		logger.Printf("trusted-miner RandomX-validation skip ENABLED for RXT/RXM (threshold=%d penalty=%d change=%d min=%d -- 0 means the documented default is in effect)", cfg.trustThreshold, cfg.trustPenalty, cfg.trustChange, cfg.trustMin)
+	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2a): worker
+	// count is runtime.NumCPU() by DEFAULT (server.NewServer's own
+	// construction already applies this -- see solo/asyncvalidation.go's
+	// doc comment), not a hardcoded literal 8; an operator who wants a
+	// different fixed count can still get one via -randomx-workers.
+	if cfg.randomxWorkers > 0 {
+		server.SetRandomXWorkerPoolSize(cfg.randomxWorkers, 0)
+		logger.Printf("RandomX-family async validation worker pool size overridden to %d (default would have been runtime.NumCPU()=%d)", cfg.randomxWorkers, runtime.NumCPU())
+	}
+
+	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b): disconnect
+	// a session after too many consecutive real RandomX-family
+	// block-find-level validation failures, so a hostile session
+	// submitting fabricated above-target claims cannot keep flooding
+	// the shared async validation pool for free. Enabled by default
+	// (a security-hardening default, not an opt-in tradeoff) --
+	// -invalid-share-disconnect-enabled=false turns it off entirely.
+	server.SetInvalidShareGuardConfig(leaflib.InvalidShareGuardConfig{
+		Enabled:   cfg.invalidShareDisconnectEnabled,
+		Threshold: cfg.invalidShareDisconnectThreshold,
+	})
+	if cfg.invalidShareDisconnectEnabled {
+		logger.Printf("consecutive-invalid-share disconnect guard ENABLED (threshold=%d -- 0 means the documented default is in effect)", cfg.invalidShareDisconnectThreshold)
+	} else {
+		logger.Printf("consecutive-invalid-share disconnect guard DISABLED by operator config")
 	}
 
 	// Real, manual ban/forced-minimum-difficulty enforcement (see

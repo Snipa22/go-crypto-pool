@@ -44,6 +44,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -99,6 +100,14 @@ type config struct {
 
 	dialTimeout    time.Duration
 	requestTimeout time.Duration
+
+	// randomxWorkers/invalidShareDisconnectEnabled/
+	// invalidShareDisconnectThreshold mirror cmd/leaf-solo's own
+	// identical fields exactly — see that file's doc comments for the
+	// full DISPATCH_BRIEF.md 2026-09-10 Fix 2a/Fix 2b rationale.
+	randomxWorkers                  int
+	invalidShareDisconnectEnabled   bool
+	invalidShareDisconnectThreshold int
 
 	// metricsListenAddress/maxAddressLabels follow cmd/leaf-solo's
 	// exact established convention for this flag pair (see
@@ -198,6 +207,10 @@ func loadConfig() (config, error) {
 	flag.DurationVar(&cfg.dialTimeout, "upstream-dial-timeout", envOrDuration("LEAF_PROXY_UPSTREAM_DIAL_TIMEOUT", 10*time.Second), "timeout for dialing the upstream pool. Env: LEAF_PROXY_UPSTREAM_DIAL_TIMEOUT")
 	flag.DurationVar(&cfg.requestTimeout, "upstream-request-timeout", envOrDuration("LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT", 15*time.Second), "timeout for a single upstream request/response round-trip. Env: LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT")
 
+	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_PROXY_RANDOMX_WORKERS", 0), "RandomX async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_PROXY_RANDOMX_WORKERS")
+	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a downstream session after too many CONSECUTIVE real RandomX validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
+	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a downstream session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD")
+
 	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_PROXY_METRICS_LISTEN_ADDRESS", "127.0.0.1:9601"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the downstream-facing stratum port). Defaults to loopback-only (127.0.0.1) -- an operator must explicitly set this to a wildcard/public address to expose stats/metrics publicly. Set to empty string to disable. Env: LEAF_PROXY_METRICS_LISTEN_ADDRESS")
 	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOrBool("LEAF_PROXY_HIDE_REMOTE_ADDRESS", false), "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_PROXY_HIDE_REMOTE_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_PROXY_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_PROXY_MAX_ADDRESS_LABELS")
@@ -249,6 +262,10 @@ type fileConfig struct {
 
 	DialTimeoutSeconds    *int `toml:"upstream_dial_timeout_seconds"`
 	RequestTimeoutSeconds *int `toml:"upstream_request_timeout_seconds"`
+
+	RandomXWorkers                  *int  `toml:"randomx_workers"`
+	InvalidShareDisconnectEnabled   *bool `toml:"invalid_share_disconnect_enabled"`
+	InvalidShareDisconnectThreshold *int  `toml:"invalid_share_disconnect_threshold"`
 
 	MetricsListenAddress *string `toml:"metrics_listen_address"`
 	MaxAddressLabels     *int    `toml:"max_address_labels"`
@@ -315,6 +332,10 @@ func applyConfigFile(cfg *config) error {
 		d := time.Duration(*fc.RequestTimeoutSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.requestTimeout, &d, visited, "upstream-request-timeout", "LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT")
 	}
+
+	cfgfile.ApplyInt(&cfg.randomxWorkers, fc.RandomXWorkers, visited, "randomx-workers", "LEAF_PROXY_RANDOMX_WORKERS")
+	cfgfile.ApplyBool(&cfg.invalidShareDisconnectEnabled, fc.InvalidShareDisconnectEnabled, visited, "invalid-share-disconnect-enabled", "LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED")
+	cfgfile.ApplyInt(&cfg.invalidShareDisconnectThreshold, fc.InvalidShareDisconnectThreshold, visited, "invalid-share-disconnect-threshold", "LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD")
 
 	cfgfile.ApplyString(&cfg.metricsListenAddress, fc.MetricsListenAddress, visited, "metrics-listen-address", "LEAF_PROXY_METRICS_LISTEN_ADDRESS")
 	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_PROXY_MAX_ADDRESS_LABELS")
@@ -441,6 +462,29 @@ func main() {
 
 	server := proxy.NewServer(cm, jobManager, rxValidator, upstream, logger, vardiffCfg, cfg.jobMaxAge)
 	defer server.Shutdown()
+
+	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2a): worker
+	// count is runtime.NumCPU() by DEFAULT (proxy.NewServer's own
+	// construction already applies this), not a hardcoded literal 8;
+	// an operator who wants a different fixed count can still get one
+	// via -randomx-workers.
+	if cfg.randomxWorkers > 0 {
+		server.SetRandomXWorkerPoolSize(cfg.randomxWorkers, 0)
+		logger.Printf("RandomX async validation worker pool size overridden to %d (default would have been runtime.NumCPU()=%d)", cfg.randomxWorkers, runtime.NumCPU())
+	}
+
+	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b): disconnect
+	// a downstream session after too many consecutive real RandomX
+	// validation failures. Enabled by default.
+	server.SetInvalidShareGuardConfig(leaflib.InvalidShareGuardConfig{
+		Enabled:   cfg.invalidShareDisconnectEnabled,
+		Threshold: cfg.invalidShareDisconnectThreshold,
+	})
+	if cfg.invalidShareDisconnectEnabled {
+		logger.Printf("consecutive-invalid-share disconnect guard ENABLED (threshold=%d -- 0 means the documented default is in effect)", cfg.invalidShareDisconnectThreshold)
+	} else {
+		logger.Printf("consecutive-invalid-share disconnect guard DISABLED by operator config")
+	}
 
 	// Real, manual ban enforcement (see internal/leaflib/addressflags's
 	// package doc comment). Disabled (server.addressFlags stays nil)

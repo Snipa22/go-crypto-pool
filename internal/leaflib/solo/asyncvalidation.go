@@ -1,7 +1,10 @@
 // Copyright and license: see repository LICENSE (MIT).
 package solo
 
-import "sync"
+import (
+	"runtime"
+	"sync"
+)
 
 // PERFORMANCE FIX (Alex, live production incident, 2026-08-30): Session.Run's
 // read loop (session.go) used to call handleSubmit synchronously and block on
@@ -58,32 +61,48 @@ import "sync"
 // meaningful bound on how much concurrent randomx-service load THIS leaf
 // process ever generates, regardless of how many miners are connected.
 //
-// THE BOUND ITSELF (asyncValidationWorkers = 8, asyncValidationQueueSize =
-// 256): 8 mirrors this package's other already-justified small, fixed
-// concurrency-adjacent constant (defaultSessionJobHistorySize) and is
-// comfortably above what a single randomx-service instance can usefully
-// pipeline (its own hashing is still effectively serialized per active
-// seed -- more concurrent callers mostly overlap NETWORK/HTTP latency, not
-// actual hash compute), while staying small enough that even a fully
-// saturated pool represents a small, known amount of in-flight HTTP work
-// against that daemon rather than an unbounded pile-up. Recall from the same
-// investigation: repeated request pileups against an overloaded
-// randomx-service have been observed to wedge it into a permanently
-// unresponsive state (client-side-timeout-pileup failure mode) -- a small
-// worker count is a deliberate hedge against reproducing that. 256 is
-// generous headroom above 8 workers for a genuine, sustained multi-
-// thousand-share/sec flood (the exact production symptom this fix
-// addresses) to be absorbed for a moment without the dispatching Submit
-// call itself blocking, while still being a small, fixed, memory-bounded
+// THE BOUND ITSELF -- HARDENING FIX (Alex, DISPATCH_BRIEF.md,
+// 2026-09-10): this pool's worker count used to be a hardcoded literal
+// 8, justified below (in this doc comment's git history) purely by
+// analogy to defaultSessionJobHistorySize -- a fixed, arbitrary
+// constant with no actual relationship to how much real concurrency
+// THIS process's host can usefully drive against randomx-service.
+// Alex's explicit correction: "why only 8 workers? numcpu is the
+// correct number of workers that we can send the backend." The
+// worker count is now DefaultAsyncValidationWorkers() ==
+// runtime.NumCPU() by default (see NewAsyncValidationPool's workers<=0
+// fallback below) -- scales with the actual host this leaf process is
+// running on (a small VM and a large bare-metal box get correspondingly
+// different, host-appropriate concurrency, rather than the same fixed
+// 8 either way) -- while still fully operator-overridable (see
+// Server.SetRandomXWorkerPoolSize / cmd/leaf-solo, cmd/leaf-direct,
+// cmd/leaf-proxy's own -randomx-workers flag) for a deployment that
+// genuinely needs a different fixed number (e.g. to deliberately cap
+// concurrent load against a randomx-service instance shared with other
+// processes on the same host). AsyncValidationQueueSize (256) is
+// unaffected by this change and keeps its original justification:
+// generous headroom for a genuine, sustained multi-thousand-share/sec
+// flood to be absorbed for a moment without the dispatching Submit call
+// itself blocking, while still being a small, fixed, memory-bounded
 // number -- once the queue is genuinely full, Submit blocks the CALLER
 // (real backpressure, not a silent drop and not more goroutines), and since
 // Submit is itself always called from within a spawned dispatch already
 // off the read loop (see session.go's handleSubmit), that backpressure
 // never blocks Session.Run's own scanner.Scan() loop.
-const (
-	AsyncValidationWorkers   = 8
-	AsyncValidationQueueSize = 256
-)
+const AsyncValidationQueueSize = 256
+
+// DefaultAsyncValidationWorkers returns the DEFAULT worker count
+// NewAsyncValidationPool falls back to when its caller passes
+// workers <= 0 -- runtime.NumCPU(), per this file's own doc comment
+// above (Alex's explicit direction: NumCPU, not a fixed literal).
+// Computed fresh on every call (not cached at package-init/var-init
+// time) so it reflects this process's actual runtime.GOMAXPROCS-
+// relevant CPU count at the moment a pool is genuinely constructed,
+// not whatever it happened to be at process startup (matters for e.g.
+// a container whose CPU quota is applied/changed before this runs).
+func DefaultAsyncValidationWorkers() int {
+	return runtime.NumCPU()
+}
 
 // AsyncValidationPool is a small, fixed-size worker pool used to run
 // RandomX-family (RXT/RXM) share validation off Session.Run's read loop --
@@ -94,34 +113,48 @@ const (
 // can share the exact same pool implementation for its own, structurally
 // identical read-loop-blocking bug, rather than duplicating it.
 type AsyncValidationPool struct {
-	jobs chan func()
-	done chan struct{}
-	wg   sync.WaitGroup
+	jobs    chan func()
+	done    chan struct{}
+	wg      sync.WaitGroup
+	workers int
 }
 
 // NewAsyncValidationPool starts workers goroutines immediately, each ready
 // to pull closures off a queue bounded to queueSize entries. A non-positive
-// workers/queueSize falls back to AsyncValidationWorkers/
-// AsyncValidationQueueSize respectively, so a caller can pass zero values
-// (e.g. a Server built without deliberately overriding either) and still
-// get the documented, justified default bound rather than an unbounded or
-// zero-capacity pool.
+// workers falls back to DefaultAsyncValidationWorkers() (runtime.NumCPU())
+// and a non-positive queueSize falls back to AsyncValidationQueueSize, so a
+// caller can pass zero values (e.g. a Server built without deliberately
+// overriding either) and still get the documented, justified default bound
+// rather than an unbounded or zero-capacity pool -- and an operator who
+// DOES want a specific fixed worker count can still get one by passing a
+// positive value (see Server.SetRandomXWorkerPoolSize).
 func NewAsyncValidationPool(workers, queueSize int) *AsyncValidationPool {
 	if workers <= 0 {
-		workers = AsyncValidationWorkers
+		workers = DefaultAsyncValidationWorkers()
 	}
 	if queueSize <= 0 {
 		queueSize = AsyncValidationQueueSize
 	}
 	p := &AsyncValidationPool{
-		jobs: make(chan func(), queueSize),
-		done: make(chan struct{}),
+		jobs:    make(chan func(), queueSize),
+		done:    make(chan struct{}),
+		workers: workers,
 	}
 	p.wg.Add(workers)
 	for i := 0; i < workers; i++ {
 		go p.worker()
 	}
 	return p
+}
+
+// Workers reports how many worker goroutines this pool was actually
+// constructed with (post the workers<=0 -> DefaultAsyncValidationWorkers()
+// fallback in NewAsyncValidationPool) -- diagnostic/test use, so a
+// caller (or a test) can confirm the real, live worker count rather
+// than re-deriving what NewAsyncValidationPool's fallback would have
+// picked independently.
+func (p *AsyncValidationPool) Workers() int {
+	return p.workers
 }
 
 func (p *AsyncValidationPool) worker() {

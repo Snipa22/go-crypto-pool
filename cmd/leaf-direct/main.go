@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +67,14 @@ type config struct {
 	monerodURL      string
 	algo            string
 	poolType        string
+
+	// randomxWorkers/invalidShareDisconnectEnabled/
+	// invalidShareDisconnectThreshold mirror cmd/leaf-solo's own
+	// identical fields exactly — see that file's doc comments for the
+	// full DISPATCH_BRIEF.md 2026-09-10 Fix 2a/Fix 2b rationale.
+	randomxWorkers                  int
+	invalidShareDisconnectEnabled   bool
+	invalidShareDisconnectThreshold int
 
 	// poolID is LEAF_DIRECT_POOL_ID / -pool-id: the real, static,
 	// operator-assigned integer identifying this leaf-direct
@@ -242,11 +251,14 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_DIRECT_NETWORK", "testnet"), "network tag for share/block records: mainnet|testnet. Env: LEAF_DIRECT_NETWORK")
 	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_DIRECT_COIN", "tari"), "which coin/PoW family this leaf-direct process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_DIRECT_COIN")
 	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_DIRECT_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081). REQUIRED when -coin=monero; ignored for -coin=tari. Env: LEAF_DIRECT_MONEROD_URL")
-	flag.BoolVar(&cfg.trustEnabled, "trust-enabled", envOr("LEAF_DIRECT_TRUST_ENABLED", "false") == "true", "enable the real, legacy-ported probabilistic RandomX-validation-skip mechanism for RXT/RXM shares (see internal/leaflib/solo/trust.go) -- mirrors leaf-solo's identical flag exactly. Disabled by default. Env: LEAF_DIRECT_TRUST_ENABLED (\"true\" to enable)")
+	flag.BoolVar(&cfg.trustEnabled, "trust-enabled", envOr("LEAF_DIRECT_TRUST_ENABLED", "false") == "true", "enable the real, legacy-ported probabilistic RandomX-validation-skip mechanism for RXT/RXM shares (see internal/leaflib/solo/trust.go) -- mirrors leaf-solo's identical flag exactly. Disabled by default. REAL-MONEY RISK (DISPATCH_BRIEF.md, 2026-09-10): unlike leaf-solo (no share table/backend/payouts, and this mechanism has since been removed there entirely), a leaf-direct share that skips validation here still reaches the real backend's payout accounting on the miner's own claimed value, with no cryptographic re-check by this leaf -- see internal/leaflib/direct.Server.EnableTrust's doc comment for the full risk framing. A deliberate trust-for-throughput tradeoff, not a free feature. Env: LEAF_DIRECT_TRUST_ENABLED (\"true\" to enable)")
 	flag.IntVar(&cfg.trustThreshold, "trust-threshold", envOrInt("LEAF_DIRECT_TRUST_THRESHOLD", 0), "real trust-ramp threshold gate -- 0/unset uses the documented default (10). Env: LEAF_DIRECT_TRUST_THRESHOLD")
 	flag.IntVar(&cfg.trustPenalty, "trust-penalty", envOrInt("LEAF_DIRECT_TRUST_PENALTY", 0), "real trust-ramp penalty gate, re-armed after any rejected share -- 0/unset uses the documented default (30). Env: LEAF_DIRECT_TRUST_PENALTY")
 	flag.IntVar(&cfg.trustChange, "trust-change", envOrInt("LEAF_DIRECT_TRUST_CHANGE", 0), "real per-accepted-share probability decrement -- 0/unset uses the documented default (1). Env: LEAF_DIRECT_TRUST_CHANGE")
 	flag.IntVar(&cfg.trustMin, "trust-min", envOrInt("LEAF_DIRECT_TRUST_MIN", 0), "real probability floor -- 0/unset uses the documented default (20). Env: LEAF_DIRECT_TRUST_MIN")
+	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_DIRECT_RANDOMX_WORKERS", 0), "RandomX-family (RXT/RXM) async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_DIRECT_RANDOMX_WORKERS")
+	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_DIRECT_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a session after too many CONSECUTIVE real RandomX-family (RXT/RXM) validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_DIRECT_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
+	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_DIRECT_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_DIRECT_INVALID_SHARE_DISCONNECT_THRESHOLD")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_DIRECT_ALGO", "sha3x"), "which single mining algorithm this leaf-direct process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_DIRECT_ALGO")
 	flag.StringVar(&cfg.poolType, "pool-type", envOr("LEAF_DIRECT_POOL_TYPE", ""), "real pool payout model stamped onto every share/block forwarded to the backend: pplns|pps|prop|solo. REQUIRED (no safe silent default -- determines real payout accounting semantics). Env: LEAF_DIRECT_POOL_TYPE")
 	flag.IntVar(&cfg.poolID, "pool-id", envOrInt("LEAF_DIRECT_POOL_ID", 0), "real, static, operator-assigned pool-server-source identifier stamped onto every share/block forwarded to the backend (see internal/proto/share.proto's Share.pool_id doc comment). REQUIRED, must be > 0 (no safe silent default -- see this flag's own field doc comment on config.poolID for why 0/unset is not a safe fallback). Env: LEAF_DIRECT_POOL_ID")
@@ -326,6 +338,10 @@ type fileConfig struct {
 	TrustChange    *int  `toml:"trust_change"`
 	TrustMin       *int  `toml:"trust_min"`
 
+	RandomXWorkers                  *int  `toml:"randomx_workers"`
+	InvalidShareDisconnectEnabled   *bool `toml:"invalid_share_disconnect_enabled"`
+	InvalidShareDisconnectThreshold *int  `toml:"invalid_share_disconnect_threshold"`
+
 	Algo              *string `toml:"algo"`
 	PoolType          *string `toml:"pool_type"`
 	PoolID            *int    `toml:"pool_id"`
@@ -404,6 +420,9 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyInt(&cfg.trustPenalty, fc.TrustPenalty, visited, "trust-penalty", "LEAF_DIRECT_TRUST_PENALTY")
 	cfgfile.ApplyInt(&cfg.trustChange, fc.TrustChange, visited, "trust-change", "LEAF_DIRECT_TRUST_CHANGE")
 	cfgfile.ApplyInt(&cfg.trustMin, fc.TrustMin, visited, "trust-min", "LEAF_DIRECT_TRUST_MIN")
+	cfgfile.ApplyInt(&cfg.randomxWorkers, fc.RandomXWorkers, visited, "randomx-workers", "LEAF_DIRECT_RANDOMX_WORKERS")
+	cfgfile.ApplyBool(&cfg.invalidShareDisconnectEnabled, fc.InvalidShareDisconnectEnabled, visited, "invalid-share-disconnect-enabled", "LEAF_DIRECT_INVALID_SHARE_DISCONNECT_ENABLED")
+	cfgfile.ApplyInt(&cfg.invalidShareDisconnectThreshold, fc.InvalidShareDisconnectThreshold, visited, "invalid-share-disconnect-threshold", "LEAF_DIRECT_INVALID_SHARE_DISCONNECT_THRESHOLD")
 
 	cfgfile.ApplyString(&cfg.algo, fc.Algo, visited, "algo", "LEAF_DIRECT_ALGO")
 	cfgfile.ApplyString(&cfg.poolType, fc.PoolType, visited, "pool-type", "LEAF_DIRECT_POOL_TYPE")
@@ -952,6 +971,29 @@ func main() {
 		}
 		server.EnableTrust(trustCfg)
 		logger.Printf("trusted-miner RandomX-validation skip ENABLED for RXT/RXM (threshold=%d penalty=%d change=%d min=%d -- 0 means the documented default is in effect)", cfg.trustThreshold, cfg.trustPenalty, cfg.trustChange, cfg.trustMin)
+	}
+
+	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2a): worker
+	// count is runtime.NumCPU() by DEFAULT (direct.NewServer's own
+	// construction already applies this), not a hardcoded literal 8;
+	// an operator who wants a different fixed count can still get one
+	// via -randomx-workers.
+	if cfg.randomxWorkers > 0 {
+		server.SetRandomXWorkerPoolSize(cfg.randomxWorkers, 0)
+		logger.Printf("RandomX-family async validation worker pool size overridden to %d (default would have been runtime.NumCPU()=%d)", cfg.randomxWorkers, runtime.NumCPU())
+	}
+
+	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b): disconnect
+	// a session after too many consecutive real RandomX-family
+	// validation failures. Enabled by default.
+	server.SetInvalidShareGuardConfig(leaflib.InvalidShareGuardConfig{
+		Enabled:   cfg.invalidShareDisconnectEnabled,
+		Threshold: cfg.invalidShareDisconnectThreshold,
+	})
+	if cfg.invalidShareDisconnectEnabled {
+		logger.Printf("consecutive-invalid-share disconnect guard ENABLED (threshold=%d -- 0 means the documented default is in effect)", cfg.invalidShareDisconnectThreshold)
+	} else {
+		logger.Printf("consecutive-invalid-share disconnect guard DISABLED by operator config")
 	}
 
 	// Real, manual ban/forced-minimum-difficulty enforcement (see

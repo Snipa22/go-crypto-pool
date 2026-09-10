@@ -39,6 +39,13 @@ func directLargeResultHash(idx int) []byte {
 // fakeDelayedRandomXValidator exactly.
 type fakeDelayedDirectRandomXValidator struct {
 	delay time.Duration
+	// alwaysReject, if true, always returns (false, nil) instead of
+	// (true, nil) -- used by hardening_test.go's DoS-disconnect
+	// regression test to deterministically simulate a session whose
+	// claims always fail real validation, without needing a real
+	// daemon or a validFunc keyed on share content (this fake has no
+	// such hook, unlike solo's own fakeDelayedRandomXValidator).
+	alwaysReject bool
 
 	mu             sync.Mutex
 	calls          int
@@ -62,7 +69,7 @@ func (v *fakeDelayedDirectRandomXValidator) Validate(ctx context.Context, share 
 	v.mu.Lock()
 	v.concurrent--
 	v.mu.Unlock()
-	return true, nil
+	return !v.alwaysReject, nil
 }
 
 func (v *fakeDelayedDirectRandomXValidator) snapshot() (calls, peakConcurrent int) {

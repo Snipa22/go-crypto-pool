@@ -99,6 +99,22 @@ upstream_dial_timeout_seconds = 10
 # (default: 15)
 upstream_request_timeout_seconds = 15
 
+# RandomX async validation worker pool size (see
+# internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented
+# default, runtime.NumCPU() -- NOT a hardcoded literal. (default: 0)
+randomx_workers = 0
+
+# Disconnect a downstream session after too many CONSECUTIVE real RandomX
+# validation failures (see internal/leaflib.InvalidShareGuard) -- a
+# security-hardening default, enabled unless explicitly turned off.
+# (default: true)
+invalid_share_disconnect_enabled = true
+
+# Consecutive-invalid-share threshold before a downstream session is
+# disconnected (see invalid_share_disconnect_enabled above). 0/unset uses
+# the documented default (20). (default: 0)
+invalid_share_disconnect_threshold = 0
+
 # HTTP listen address for /metrics (Prometheus) and the stats page. Separate
 # from listen_address (the downstream-facing stratum port). Defaults to
 # loopback-only; set to an empty string to disable.

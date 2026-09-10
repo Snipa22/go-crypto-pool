@@ -32,6 +32,14 @@ monerod_url = ""
 
 # Enable the real, legacy-ported probabilistic RandomX-validation-skip
 # mechanism for RXT/RXM shares. Disabled by default. (default: false)
+#
+# REAL-MONEY RISK (DISPATCH_BRIEF.md, 2026-09-10): unlike leaf-solo (this
+# mechanism has since been removed there entirely -- see leaf-solo.example
+# .toml), a leaf-direct share that skips validation here still reaches the
+# real backend's payout accounting on the miner's own claimed value, with no
+# cryptographic re-check by this leaf -- see
+# internal/leaflib/direct.Server.EnableTrust's doc comment for the full risk
+# framing. A deliberate trust-for-throughput tradeoff, not a free feature.
 trust_enabled = false
 
 # Real trust-ramp threshold gate -- 0/unset uses the documented default (10).
@@ -49,6 +57,22 @@ trust_change = 0
 # Real probability floor -- 0/unset uses the documented default (20).
 # (default: 0)
 trust_min = 0
+
+# RandomX-family (RXT/RXM) async validation worker pool size (see
+# internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented
+# default, runtime.NumCPU() -- NOT a hardcoded literal. (default: 0)
+randomx_workers = 0
+
+# Disconnect a session after too many CONSECUTIVE real RandomX-family
+# (RXT/RXM) validation failures (see internal/leaflib.InvalidShareGuard) --
+# a security-hardening default, enabled unless explicitly turned off.
+# (default: true)
+invalid_share_disconnect_enabled = true
+
+# Consecutive-invalid-share threshold before a session is disconnected (see
+# invalid_share_disconnect_enabled above). 0/unset uses the documented
+# default (20). (default: 0)
+invalid_share_disconnect_threshold = 0
 
 # Which single mining algorithm this leaf-direct process serves: sha3x
 # (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/
