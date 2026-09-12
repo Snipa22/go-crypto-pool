@@ -22,20 +22,80 @@
 //     actually returned success (a tx_hash). See Engine.runBatch.
 //   - Every attempted transfer is recorded (Repository.RecordPendingPayout)
 //     BEFORE the real Transfer RPC call is made, and resolved to
-//     SENT/FAILED immediately after — so a crash mid-call leaves a
-//     durable, queryable PENDING row rather than silently vanishing
-//     (see migrations/0002_wallet_disbursements.up.sql's doc comment).
-//   - A failed Transfer call debits nothing — the underlying balance
-//     rows remain untouched and are simply retried on the next cycle
-//     (RunOnce's next invocation re-queries PayableBalances fresh).
+//     SENT/FAILED/AMBIGUOUS immediately after — so a crash mid-call
+//     leaves a durable, queryable PENDING row rather than silently
+//     vanishing (see migrations/0002_wallet_disbursements.up.sql's
+//     doc comment).
+//   - A Transfer failure that is PROVABLY pre-broadcast (marked
+//     wallet.ErrNotBroadcast) debits nothing and is recorded FAILED —
+//     the underlying balance rows remain untouched and are simply
+//     retried on the next cycle (RunOnce's next invocation re-queries
+//     PayableBalances fresh).
+//   - Any OTHER Transfer failure, and any failure of the
+//     CompletePayoutSent bookkeeping write that follows a successful
+//     Transfer, is recorded AMBIGUOUS and HALTS disbursement for that
+//     (algo, network) until a human resolves it. See the section
+//     below — this is the single most important property in this
+//     package.
 //   - Every cycle checks the wallet's real UNLOCKED balance before
 //     attempting any batch for that cycle, and skips (does not
 //     partially attempt) any batch whose total would exceed it — see
 //     Engine.RunOnce's insufficient-funds handling.
+//
+// # Ambiguous outcomes and why this package halts instead of retrying
+//
+// This package used to treat EVERY Transfer error as "definitely no
+// coin moved": it called Repository.FailPayout, which leaves the
+// underlying balances payable, and the very next cycle sent the same
+// coin again. Two real, already-present code paths broke that
+// assumption and caused genuine double payments:
+//
+//  1. monero-wallet-rpc's `transfer` can take longer than the wallet
+//     RPC HTTP client's timeout and STILL broadcast for real. The
+//     client sees a timeout; the coin is gone.
+//  2. internal/backend/wallet/tari.go has an explicit path where the
+//     recipient transfer SUCCEEDS (broadcast, real tx id) but the
+//     follow-up GetTransactionInfo fee lookup fails — Transfer still
+//     returns an error for the whole call.
+//
+// So the rule is now inverted and fail-safe. FAILED (retry) requires
+// PROOF of non-broadcast, in the form of wallet.ErrNotBroadcast (see
+// that sentinel's doc comment — only the wallet implementations can
+// establish it, e.g. a local request-validation refusal or an
+// explicit rejection the wallet itself answered with). Everything
+// else — timeouts, transport failures, unparseable responses, a
+// success response with no tx_hash, a post-broadcast lookup failure —
+// is AMBIGUOUS, which:
+//
+//   - marks the payout row AMBIGUOUS rather than FAILED (a distinct
+//     status, deliberately NOT reusing FAILED: FAILED asserts
+//     "nothing happened", AMBIGUOUS asserts the opposite is possible
+//     — see migrations/0010_payouts_ambiguous_status.up.sql);
+//   - leaves the affected `balance` rows frozen: Repository.PayableBalances
+//     excludes every row referenced by an unresolved (PENDING or
+//     AMBIGUOUS) payout, so they cannot be re-paid even by accident;
+//   - abandons the rest of the current cycle for that (algo, network)
+//     instead of attempting the remaining batches;
+//   - makes every subsequent cycle for that (algo, network) refuse to
+//     pay anything out at all (RunOnce's up-front UnresolvedPayouts
+//     check), and makes cmd/backend refuse to even START the loop for
+//     that pair on the next process launch.
+//
+// Recovery is deliberately manual: an operator confirms on-chain
+// whether the transfer really happened and runs `backend payout
+// resolve-sent` (records it, debits balances, no re-payment) or
+// `backend payout resolve-not-sent` (makes the balances payable
+// again). There is no automatic reconciliation, by choice: neither
+// wallet client exposes a transfer-history/listing RPC this package
+// could diff against (Monero's client wraps only `transfer` and
+// `get_balance`; Tari's only adds a by-transaction-id lookup, which
+// is useless when the ambiguity is precisely that no id came back),
+// so any "automatic" recovery would have to guess about real money.
 package disburse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -44,6 +104,24 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
+
+// ErrHalted is returned by RunOnce when it refuses to run a
+// disbursement cycle for an (algo, network) because that pair has at
+// least one unresolved (PENDING or AMBIGUOUS) payout row — see this
+// package's doc comment. Callers can use errors.Is to distinguish
+// this deliberate, safety-driven refusal from a genuine
+// repository/wallet failure; cmd/backend's startup check reports it
+// distinctly, and RunLoop keeps logging it once per tick (loudly, on
+// purpose: a halted payout pipeline must not fade into silence).
+var ErrHalted = errors.New("disburse: disbursement halted: unresolved payout(s) require manual resolution")
+
+// errAmbiguous is the internal marker runBatch returns (wrapped)
+// when a batch ended in an ambiguous state, so RunOnce can abandon
+// the rest of the cycle rather than attempting further batches. Not
+// exported: callers outside this package should look at
+// Result.BatchesAmbiguous / the AMBIGUOUS payout rows themselves,
+// not try to classify errors this package already classified.
+var errAmbiguous = errors.New("ambiguous transfer outcome")
 
 // PayableBalance is one payable `balance` row, as needed for
 // disbursement — mirrors db.PayableBalance field-for-field, kept as
@@ -84,15 +162,29 @@ type PayoutEntry struct {
 // cmd/backend, mirroring unlocker.Repository/payout.Repository's role.
 type Repository interface {
 	// PayableBalances returns every balance row for (algo, network)
-	// with pending_balance >= minPayout — see db.Repository's
-	// identically-named method's doc comment.
+	// with pending_balance >= minPayout, EXCLUDING any row
+	// referenced by an unresolved (PENDING/AMBIGUOUS) payout — see
+	// db.Repository's identically-named method's doc comment.
 	PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]PayableBalance, error)
+
+	// UnresolvedPayouts returns every unresolved (PENDING or
+	// AMBIGUOUS) payout row for (algo, network). RunOnce calls this
+	// FIRST, before touching a wallet or a balance row, and refuses
+	// to run the cycle at all if the result is non-empty — see this
+	// package's doc comment on why disbursement halts rather than
+	// retrying.
+	UnresolvedPayouts(ctx context.Context, algo, network string) ([]UnresolvedPayout, error)
 
 	// RecordPendingPayout durably records one about-to-be-attempted
 	// transfer batch BEFORE the real Transfer RPC call is made,
 	// returning an opaque payout-row id used by
-	// CompletePayoutSent/FailPayout to resolve it afterward.
-	RecordPendingPayout(ctx context.Context, algo, network string, balanceIDs []int64, amount int64) (int64, error)
+	// CompletePayoutSent/FailPayout/MarkPayoutAmbiguous to resolve
+	// it afterward. entries carries the exact per-balance-row debit
+	// this attempt would apply, which must be persisted so an
+	// ambiguous outcome can later be resolved to SENT by replaying
+	// precisely that debit (see db.Repository's identically-named
+	// method); amount is the real on-chain destination total.
+	RecordPendingPayout(ctx context.Context, algo, network string, entries []DebitEntry, amount int64) (int64, error)
 
 	// CompletePayoutSent atomically debits every entry's amount from
 	// pending_balance into paid_balance and marks payoutID SENT with
@@ -101,8 +193,37 @@ type Repository interface {
 	CompletePayoutSent(ctx context.Context, payoutID int64, entries []DebitEntry, txHash string, fee int64) error
 
 	// FailPayout marks payoutID FAILED with errMsg. Never touches
-	// any balance row (see this package's doc comment).
+	// any balance row, leaving them payable next cycle — so it is
+	// ONLY valid for a failure proven to be pre-broadcast (see
+	// wallet.ErrNotBroadcast and this package's doc comment).
 	FailPayout(ctx context.Context, payoutID int64, errMsg string) error
+
+	// MarkPayoutAmbiguous marks payoutID AMBIGUOUS with errMsg and,
+	// when non-empty, txHash. Touches no balance row and — unlike
+	// FailPayout — does NOT make those balances payable again:
+	// PayableBalances excludes rows referenced by an unresolved
+	// payout, and RunOnce refuses to run at all while one exists.
+	MarkPayoutAmbiguous(ctx context.Context, payoutID int64, txHash, errMsg string) error
+}
+
+// UnresolvedPayout is one unresolved (PENDING or AMBIGUOUS) payout
+// row as this package needs to see it — mirrors the operationally
+// relevant subset of db.UnresolvedPayout, kept as this package's own
+// type for the same dependency-direction reason PayableBalance and
+// DebitEntry are.
+type UnresolvedPayout struct {
+	ID     int64
+	Status string
+	Amount int64
+	// BalanceIDs is which `balance` rows this unresolved payout
+	// covers — i.e. exactly the rows frozen out of PayableBalances
+	// while it stays unresolved. Logged verbatim by the halt/startup
+	// messages so an operator can see whose balances are affected
+	// without a second query.
+	BalanceIDs []int64
+	TxHash     string
+	Error      string
+	Created    time.Time
 }
 
 // DebitEntry is the (balanceID, amount) pair Repository.CompletePayoutSent
@@ -233,11 +354,29 @@ type Result struct {
 	Batches       int
 	BatchesSent   int
 	BatchesFailed int
+	// BatchesAmbiguous counts batches that ended in the AMBIGUOUS
+	// state this cycle — real coin may have moved, the balances are
+	// frozen, and a human must resolve it (see this package's doc
+	// comment). At most 1, since the first ambiguous batch abandons
+	// the rest of the cycle.
+	BatchesAmbiguous int
 	// Skipped is 1 if the entire cycle was skipped for insufficient
 	// unlocked wallet balance (see RunOnce), 0 otherwise. Not a count
 	// of individual batches — insufficiency is evaluated once, for
 	// the whole cycle's total, before any batching happens.
 	Skipped int
+	// Halted is 1 if the cycle refused to pay anything out because
+	// this (algo, network) already had unresolved payout row(s) when
+	// it started (RunOnce also returns an error wrapping ErrHalted
+	// in that case), 0 otherwise. Distinct from Skipped: Skipped is
+	// a routine "not enough unlocked funds right now, try later",
+	// Halted is "something is wrong with real money and a human has
+	// to look".
+	Halted int
+	// Unresolved is how many unresolved (PENDING/AMBIGUOUS) payout
+	// rows this cycle observed for this (algo, network) at its
+	// start. Zero on a healthy cycle.
+	Unresolved int
 	// TotalSent is the sum of every batch's PayoutEntry amounts that
 	// was ACTUALLY sent this cycle (excludes failed/skipped batches).
 	TotalSent int64
@@ -270,6 +409,16 @@ type Result struct {
 // depend on batching/iteration order, which is not a policy this
 // engine should be silently making. The next cycle retries the full
 // set once more funds are available.
+//
+// HALT GATE: before any of the above, RunOnce asks the repository
+// whether this (algo, network) has any unresolved (PENDING or
+// AMBIGUOUS) payout row. If it does, the cycle pays out NOTHING —
+// Result.Halted = 1, and an error wrapping ErrHalted is returned —
+// until an operator resolves those rows by hand. See this package's
+// doc comment for why halting is the correct response and
+// cmd/backend/payoutcli.go for the resolution path. Likewise, if a
+// batch goes ambiguous partway through a cycle, the remaining batches
+// are abandoned rather than attempted.
 func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, error) {
 	start := time.Now()
 	var result Result
@@ -285,6 +434,30 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 	}
 	if e.cfg.MaxDestinationsPerBatch <= 0 {
 		return result, fmt.Errorf("disburse: RunOnce: Config.MaxDestinationsPerBatch must be > 0")
+	}
+
+	// Halt gate. Deliberately the very first thing this cycle does:
+	// no wallet call, no balance query, no payout row is created
+	// while a previous attempt's outcome is still unknown.
+	unresolved, err := e.repo.UnresolvedPayouts(ctx, algo, network)
+	if err != nil {
+		return result, fmt.Errorf("disburse: RunOnce: checking for unresolved payouts: %w", err)
+	}
+	e.setUnresolvedGauge(algo, network, len(unresolved))
+	if len(unresolved) > 0 {
+		result.Halted = 1
+		result.Unresolved = len(unresolved)
+		for _, p := range unresolved {
+			e.logf("disburse: %s/%s: HALTED: payout %d is unresolved (status=%s amount=%d balance_ids=%v tx_hash=%q created=%s): %s",
+				algo, network, p.ID, p.Status, p.Amount, p.BalanceIDs, p.TxHash, p.Created.UTC().Format(time.RFC3339), p.Error)
+		}
+		e.logf("disburse: %s/%s: HALTED: %d unresolved payout(s) — NOTHING will be paid out for this algo/network until an operator resolves them. "+
+			"Inspect with `backend payout list-unresolved -algo=%s -network=%s`, confirm on-chain whether each transfer really happened, then run "+
+			"`backend payout resolve-sent` (it DID broadcast: records it, debits balances, no re-payment) or `backend payout resolve-not-sent` "+
+			"(it did NOT broadcast: makes those balances payable again).",
+			algo, network, len(unresolved), algo, network)
+		e.observeHalt(algo, network, metrics.HaltReasonUnresolvedPayouts)
+		return result, fmt.Errorf("disburse: RunOnce: %s/%s: %d unresolved payout(s): %w", algo, network, len(unresolved), ErrHalted)
 	}
 
 	rows, err := e.repo.PayableBalances(ctx, algo, network, e.cfg.MinPayoutAtomic)
@@ -315,12 +488,26 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 	}
 
 	batches := buildBatches(rows, e.cfg.MaxDestinationsPerBatch)
-	for _, batch := range batches {
+	for i, batch := range batches {
 		result.Batches++
 		sent, fee, err := e.runBatch(ctx, algo, network, batch)
 		if err != nil {
+			if errors.Is(err, errAmbiguous) {
+				result.BatchesAmbiguous++
+				e.observeBatch(algo, network, metrics.DisbursementResultAmbiguous)
+				e.observeHalt(algo, network, metrics.HaltReasonAmbiguousBatch)
+				e.logf("disburse: %s/%s: HALTING this cycle after an ambiguous batch outcome: %v", algo, network, err)
+				if remaining := len(batches) - i - 1; remaining > 0 {
+					e.logf("disburse: %s/%s: abandoning the remaining %d batch(es) of this cycle — no further coin will be moved for this algo/network until the ambiguous payout above is manually resolved",
+						algo, network, remaining)
+				}
+				// Return the error so RunLoop logs it loudly every
+				// cycle. The engine will refuse outright at the halt
+				// gate from the next cycle onward.
+				return result, err
+			}
 			result.BatchesFailed++
-			e.logf("disburse: %s/%s: batch of %d destinations failed: %v", algo, network, len(batch), err)
+			e.logf("disburse: %s/%s: batch of %d destinations failed (provably not broadcast, balances stay payable): %v", algo, network, len(batch), err)
 			e.observeBatch(algo, network, metrics.DisbursementResultFailed)
 			continue
 		}
@@ -341,6 +528,28 @@ func (e *Engine) observeBatch(algo, network, result string) {
 		return
 	}
 	e.cfg.Metrics.DisbursementBatchesTotal.WithLabelValues(algo, network, result).Inc()
+}
+
+func (e *Engine) observeHalt(algo, network, reason string) {
+	if e.cfg.Metrics == nil {
+		return
+	}
+	e.cfg.Metrics.DisbursementHaltsTotal.WithLabelValues(algo, network, reason).Inc()
+}
+
+func (e *Engine) observeAmbiguous(algo, network, cause string) {
+	if e.cfg.Metrics == nil {
+		return
+	}
+	e.cfg.Metrics.DisbursementAmbiguousPayoutsTotal.WithLabelValues(algo, network, cause).Inc()
+	e.cfg.Metrics.DisbursementUnresolvedPayouts.WithLabelValues(algo, network).Inc()
+}
+
+func (e *Engine) setUnresolvedGauge(algo, network string, n int) {
+	if e.cfg.Metrics == nil {
+		return
+	}
+	e.cfg.Metrics.DisbursementUnresolvedPayouts.WithLabelValues(algo, network).Set(float64(n))
 }
 
 // buildBatches groups payable rows into real-Transfer-call-sized
@@ -393,9 +602,16 @@ func buildBatches(rows []PayableBalance, maxPerBatch int) [][]PayableBalance {
 // this cycle purely because of a configuration edge case, which is a
 // worse outcome than the miner receiving a token amount instead of
 // the full fee being collected).
+//
+// FAILURE HANDLING (money-critical — see this package's doc comment):
+// the returned error is wrapped with errAmbiguous whenever the
+// outcome cannot rule out that real coin already moved, which is the
+// default for anything other than a wallet.ErrNotBroadcast-marked
+// Transfer error. In that case the payout row is marked AMBIGUOUS
+// (never FAILED) so the balances stay frozen, and RunOnce abandons
+// the remaining batches.
 func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []PayableBalance) (sent, fee int64, err error) {
 	destinations := make([]wallet.Destination, 0, len(batch))
-	balanceIDs := make([]int64, 0, len(batch))
 	forceFees := make([]int64, len(batch))
 	var total int64
 	var paymentID string
@@ -417,28 +633,17 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 		}
 		forceFees[i] = rowFee
 		destinations = append(destinations, wallet.Destination{Address: r.PaymentAddress, Amount: amount})
-		balanceIDs = append(balanceIDs, r.ID)
 		total += amount
 	}
 
-	payoutID, err := e.repo.RecordPendingPayout(ctx, algo, network, balanceIDs, total)
-	if err != nil {
-		return 0, 0, fmt.Errorf("recording pending payout: %w", err)
-	}
-
-	result, transferErr := e.cfg.Wallet.Transfer(ctx, wallet.TransferRequest{
-		Destinations: destinations,
-		PaymentID:    paymentID,
-		Priority:     e.cfg.TransferPriority,
-		RingSize:     e.cfg.TransferRingSize,
-	})
-	if transferErr != nil {
-		if failErr := e.repo.FailPayout(ctx, payoutID, transferErr.Error()); failErr != nil {
-			e.logf("disburse: %s/%s: payout %d: also failed to mark payout as FAILED: %v", algo, network, payoutID, failErr)
-		}
-		return 0, 0, fmt.Errorf("transfer: %w", transferErr)
-	}
-
+	// entries is built BEFORE the attempt and handed to
+	// RecordPendingPayout so the exact per-row debit this batch would
+	// apply is durably recorded up front — that record is what makes
+	// an ambiguous outcome resolvable to SENT later without guessing
+	// (see Repository.RecordPendingPayout and
+	// db.Repository.ResolvePayoutSent). Deliberately the same slice
+	// used for CompletePayoutSent on the success path, so the two can
+	// never disagree.
 	entries := make([]DebitEntry, 0, len(batch))
 	var totalForceFee int64
 	for i, r := range batch {
@@ -450,14 +655,75 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 		})
 		totalForceFee += forceFees[i]
 	}
+
+	payoutID, err := e.repo.RecordPendingPayout(ctx, algo, network, entries, total)
+	if err != nil {
+		// Nothing has been attempted yet and no payout row exists,
+		// so this is safely retriable: not ambiguous.
+		return 0, 0, fmt.Errorf("recording pending payout: %w", err)
+	}
+
+	result, transferErr := e.cfg.Wallet.Transfer(ctx, wallet.TransferRequest{
+		Destinations: destinations,
+		PaymentID:    paymentID,
+		Priority:     e.cfg.TransferPriority,
+		RingSize:     e.cfg.TransferRingSize,
+	})
+	if transferErr != nil {
+		if errors.Is(transferErr, wallet.ErrNotBroadcast) {
+			// PROVABLY pre-broadcast (see wallet.ErrNotBroadcast):
+			// no transaction was created, so FAILED is correct and
+			// the balances legitimately stay payable for next cycle.
+			if failErr := e.repo.FailPayout(ctx, payoutID, transferErr.Error()); failErr != nil {
+				e.logf("disburse: %s/%s: payout %d: also failed to mark payout as FAILED: %v", algo, network, payoutID, failErr)
+			}
+			return 0, 0, fmt.Errorf("transfer: %w", transferErr)
+		}
+
+		// NOT proven pre-broadcast: real coin MAY already have moved
+		// (a timed-out but successful transfer, a transport failure
+		// after the wallet accepted, Tari's succeeded-transfer-but-
+		// failed-fee-lookup path, ...). Recording this FAILED is
+		// exactly the bug this code exists to prevent — it would
+		// leave the balance payable and re-send the same coin next
+		// cycle. Mark AMBIGUOUS instead, which freezes those
+		// balances out of PayableBalances and halts this (algo,
+		// network) until a human confirms on-chain.
+		msg := fmt.Sprintf("transfer outcome AMBIGUOUS (may or may not have broadcast, balances frozen pending manual resolution): %v", transferErr)
+		if markErr := e.repo.MarkPayoutAmbiguous(ctx, payoutID, "", msg); markErr != nil {
+			// Worst case: we cannot even record the ambiguity. The
+			// payout row is still PENDING, which is ALSO an
+			// unresolved status and therefore still freezes these
+			// balances and still halts the next cycle — the safety
+			// property holds either way. Log both errors loudly.
+			e.logf("disburse: %s/%s: payout %d: CRITICAL: transfer outcome is ambiguous (%v) AND marking it AMBIGUOUS failed (%v) — the row stays PENDING, which still blocks disbursement for this algo/network; resolve it manually",
+				algo, network, payoutID, transferErr, markErr)
+		}
+		e.observeAmbiguous(algo, network, metrics.AmbiguousCauseTransfer)
+		e.logf("disburse: %s/%s: payout %d: AMBIGUOUS: %d destination(s), %d atomic units: %v — balances for this payout are frozen and disbursement for %s/%s is halted until `backend payout resolve-sent`/`resolve-not-sent` is run for payout %d",
+			algo, network, payoutID, len(batch), total, transferErr, algo, network, payoutID)
+		return 0, 0, fmt.Errorf("transfer (payout %d): %w: %w", payoutID, errAmbiguous, transferErr)
+	}
+
 	if err := e.repo.CompletePayoutSent(ctx, payoutID, entries, result.TxHash, result.Fee); err != nil {
 		// The real transfer already happened on-chain at this point
 		// — this error means the LOCAL bookkeeping failed to record
-		// it, a serious but different failure mode than a failed
-		// Transfer call (real coin DID move). Surfaced as an error
-		// (so it's loud), but this batch is still reported via the
-		// tx_hash in the error message for manual reconciliation.
-		return 0, 0, fmt.Errorf("transfer succeeded (tx_hash=%s amount=%d fee=%d) but recording it failed: %w", result.TxHash, result.Amount, result.Fee, err)
+		// it. Coin DEFINITELY moved, so the balances must NOT become
+		// payable again: mark the row AMBIGUOUS (carrying the real
+		// tx_hash, which is exactly what an operator needs to
+		// confirm and then resolve it via `backend payout
+		// resolve-sent`) and halt.
+		msg := fmt.Sprintf("transfer SUCCEEDED (tx_hash=%s amount=%d fee=%d) but recording it failed, balances NOT yet debited: %v",
+			result.TxHash, result.Amount, result.Fee, err)
+		if markErr := e.repo.MarkPayoutAmbiguous(ctx, payoutID, result.TxHash, msg); markErr != nil {
+			e.logf("disburse: %s/%s: payout %d: CRITICAL: transfer succeeded (tx_hash=%s) but BOTH recording it (%v) and marking it AMBIGUOUS (%v) failed — the row stays PENDING, which still blocks disbursement for this algo/network; resolve it manually with tx_hash=%s",
+				algo, network, payoutID, result.TxHash, err, markErr, result.TxHash)
+		}
+		e.observeAmbiguous(algo, network, metrics.AmbiguousCauseBookkeeping)
+		e.logf("disburse: %s/%s: payout %d: AMBIGUOUS: real transfer tx_hash=%s SUCCEEDED but bookkeeping failed (%v) — coin has moved, balances are NOT debited and are frozen; resolve with `backend payout resolve-sent -id=%d -tx-hash=%s`",
+			algo, network, payoutID, result.TxHash, err, payoutID, result.TxHash)
+		return 0, 0, fmt.Errorf("transfer succeeded (payout %d tx_hash=%s amount=%d fee=%d) but recording it failed: %w: %w",
+			payoutID, result.TxHash, result.Amount, result.Fee, errAmbiguous, err)
 	}
 
 	if totalForceFee > 0 {
@@ -469,6 +735,49 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 	return total, result.Fee, nil
 }
 
+// CheckTargets partitions targets into those that are safe to
+// disburse for and those that must not be started because they
+// already have unresolved (PENDING or AMBIGUOUS) payout rows — the
+// startup check cmd/backend runs before wiring RunLoop, so a process
+// restart can never quietly resume paying out an (algo, network)
+// whose previous attempt's outcome is still unknown.
+//
+// It is intentionally a method on Engine rather than free-standing
+// logic in cmd/backend: the "what counts as unresolved" rule, the
+// operator-facing remediation message, and the metrics emitted all
+// live here next to RunOnce's own halt gate, so the two cannot drift
+// apart. blocked is returned in targets' order, each with the
+// unresolved rows found, so the caller can log specifics.
+//
+// A repository error is returned as-is and must be treated as fatal
+// by the caller: being unable to determine whether a payout is
+// unresolved is emphatically NOT the same as there being none, and
+// starting disbursement on that basis is how money gets sent twice.
+func (e *Engine) CheckTargets(ctx context.Context, targets []Target) (safe []Target, blocked []BlockedTarget, err error) {
+	for _, t := range targets {
+		unresolved, uErr := e.repo.UnresolvedPayouts(ctx, t.Algo, t.Network)
+		if uErr != nil {
+			return nil, nil, fmt.Errorf("disburse: CheckTargets: %s/%s: checking for unresolved payouts: %w", t.Algo, t.Network, uErr)
+		}
+		e.setUnresolvedGauge(t.Algo, t.Network, len(unresolved))
+		if len(unresolved) == 0 {
+			safe = append(safe, t)
+			continue
+		}
+		e.observeHalt(t.Algo, t.Network, metrics.HaltReasonUnresolvedPayouts)
+		blocked = append(blocked, BlockedTarget{Target: t, Unresolved: unresolved})
+	}
+	return safe, blocked, nil
+}
+
+// BlockedTarget is one (algo, network) CheckTargets refused to clear
+// for disbursement, together with the unresolved payout rows that
+// caused the refusal.
+type BlockedTarget struct {
+	Target     Target
+	Unresolved []UnresolvedPayout
+}
+
 // RunLoop calls RunOnce for every (algo, network) pair in targets
 // every interval, until ctx is canceled. Never returns an error
 // itself — RunOnce's own errors (repository/wallet failures at the
@@ -476,6 +785,13 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 // RunOnce already handles internally) are logged and swallowed so one
 // bad cycle does not take down the whole poll loop, mirroring
 // unlocker.Unlocker.RunLoop's contract exactly.
+//
+// That includes ErrHalted: a halted (algo, network) is logged on
+// every tick rather than silently dropped or allowed to stop the loop
+// for the OTHER targets, which may be perfectly healthy. Callers
+// should prefer not to pass a known-halted target at all (see
+// CheckTargets), but RunOnce's own halt gate means doing so is safe —
+// it simply pays out nothing for that pair.
 func (e *Engine) RunLoop(ctx context.Context, targets []Target, interval time.Duration) {
 	if interval <= 0 {
 		e.logf("disburse: RunLoop: interval <= 0, exiting without polling")

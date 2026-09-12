@@ -156,6 +156,20 @@ disburse_max_destinations_per_batch = 15
 # the Monero and Tari disbursement engines. (default: 600)
 disburse_poll_interval_seconds = 600
 
+# Timeout for real wallet RPC calls, in seconds: the monero-wallet-rpc HTTP
+# client's timeout, and the bound on Tari's READ-ONLY wallet GRPC lookups.
+#
+# MONEY-CRITICAL, not a routine tuning knob. A real monero-wallet-rpc
+# `transfer` call can take longer than this and STILL broadcast the
+# transaction; when the client gives up first, the backend cannot tell whether
+# the coin moved, so it records the payout AMBIGUOUS and HALTS all
+# disbursement for that algo/network until an operator resolves it by hand
+# (`backend payout list-unresolved`). Set this generously -- too short simply
+# converts good payouts into manual incidents. Too long only risks the
+# disbursement loop stalling on a dead wallet RPC until the next tick.
+# (default: 60)
+wallet_rpc_timeout_seconds = 60
+
 # Address (host:port) of a real Tari console/base wallet GRPC endpoint. When
 # set, enables the Tari payout disbursement engine. (default: "")
 tari_wallet_grpc_addr = ""

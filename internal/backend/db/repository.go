@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -435,6 +436,23 @@ type PayableBalance struct {
 // disbursement policy is a legitimate operator choice, not a caller
 // error) — the force_payout override is purely additive on top of
 // the normal minPayout check, never a replacement for it.
+//
+// IN-FLIGHT EXCLUSION (money-critical, see
+// migrations/0010_payouts_ambiguous_status.up.sql): a balance row
+// referenced by an UNRESOLVED `payouts` row for the same (algo,
+// network) — status PENDING (attempted, outcome never recorded) or
+// AMBIGUOUS (attempted, and the failure cannot rule out that real
+// coin already moved) — is NEVER returned here, no matter how large
+// its pending_balance or whether it is force_payout-flagged. This is
+// the row-level half of the double-payment fix: before it existed,
+// an errored Transfer flipped the payout row to FAILED and this query
+// happily handed the exact same balance rows back to the very next
+// disbursement cycle, which sent the same coin a second time. The
+// engine additionally halts the whole (algo, network) cycle when any
+// unresolved row exists (see internal/backend/disburse's RunOnce and
+// Repository.UnresolvedPayouts) — this clause is the defense-in-depth
+// layer underneath that, so even a caller that skipped the halt check
+// cannot re-pay an in-flight balance.
 func (r *Repository) PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
 	if err := ValidateAlgo(algo); err != nil {
 		return nil, err
@@ -448,6 +466,13 @@ func (r *Repository) PayableBalances(ctx context.Context, algo, network string, 
 		FROM balance
 		WHERE algo = $1 AND network = $2 AND pending_balance > 0
 		  AND (pending_balance >= $3 OR force_payout = TRUE)
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM payouts p
+		      WHERE p.algo = $1 AND p.network = $2
+		        AND p.status IN ('PENDING', 'AMBIGUOUS')
+		        AND balance.id = ANY (p.balance_ids)
+		  )
 		ORDER BY id ASC`
 	rows, err := r.pool.Query(ctx, stmt, algo, network, minPayout)
 	if err != nil {
@@ -514,17 +539,52 @@ type DisburseEntry struct {
 // lost one (an operator can always find every attempted disbursement
 // by querying this table, even ones that never got a further status
 // update because the process died mid-call).
-func (r *Repository) RecordPendingPayout(ctx context.Context, algo, network string, balanceIDs []int64, amount int64) (int64, error) {
+//
+// entries is the exact per-`balance`-row debit detail this attempt
+// WOULD apply on success — persisted verbatim into the row's
+// pending_entries JSONB column alongside the derived balance_ids
+// array. This is not bookkeeping nicety: it is the only durable
+// record of the per-row amount/force_payout/force-payout-fee split,
+// and resolving an AMBIGUOUS payout to SENT by hand has to replay
+// precisely that split rather than re-deriving it from live `balance`
+// rows (which may have accrued more since). See
+// migrations/0010_payouts_ambiguous_status.up.sql's doc comment on
+// pending_entries, and ResolvePayoutSent.
+//
+// amount is the batch's real on-chain destination total (i.e. after
+// any per-row force-payout fee deduction), which is NOT necessarily
+// the sum of entries' Amount fields (those are full pending_balance
+// debits) — the two are deliberately distinct, see DisburseEntry.
+func (r *Repository) RecordPendingPayout(ctx context.Context, algo, network string, entries []DisburseEntry, amount int64) (int64, error) {
 	if err := ValidateAlgo(algo); err != nil {
 		return 0, err
 	}
+	if len(entries) == 0 {
+		return 0, fmt.Errorf("db: recording pending payout: at least one entry is required")
+	}
+
+	balanceIDs := make([]int64, 0, len(entries))
+	records := make([]PayoutEntryRecord, 0, len(entries))
+	for _, e := range entries {
+		balanceIDs = append(balanceIDs, e.BalanceID)
+		records = append(records, PayoutEntryRecord{
+			BalanceID:            e.BalanceID,
+			Amount:               e.Amount,
+			ForcePayout:          e.ForcePayout,
+			ForcePayoutFeeAtomic: e.ForcePayoutFeeAtomic,
+		})
+	}
+	entriesJSON, err := json.Marshal(records)
+	if err != nil {
+		return 0, fmt.Errorf("db: recording pending payout: encoding pending_entries: %w", err)
+	}
 
 	const stmt = `
-		INSERT INTO payouts (algo, network, status, balance_ids, amount)
-		VALUES ($1, $2, 'PENDING', $3, $4)
+		INSERT INTO payouts (algo, network, status, balance_ids, amount, pending_entries)
+		VALUES ($1, $2, 'PENDING', $3, $4, $5)
 		RETURNING id`
 	var id int64
-	if err := r.pool.QueryRow(ctx, stmt, algo, network, balanceIDs, amount).Scan(&id); err != nil {
+	if err := r.pool.QueryRow(ctx, stmt, algo, network, balanceIDs, amount, entriesJSON).Scan(&id); err != nil {
 		return 0, fmt.Errorf("db: recording pending payout: %w", err)
 	}
 	return id, nil
@@ -546,7 +606,24 @@ func (r *Repository) RecordPendingPayout(ctx context.Context, algo, network stri
 // transfer has already happened by the time this is called (see
 // disburse.go), so this step is bookkeeping that must not itself
 // introduce a new consistency gap.
+//
+// The `payouts` UPDATE is guarded on status IN ('PENDING',
+// 'AMBIGUOUS') — the only two states a payout can legitimately be
+// completed FROM. A row already SENT (or already resolved to FAILED
+// by an operator) is refused with an error rather than debited a
+// second time; this is what makes the debit half of this transaction
+// idempotent-safe against a concurrent/duplicate completion attempt
+// on the same payout id, which on real money is the difference
+// between a retried bookkeeping write and double-debiting a miner.
 func (r *Repository) CompletePayoutSent(ctx context.Context, payoutID int64, entries []DisburseEntry, txHash string, fee int64) error {
+	return r.completePayoutSent(ctx, payoutID, entries, txHash, fee, nil, nil)
+}
+
+// completePayoutSent is CompletePayoutSent's implementation, shared
+// with ResolvePayoutSent (which passes a non-nil resolvedBy/note so
+// the same single transaction also records who manually resolved the
+// row and why — see payoutreconcile.go).
+func (r *Repository) completePayoutSent(ctx context.Context, payoutID int64, entries []DisburseEntry, txHash string, fee int64, resolvedBy, note *string) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("db: completing payout %d: beginning transaction: %w", payoutID, err)
@@ -575,14 +652,16 @@ func (r *Repository) CompletePayoutSent(ctx context.Context, payoutID int64, ent
 
 	const payoutStmt = `
 		UPDATE payouts
-		SET status = 'SENT', tx_hash = $2, fee = $3, force_payout_fee_atomic = $4, completed_at = now()
-		WHERE id = $1`
-	tag, err := tx.Exec(ctx, payoutStmt, payoutID, txHash, fee, totalForceFee)
+		SET status = 'SENT', tx_hash = $2, fee = $3, force_payout_fee_atomic = $4,
+		    resolved_by = COALESCE($5, resolved_by), resolution_note = COALESCE($6, resolution_note),
+		    completed_at = now()
+		WHERE id = $1 AND status IN ('PENDING', 'AMBIGUOUS')`
+	tag, err := tx.Exec(ctx, payoutStmt, payoutID, txHash, fee, totalForceFee, resolvedBy, note)
 	if err != nil {
 		return fmt.Errorf("db: completing payout %d: updating payouts row: %w", payoutID, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("db: completing payout %d: no such payouts row", payoutID)
+		return fmt.Errorf("db: completing payout %d: no payouts row in PENDING/AMBIGUOUS status (already resolved, or no such row) — refusing to debit balances a second time", payoutID)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -593,10 +672,19 @@ func (r *Repository) CompletePayoutSent(ctx context.Context, payoutID int64, ent
 
 // FailPayout flips the `payouts` row identified by payoutID to
 // FAILED with the given error message. Deliberately does NOT touch
-// any `balance` row — a failed Transfer RPC call means no real coin
-// moved, so the underlying balances remain payable and are simply
-// picked up again by the next disbursement cycle's
-// PayableBalances call (see disburse.go).
+// any `balance` row — FAILED means, specifically and only, that the
+// real Transfer RPC call PROVABLY never broadcast anything (a
+// locally-detected request-validation failure, or an explicit
+// rejection the wallet itself answered with), so the underlying
+// balances remain payable and are simply picked up again by the next
+// disbursement cycle's PayableBalances call (see disburse.go).
+//
+// Callers must NOT use this for an error that merely might not have
+// broadcast: that is what MarkPayoutAmbiguous is for. Getting this
+// distinction wrong is precisely how the same coin gets sent twice —
+// see migrations/0010_payouts_ambiguous_status.up.sql's doc comment
+// and internal/backend/wallet.ErrNotBroadcast (the only sanctioned
+// signal for "definitely not broadcast").
 func (r *Repository) FailPayout(ctx context.Context, payoutID int64, errMsg string) error {
 	const stmt = `
 		UPDATE payouts
@@ -608,6 +696,44 @@ func (r *Repository) FailPayout(ctx context.Context, payoutID int64, errMsg stri
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("db: failing payout %d: no such payouts row", payoutID)
+	}
+	return nil
+}
+
+// MarkPayoutAmbiguous flips the `payouts` row identified by payoutID
+// to AMBIGUOUS — the "real coin MAY already have moved on-chain, a
+// human must check before anything else is paid out for this (algo,
+// network)" state introduced by
+// migrations/0010_payouts_ambiguous_status.up.sql. Like FailPayout it
+// touches no `balance` row, but unlike FailPayout the affected
+// balances do NOT become payable again: PayableBalances excludes
+// every row referenced by an unresolved payout, and disburse.Engine
+// halts the whole (algo, network) while one exists.
+//
+// txHash, when non-empty, is recorded on the row — this matters for
+// the CompletePayoutSent-failed-after-a-successful-broadcast case,
+// where the real transaction hash IS known and is exactly what an
+// operator needs to confirm the transfer on-chain before resolving.
+// An empty txHash leaves any existing tx_hash untouched (the
+// transfer-errored case genuinely has no hash to record).
+//
+// completed_at is deliberately left NULL: AMBIGUOUS is not a
+// completed outcome, it is an open incident awaiting manual
+// resolution (see cmd/backend/payoutcli.go's resolve-sent /
+// resolve-not-sent subcommands, which are what finally set it).
+func (r *Repository) MarkPayoutAmbiguous(ctx context.Context, payoutID int64, txHash, errMsg string) error {
+	const stmt = `
+		UPDATE payouts
+		SET status = 'AMBIGUOUS',
+		    error = $2,
+		    tx_hash = COALESCE(NULLIF($3, ''), tx_hash)
+		WHERE id = $1`
+	tag, err := r.pool.Exec(ctx, stmt, payoutID, errMsg, txHash)
+	if err != nil {
+		return fmt.Errorf("db: marking payout %d ambiguous: %w", payoutID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("db: marking payout %d ambiguous: no such payouts row", payoutID)
 	}
 	return nil
 }

@@ -53,12 +53,39 @@ func WithDigestAuth(username, password string) Option {
 	}
 }
 
-// WithTimeout overrides the default 30s HTTP client timeout. Real
-// transfer calls against a busy/syncing wallet can legitimately take
-// longer than simple balance queries, so callers moving large payout
-// batches may want a longer timeout than this package's default.
+// DefaultTimeout is the HTTP client timeout NewMoneroWalletRPC uses
+// when no WithTimeout option is supplied.
+//
+// 60s, not the 30s this package used to hardcode with no override
+// wired anywhere: a real monero-wallet-rpc `transfer` call against a
+// busy or syncing wallet can take well over 30 seconds and STILL
+// broadcast the transaction for real. When the HTTP client gives up
+// first, the caller sees a timeout error while the coin is genuinely
+// gone — historically that error was recorded as FAILED and the same
+// coin was re-sent on the next disbursement cycle (see
+// migrations/0010_payouts_ambiguous_status.up.sql). Callers must now
+// treat such a timeout as ambiguous rather than failed (see
+// ErrNotBroadcast in wallet.go), but a default that makes the
+// false-positive rarer in the first place is still strictly better,
+// and it is now genuinely overridable end-to-end from cmd/backend
+// (GCPOOL_WALLET_RPC_TIMEOUT / -wallet-rpc-timeout).
+const DefaultTimeout = 60 * time.Second
+
+// WithTimeout overrides DefaultTimeout as this client's HTTP timeout.
+// Real transfer calls against a busy/syncing wallet can legitimately
+// take much longer than simple balance queries, so callers moving
+// large payout batches may want a longer timeout than the default —
+// and an over-tight timeout on a transfer is not merely a failed
+// call, it manufactures an ambiguous "did the coin move?" incident
+// that halts disbursement until a human resolves it (see
+// DefaultTimeout's doc comment). A non-positive d is ignored, leaving
+// DefaultTimeout in effect: "no timeout at all" is not a value this
+// constructor will silently accept for a fund-moving client.
 func WithTimeout(d time.Duration) Option {
 	return func(o *moneroWalletRPCOptions) {
+		if d <= 0 {
+			return
+		}
 		o.timeout = d
 	}
 }
@@ -77,7 +104,7 @@ func WithAccountIndex(index uint64) Option {
 // "http://127.0.0.1:18083" — no trailing slash or "/json_rpc" suffix
 // required).
 func NewMoneroWalletRPC(baseURL string, opts ...Option) *MoneroWalletRPC {
-	o := moneroWalletRPCOptions{timeout: 30 * time.Second}
+	o := moneroWalletRPCOptions{timeout: DefaultTimeout}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -128,6 +155,30 @@ type walletRPCResponse struct {
 // baseURL+"/json_rpc" — the same endpoint path every real
 // monero-wallet-rpc method (transfer, get_balance, ...) is dispatched
 // through.
+//
+// Error classification (load-bearing for Transfer's caller, see
+// ErrNotBroadcast in wallet.go): only failures that PROVABLY happened
+// before monero-wallet-rpc could act on the request are marked
+// NotBroadcast —
+//
+//   - request marshaling/construction failures (never left this
+//     process at all);
+//   - HTTP 401/403 (rejected at the authentication gate, before the
+//     JSON-RPC method was ever dispatched);
+//   - a well-formed JSON-RPC error envelope in an HTTP 200 response:
+//     monero-wallet-rpc itself answered, reporting that the method
+//     failed and no transaction was created (e.g. its real "not
+//     enough unlocked money" / "invalid address" errors). This is
+//     the wallet's own explicit "I did not do it", which is exactly
+//     the "hard rejection" case that is safe to retry.
+//
+// Everything else — connection failures, timeouts (including the
+// client Timeout that historically caused real double payments, see
+// DefaultTimeout), any other non-200 status, an unparseable body — is
+// left UNMARKED, i.e. treated by callers as "may have broadcast".
+// That is deliberate and must stay that way: a transport-level
+// failure carries no information whatsoever about whether the wallet
+// already built and relayed the transaction.
 func (w *MoneroWalletRPC) call(ctx context.Context, method string, params any, out any) error {
 	reqBody, err := json.Marshal(walletRPCRequest{
 		JSONRPC: "2.0",
@@ -136,12 +187,12 @@ func (w *MoneroWalletRPC) call(ctx context.Context, method string, params any, o
 		Params:  params,
 	})
 	if err != nil {
-		return fmt.Errorf("wallet: monero: marshaling %s request: %w", method, err)
+		return NotBroadcast(fmt.Errorf("wallet: monero: marshaling %s request: %w", method, err))
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+"/json_rpc", bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("wallet: monero: building %s request: %w", method, err)
+		return NotBroadcast(fmt.Errorf("wallet: monero: building %s request: %w", method, err))
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
@@ -156,7 +207,11 @@ func (w *MoneroWalletRPC) call(ctx context.Context, method string, params any, o
 		return fmt.Errorf("wallet: monero: reading %s response body: %w", method, err)
 	}
 	if httpResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("wallet: monero: %s request returned HTTP %d: %s", method, httpResp.StatusCode, string(body))
+		statusErr := fmt.Errorf("wallet: monero: %s request returned HTTP %d: %s", method, httpResp.StatusCode, string(body))
+		if httpResp.StatusCode == http.StatusUnauthorized || httpResp.StatusCode == http.StatusForbidden {
+			return NotBroadcast(statusErr)
+		}
+		return statusErr
 	}
 
 	var rpcResp walletRPCResponse
@@ -164,7 +219,7 @@ func (w *MoneroWalletRPC) call(ctx context.Context, method string, params any, o
 		return fmt.Errorf("wallet: monero: decoding %s response: %w", method, err)
 	}
 	if rpcResp.Error != nil {
-		return rpcResp.Error
+		return NotBroadcast(rpcResp.Error)
 	}
 	if out != nil {
 		if err := json.Unmarshal(rpcResp.Result, out); err != nil {
@@ -208,18 +263,22 @@ type transferResult struct {
 // destinations or any non-positive Destination.Amount — both are
 // caller bugs (see internal/backend/disburse's batching, which never
 // constructs either), not something the real RPC needs to be asked
-// to reject on this codebase's behalf.
+// to reject on this codebase's behalf. Those local refusals, and the
+// RPC-level rejections `call` classifies as such, are marked
+// NotBroadcast; the transport/decode failures are not. See `call`'s
+// and ErrNotBroadcast's doc comments — this classification is what
+// keeps a slow-but-successful transfer from being re-sent.
 func (w *MoneroWalletRPC) Transfer(ctx context.Context, req TransferRequest) (TransferResult, error) {
 	if len(req.Destinations) == 0 {
-		return TransferResult{}, fmt.Errorf("wallet: monero: Transfer: at least one destination is required")
+		return TransferResult{}, NotBroadcast(fmt.Errorf("wallet: monero: Transfer: at least one destination is required"))
 	}
 	dests := make([]transferDestination, 0, len(req.Destinations))
 	for _, d := range req.Destinations {
 		if d.Amount <= 0 {
-			return TransferResult{}, fmt.Errorf("wallet: monero: Transfer: destination %s has non-positive amount %d", d.Address, d.Amount)
+			return TransferResult{}, NotBroadcast(fmt.Errorf("wallet: monero: Transfer: destination %s has non-positive amount %d", d.Address, d.Amount))
 		}
 		if d.Address == "" {
-			return TransferResult{}, fmt.Errorf("wallet: monero: Transfer: destination has an empty address")
+			return TransferResult{}, NotBroadcast(fmt.Errorf("wallet: monero: Transfer: destination has an empty address"))
 		}
 		dests = append(dests, transferDestination{Amount: uint64(d.Amount), Address: d.Address})
 	}
@@ -235,9 +294,19 @@ func (w *MoneroWalletRPC) Transfer(ctx context.Context, req TransferRequest) (Tr
 
 	var result transferResult
 	if err := w.call(ctx, "transfer", params, &result); err != nil {
+		// %w preserves whatever NotBroadcast marking `call` applied
+		// (or deliberately did not apply) — do not collapse this to
+		// a plain string, errors.Is(..., ErrNotBroadcast) upstream
+		// depends on the chain surviving.
 		return TransferResult{}, fmt.Errorf("wallet: monero: transfer: %w", err)
 	}
 	if result.TxHash == "" {
+		// Deliberately NOT marked NotBroadcast: the RPC reported
+		// success, so the wallet may well have built and relayed a
+		// real transaction whose hash simply did not come back to
+		// us. Treating this as "nothing happened" would be exactly
+		// the double-payment assumption this codebase no longer
+		// makes.
 		return TransferResult{}, fmt.Errorf("wallet: monero: transfer: RPC reported success but returned no tx_hash")
 	}
 	return TransferResult{
