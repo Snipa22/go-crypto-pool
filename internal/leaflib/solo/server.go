@@ -7,7 +7,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
@@ -106,7 +108,19 @@ type Server struct {
 	// cmd/leaf-solo/main.go), this flag intentionally still defaults
 	// off so operators who want the existing page unchanged get
 	// exactly that.
-	hideRemoteAddress bool
+	//
+	// HARDENING FIX (FIX_BRIEF.md, finding #20): atomic.Bool, not a
+	// plain bool -- every real main.go calls SetHideRemoteAddress
+	// exactly once before Serve begins accepting connections, so
+	// this was benign in practice, but statsui.go's StatsHTMLHandler
+	// reads it from within an http.HandlerFunc closure invoked on a
+	// per-request goroutine, and a plain bool read there races (under
+	// `go test -race`) against any write from a DIFFERENT goroutine
+	// -- e.g. a future caller that (unlike today's main.go) invokes
+	// SetHideRemoteAddress after Serve has already started. Matches
+	// this codebase's existing atomic-heavy concurrency style
+	// elsewhere (Session.loggedIn, UpstreamClient.connected, etc.).
+	hideRemoteAddress atomic.Bool
 
 	// randomxPool is the bounded, server-wide worker pool session.go's
 	// handleSubmit dispatches RandomX-family (RXT/RXM) share validation
@@ -249,7 +263,7 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 // Safe to call at any point before or after Serve begins accepting
 // connections; StatsHTMLHandler reads it fresh on every request.
 func (s *Server) SetHideRemoteAddress(hide bool) {
-	s.hideRemoteAddress = hide
+	s.hideRemoteAddress.Store(hide)
 }
 
 // SetDebugLogger opts this Server (and every Session it creates) into
@@ -423,6 +437,27 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener, port PortConfig) er
 // a real net.Listener/Serve call this directly with whichever
 // difficulty that test wants the session to start at.
 func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficulty uint64) {
+	// HARDENING FIX (FIX_BRIEF.md, finding #20): recover any panic
+	// from this goroutine's own body (including Session.Run, called
+	// synchronously below, which is where any future real-world
+	// regression is most likely to actually panic) -- unlike the
+	// backend's net/http (which recovers per-request automatically),
+	// nothing in this leaf's own Serve/handleConn accept path ever
+	// did, so a panic here used to take down this ENTIRE leaf
+	// process, killing every other already-connected miner's session
+	// too, not just this one connection. Registered FIRST (so it
+	// runs LAST during panic unwinding, after the session-cleanup
+	// defer below has already run normally) and unconditionally
+	// closes conn directly (idempotent even if mc/session already
+	// closed it) so this is safe regardless of how far handleConn got
+	// before panicking.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Printf("solo: recovered from a panic in handleConn for remote=%s (closing only this connection; every other session and this leaf's own accept loop are unaffected): %v\n%s", conn.RemoteAddr(), r, debug.Stack())
+			_ = conn.Close()
+		}
+	}()
+
 	mc, err := s.cm.Accept(ctx, conn)
 	if err != nil {
 		// Accept already closed conn on rejection (see
@@ -498,8 +533,13 @@ type SessionStat struct {
 	// estimated hashrate in hashes/second, derived from its own
 	// difficulty-weighted accept-history accumulator and connection
 	// age — see leaflib.EstimateHashrateHz's doc comment for the
-	// full formula/rationale (industry-standard difficulty*2^32/time
-	// approximation, not a cryptographically exact hash count).
+	// full formula (hashesAccumulated/elapsedSeconds; NO 2^32 or
+	// other multiplier is applied — an earlier revision of this
+	// comment incorrectly described a "difficulty*2^32/time"
+	// formula, which was a real, since-fixed bug in a previous
+	// version of EstimateHashrateHz itself, not the current, correct
+	// behavior; see that function's own doc comment for the fix
+	// history — FIX_BRIEF.md, finding #20).
 	EstimatedHashrate float64
 }
 

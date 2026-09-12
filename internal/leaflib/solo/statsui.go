@@ -152,7 +152,7 @@ func (s *Server) StatsHTMLHandler() http.Handler {
 			Stats:             st,
 			MaxAddressLabels:  s.maxAddressLabels,
 			AddressCapped:     len(st.MinersByAddress) > 0 && st.MinersByAddress[len(st.MinersByAddress)-1].Address == "other",
-			HideRemoteAddress: s.hideRemoteAddress,
+			HideRemoteAddress: s.hideRemoteAddress.Load(),
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := statsPageTemplate.Execute(w, data); err != nil {

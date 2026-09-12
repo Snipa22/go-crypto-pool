@@ -41,6 +41,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -139,9 +140,10 @@ type Server struct {
 	lastTransportAt     atomic.Value // time.Time
 
 	// hideRemoteAddress mirrors internal/leaflib/solo/server.go's
-	// identical field exactly — see that doc comment. Defaults to
+	// identical field exactly — see that doc comment (including its
+	// FIX_BRIEF.md finding #20 atomic.Bool rationale). Defaults to
 	// false; set via SetHideRemoteAddress.
-	hideRemoteAddress bool
+	hideRemoteAddress atomic.Bool
 
 	// randomxPool mirrors solo.Server's own identical field exactly —
 	// see solo/asyncvalidation.go's package doc comment for the full
@@ -404,7 +406,7 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetr
 // SetHideRemoteAddress mirrors internal/leaflib/solo/server.go's
 // identical method exactly — see that doc comment.
 func (s *Server) SetHideRemoteAddress(hide bool) {
-	s.hideRemoteAddress = hide
+	s.hideRemoteAddress.Store(hide)
 }
 
 // SetRandomXWorkerPoolSize mirrors solo.Server's own identical
@@ -657,6 +659,16 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener, port solo.PortConfi
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficulty uint64) {
+	// HARDENING FIX (FIX_BRIEF.md, finding #20): mirrors
+	// solo.Server's own identical handleConn recovery exactly -- see
+	// that method's doc comment for the full rationale.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Printf("direct: recovered from a panic in handleConn for remote=%s (closing only this connection; every other session and this leaf's own accept loop are unaffected): %v\n%s", conn.RemoteAddr(), r, debug.Stack())
+			_ = conn.Close()
+		}
+	}()
+
 	mc, err := s.cm.Accept(ctx, conn)
 	if err != nil {
 		if errors.Is(err, leaflib.ErrConnectionRejected) {
