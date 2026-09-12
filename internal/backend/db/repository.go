@@ -213,6 +213,17 @@ type PendingBlock struct {
 	Height     int64
 	Difficulty int64
 	Value      *int64
+
+	// InsertedAt is this row's `blocks.inserted_at` (server-side
+	// receipt time, NOT the leaf-supplied block_timestamp -- see that
+	// column's own doc comment in the migration). Used by
+	// internal/backend/unlocker's pending-blocks-age gauge (see
+	// PROD_HARDENING_REVIEW.md finding #11) to report how long the
+	// OLDEST still-pending block for an (algo, network) has been
+	// stuck, which is deliberately based on when THIS backend first
+	// saw the block, not on whatever clock-skewed timestamp a leaf
+	// happened to attach to it.
+	InsertedAt time.Time
 }
 
 // PendingBlocks returns every blocks row with valid = TRUE AND
@@ -227,7 +238,7 @@ func (r *Repository) PendingBlocks(ctx context.Context, algo string) ([]PendingB
 	}
 
 	const stmt = `
-		SELECT id, algo, network, pool_type, hash, height, difficulty, value
+		SELECT id, algo, network, pool_type, hash, height, difficulty, value, inserted_at
 		FROM blocks
 		WHERE algo = $1 AND valid = TRUE AND unlocked = FALSE
 		ORDER BY id ASC`
@@ -240,7 +251,7 @@ func (r *Repository) PendingBlocks(ctx context.Context, algo string) ([]PendingB
 	var out []PendingBlock
 	for rows.Next() {
 		var pb PendingBlock
-		if err := rows.Scan(&pb.ID, &pb.Algo, &pb.Network, &pb.PoolType, &pb.Hash, &pb.Height, &pb.Difficulty, &pb.Value); err != nil {
+		if err := rows.Scan(&pb.ID, &pb.Algo, &pb.Network, &pb.PoolType, &pb.Hash, &pb.Height, &pb.Difficulty, &pb.Value, &pb.InsertedAt); err != nil {
 			return nil, fmt.Errorf("db: scanning pending block row: %w", err)
 		}
 		out = append(out, pb)
@@ -453,6 +464,21 @@ type PayableBalance struct {
 // Repository.UnresolvedPayouts) — this clause is the defense-in-depth
 // layer underneath that, so even a caller that skipped the halt check
 // cannot re-pay an in-flight balance.
+//
+// EMPTY-ADDRESS DEFENSE IN DEPTH (PROD_HARDENING_REVIEW.md finding
+// #10): a balance row with payment_address = ” (or all-whitespace)
+// is NEVER returned here either, no matter how large its
+// pending_balance. Such a row cannot legitimately exist going
+// forward (cmd/backend's validateDonationConfig now refuses to start
+// with a donation percent configured against an empty donation
+// address, the only known way one of these was ever created), but
+// this clause protects any row that predates that validation from
+// poisoning its entire disbursement batch forever (see
+// wallet/monero_rpc.go's Transfer, which rejects an empty destination
+// address and fails the WHOLE batch, silently blocking every other
+// miner co-batched with it) — an operator still has to fix the
+// underlying row by hand (it is simply excluded, not deleted), but it
+// can no longer take other miners' payouts down with it.
 func (r *Repository) PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
 	if err := ValidateAlgo(algo); err != nil {
 		return nil, err
@@ -465,6 +491,7 @@ func (r *Repository) PayableBalances(ctx context.Context, algo, network string, 
 		SELECT id, payment_address, payment_id, pending_balance, force_payout
 		FROM balance
 		WHERE algo = $1 AND network = $2 AND pending_balance > 0
+		  AND trim(payment_address) <> ''
 		  AND (pending_balance >= $3 OR force_payout = TRUE)
 		  AND NOT EXISTS (
 		      SELECT 1
@@ -494,8 +521,50 @@ func (r *Repository) PayableBalances(ctx context.Context, algo, network string, 
 	return out, nil
 }
 
-// DisburseEntry is one balance row's contribution to a single real
-// on-chain transfer — the real-schema counterpart of
+// PendingBalanceTotal is one (algo, network)'s outstanding
+// pending_balance total — the real-schema source for
+// cmd/backend's pending-balance poller (see metrics.Metrics.
+// PendingBalanceOutstanding's doc comment, PROD_HARDENING_REVIEW.md
+// finding #19).
+type PendingBalanceTotal struct {
+	Algo    string
+	Network string
+	Total   int64
+}
+
+// PendingBalanceTotals returns the sum of every positive
+// `balance.pending_balance` row, grouped by (algo, network) — an
+// (algo, network) pair with no rows at all (or whose rows are all
+// exactly zero) is simply absent from the result, not returned as a
+// zero-value row; the caller (cmd/backend's poller) is responsible
+// for deciding how to represent "no outstanding balance" on the
+// corresponding Prometheus gauge.
+func (r *Repository) PendingBalanceTotals(ctx context.Context) ([]PendingBalanceTotal, error) {
+	const stmt = `
+		SELECT algo, network, SUM(pending_balance)
+		FROM balance
+		WHERE pending_balance > 0
+		GROUP BY algo, network`
+	rows, err := r.pool.Query(ctx, stmt)
+	if err != nil {
+		return nil, fmt.Errorf("db: querying pending balance totals: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PendingBalanceTotal
+	for rows.Next() {
+		var t PendingBalanceTotal
+		if err := rows.Scan(&t.Algo, &t.Network, &t.Total); err != nil {
+			return nil, fmt.Errorf("db: scanning pending balance total row: %w", err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterating pending balance total rows: %w", err)
+	}
+	return out, nil
+}
+
 // disburse.PayoutEntry, kept as this package's own type for the same
 // dependency-direction reason PayoutShare/ShareRow are kept separate
 // (see internal/backend/payout's doc comment).
