@@ -3,6 +3,7 @@ package direct
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"sync"
@@ -29,10 +30,52 @@ type blockSubmitClient interface {
 // outcome from a MultiNodeSubmitter.SubmitBlock call — see that
 // method's doc comment for why every node's result is reported
 // individually rather than collapsed into a single bool.
+//
+// BlockHash is the base node's own real, canonical block hash — the
+// raw bytes of tari_generated.SubmitBlockResponse.block_hash, i.e.
+// the base node's own GRPC SubmitBlock RPC response, NOT a locally
+// computed placeholder. It is only populated when Accepted is true
+// (a rejected/errored submission has no response to read a hash
+// from); callers needing the real hash for backend reporting/relay
+// should use realBlockHashHex on the results slice rather than
+// picking an arbitrary result's BlockHash directly.
 type NodeSubmitResult struct {
-	Address  string
-	Accepted bool
-	Err      error
+	Address   string
+	Accepted  bool
+	Err       error
+	BlockHash []byte
+}
+
+// realBlockHashHex extracts the real, base-node-confirmed block hash
+// (hex-encoded) from results: the first accepted result carrying a
+// non-empty BlockHash — see NodeSubmitResult's doc comment (this is
+// the base node's own SubmitBlockResponse.block_hash, not a locally
+// computed nonce/height placeholder). Returns "" if no accepted
+// result carries a hash (e.g. every configured node rejected/
+// errored).
+//
+// Every accepting node should report the identical real chain hash
+// for the same accepted block; if a later accepted result reports a
+// DIFFERENT non-empty hash than the one already selected, that's
+// logged as a warning (a serious anomaly worth investigating) but
+// does not change the returned value — the first one found still
+// wins, per this function's own contract.
+func realBlockHashHex(results []NodeSubmitResult, logger *log.Logger) string {
+	var hash string
+	for _, r := range results {
+		if !r.Accepted || len(r.BlockHash) == 0 {
+			continue
+		}
+		h := hex.EncodeToString(r.BlockHash)
+		if hash == "" {
+			hash = h
+			continue
+		}
+		if h != hash && logger != nil {
+			logger.Printf("direct: WARNING: node %s reported block hash %s, differing from already-selected real hash %s for the same accepted block submission — every accepting node should report the identical real chain hash", r.Address, h, hash)
+		}
+	}
+	return hash
 }
 
 // MultiNodeSubmitter submits a found block to multiple configured Tari
@@ -188,8 +231,12 @@ func (m *MultiNodeSubmitter) SubmitBlock(ctx context.Context, block *tari_genera
 func submitToOneNode(ctx context.Context, addr string, client blockSubmitClient, block *tari_generated.Block) NodeSubmitResult {
 	done := make(chan NodeSubmitResult, 1)
 	go func() {
-		_, err := client.SubmitBlock(block)
-		done <- NodeSubmitResult{Address: addr, Accepted: err == nil, Err: err}
+		resp, err := client.SubmitBlock(block)
+		res := NodeSubmitResult{Address: addr, Accepted: err == nil, Err: err}
+		if err == nil {
+			res.BlockHash = resp.GetBlockHash()
+		}
+		done <- res
 	}()
 	select {
 	case r := <-done:

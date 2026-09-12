@@ -227,16 +227,34 @@ func waitForBlockCount(t *testing.T, tr *fakeShareTransport, want int) {
 
 func (f *fakeShareTransport) Close() error { return nil }
 
+// fakeAcceptingBlockClientRealHash is the real, base-node-confirmed
+// block hash fakeAcceptingBlockClient reports on every accepted
+// submission — a fixed, real-looking 32-byte value tests assert flows
+// through end-to-end (backend report + relay), regression coverage
+// for the confirmed production bug where a locally computed
+// "nonce-height" placeholder string was used instead (see
+// TestDirectSessionSubmitMeetingBlockDifficulty).
+var fakeAcceptingBlockClientRealHash = []byte{
+	0xca, 0xfe, 0xba, 0xbe, 0x11, 0x22, 0x33, 0x44,
+	0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+	0xdd, 0xee, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04,
+	0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+}
+
 // fakeAcceptingBlockClient is a blockSubmitClient test double that
 // always accepts, for wiring the Server's MultiSubmit path in tests
-// that need a genuine block-find to succeed end-to-end.
+// that need a genuine block-find to succeed end-to-end. It returns a
+// real, non-empty SubmitBlockResponse.block_hash (as the real base
+// node would) so tests can assert the real hash flows through the
+// backend-report/relay path rather than a locally computed
+// placeholder.
 type fakeAcceptingBlockClient struct {
 	calls atomic.Int64
 }
 
 func (f *fakeAcceptingBlockClient) SubmitBlock(_ *tari_generated.Block) (*tari_generated.SubmitBlockResponse, error) {
 	f.calls.Add(1)
-	return &tari_generated.SubmitBlockResponse{}, nil
+	return &tari_generated.SubmitBlockResponse{BlockHash: fakeAcceptingBlockClientRealHash}, nil
 }
 
 func (f *fakeAcceptingBlockClient) Close() error { return nil }
@@ -1052,9 +1070,11 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	blocksLen := len(h.transport.blocks)
 	var blockPoolType poolpb.PoolType
 	var blockPoolID int32
+	var blockHash string
 	if blocksLen > 0 {
 		blockPoolType = h.transport.blocks[0].GetPoolType()
 		blockPoolID = h.transport.blocks[0].GetPoolId()
+		blockHash = h.transport.blocks[0].GetHash()
 	}
 	h.transport.mu.Unlock()
 	if blocksLen > 0 && blockPoolType != poolpb.PoolType_POOL_TYPE_SOLO {
@@ -1062,6 +1082,19 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	}
 	if blocksLen > 0 && blockPoolID != 42 {
 		t.Errorf("forwarded block must carry the server's configured PoolID (42), got %v", blockPoolID)
+	}
+	// Regression coverage for the confirmed production bug: the
+	// forwarded block's hash must be the REAL base-node-confirmed
+	// hash (fakeAcceptingBlockClient's SubmitBlockResponse.block_hash,
+	// hex-encoded) — NOT a locally computed "nonce-height" placeholder
+	// string (which historically caused hex.DecodeString to fail
+	// downstream in the backend's block-unlocker on every real find).
+	wantHash := hex.EncodeToString(fakeAcceptingBlockClientRealHash)
+	if blocksLen > 0 && blockHash != wantHash {
+		t.Errorf("forwarded block must carry the real base-node-confirmed hash %q, got %q (a nonce-height placeholder would look like \"<hex nonce>-<height>\", e.g. contain a '-')", wantHash, blockHash)
+	}
+	if blocksLen > 0 && strings.Contains(blockHash, "-") {
+		t.Errorf("forwarded block hash %q looks like the old nonce-height placeholder format (contains '-'), not a real hex block hash", blockHash)
 	}
 }
 
