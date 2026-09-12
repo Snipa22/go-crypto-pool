@@ -777,18 +777,19 @@ func (a repositoryAdapter) InsertShare(ctx context.Context, s api.ShareRecord, b
 
 func (a repositoryAdapter) InsertBlock(ctx context.Context, b api.BlockRecord) error {
 	return a.repo.InsertBlock(ctx, db.Block{
-		Algo:       b.Algo,
-		Network:    b.Network,
-		PoolType:   b.PoolType,
-		Hash:       b.Hash,
-		Height:     b.Height,
-		Difficulty: b.Difficulty,
-		Shares:     b.Shares,
-		Timestamp:  b.Timestamp,
-		Unlocked:   b.Unlocked,
-		Valid:      b.Valid,
-		Value:      b.Value,
-		PoolID:     b.PoolID,
+		Algo:           b.Algo,
+		Network:        b.Network,
+		PoolType:       b.PoolType,
+		Hash:           b.Hash,
+		Height:         b.Height,
+		Difficulty:     b.Difficulty,
+		Shares:         b.Shares,
+		Timestamp:      b.Timestamp,
+		Unlocked:       b.Unlocked,
+		Valid:          b.Valid,
+		Value:          b.Value,
+		PoolID:         b.PoolID,
+		MergeMineChain: b.MergeMineChain,
 	})
 }
 
@@ -1210,15 +1211,16 @@ func (a unlockerRepositoryAdapter) PendingBlocks(ctx context.Context, algo strin
 	out := make([]unlocker.Block, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, unlocker.Block{
-			ID:         r.ID,
-			Algo:       r.Algo,
-			Network:    r.Network,
-			Hash:       r.Hash,
-			Height:     r.Height,
-			PoolType:   r.PoolType,
-			Difficulty: r.Difficulty,
-			Value:      r.Value,
-			InsertedAt: r.InsertedAt,
+			ID:             r.ID,
+			Algo:           r.Algo,
+			Network:        r.Network,
+			Hash:           r.Hash,
+			Height:         r.Height,
+			PoolType:       r.PoolType,
+			Difficulty:     r.Difficulty,
+			Value:          r.Value,
+			InsertedAt:     r.InsertedAt,
+			MergeMineChain: r.MergeMineChain,
 		})
 	}
 	return out, nil
@@ -1420,6 +1422,7 @@ var tariAlgos = []string{"RXT", "C29", "SHA3X"}
 // — see run()).
 func buildUnlockerConfig(cfg config, debug *leaflib.DebugLogger) (out unlocker.Config, ok bool, err error) {
 	out.Coins = map[string]unlocker.CoinConfig{}
+	out.MergeMineChainVerifiers = map[string]unlocker.CoinConfig{}
 	out.PollInterval = cfg.unlockerPollInterval
 	out.Debug = debug
 
@@ -1428,6 +1431,16 @@ func buildUnlockerConfig(cfg config, debug *leaflib.DebugLogger) (out unlocker.C
 		for _, algo := range tariAlgos {
 			out.Coins[algo] = unlocker.CoinConfig{Verifier: verifier, MaturityDepth: cfg.unlockerTariMaturity}
 		}
+		// The SAME Tari base node GRPC verifier ALSO covers ALGO_RXM
+		// blocks rows whose merge_mine_chain is "TARI" -- the
+		// secondary, merge-mined-chain leg of an RXM find (see
+		// internal/proto.Block.merge_mine_chain's doc comment and
+		// internal/backend/unlocker's merge_mine_chain-keyed
+		// dispatch). This is genuinely the SAME chain/verifier the
+		// tariAlgos loop above already configures for RXT/C29/SHA3X
+		// -- a Tari block is a Tari block regardless of which algo's
+		// leaf happened to submit it.
+		out.MergeMineChainVerifiers["TARI"] = unlocker.CoinConfig{Verifier: verifier, MaturityDepth: cfg.unlockerTariMaturity}
 		ok = true
 	}
 

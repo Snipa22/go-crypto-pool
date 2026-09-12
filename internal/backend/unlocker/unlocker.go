@@ -39,6 +39,15 @@ type Block struct {
 	Hash    string
 	Height  int64
 
+	// MergeMineChain mirrors db.PendingBlock.MergeMineChain /
+	// internal/proto.Block.merge_mine_chain (see those fields' doc
+	// comments) -- nil for the primary/Monero leg of an ALGO_RXM
+	// find, or a chain name (e.g. "TARI") for the secondary
+	// merge-mined chain's own leg of that same find. RunOnce routes
+	// a non-nil-MergeMineChain row to Config.MergeMineChainVerifiers
+	// instead of Config.Coins[algo] -- see that field's doc comment.
+	MergeMineChain *string
+
 	// PoolType and Difficulty are only needed for the optional
 	// PayoutTrigger path below (see Config.PayoutTrigger) —
 	// checkBlock's own chain-maturity logic never reads them. They
@@ -120,7 +129,29 @@ type Config struct {
 	// SHA3X blocks simply stay pending forever (visible/inspectable in
 	// the DB, just never auto-unlocked) until a Tari verifier is
 	// configured too.
+	//
+	// Every ALGO_RXM row -- primary/Monero leg (MergeMineChain nil)
+	// AND secondary merge-mined-chain legs (MergeMineChain non-nil)
+	// alike -- is returned by one PendingBlocks(ctx, "RXM") call and
+	// routed here first; a non-nil MergeMineChain row is then
+	// re-routed to MergeMineChainVerifiers instead of this map's
+	// "RXM" entry — see checkBlock's doc comment for the exact
+	// dispatch order.
 	Coins map[string]CoinConfig
+
+	// MergeMineChainVerifiers maps a merge_mine_chain name (e.g.
+	// "TARI") to the CoinConfig used to verify/mature THAT chain's
+	// own leg of a merge-mined find, independent of whichever algo's
+	// Coins entry the primary leg uses. Today's only real production
+	// entry is "TARI" -> the SAME chain.TariVerifier already
+	// configured for ALGO_RXT/C29/SHA3X (see cmd/backend's
+	// buildUnlockerConfig) -- a Tari block is a Tari block regardless
+	// of which algo's leaf originally submitted it. A block row whose
+	// MergeMineChain names a chain with NO entry here is left pending
+	// (logged, not an error) rather than silently dropped or
+	// misrouted to the wrong verifier -- mirrors Coins' own "no entry
+	// = never polled" convention above.
+	MergeMineChainVerifiers map[string]CoinConfig
 
 	// PollInterval is how often RunLoop re-checks every configured
 	// algo's pending blocks. Required to be > 0 for RunLoop (RunOnce
@@ -250,7 +281,26 @@ func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 			// simply having no entry (and thus a stale, unreset
 			// gauge value) for it.
 			seenNetwork(b.Network)
-			switch outcome, err := u.checkBlock(ctx, b, coinCfg); {
+
+			// resolveCoinConfig re-routes a merge-mined-chain leg
+			// (b.MergeMineChain non-nil, e.g. "TARI") to its OWN
+			// verifier/maturity depth instead of this algo's own
+			// coinCfg -- see that method's doc comment. A row whose
+			// chain has no configured verifier is left pending
+			// (logged), never treated as an error or misrouted to
+			// the primary chain's verifier.
+			effectiveCfg, hasVerifier := coinCfg, true
+			if b.MergeMineChain != nil {
+				effectiveCfg, hasVerifier = u.resolveCoinConfig(b)
+			}
+			if !hasVerifier {
+				total.Pending++
+				u.logf("unlocker: %s: block id=%d height=%d hash=%s: no verifier configured for merge-mine chain %q, leaving pending", algo, b.ID, b.Height, b.Hash, *b.MergeMineChain)
+				trackPending(seenNetwork(b.Network), b)
+				continue
+			}
+
+			switch outcome, err := u.checkBlock(ctx, b, effectiveCfg); {
 			case err != nil:
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: %v", algo, b.ID, b.Height, b.Hash, err)
 				total.Errors++
@@ -391,6 +441,35 @@ const (
 //   - Verify succeeds, Found, not Orphaned, Confirmations <
 //     coinCfg.MaturityDepth: outcomePending, nil — still confirming,
 //     retried next pass.
+//
+// coinCfg here is the CALLER-RESOLVED CoinConfig for b: RunOnce picks
+// it from Config.MergeMineChainVerifiers[b.MergeMineChain] when
+// b.MergeMineChain is non-nil, or Config.Coins[b.Algo] otherwise —
+// see resolveCoinConfig's doc comment. checkBlock itself has no
+// awareness of that routing; it just verifies against whichever
+// Verifier it was handed.
+
+// resolveCoinConfig picks the right CoinConfig for block b:
+// b.MergeMineChain non-nil (a secondary merge-mined-chain leg, e.g.
+// "TARI") routes to Config.MergeMineChainVerifiers[*b.MergeMineChain];
+// b.MergeMineChain nil (the primary leg -- Monero, for ALGO_RXM, or
+// simply "this algo's only chain" for every non-merge-mined algo)
+// routes to Config.Coins[b.Algo] exactly as before this field existed.
+// ok is false when the resolved map has no entry for the relevant key
+// -- callers must treat that as "leave this block pending", NOT as an
+// error (mirrors Config.Coins' own established "no entry configured
+// = never polled" convention; a genuinely misconfigured/not-yet-
+// configured merge-mined chain is a deployment gap to fix, not a bug
+// to crash on).
+func (u *Unlocker) resolveCoinConfig(b Block) (CoinConfig, bool) {
+	if b.MergeMineChain != nil {
+		cfg, ok := u.cfg.MergeMineChainVerifiers[*b.MergeMineChain]
+		return cfg, ok
+	}
+	cfg, ok := u.cfg.Coins[b.Algo]
+	return cfg, ok
+}
+
 func (u *Unlocker) checkBlock(ctx context.Context, b Block, coinCfg CoinConfig) (blockOutcome, error) {
 	if coinCfg.Verifier == nil {
 		return outcomePending, fmt.Errorf("no ChainVerifier configured for this algo")

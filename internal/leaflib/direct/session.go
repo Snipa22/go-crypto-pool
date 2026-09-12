@@ -759,6 +759,19 @@ func (s *Session) handleSubmit(req solo.Request) {
 			// sha256(blob) placeholder did). Always false for every
 			// other algo.
 			skipBackendForward bool
+			// mergeMineForwards accumulates ZERO OR MORE additional
+			// Block messages this ALGO_RXM find should ALSO forward,
+			// one per CONFIGURED merge-mined chain (s.server.mergeMineChains)
+			// that genuinely cleared its own real target on this
+			// SAME submission -- see mergeMineBlockForward's doc
+			// comment. Always empty for every non-RXM algo, and
+			// empty for RXM too when no merge-mine chains are
+			// configured (ServerConfig.MergeMineChains) or the
+			// primary submit_block call errored (see
+			// solo.MoneroNodeClient.SubmitBlockAuxChains' doc
+			// comment on why an error there is never attributed to
+			// one specific leg).
+			mergeMineForwards []mergeMineBlockForward
 		)
 		switch job.Algo {
 		case poolpb.Algo_ALGO_RXM:
@@ -766,7 +779,32 @@ func (s *Session) handleSubmit(req solo.Request) {
 				s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
 				return
 			}
-			if submitErr := s.server.node.SubmitBlock(context.Background(), candidate); submitErr != nil {
+			// AUX-CHAIN FIX (multi-chain RXM merge-mine recording):
+			// when s.server.node ALSO implements
+			// solo.AuxChainSubmitter (true today whenever this
+			// leaf's configured Monero endpoint is a
+			// minotari_merge_mining_proxy listener rather than raw
+			// monerod -- see cmd/leaf-direct's -monerod-url doc
+			// comment), this SAME submit_block call additionally
+			// reports whether any OTHER configured chain (today:
+			// Tari) ALSO cleared its own real target on this SAME
+			// PoW submission -- see solo.AuxChainResult's doc
+			// comment for the real, live-confirmed wire shape
+			// (aux_chain_data array, "xtr" for Tari). Falls back to
+			// the plain SubmitBlock call (identical to pre-existing
+			// behavior) when the configured node has no such
+			// capability (e.g. a bare monerod with no merge-mining
+			// proxy in front of it).
+			var (
+				auxChains []solo.AuxChainResult
+				submitErr error
+			)
+			if auxSubmitter, ok := s.server.node.(solo.AuxChainSubmitter); ok {
+				auxChains, submitErr = auxSubmitter.SubmitBlockAuxChains(context.Background(), candidate)
+			} else {
+				submitErr = s.server.node.SubmitBlock(context.Background(), candidate)
+			}
+			if submitErr != nil {
 				submitOK = false
 				s.server.logger.Printf("direct: monero BLOCK SUBMIT FAILED (single-node; multi-node Monero submit is a known, deferred gap) for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, submitErr)
 			} else {
@@ -793,6 +831,16 @@ func (s *Session) handleSubmit(req solo.Request) {
 				} else {
 					blockHashHex = hashHex
 				}
+
+				// For EACH configured merge-mined chain
+				// (s.server.mergeMineChains), forward a SEPARATE
+				// Block message ONLY when auxChains actually
+				// carries a real, non-empty hash for that chain's
+				// own AuxChainID -- never fabricate a leg that
+				// didn't genuinely clear its own target (mirrors
+				// this method's own skipBackendForward convention
+				// above for the primary leg's unresolved-hash case).
+				mergeMineForwards = matchMergeMineForwards(s.server.mergeMineChains, auxChains)
 			}
 		default:
 			block, ok := candidate.(*tari_generated.Block)
@@ -869,8 +917,25 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// even longer span on the (rare, but real) block-find path.
 		if skipBackendForward {
 			s.server.logger.Printf("direct: NOT forwarding block find to backend for session %s (job %s, height %d) -- real hash unresolved, see the MONERO BLOCK HASH UNRESOLVED log line above", s.sessionID, job.ID, job.Height)
-		} else if ok := s.server.forwardPool.TrySubmit(func() { s.forwardBlock(share, job, blockHashHex) }); !ok {
+		} else if ok := s.server.forwardPool.TrySubmit(func() { s.forwardBlock(share, job, blockHashHex, "") }); !ok {
 			s.server.logger.Printf("direct: forward pool saturated or unavailable, dropping block forward to backend for session %s", s.sessionID)
+		}
+
+		// Forward one ADDITIONAL Block message per merge-mine chain
+		// that genuinely cleared its own target on this SAME
+		// submission (mergeMineForwards, populated only in the
+		// ALGO_RXM case above) -- e.g. "TARI". Each is its own,
+		// independent forwardBlock call with that chain's own real
+		// hash and merge_mine_chain marker; never coupled to whether
+		// the primary (Monero) leg's own forward above succeeded,
+		// was skipped, or even ran at all -- Alex's explicit design
+		// direction is that a merge-mine find can pay out on either
+		// chain, Tari, or both, independently.
+		for _, mm := range mergeMineForwards {
+			mm := mm
+			if ok := s.server.forwardPool.TrySubmit(func() { s.forwardBlock(share, job, mm.hashHex, mm.chainName) }); !ok {
+				s.server.logger.Printf("direct: forward pool saturated or unavailable, dropping merge-mine (%s) block forward to backend for session %s", mm.chainName, s.sessionID)
+			}
 		}
 
 		go s.server.jobManager.InvalidateAll()
@@ -954,6 +1019,40 @@ func acceptedAddresses(results []NodeSubmitResult) []string {
 	return out
 }
 
+// mergeMineBlockForward is one ADDITIONAL merge-mine-chain leg of an
+// ALGO_RXM block find that genuinely cleared its own target on the
+// SAME submission as the primary (Monero) leg -- see
+// handleSubmit's ALGO_RXM case (mergeMineForwards) and
+// forwardBlock's mergeMineChain parameter.
+type mergeMineBlockForward struct {
+	chainName string // e.g. "TARI" -- becomes poolpb.Block.MergeMineChain
+	hashHex   string // that chain's own real, confirmed block hash
+}
+
+// matchMergeMineForwards is the pure, independently-testable matching
+// logic behind handleSubmit's ALGO_RXM mergeMineForwards
+// construction: for each configured chain, if auxChains carries a
+// real, non-empty hash for that chain's own AuxChainID, emit ONE
+// mergeMineBlockForward for it. A configured chain with NO matching
+// (or empty-hash) auxChains entry is simply skipped -- never
+// fabricated. Order of the returned slice follows configured's own
+// order; at most one forward is emitted per configured chain (the
+// first matching auxChains entry wins, mirroring a real
+// minotari_merge_mining_proxy response's own aux_chain_data never
+// carrying more than one entry per chain id in practice).
+func matchMergeMineForwards(configured []MergeMineChainConfig, auxChains []solo.AuxChainResult) []mergeMineBlockForward {
+	var out []mergeMineBlockForward
+	for _, mc := range configured {
+		for _, aux := range auxChains {
+			if aux.ChainID == mc.AuxChainID && aux.Hash != "" {
+				out = append(out, mergeMineBlockForward{chainName: mc.Name, hashHex: aux.Hash})
+				break
+			}
+		}
+	}
+	return out
+}
+
 // forwardShare best-effort-forwards share to the real backend via
 // transport.ShareTransport.SubmitShare, bounded by a real timeout so a
 // slow/unreachable backend cannot hang this session's submit handling
@@ -986,7 +1085,13 @@ func (s *Session) forwardShare(share *poolpb.Share) {
 // all for a Monero find whose real hash could not be resolved, see
 // handleSubmit's skipBackendForward), computed by the caller since
 // this method no longer assumes a *tari_generated.Block shape.
-func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex string) {
+//
+// mergeMineChain is "" for the primary leg (Tari's own native find,
+// or ALGO_RXM's primary Monero leg) and a chain name (e.g. "TARI")
+// for a secondary merge-mined-chain leg of an ALGO_RXM find (see
+// mergeMineBlockForward) -- forwarded verbatim as
+// poolpb.Block.MergeMineChain (nil when empty).
+func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex string, mergeMineChain string) {
 	if s.server.transport == nil {
 		return
 	}
@@ -994,6 +1099,9 @@ func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex 
 		Algo: job.Algo, Network: s.server.network, Hash: blockHashHex,
 		Difficulty: share.GetBlockDiff(), Height: int64(job.Height),
 		Timestamp: time.Now().Unix(), PoolType: s.server.poolType, PoolId: s.server.poolID, Valid: true,
+	}
+	if mergeMineChain != "" {
+		pbBlock.MergeMineChain = &mergeMineChain
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

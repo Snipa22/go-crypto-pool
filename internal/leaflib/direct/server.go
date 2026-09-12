@@ -197,6 +197,12 @@ type Server struct {
 	// resolveMoneroBlockHash returns a clear error rather than a
 	// placeholder in that case, never silently substituting one.
 	moneroHeaderResolver moneroBlockHeaderResolver
+
+	// mergeMineChains mirrors ServerConfig.MergeMineChains verbatim
+	// (see that field's doc comment) -- consulted only by session.go's
+	// ALGO_RXM block-find handling. Empty (nil) for -coin=tari and
+	// every pre-existing caller.
+	mergeMineChains []MergeMineChainConfig
 }
 
 // defaultForwardPoolWorkers/defaultForwardPoolQueueSize size Fix 12's
@@ -319,6 +325,40 @@ type ServerConfig struct {
 	// forwarding a placeholder hash, per this fix's explicit
 	// fallback-hardening requirement.
 	MonerodURL string
+
+	// MergeMineChains lists every merge-mined chain (beyond the
+	// primary chain Node/MonerodURL already cover) session.go's
+	// ALGO_RXM block-find handling should check the SAME real PoW
+	// submission against, in addition to the primary chain. Today
+	// there is exactly one real configured entry (Tari, via a
+	// minotari_merge_mining_proxy -- see cmd/leaf-direct's
+	// -merge-mine-chains flag), but this is deliberately a SLICE, not
+	// a single hardcoded Tari-only field: a future leaf-direct-monero
+	// instance could in principle be configured against more than one
+	// merge-mined-chain target without a code change here. Empty
+	// (the default, and every -coin=tari / pre-existing caller) means
+	// no merge-mine-chain checking at all -- session.go's ALGO_RXM
+	// handling then behaves exactly as before this feature existed
+	// (single Monero-leg-only forward).
+	MergeMineChains []MergeMineChainConfig
+}
+
+// MergeMineChainConfig names ONE merge-mined chain this Server's
+// ALGO_RXM block-find handling should independently check the real
+// PoW submission against, on top of the primary chain (Monero).
+type MergeMineChainConfig struct {
+	// Name is this chain's blocks.merge_mine_chain marker forwarded
+	// on poolpb.Block.MergeMineChain (e.g. "TARI"). Required
+	// non-empty.
+	Name string
+
+	// AuxChainID is the aux-chain identifier a merge-mining proxy's
+	// own submit_block response tags THIS chain's aux_chain_data
+	// entry with (see solo.AuxChainResult.ChainID's doc comment --
+	// Tari's own real minotari_merge_mining_proxy convention,
+	// confirmed live against CT132's tari-mmproxy.service, is "xtr").
+	// Required non-empty.
+	AuxChainID string
 }
 
 // NewServer constructs a Server.
@@ -355,6 +395,7 @@ func NewServer(cfg ServerConfig) *Server {
 	if strings.TrimSpace(cfg.MonerodURL) != "" {
 		s.moneroHeaderResolver = NewMoneroBlockHeaderClient(cfg.MonerodURL)
 	}
+	s.mergeMineChains = cfg.MergeMineChains
 	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {
 		s.unsubscribe = cfg.JobManager.Subscribe(s.invalidateAndRepushJobs)
