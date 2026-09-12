@@ -114,6 +114,38 @@ type Session struct {
 
 	connectedAt       time.Time
 	currentDifficulty atomic.Uint64
+	// hashesAccumulated is the difficulty-weighted accept-history sum
+	// this session's own EstimatedHashrate stat card (server.go's
+	// SessionStat, and the aggregate leaf-proxy-wide "Global
+	// hashrate" card, statsui.go) is derived from -- see
+	// leaflib.EstimateHashrateHz's doc comment for the formula.
+	//
+	// SECURITY/TRUST CAVEAT (FIX_BRIEF.md, finding #16 -- documentation-
+	// only fix per the audit's own accepted-scope framing): the LOCAL-
+	// CREDIT branch of handleSubmit below (the `diff < job.UpstreamShareDiff`
+	// case) increments this counter using ONLY the miner's own
+	// self-claimed result hash's derived difficulty, with ZERO
+	// cryptographic validation -- s.server.validator.ValidateBlobSeedResult
+	// is never called for a locally-credited share at all (see that
+	// branch's own doc comment for why: this leaf only ever re-validates
+	// a genuine upstream-forward candidate). A hostile miner can submit
+	// arbitrary, made-up (but well-formed, sufficiently-high, distinct-
+	// nonce) claims and inflate this counter -- and therefore this
+	// session's own EstimatedHashrate and this leaf's aggregate
+	// TotalEstimatedHashrate "Global hashrate" headline stat card --
+	// completely arbitrarily, with no real PoW behind any of it. This
+	// is INHERITED behavior (the local-credit design predates the
+	// hashrate stat cards; ShareDecisionsTotal/local_credit already
+	// carried this same trust assumption for accounting purposes) --
+	// what's new is presenting a number derived from unauthenticated,
+	// unvalidated input as an operator-facing "headline" stat with no
+	// caveat. Treat any EstimatedHashrate/TotalEstimatedHashrate value
+	// that is suspiciously high relative to a session's/fleet's real
+	// known hardware as a signal to investigate, not as ground truth --
+	// and see this leaf's own metrics package doc comment (Decision
+	// label values) for the accompanying local_credit/upstream_forward
+	// split, which is the more trustworthy of the two signals (an
+	// upstream_forward share DID pass real cryptographic validation).
 	hashesAccumulated atomic.Uint64
 
 	// forcedMinDifficulty is this session's own operator-forced
@@ -743,6 +775,12 @@ func (s *Session) handleSubmit(req Request) {
 		// matching randomx_puregolang.go's documented contract
 		// exactly (this leaf only re-validates a genuine
 		// upstream-forward candidate).
+		//
+		// See s.hashesAccumulated's own doc comment (FIX_BRIEF.md,
+		// finding #16) for the explicit caveat this implies: the
+		// s.hashesAccumulated.Add call below credits this session's
+		// (and this leaf's aggregate) hashrate stat purely from the
+		// miner's own unvalidated claim.
 		s.shareCount.Add(1)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.server.recordShareDecision(false)
@@ -880,12 +918,23 @@ func (s *Session) handleSubmit(req Request) {
 		s.writeShareResponse(req.ID, true, "")
 	}
 
-	if ok := s.server.randomxPool.Submit(finishSubmit); !ok {
-		// Pool already stopped (server shutting down) -- respond with
-		// a real rejection rather than leaving this submit unanswered
-		// (mirrors solo.Session's/direct.Session's identical
+	// HARDENING FIX (FIX_BRIEF.md, finding #15): TrySubmit, NOT Submit
+	// -- this call runs directly on Session.Run's own read loop
+	// (handleSubmit is called synchronously from it), so a blocking
+	// Submit here would let one saturated/flooding session's own
+	// dispatch block every OTHER session's next read-loop iteration
+	// too, once the shared, server-scoped pool's bounded queue and
+	// every worker are simultaneously busy -- see
+	// solo/session.go's/direct/session.go's identical change for the
+	// full rationale.
+	if ok := s.server.randomxPool.TrySubmit(finishSubmit); !ok {
+		// Pool already stopped (server shutting down), OR its bounded
+		// queue is genuinely saturated and every worker is busy right
+		// now -- respond with a real rejection rather than leaving
+		// this submit unanswered or blocking this read loop waiting
+		// for room (mirrors solo.Session's/direct.Session's identical
 		// dispatch-failure handling exactly).
-		s.writeShareResponse(req.ID, false, "pool is shutting down, please reconnect")
+		s.writeShareResponse(req.ID, false, "validation pool is saturated or shutting down, please retry")
 	}
 }
 

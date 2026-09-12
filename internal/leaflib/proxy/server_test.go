@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -182,7 +183,23 @@ func scrapeMetrics(t *testing.T, s *Server) string {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	buf := make([]byte, 65536)
-	n, _ := resp.Body.Read(buf)
-	return string(buf[:n])
+	// BUG FIX: a single resp.Body.Read(buf) call is NOT guaranteed to
+	// return the entire response body in one call (io.Reader's
+	// contract explicitly allows a short read even when more data is
+	// available, and a real net/http chunked-transfer response body
+	// commonly returns one chunk per Read call) -- this was
+	// discovered as a genuine, real flake once this package's
+	// /metrics output grew past whatever chunk boundary net/http
+	// happened to use (adding FIX_BRIEF.md finding #18's malformed-
+	// blob-breaker/seed-hash-decode-error metrics pushed
+	// leaf_proxy_upstream_reconnects_total past a chunk boundary,
+	// silently truncating it out of a single short Read's result).
+	// io.ReadAll is the correct, robust way to read an entire
+	// response body regardless of how many underlying chunks/Read
+	// calls it takes.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading /metrics response body: %v", err)
+	}
+	return string(body)
 }

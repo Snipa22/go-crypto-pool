@@ -133,6 +133,32 @@ type AsyncPoolStats struct {
 
 type AsyncPoolStatsFunc func() AsyncPoolStats
 
+// MalformedBlobBreakerStats/MalformedBlobBreakerStatsFunc mirror
+// AsyncPoolStats/AsyncPoolStatsFunc's own identical "snapshot polled
+// live at scrape time" shape (FIX_BRIEF.md, finding #18) for
+// upstream.go's malformedBlobBreaker -- decoupled from that type for
+// the same import-cycle-avoidance reason AsyncPoolStats is decoupled
+// from *solo.AsyncValidationPool (see this package's doc comment).
+type MalformedBlobBreakerStats struct {
+	// OpensTotal is the real, monotonically-increasing count of times
+	// the breaker has opened (tripped) since process start.
+	OpensTotal uint64
+	// Open is the breaker's CURRENT state: true while it is refusing
+	// new recovery-wrapped blocktemplate_blob conversions.
+	Open bool
+}
+
+type MalformedBlobBreakerStatsFunc func() MalformedBlobBreakerStats
+
+// SeedHashStats/SeedHashStatsFunc mirror the same snapshot-polled
+// shape (FIX_BRIEF.md, finding #18) for
+// UpstreamClient.SeedHashDecodeErrorsTotal.
+type SeedHashStats struct {
+	DecodeErrorsTotal uint64
+}
+
+type SeedHashStatsFunc func() SeedHashStats
+
 // Metrics holds every Prometheus collector leaf-proxy registers, plus
 // the registry they live in. Constructed via New; safe for concurrent
 // use.
@@ -171,9 +197,11 @@ type Metrics struct {
 
 	BuildInfo *prometheus.GaugeVec
 
-	maxAddressLabels int
-	snapshot         SnapshotFunc
-	asyncPoolStats   AsyncPoolStatsFunc
+	maxAddressLabels     int
+	snapshot             SnapshotFunc
+	asyncPoolStats       AsyncPoolStatsFunc
+	malformedBlobBreaker MalformedBlobBreakerStatsFunc
+	seedHashStats        SeedHashStatsFunc
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -250,6 +278,21 @@ func (m *Metrics) SetAsyncPoolSource(fn AsyncPoolStatsFunc) {
 	m.asyncPoolStats = fn
 }
 
+// SetMalformedBlobBreakerSource wires the live
+// upstream.go-owned malformed-blob circuit breaker snapshot provider
+// (FIX_BRIEF.md, finding #18) -- see MalformedBlobBreakerStats' doc
+// comment.
+func (m *Metrics) SetMalformedBlobBreakerSource(fn MalformedBlobBreakerStatsFunc) {
+	m.malformedBlobBreaker = fn
+}
+
+// SetSeedHashStatsSource wires the live UpstreamClient
+// seed-hash-decode-error snapshot provider (FIX_BRIEF.md, finding
+// #18) -- see SeedHashStats' doc comment.
+func (m *Metrics) SetSeedHashStatsSource(fn SeedHashStatsFunc) {
+	m.seedHashStats = fn
+}
+
 // Handler returns the standard Prometheus text-exposition HTTP handler
 // scoped to this Metrics' private registry.
 func (m *Metrics) Handler() http.Handler {
@@ -306,6 +349,29 @@ var (
 	asyncPoolSubmitBlockedTotalDesc = prometheus.NewDesc(
 		"leaf_async_validation_submit_blocked_total",
 		"Total number of Submit calls to the shared AsyncValidationPool that could not take the fast, non-blocking path (queue full and every worker busy) -- the real saturation signal for Finding 2's bounded-queue/NumCPU-workers fix.",
+		nil, nil,
+	)
+
+	// malformedBlobBreaker*Desc back FIX_BRIEF.md finding #18's
+	// circuit breaker observability -- see
+	// MalformedBlobBreakerStats' own doc comment.
+	malformedBlobBreakerOpenDesc = prometheus.NewDesc(
+		"leaf_proxy_malformed_blob_breaker_open",
+		"1 if upstream.go's known-go-xmr-lib-bug circuit breaker (convertTemplateBlobToHashingBlob) is currently open (refusing new recovery-wrapped blocktemplate_blob conversions after too many consecutive parse timeouts/panics), 0 otherwise.",
+		nil, nil,
+	)
+	malformedBlobBreakerOpensTotalDesc = prometheus.NewDesc(
+		"leaf_proxy_malformed_blob_breaker_opens_total",
+		"Total number of times upstream.go's malformed-blocktemplate_blob circuit breaker has opened (tripped) since process start.",
+		nil, nil,
+	)
+
+	// seedHashDecodeErrorsTotalDesc backs FIX_BRIEF.md finding #18's
+	// previously-silently-dropped job.SeedHash decode error -- see
+	// SeedHashStats' own doc comment.
+	seedHashDecodeErrorsTotalDesc = prometheus.NewDesc(
+		"leaf_proxy_seed_hash_decode_errors_total",
+		"Total number of upstream jobs received with a non-empty but unparseable seed_hash field (previously silently dropped; now logged and counted here).",
 		nil, nil,
 	)
 )
@@ -371,5 +437,20 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(asyncPoolQueueDepthDesc, prometheus.GaugeValue, float64(stats.QueueDepth))
 		ch <- prometheus.MustNewConstMetric(asyncPoolInFlightWorkersDesc, prometheus.GaugeValue, float64(stats.InFlightWorkers))
 		ch <- prometheus.MustNewConstMetric(asyncPoolSubmitBlockedTotalDesc, prometheus.CounterValue, float64(stats.SubmitBlockedTotal))
+	}
+
+	if m.malformedBlobBreaker != nil {
+		st := m.malformedBlobBreaker()
+		openValue := 0.0
+		if st.Open {
+			openValue = 1.0
+		}
+		ch <- prometheus.MustNewConstMetric(malformedBlobBreakerOpenDesc, prometheus.GaugeValue, openValue)
+		ch <- prometheus.MustNewConstMetric(malformedBlobBreakerOpensTotalDesc, prometheus.CounterValue, float64(st.OpensTotal))
+	}
+
+	if m.seedHashStats != nil {
+		st := m.seedHashStats()
+		ch <- prometheus.MustNewConstMetric(seedHashDecodeErrorsTotalDesc, prometheus.CounterValue, float64(st.DecodeErrorsTotal))
 	}
 }

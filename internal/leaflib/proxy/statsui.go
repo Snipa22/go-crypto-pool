@@ -66,8 +66,9 @@ const statsPageHTML = `<!DOCTYPE html>
     <div class="card"><div class="value">{{.Stats.TotalShares}}</div><div class="label">Total shares (connected sessions)</div></div>
     <div class="card"><div class="value">{{.Stats.TotalBlocks}}</div><div class="label">Total upstream-forwarded (connected sessions)</div></div>
     <div class="card"><div class="value">{{.Stats.MinDifficulty}} / {{.Stats.MedianDifficulty}} / {{.Stats.MaxDifficulty}}</div><div class="label">Vardiff min / median / max</div></div>
-    <div class="card"><div class="value">{{formatHashrate .Stats.TotalEstimatedHashrate}}</div><div class="label">Global hashrate</div></div>
+    <div class="card" title="Includes locally-credited shares below the upstream pool's requested difficulty, which are accepted on the miner's own self-claimed hash with no cryptographic re-validation -- see internal/leaflib/proxy/server.go's SessionStat.EstimatedHashrate doc comment (FIX_BRIEF.md, finding #16). Treat as an approximate, miner-spoofable indicator, not an authoritative measurement."><div class="value">{{formatHashrate .Stats.TotalEstimatedHashrate}}</div><div class="label">Global hashrate*</div></div>
   </div>
+  <p class="empty">* Global hashrate includes locally-credited (unvalidated, self-reported) shares below the upstream pool's own requested difficulty -- see this leaf's own docs for the full caveat.</p>
 
   <h2>Miners by address{{if .AddressCapped}} (capped to {{.MaxAddressLabels}}, overflow in "other"){{end}}</h2>
   {{if .Stats.MinersByAddress}}
@@ -153,7 +154,7 @@ func (s *Server) StatsHTMLHandler() http.Handler {
 			Stats:             st,
 			MaxAddressLabels:  s.maxAddressLabels,
 			AddressCapped:     len(st.MinersByAddress) > 0 && st.MinersByAddress[len(st.MinersByAddress)-1].Address == "other",
-			HideRemoteAddress: s.hideRemoteAddress,
+			HideRemoteAddress: s.hideRemoteAddress.Load(),
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := statsPageTemplate.Execute(w, data); err != nil {
