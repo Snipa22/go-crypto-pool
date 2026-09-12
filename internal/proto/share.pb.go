@@ -674,9 +674,33 @@ type Block struct {
 	// the same static, operator-assigned pool-server-source identifier,
 	// stamped on a found block's report exactly like it is on every
 	// share.
-	PoolId        int32 `protobuf:"varint,12,opt,name=pool_id,json=poolId,proto3" json:"pool_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PoolId int32 `protobuf:"varint,12,opt,name=pool_id,json=poolId,proto3" json:"pool_id,omitempty"`
+	// merge_mine_chain names which merge-mined chain this Block row
+	// belongs to, for algos where ONE real PoW submission can
+	// independently clear more than one chain's own real difficulty
+	// target (today: ALGO_RXM/Monero, merge-mined with Tari via a
+	// minotari_merge_mining_proxy sitting between the leaf and real
+	// monerod). unset (nil)/absent means this row is the PRIMARY leg
+	// (Monero, for ALGO_RXM) — every historical Block/blocks row before
+	// this field existed is implicitly the primary leg. A non-nil value
+	// (e.g. "TARI") means this row is the SECONDARY merge-mined chain's
+	// OWN leg of that same submission: its own real, independently
+	// resolved hash, independently verified/matured/paid via that
+	// chain's own existing ChainVerifier (see
+	// internal/backend/chain.TariVerifier and
+	// internal/backend/unlocker's merge_mine_chain-keyed dispatch) --
+	// never the primary chain's verifier. ONE PoW submission that
+	// clears both chains' targets produces TWO separate Block messages
+	// (one with merge_mine_chain unset, one with it set) — never a
+	// single row trying to represent both. Deliberately a free-form
+	// string, not a new Algo enum value: the merge-mined chain is NOT a
+	// distinct algo/leaf (ALGO_RXT's own dedicated leaf-direct-rxt.service
+	// and blocks rows are completely separate and untouched by this
+	// field), and a string leaves room for more than one configured
+	// merge-mined chain per leaf in the future without an enum change.
+	MergeMineChain *string `protobuf:"bytes,13,opt,name=merge_mine_chain,json=mergeMineChain,proto3,oneof" json:"merge_mine_chain,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Block) Reset() {
@@ -793,6 +817,13 @@ func (x *Block) GetPoolId() int32 {
 	return 0
 }
 
+func (x *Block) GetMergeMineChain() string {
+	if x != nil && x.MergeMineChain != nil {
+		return *x.MergeMineChain
+	}
+	return ""
+}
+
 var File_internal_proto_share_proto protoreflect.FileDescriptor
 
 const file_internal_proto_share_proto_rawDesc = "" +
@@ -837,7 +868,7 @@ const file_internal_proto_share_proto_rawDesc = "" +
 	"sha3xProof\x12#\n" +
 	"\rtrusted_share\x18\x10 \x01(\bR\ftrustedShareB\v\n" +
 	"\traw_proofB\r\n" +
-	"\v_payment_id\"\xf8\x02\n" +
+	"\v_payment_id\"\xbc\x03\n" +
 	"\x05Block\x12!\n" +
 	"\x04algo\x18\x01 \x01(\x0e2\r.pool.v1.AlgoR\x04algo\x12*\n" +
 	"\anetwork\x18\x02 \x01(\x0e2\x10.pool.v1.NetworkR\anetwork\x12\x12\n" +
@@ -853,8 +884,10 @@ const file_internal_proto_share_proto_rawDesc = "" +
 	"\x05value\x18\n" +
 	" \x01(\x03H\x00R\x05value\x88\x01\x01\x12\x16\n" +
 	"\x06height\x18\v \x01(\x03R\x06height\x12\x17\n" +
-	"\apool_id\x18\f \x01(\x05R\x06poolIdB\b\n" +
-	"\x06_value*V\n" +
+	"\apool_id\x18\f \x01(\x05R\x06poolId\x12-\n" +
+	"\x10merge_mine_chain\x18\r \x01(\tH\x01R\x0emergeMineChain\x88\x01\x01B\b\n" +
+	"\x06_valueB\x13\n" +
+	"\x11_merge_mine_chain*V\n" +
 	"\x04Algo\x12\x14\n" +
 	"\x10ALGO_UNSPECIFIED\x10\x00\x12\f\n" +
 	"\bALGO_RXT\x10\x01\x12\f\n" +

@@ -497,6 +497,117 @@ func (c *MoneroNodeClient) SubmitBlock(ctx context.Context, candidate any) error
 	return c.call(ctx, "submit_block", []string{hex.EncodeToString(blob)}, nil)
 }
 
+// AuxChainResult is one merge-mined chain's own real acceptance
+// outcome from the SAME submit_block call as the primary (Monero)
+// chain, as reported by a minotari_merge_mining_proxy sitting
+// between this client and real monerod (see this package's own
+// -coin=monero deployment convention: MoneroNodeClient's baseURL may
+// point at either raw monerod OR at such a proxy — the wire protocol
+// this package speaks is identical either way, since the proxy is a
+// monerod-JSON-RPC-compatible surface).
+//
+// Confirmed against the real tari-project/tari source
+// (applications/minotari_merge_mining_proxy/src/proxy/inner.rs,
+// handle_submit_block/append_aux_chain_data) and live against
+// CT132's tari-mmproxy.service this session: on a submit_block call
+// whose embedded Tari merge-mining header clears Tari's OWN real
+// difficulty target AND the Tari base node accepts the resulting
+// block, the proxy's JSON-RPC result gains an aux_chain_data array
+// with entries shaped {"id": "xtr", "block_hash": "<hex>"} --
+// "xtr" is Tari's own real aux-chain identifier in this response.
+// When Tari's target isn't cleared, or IS cleared but the Tari base
+// node then rejects the submission, aux_chain_data is simply absent
+// (no entry for that chain) — this is NOT an error condition for the
+// Monero leg, which this same submit_block response resolves
+// entirely independently (see moneroSubmitBlockAuxResult's own doc
+// comment for the exact decode).
+type AuxChainResult struct {
+	// ChainID is the aux-chain identifier as reported by the proxy's
+	// own response (e.g. "xtr" for Tari) -- callers match this
+	// against their own configured chain-target list (see
+	// internal/leaflib/direct.MergeMineChainConfig.AuxChainID) rather
+	// than this package hardcoding any particular chain name.
+	ChainID string
+	// Hash is the real, chain-confirmed block hash for ChainID,
+	// hex-encoded exactly as the proxy reported it.
+	Hash string
+}
+
+// moneroSubmitBlockAuxResult decodes submit_block's real JSON-RPC
+// result payload when the underlying endpoint is a merge-mining
+// proxy: a normal monerod-style {"status":"OK","untrusted":bool}
+// PLUS an optional "aux_chain_data" array carrying each OTHER
+// configured chain's own real acceptance outcome for this SAME
+// submission (see AuxChainResult's doc comment). Raw monerod itself
+// never populates aux_chain_data at all (unknown field, silently
+// ignored by json.Unmarshal) — decoding this same struct against a
+// raw-monerod submit_block response is safe and simply yields zero
+// AuxChainData entries.
+type moneroSubmitBlockAuxResult struct {
+	Status       string `json:"status"`
+	Untrusted    bool   `json:"untrusted"`
+	AuxChainData []struct {
+		ID        string `json:"id"`
+		BlockHash string `json:"block_hash"`
+	} `json:"aux_chain_data"`
+}
+
+// SubmitBlockAuxChains performs the exact SAME real submit_block call
+// SubmitBlock does, additionally decoding the response for any
+// aux_chain_data entries (see AuxChainResult's doc comment). A
+// non-nil error here means submit_block itself failed (the SAME
+// outcome SubmitBlock's own error return would represent) -- when
+// that happens, auxChains is always nil: this deployment's mmproxy
+// (submit_to_origin=false) reports the WHOLE call's outcome, so an
+// error here does not distinguish "the primary chain rejected it"
+// from "a configured secondary chain rejected it" -- callers must
+// not assume a submit_block error is specific to either leg (see
+// internal/leaflib/direct/session.go's ALGO_RXM block-find handling
+// for how this ambiguity is handled conservatively: neither leg is
+// forwarded to the backend on error, exactly mirroring this
+// package's existing skipBackendForward-style "never fabricate,
+// when in doubt leave it out" convention). On success (nil error),
+// auxChains reflects exactly whatever aux_chain_data entries (zero or
+// more) the response carried.
+func (c *MoneroNodeClient) SubmitBlockAuxChains(ctx context.Context, candidate any) (auxChains []AuxChainResult, err error) {
+	blob, ok := candidate.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("solo: monero: SubmitBlockAuxChains: candidate is not a []byte (got %T)", candidate)
+	}
+	var result moneroSubmitBlockAuxResult
+	if err := c.call(ctx, "submit_block", []string{hex.EncodeToString(blob)}, &result); err != nil {
+		return nil, err
+	}
+	for _, entry := range result.AuxChainData {
+		if entry.ID == "" || entry.BlockHash == "" {
+			continue
+		}
+		auxChains = append(auxChains, AuxChainResult{ChainID: entry.ID, Hash: entry.BlockHash})
+	}
+	return auxChains, nil
+}
+
+// AuxChainSubmitter is implemented by a NodeClient whose underlying
+// submit_block-equivalent RPC endpoint may ALSO be a merge-mining
+// proxy reporting one or more OTHER chains' own real acceptance
+// outcome for the SAME submission (today: MoneroNodeClient, when its
+// configured baseURL is a minotari_merge_mining_proxy listener rather
+// than raw monerod -- see cmd/leaf-direct's -monerod-url doc comment
+// and AuxChainResult's own doc comment). Callers must type-assert for
+// this optional capability (`node.(AuxChainSubmitter)`) rather than
+// assuming every NodeClient implementation has it -- the Tari
+// (-coin=tari) NodeClient implementation deliberately does not
+// implement this interface at all, since Tari mining has no
+// analogous "one PoW submission, multiple independently-checked
+// chain targets" concept today.
+type AuxChainSubmitter interface {
+	SubmitBlockAuxChains(ctx context.Context, candidate any) ([]AuxChainResult, error)
+}
+
+// Compile-time assertion that MoneroNodeClient satisfies
+// AuxChainSubmitter.
+var _ AuxChainSubmitter = (*MoneroNodeClient)(nil)
+
 // parseMoneroBlockHeaderNonceOffset computes the REAL, CURRENT byte
 // offset of the 4-byte nonce field within blockhashingBlob by actually
 // walking Monero's real block_header varint fields

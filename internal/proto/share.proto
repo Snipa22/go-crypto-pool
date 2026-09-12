@@ -181,4 +181,29 @@ message Block {
   // stamped on a found block's report exactly like it is on every
   // share.
   int32 pool_id = 12;
+
+  // merge_mine_chain names which merge-mined chain this Block row
+  // belongs to, for algos where ONE real PoW submission can
+  // independently clear more than one chain's own real difficulty
+  // target (today: ALGO_RXM/Monero, merge-mined with Tari via a
+  // minotari_merge_mining_proxy sitting between the leaf and real
+  // monerod). unset (nil)/absent means this row is the PRIMARY leg
+  // (Monero, for ALGO_RXM) — every historical Block/blocks row before
+  // this field existed is implicitly the primary leg. A non-nil value
+  // (e.g. "TARI") means this row is the SECONDARY merge-mined chain's
+  // OWN leg of that same submission: its own real, independently
+  // resolved hash, independently verified/matured/paid via that
+  // chain's own existing ChainVerifier (see
+  // internal/backend/chain.TariVerifier and
+  // internal/backend/unlocker's merge_mine_chain-keyed dispatch) --
+  // never the primary chain's verifier. ONE PoW submission that
+  // clears both chains' targets produces TWO separate Block messages
+  // (one with merge_mine_chain unset, one with it set) — never a
+  // single row trying to represent both. Deliberately a free-form
+  // string, not a new Algo enum value: the merge-mined chain is NOT a
+  // distinct algo/leaf (ALGO_RXT's own dedicated leaf-direct-rxt.service
+  // and blocks rows are completely separate and untouched by this
+  // field), and a string leaves room for more than one configured
+  // merge-mined chain per leaf in the future without an enum change.
+  optional string merge_mine_chain = 13;
 }

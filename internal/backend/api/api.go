@@ -98,6 +98,12 @@ type BlockRecord struct {
 	Valid      bool
 	Value      *int64
 	PoolID     int32
+
+	// MergeMineChain mirrors internal/proto.Block.merge_mine_chain /
+	// db.Block.MergeMineChain (see those fields' doc comments) -- nil
+	// for the primary/Monero leg of an ALGO_RXM find, non-nil (e.g.
+	// "TARI") for a secondary merge-mined chain leg.
+	MergeMineChain *string
 }
 
 // HeightPartitionBucketSize is passed to InsertShare's bucketSize
@@ -575,18 +581,23 @@ func blockToRecord(b *poolpb.Block) BlockRecord {
 	if b.Value != nil {
 		value = b.Value
 	}
+	var mergeMineChain *string
+	if b.MergeMineChain != nil {
+		mergeMineChain = b.MergeMineChain
+	}
 	return BlockRecord{
-		Algo:       algoString(b.GetAlgo()),
-		Network:    networkString(b.GetNetwork()),
-		PoolType:   poolTypeString(b.GetPoolType()),
-		Hash:       b.GetHash(),
-		Height:     b.GetHeight(),
-		Difficulty: b.GetDifficulty(),
-		Shares:     b.GetShares(),
-		Timestamp:  b.GetTimestamp(),
-		Unlocked:   b.GetUnlocked(),
-		Valid:      b.GetValid(),
-		Value:      value,
-		PoolID:     b.GetPoolId(),
+		Algo:           algoString(b.GetAlgo()),
+		Network:        networkString(b.GetNetwork()),
+		PoolType:       poolTypeString(b.GetPoolType()),
+		Hash:           b.GetHash(),
+		Height:         b.GetHeight(),
+		Difficulty:     b.GetDifficulty(),
+		Shares:         b.GetShares(),
+		Timestamp:      b.GetTimestamp(),
+		Unlocked:       b.GetUnlocked(),
+		Valid:          b.GetValid(),
+		Value:          value,
+		PoolID:         b.GetPoolId(),
+		MergeMineChain: mergeMineChain,
 	}
 }

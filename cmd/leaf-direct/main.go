@@ -65,6 +65,7 @@ type config struct {
 	network         string
 	coin            string
 	monerodURL      string
+	mergeMineChains string
 	algo            string
 	poolType        string
 
@@ -258,6 +259,7 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_DIRECT_NETWORK", "testnet"), "network tag for share/block records: mainnet|testnet. Env: LEAF_DIRECT_NETWORK")
 	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_DIRECT_COIN", "tari"), "which coin/PoW family this leaf-direct process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_DIRECT_COIN")
 	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_DIRECT_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081). REQUIRED when -coin=monero; ignored for -coin=tari. Env: LEAF_DIRECT_MONEROD_URL")
+	flag.StringVar(&cfg.mergeMineChains, "merge-mine-chains", envOr("LEAF_DIRECT_MERGE_MINE_CHAINS", ""), "comma-separated NAME:auxid pairs naming every merge-mined chain this leaf should ALSO check the same PoW submission against, on top of the primary chain -- only meaningful for -coin=monero, ignored for -coin=tari. auxid is the aux-chain identifier a merge-mining proxy's own submit_block response tags that chain's aux_chain_data entry with (see internal/leaflib/solo.AuxChainResult's doc comment; Tari's own real minotari_merge_mining_proxy convention, confirmed live, is \"xtr\"). Empty (default) disables merge-mine-chain checking entirely -- this leaf then behaves exactly as it did before this feature existed. Example: 'TARI:xtr'. A future deployment could configure more than one entry (comma-separated) without a code change. Env: LEAF_DIRECT_MERGE_MINE_CHAINS")
 	flag.BoolVar(&cfg.trustEnabled, "trust-enabled", envOr("LEAF_DIRECT_TRUST_ENABLED", "false") == "true", "enable the real, legacy-ported probabilistic RandomX-validation-skip mechanism for RXT/RXM shares (see internal/leaflib/solo/trust.go) -- mirrors leaf-solo's identical flag exactly. Disabled by default. REAL-MONEY RISK (DISPATCH_BRIEF.md, 2026-09-10): unlike leaf-solo (no share table/backend/payouts, and this mechanism has since been removed there entirely), a leaf-direct share that skips validation here still reaches the real backend's payout accounting on the miner's own claimed value, with no cryptographic re-check by this leaf -- see internal/leaflib/direct.Server.EnableTrust's doc comment for the full risk framing. A deliberate trust-for-throughput tradeoff, not a free feature. Env: LEAF_DIRECT_TRUST_ENABLED (\"true\" to enable)")
 	flag.IntVar(&cfg.trustThreshold, "trust-threshold", envOrInt("LEAF_DIRECT_TRUST_THRESHOLD", 0), "real trust-ramp threshold gate -- 0/unset uses the documented default (10). Env: LEAF_DIRECT_TRUST_THRESHOLD")
 	flag.IntVar(&cfg.trustPenalty, "trust-penalty", envOrInt("LEAF_DIRECT_TRUST_PENALTY", 0), "real trust-ramp penalty gate, re-armed after any rejected share -- 0/unset uses the documented default (30). Env: LEAF_DIRECT_TRUST_PENALTY")
@@ -340,6 +342,7 @@ type fileConfig struct {
 	Network         *string `toml:"network"`
 	Coin            *string `toml:"coin"`
 	MonerodURL      *string `toml:"monerod_url"`
+	MergeMineChains *string `toml:"merge_mine_chains"`
 
 	TrustEnabled   *bool `toml:"trust_enabled"`
 	TrustThreshold *int  `toml:"trust_threshold"`
@@ -425,6 +428,7 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "LEAF_DIRECT_NETWORK")
 	cfgfile.ApplyString(&cfg.coin, fc.Coin, visited, "coin", "LEAF_DIRECT_COIN")
 	cfgfile.ApplyString(&cfg.monerodURL, fc.MonerodURL, visited, "monerod-url", "LEAF_DIRECT_MONEROD_URL")
+	cfgfile.ApplyString(&cfg.mergeMineChains, fc.MergeMineChains, visited, "merge-mine-chains", "LEAF_DIRECT_MERGE_MINE_CHAINS")
 
 	cfgfile.ApplyBool(&cfg.trustEnabled, fc.TrustEnabled, visited, "trust-enabled", "LEAF_DIRECT_TRUST_ENABLED")
 	cfgfile.ApplyInt(&cfg.trustThreshold, fc.TrustThreshold, visited, "trust-threshold", "LEAF_DIRECT_TRUST_THRESHOLD")
@@ -640,6 +644,43 @@ func algoFromString(s string) poolpb.Algo {
 // that function's doc comment.
 func isMoneroCoin(coin string) bool {
 	return strings.EqualFold(strings.TrimSpace(coin), "monero")
+}
+
+// parseMergeMineChains parses -merge-mine-chains/LEAF_DIRECT_MERGE_MINE_CHAINS
+// ("NAME:auxid,NAME2:auxid2", e.g. "TARI:xtr") into
+// direct.ServerConfig.MergeMineChains. An empty/whitespace-only raw
+// string (the default) returns nil -- no merge-mine-chain checking at
+// all, exactly the pre-existing behavior. A malformed entry (missing
+// ':', or an empty name/auxid on either side of it) is logged and
+// skipped rather than aborting startup -- a genuinely misconfigured
+// merge-mine-chains flag should not take down an otherwise-working
+// leaf-direct process; the primary (Monero) leg still works fine
+// with zero configured merge-mine chains.
+func parseMergeMineChains(raw string, logger *log.Logger) []direct.MergeMineChainConfig {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []direct.MergeMineChainConfig
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) != 2 {
+			logger.Printf("warning: -merge-mine-chains entry %q is not NAME:auxid, skipping", entry)
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		auxID := strings.TrimSpace(parts[1])
+		if name == "" || auxID == "" {
+			logger.Printf("warning: -merge-mine-chains entry %q has an empty name or auxid, skipping", entry)
+			continue
+		}
+		out = append(out, direct.MergeMineChainConfig{Name: name, AuxChainID: auxID})
+	}
+	return out
 }
 
 // resolveAlgo mirrors leaf-solo's own resolveAlgo exactly: for
@@ -992,8 +1033,9 @@ func main() {
 		Network: networkFromString(cfg.network), Logger: logger, Vardiff: vardiffCfg,
 		Transport: backendTransport, MultiSubmit: multiSubmit, Relay: blockRelay,
 		Algo: resolveAlgo(cfg), PoolType: poolType, PoolID: int32(cfg.poolID),
-		Debug:      debugLogger,
-		MonerodURL: moneroHeaderURL,
+		Debug:           debugLogger,
+		MonerodURL:      moneroHeaderURL,
+		MergeMineChains: parseMergeMineChains(cfg.mergeMineChains, logger),
 	})
 	defer server.Shutdown()
 

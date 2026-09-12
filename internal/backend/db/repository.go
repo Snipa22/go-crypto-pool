@@ -47,6 +47,13 @@ type Block struct {
 	Valid      bool
 	Value      *int64
 	PoolID     int32
+
+	// MergeMineChain mirrors internal/proto.Block.merge_mine_chain
+	// (see that field's doc comment) -- nil means this row is the
+	// primary/Monero leg of an ALGO_RXM find; a non-nil value (e.g.
+	// "TARI") names the secondary merge-mined chain leg. Always nil
+	// for every non-RXM algo.
+	MergeMineChain *string
 }
 
 // Repository provides minimal read/write access to the core schema. It is
@@ -182,13 +189,13 @@ func (r *Repository) InsertBlock(ctx context.Context, b Block) error {
 	const stmt = `
 		INSERT INTO blocks (
 			algo, network, pool_type, hash, height, difficulty, shares,
-			block_timestamp, unlocked, valid, value, pool_id
+			block_timestamp, unlocked, valid, value, pool_id, merge_mine_chain
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
 		)`
 	_, err := r.pool.Exec(ctx, stmt,
 		b.Algo, b.Network, b.PoolType, b.Hash, b.Height, b.Difficulty, b.Shares,
-		b.Timestamp, b.Unlocked, b.Valid, b.Value, b.PoolID,
+		b.Timestamp, b.Unlocked, b.Valid, b.Value, b.PoolID, b.MergeMineChain,
 	)
 	if err != nil {
 		return fmt.Errorf("db: inserting block: %w", err)
@@ -224,6 +231,13 @@ type PendingBlock struct {
 	// saw the block, not on whatever clock-skewed timestamp a leaf
 	// happened to attach to it.
 	InsertedAt time.Time
+
+	// MergeMineChain mirrors Block.MergeMineChain (see that field's
+	// doc comment) -- nil for the primary/Monero leg, non-nil (e.g.
+	// "TARI") for a secondary merge-mined chain leg. The unlocker
+	// (internal/backend/unlocker) uses this to route each pending
+	// block row to the correct ChainVerifier.
+	MergeMineChain *string
 }
 
 // PendingBlocks returns every blocks row with valid = TRUE AND
@@ -238,7 +252,7 @@ func (r *Repository) PendingBlocks(ctx context.Context, algo string) ([]PendingB
 	}
 
 	const stmt = `
-		SELECT id, algo, network, pool_type, hash, height, difficulty, value, inserted_at
+		SELECT id, algo, network, pool_type, hash, height, difficulty, value, inserted_at, merge_mine_chain
 		FROM blocks
 		WHERE algo = $1 AND valid = TRUE AND unlocked = FALSE
 		ORDER BY id ASC`
@@ -251,7 +265,7 @@ func (r *Repository) PendingBlocks(ctx context.Context, algo string) ([]PendingB
 	var out []PendingBlock
 	for rows.Next() {
 		var pb PendingBlock
-		if err := rows.Scan(&pb.ID, &pb.Algo, &pb.Network, &pb.PoolType, &pb.Hash, &pb.Height, &pb.Difficulty, &pb.Value, &pb.InsertedAt); err != nil {
+		if err := rows.Scan(&pb.ID, &pb.Algo, &pb.Network, &pb.PoolType, &pb.Hash, &pb.Height, &pb.Difficulty, &pb.Value, &pb.InsertedAt, &pb.MergeMineChain); err != nil {
 			return nil, fmt.Errorf("db: scanning pending block row: %w", err)
 		}
 		out = append(out, pb)
