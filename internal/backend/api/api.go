@@ -17,10 +17,20 @@
 //   - Optional shared-secret auth header: if the server is configured
 //     with an auth header name+value, requests missing that header (or
 //     presenting the wrong value) are rejected with 401 before any
-//     decode/DB work happens. If no auth is configured (both name and
-//     value empty), no auth check is performed at all — this mirrors the
-//     transport's "both empty means no auth header sent" v1 story
-//     symmetrically on the server side.
+//     decode/DB work happens, and counted on shares_total/blocks_total
+//     with result="unauthorized" (see internal/backend/metrics.
+//     ResultUnauthorized) — a real, queryable/alertable count of
+//     rejected-for-auth ingestion attempts, distinct from every other
+//     rejection reason (malformed body, failed validation, network
+//     mismatch — all result="rejected"). If no auth is configured
+//     (both name and value empty), no auth check is performed at all —
+//     this mirrors the transport's "both empty means no auth header
+//     sent" v1 story symmetrically on the server side. cmd/backend's
+//     own startup wiring refuses to even start with both empty unless
+//     an explicit, loudly-logged override is passed — see that
+//     command's validateIngestionAuthConfig — so this "no auth
+//     configured" state is a deliberate local/dev-only escape hatch at
+//     this package's level, not this repo's production default.
 package api
 
 import (
@@ -220,7 +230,7 @@ func (h *Handler) checkAuth(r *http.Request) bool {
 
 func (h *Handler) handleShare(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAuth(r) {
-		h.m.SharesTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRejected).Inc()
+		h.m.SharesTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultUnauthorized).Inc()
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -274,7 +284,7 @@ func (h *Handler) handleShare(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleBlock(w http.ResponseWriter, r *http.Request) {
 	if !h.checkAuth(r) {
-		h.m.BlocksTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRejected).Inc()
+		h.m.BlocksTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultUnauthorized).Inc()
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}

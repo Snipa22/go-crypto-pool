@@ -19,12 +19,27 @@ listen_addr = ":8080"
 
 # Shared-secret auth header name to require on /api/v1/share and
 # /api/v1/block, e.g. "Authorization". Must be set together with
-# auth_header_value, or not at all -- both empty means no auth check is
-# performed. (default: "")
+# auth_header_value.
+#
+# REQUIRED unless insecure_allow_unauthenticated_ingestion below is set --
+# run() refuses to start with this and auth_header_value both empty
+# otherwise. POST /api/v1/share and /api/v1/block are the leaf-to-backend
+# trust boundary carrying real payout-triggering data; leaving them
+# unauthenticated by default would let anyone with network reach to this
+# backend submit fabricated shares/blocks and get paid real coin.
+# (default: "" -- but see above, empty is only accepted with the override)
 auth_header_name = ""
 
-# Expected value for auth_header_name above. (default: "")
+# Expected value for auth_header_name above. REQUIRED alongside it (see
+# above). (default: "")
 auth_header_value = ""
+
+# LOCAL/DEV USE ONLY. Explicit, loudly-logged override that allows this
+# command to start with auth_header_name/auth_header_value both empty,
+# leaving /api/v1/share and /api/v1/block completely unauthenticated.
+# Disabled by default -- with nothing set at all, run() refuses to start
+# rather than silently accepting every share/block. (default: false)
+insecure_allow_unauthenticated_ingestion = false
 
 # (required) the network this backend is configured for. Accepts "mainnet" or
 # "testnet" (case-insensitive). No default -- startup fails fast if this is
