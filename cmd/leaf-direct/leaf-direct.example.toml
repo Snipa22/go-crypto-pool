@@ -257,3 +257,10 @@ legacy_pool_type = ""
 # ignored otherwise. (default: 0)
 legacy_pool_id = 0
 
+# Enable verbose [DEBUG]-tagged logging: share submit params, validation
+# attempt/result, backend HTTP forward attempts (URL/status/response
+# summary), job/template lifecycle, connection lifecycle, and vardiff
+# retarget events. OFF by default -- purely additive, never changes any
+# existing log line. (default: false)
+debug = false
+

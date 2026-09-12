@@ -117,6 +117,17 @@ type Server struct {
 	// Always non-nil (constructed in NewServer); SHA3X/C29 validation is
 	// entirely unaffected and never touches this pool.
 	randomxPool *AsyncValidationPool
+
+	// debugLogger is nil unless SetDebugLogger has been called (see
+	// cmd/leaf-solo/main.go) -- the real, opt-in -debug/LEAF_SOLO_DEBUG
+	// verbose logging sink (internal/leaflib/debuglog.go). Every
+	// Session created by this Server reads it through its own
+	// server back-reference (session.go's s.server.debugLogger), so
+	// there is exactly one DebugLogger per Server instance, never a
+	// global/package-level singleton. nil is a complete no-op:
+	// *leaflib.DebugLogger's own Debugf/Enabled methods are safe to
+	// call on a nil receiver.
+	debugLogger *leaflib.DebugLogger
 }
 
 // NewServer constructs a Server. cm must already be configured with the
@@ -239,6 +250,18 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 // connections; StatsHTMLHandler reads it fresh on every request.
 func (s *Server) SetHideRemoteAddress(hide bool) {
 	s.hideRemoteAddress = hide
+}
+
+// SetDebugLogger opts this Server (and every Session it creates) into
+// verbose [DEBUG]-tagged logging -- see internal/leaflib/debuglog.go's
+// doc comment and cmd/leaf-solo/main.go's -debug/LEAF_SOLO_DEBUG
+// wiring. Passing a nil or disabled *leaflib.DebugLogger (or never
+// calling this at all) is a complete no-op -- every debug call site
+// this Server/Session touches is safe to call on a nil DebugLogger.
+// Must be called before Serve begins accepting connections, mirroring
+// every other opt-in Set*/Enable* method's convention on this type.
+func (s *Server) SetDebugLogger(d *leaflib.DebugLogger) {
+	s.debugLogger = d
 }
 
 // EnableAddressFlags opts this server into the real, manual ban/
@@ -418,10 +441,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficul
 	s.sessions[mc.ID()] = session
 	s.mu.Unlock()
 
+	s.debugLogger.Debugf("solo: connection accepted: session=%s remote=%s starting_difficulty=%d", session.sessionID, conn.RemoteAddr(), startingDifficulty)
+
 	defer func() {
 		s.mu.Lock()
 		delete(s.sessions, mc.ID())
 		s.mu.Unlock()
+		s.debugLogger.Debugf("solo: connection closed: session=%s remote=%s", session.sessionID, conn.RemoteAddr())
 		_ = mc.Close("session ended")
 	}()
 

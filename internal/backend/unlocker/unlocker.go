@@ -22,6 +22,7 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/chain"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
 
 // Block is the minimal shape the Unlocker needs for one pending block
@@ -143,6 +144,16 @@ type Config struct {
 	// serves on GET /metrics, so unlocker/payout metrics show up on
 	// that one process-wide endpoint rather than a second one.
 	Metrics *metrics.Metrics
+
+	// Debug, if non-nil and enabled, adds verbose [DEBUG]-tagged
+	// logging to every RunOnce poll pass -- what was checked (algo,
+	// pending count) and what changed (per-block outcome), on top
+	// of Logf's existing per-notable-event lines. See
+	// internal/leaflib/debuglog.go's doc comment and
+	// cmd/backend/main.go's -debug/GCPOOL_DEBUG wiring. nil (the
+	// default for every pre-existing caller/test) is a complete
+	// no-op.
+	Debug *leaflib.DebugLogger
 }
 
 // Unlocker runs Config's poll loop against a Repository.
@@ -193,6 +204,7 @@ func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 			total.Errors++
 			continue
 		}
+		u.cfg.Debug.Debugf("unlocker: %s: poll pass checking %d pending block(s) (maturity depth %d)", algo, len(pending), coinCfg.MaturityDepth)
 		for _, b := range pending {
 			total.Checked++
 			switch outcome, err := u.checkBlock(ctx, b, coinCfg); {
@@ -210,6 +222,7 @@ func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 				u.observeOutcome(algo, metrics.UnlockerOutcomeOrphaned)
 			default:
 				total.Pending++
+				u.cfg.Debug.Debugf("unlocker: %s: block id=%d height=%d hash=%s: still pending, no change", algo, b.ID, b.Height, b.Hash)
 			}
 		}
 		if u.cfg.Metrics != nil {

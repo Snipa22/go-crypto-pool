@@ -191,3 +191,9 @@ template_relay_subject = ""
 # Empty (default) disables this entirely -- a complete no-op. Ignored for
 # coin=tari. (default: "")
 monero_zmq_url = ""
+
+# Enable verbose [DEBUG]-tagged logging: share submit params, validation
+# attempt/result, job/template lifecycle, connection lifecycle, and vardiff
+# retarget events. OFF by default -- purely additive, never changes any
+# existing log line. (default: false)
+debug = false

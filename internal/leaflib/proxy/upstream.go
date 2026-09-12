@@ -53,6 +53,12 @@ type UpstreamClient struct {
 	cfg    UpstreamConfig
 	logger *log.Logger
 
+	// debug is nil unless SetDebugLogger has been called (see
+	// cmd/leaf-proxy/main.go's -debug/LEAF_PROXY_DEBUG wiring) --
+	// the real, opt-in verbose logging sink (internal/leaflib/
+	// debuglog.go). nil is a complete no-op.
+	debug *leaflib.DebugLogger
+
 	// cm is a dedicated ConnectionManager used purely to get this
 	// single upstream socket the SAME lifecycle guarantees leaf-solo's
 	// downstream connections already get (single writer goroutine, a
@@ -279,6 +285,15 @@ func NewUpstreamClient(cfg UpstreamConfig, logger *log.Logger) *UpstreamClient {
 		subs:    make(map[uint64]func(*WorkerTemplate)),
 		closed:  make(chan struct{}),
 	}
+}
+
+// SetDebugLogger opts this UpstreamClient into verbose [DEBUG]-tagged
+// logging for upstream template/job lifecycle events -- see
+// internal/leaflib/debuglog.go's doc comment and
+// cmd/leaf-proxy/main.go's -debug/LEAF_PROXY_DEBUG wiring. Must be
+// called before Connect. nil/disabled is a complete no-op.
+func (uc *UpstreamClient) SetDebugLogger(d *leaflib.DebugLogger) {
+	uc.debug = d
 }
 
 // Connect dials the real upstream pool, performs the real login, and
@@ -1107,6 +1122,7 @@ func (uc *UpstreamClient) applyJob(job UpstreamJobPayload) {
 		Generation: uc.generation.Add(1),
 	}
 	uc.template.Store(t)
+	uc.debug.Debugf("proxy: upstream template applied: job_id=%s height=%d target_diff=%d generation=%d", t.JobID, t.Height, t.TargetDiff, t.Generation)
 	uc.notify(t)
 }
 

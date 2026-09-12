@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 	"google.golang.org/protobuf/proto"
 )
@@ -60,6 +61,15 @@ type HTTPProtobufTransportConfig struct {
 	// connection pooling tuning or test doubles). If nil, a client with
 	// a conservative default Timeout is constructed.
 	HTTPClient *http.Client
+
+	// Debug, if non-nil and enabled, logs every backend HTTP forward
+	// attempt (share/block POST) with the target URL, resulting
+	// status code (or the transport error), and a bounded response
+	// body summary -- see internal/leaflib/debuglog.go's doc comment
+	// and cmd/leaf-direct/main.go's -debug/LEAF_DIRECT_DEBUG wiring.
+	// nil (the default for every pre-existing caller/test) is a
+	// complete no-op.
+	Debug *leaflib.DebugLogger
 }
 
 // HTTPProtobufTransport is the v1 ShareTransport implementation: it
@@ -77,6 +87,7 @@ type HTTPProtobufTransport struct {
 	shareTimeout    time.Duration
 	blockTimeout    time.Duration
 	client          *http.Client
+	debug           *leaflib.DebugLogger
 }
 
 // NewHTTPProtobufTransport constructs an HTTPProtobufTransport from cfg.
@@ -127,6 +138,7 @@ func NewHTTPProtobufTransport(cfg HTTPProtobufTransportConfig) (*HTTPProtobufTra
 		shareTimeout:    shareTimeout,
 		blockTimeout:    blockTimeout,
 		client:          client,
+		debug:           cfg.Debug,
 	}, nil
 }
 
@@ -169,6 +181,7 @@ func (t *HTTPProtobufTransport) post(ctx context.Context, url string, msg proto.
 
 	resp, err := t.client.Do(req)
 	if err != nil {
+		t.debug.Debugf("transport: forward attempt: %s POST %s: request error: %v", kind, url, err)
 		return fmt.Errorf("transport: submit %s: %w", kind, err)
 	}
 	defer func() {
@@ -178,9 +191,11 @@ func (t *HTTPProtobufTransport) post(ctx context.Context, url string, msg proto.
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		t.debug.Debugf("transport: forward attempt: %s POST %s: status=%d response=%q", kind, url, resp.StatusCode, string(body))
 		return fmt.Errorf("transport: submit %s: backend returned status %d: %s", kind, resp.StatusCode, string(body))
 	}
 
+	t.debug.Debugf("transport: forward attempt: %s POST %s: status=%d (success)", kind, url, resp.StatusCode)
 	return nil
 }
 

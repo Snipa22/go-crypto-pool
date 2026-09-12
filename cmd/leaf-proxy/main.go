@@ -142,6 +142,12 @@ type config struct {
 	// leaf-proxy.example.toml and internal/leaflib/cfgfile for the
 	// exact precedence rule (flag > env > file > hardcoded default).
 	configFile string
+
+	// debug is -debug/LEAF_PROXY_DEBUG: enables the shared
+	// leaflib.DebugLogger (internal/leaflib/debuglog.go) for this
+	// process. OFF (false) by default -- purely additive, byte-
+	// identical existing log output when left off.
+	debug bool
 }
 
 func loadConfig() (config, error) {
@@ -220,6 +226,8 @@ func loadConfig() (config, error) {
 
 	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_PROXY_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-proxy.example.toml. Env: LEAF_PROXY_CONFIG_FILE")
 
+	flag.BoolVar(&cfg.debug, "debug", envOrBool("LEAF_PROXY_DEBUG", false), "enable verbose [DEBUG]-tagged logging (downstream submit params, validation attempt/result, upstream forward attempts/responses, template lifecycle, connection lifecycle, vardiff retargets). OFF by default -- purely additive, never changes any existing log line. Env: LEAF_PROXY_DEBUG")
+
 	flag.Parse()
 
 	if err := applyConfigFile(&cfg); err != nil {
@@ -273,6 +281,8 @@ type fileConfig struct {
 
 	AddressFlagsFile                *string `toml:"address_flags_file"`
 	AddressFlagsPollIntervalSeconds *int    `toml:"address_flags_poll_interval_seconds"`
+
+	Debug *bool `toml:"debug"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -347,6 +357,8 @@ func applyConfigFile(cfg *config) error {
 		cfgfile.ApplyDuration(&cfg.addressFlagsPollInterval, &d, visited, "address-flags-poll-interval", "LEAF_PROXY_ADDRESS_FLAGS_POLL_INTERVAL")
 	}
 
+	cfgfile.ApplyBool(&cfg.debug, fc.Debug, visited, "debug", "LEAF_PROXY_DEBUG")
+
 	return nil
 }
 
@@ -400,6 +412,16 @@ func main() {
 	}
 	logger := log.New(os.Stdout, "leaf-proxy: ", log.LstdFlags|log.Lmicroseconds)
 
+	// debugLogger is constructed exactly once per process (never a
+	// global/package-level singleton -- see
+	// internal/leaflib/debuglog.go's doc comment) and threaded down
+	// via Server.SetDebugLogger and UpstreamClient.SetDebugLogger
+	// below.
+	debugLogger := leaflib.NewDebugLogger(logger, cfg.debug)
+	if cfg.debug {
+		logger.Print("debug logging ENABLED (-debug/LEAF_PROXY_DEBUG) -- verbose [DEBUG]-tagged output follows for downstream submits, validation, upstream forwarding, template lifecycle, connection lifecycle, and vardiff retargets")
+	}
+
 	if cfg.upstreamLogin == "" {
 		logger.Fatal("LEAF_PROXY_UPSTREAM_LOGIN (or -upstream-login) is required: a real XMR payout address to log in to the upstream pool with")
 	}
@@ -420,6 +442,7 @@ func main() {
 		IdleTimeout:           cfg.idleTimeout,
 		RequestTimeout:        cfg.requestTimeout,
 	}, logger)
+	upstream.SetDebugLogger(debugLogger)
 
 	if err := upstream.Connect(ctx); err != nil {
 		logger.Fatalf("failed to connect/login to upstream pool: %v", err)
@@ -462,6 +485,8 @@ func main() {
 
 	server := proxy.NewServer(cm, jobManager, rxValidator, upstream, logger, vardiffCfg, cfg.jobMaxAge)
 	defer server.Shutdown()
+
+	server.SetDebugLogger(debugLogger)
 
 	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2a): worker
 	// count is runtime.NumCPU() by DEFAULT (proxy.NewServer's own

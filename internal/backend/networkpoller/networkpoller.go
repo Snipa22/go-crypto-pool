@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
 
 // State is one real, live chain-state snapshot a Source has fetched
@@ -130,6 +132,15 @@ type Config struct {
 
 	// Metrics, if non-nil, is reported to once per Target per pass.
 	Metrics Metrics
+
+	// Debug, if non-nil and enabled, adds verbose [DEBUG]-tagged
+	// logging to every RunOnce pass -- what was checked (target,
+	// fetched state) and what changed (upsert outcome) -- see
+	// internal/leaflib/debuglog.go's doc comment and
+	// cmd/backend/main.go's -debug/GCPOOL_DEBUG wiring. nil (the
+	// default for every pre-existing caller/test) is a complete
+	// no-op.
+	Debug *leaflib.DebugLogger
 }
 
 // Poller runs Config's poll loop against a Repository.
@@ -190,6 +201,7 @@ func (p *Poller) RunOnce(ctx context.Context) PassResult {
 			p.logf("networkpoller: %s/%s: recording real network state: %v", t.Algo, t.Network, err)
 		} else {
 			total.Fetched++
+			p.cfg.Debug.Debugf("networkpoller: %s/%s: fetched height=%d best_block_hash=%s, recorded successfully", t.Algo, t.Network, state.Height, state.BestBlockHash)
 		}
 
 		if p.cfg.Metrics != nil {

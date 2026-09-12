@@ -148,6 +148,14 @@ type Server struct {
 	// Defaults to leaflib.DefaultInvalidShareGuardConfig() (enabled)
 	// in NewServer; overridable via SetInvalidShareGuardConfig.
 	invalidShareGuardConfig leaflib.InvalidShareGuardConfig
+
+	// debugLogger is nil unless SetDebugLogger has been called (see
+	// cmd/leaf-proxy/main.go's -debug/LEAF_PROXY_DEBUG wiring) --
+	// the real, opt-in verbose logging sink (internal/leaflib/
+	// debuglog.go). Every Session created by this Server reads it
+	// through its own server back-reference. nil is a complete
+	// no-op.
+	debugLogger *leaflib.DebugLogger
 }
 
 // NewServer constructs a Server. cm must already be configured with
@@ -226,6 +234,14 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 // identical method exactly — see that doc comment.
 func (s *Server) SetHideRemoteAddress(hide bool) {
 	s.hideRemoteAddress = hide
+}
+
+// SetDebugLogger opts this Server (and every Session it creates) into
+// verbose [DEBUG]-tagged logging -- mirrors solo.Server.SetDebugLogger
+// exactly (see that method's doc comment). nil/disabled is a complete
+// no-op.
+func (s *Server) SetDebugLogger(d *leaflib.DebugLogger) {
+	s.debugLogger = d
 }
 
 // SetRandomXWorkerPoolSize mirrors solo.Server's own identical
@@ -475,10 +491,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficul
 	s.sessions[mc.ID()] = session
 	s.mu.Unlock()
 
+	s.debugLogger.Debugf("proxy: connection accepted: session=%s remote=%s starting_difficulty=%d", session.sessionID, conn.RemoteAddr(), startingDifficulty)
+
 	defer func() {
 		s.mu.Lock()
 		delete(s.sessions, mc.ID())
 		s.mu.Unlock()
+		s.debugLogger.Debugf("proxy: connection closed: session=%s remote=%s", session.sessionID, conn.RemoteAddr())
 		_ = mc.Close("session ended")
 	}()
 

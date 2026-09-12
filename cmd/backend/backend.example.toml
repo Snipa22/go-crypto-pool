@@ -164,3 +164,11 @@ wallet_stats_poll_interval_seconds = 60
 # file on disk. Left commented out here for that reason -- uncomment only
 # if you understand the tradeoff.
 # jwt_secret = ""
+
+# Enable verbose [DEBUG]-tagged logging for the block unlocker/
+# disbursement engines/network-state poller's poll-cycle detail (what was
+# checked, what changed -- e.g. maturity check results, payout batch
+# decisions, network tip state). OFF by default -- purely additive, never
+# changes any existing log line. (default: false)
+debug = false
+

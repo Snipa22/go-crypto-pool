@@ -363,6 +363,14 @@ type JobManagerConfig struct {
 	Relay *relay.Relay
 
 	Logger *log.Logger
+
+	// Debug, if non-nil and enabled, adds verbose [DEBUG]-tagged
+	// logging for this JobManager's own template-fetch/tip-poll/
+	// invalidation lifecycle (see jobForXN/tipPollLoop/InvalidateAll)
+	// -- see internal/leaflib/debuglog.go's doc comment. nil (the
+	// default for every pre-existing caller/test) is a complete
+	// no-op: Debugf is safe to call on a nil *leaflib.DebugLogger.
+	Debug *leaflib.DebugLogger
 }
 
 // JobManager maintains a per-xn cache of independently-generated block
@@ -485,8 +493,10 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 		return job, nil
 	}
 
+	jm.cfg.Debug.Debugf("solo: fetching block template for xn=%s at difficulty=%d", xn, difficulty)
 	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress, jm.cfg.Algo)
 	if err != nil {
+		jm.cfg.Debug.Debugf("solo: GetBlockTemplate for xn=%s failed: %v", xn, err)
 		return nil, fmt.Errorf("solo: GetBlockTemplate for xn %s: %w", xn, err)
 	}
 	if result == nil {
@@ -502,6 +512,8 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 	jm.perXN[xn] = job
 	jm.jobsByID[job.ID] = job
 	jm.mu.Unlock()
+
+	jm.cfg.Debug.Debugf("solo: job created xn=%s job_id=%s height=%d static_difficulty=%d network_target_difficulty=%d", xn, job.ID, job.Height, job.StaticDifficulty, job.NetworkTargetDifficulty)
 
 	return job, nil
 }
@@ -617,6 +629,7 @@ func (jm *JobManager) InvalidateAll() {
 	jm.perXN = make(map[string]*Job)
 	jm.jobsByID = make(map[string]*Job)
 	jm.mu.Unlock()
+	jm.cfg.Debug.Debugf("solo: per-xn job cache invalidated (all cached jobs dropped)")
 	jm.notify()
 }
 
@@ -735,6 +748,7 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 			last := jm.lastTipHeight
 			observed := jm.tipObserved
 			jm.mu.RUnlock()
+			jm.cfg.Debug.Debugf("solo: tip poll: observed height=%d last known height=%d (baseline seeded=%v)", height, last, observed)
 			if !observed {
 				// First successful tip observation: just seed the
 				// baseline, don't treat it as "movement" (there is

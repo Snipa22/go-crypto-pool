@@ -172,6 +172,14 @@ type Server struct {
 	// hand-rolling a second bounded-queue-plus-fixed-workers type for
 	// what is structurally the identical shape.
 	forwardPool *solo.AsyncValidationPool
+
+	// debugLogger is nil unless ServerConfig.Debug was set (see
+	// cmd/leaf-direct/main.go's -debug/LEAF_DIRECT_DEBUG wiring) --
+	// the real, opt-in verbose logging sink (internal/leaflib/
+	// debuglog.go). Every Session created by this Server reads it
+	// through its own server back-reference (session.go's
+	// s.server.debugLogger). nil is a complete no-op.
+	debugLogger *leaflib.DebugLogger
 }
 
 // defaultForwardPoolWorkers/defaultForwardPoolQueueSize size Fix 12's
@@ -268,6 +276,14 @@ type ServerConfig struct {
 	// unconditionally. Set at startup from cmd/leaf-direct's own
 	// -pool-id/LEAF_DIRECT_POOL_ID flag.
 	PoolID int32
+
+	// Debug, if non-nil and enabled, opts this Server (and every
+	// Session it creates) into verbose [DEBUG]-tagged logging -- see
+	// internal/leaflib/debuglog.go's doc comment and
+	// cmd/leaf-direct/main.go's -debug/LEAF_DIRECT_DEBUG wiring. nil
+	// (the default for every pre-existing caller/test) is a complete
+	// no-op.
+	Debug *leaflib.DebugLogger
 }
 
 // NewServer constructs a Server.
@@ -299,6 +315,7 @@ func NewServer(cfg ServerConfig) *Server {
 		// doc comment and defaultForwardPoolWorkers' doc comment for
 		// the full rationale/sizing.
 		forwardPool: solo.NewAsyncValidationPool(defaultForwardPoolWorkers, solo.AsyncValidationQueueSize),
+		debugLogger: cfg.Debug,
 	}
 	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {
@@ -571,10 +588,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficul
 	s.sessions[mc.ID()] = session
 	s.mu.Unlock()
 
+	s.debugLogger.Debugf("direct: connection accepted: session=%s remote=%s starting_difficulty=%d", session.sessionID, conn.RemoteAddr(), startingDifficulty)
+
 	defer func() {
 		s.mu.Lock()
 		delete(s.sessions, mc.ID())
 		s.mu.Unlock()
+		s.debugLogger.Debugf("direct: connection closed: session=%s remote=%s", session.sessionID, conn.RemoteAddr())
 		_ = mc.Close("session ended")
 	}()
 

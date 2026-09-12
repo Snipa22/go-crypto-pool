@@ -240,6 +240,13 @@ type config struct {
 	// leaf-direct.example.toml and internal/leaflib/cfgfile for the
 	// exact precedence rule (flag > env > file > hardcoded default).
 	configFile string
+
+	// debug is -debug/LEAF_DIRECT_DEBUG: enables the shared
+	// leaflib.DebugLogger (internal/leaflib/debuglog.go) for this
+	// process. OFF (false) by default -- purely additive, byte-
+	// identical existing log output when left off. Wired into
+	// direct.ServerConfig.Debug below.
+	debug bool
 }
 
 func loadConfig() (config, error) {
@@ -308,6 +315,8 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.moneroZMQURL, "monero-zmq-url", envOr("LEAF_DIRECT_MONERO_ZMQ_URL", ""), "real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL, faster block-invalidation trigger on top of the existing tip-poll baseline (see internal/leaflib/monero/zmq). Empty (default) disables this entirely -- a complete no-op. Ignored for -coin=tari. Env: LEAF_DIRECT_MONERO_ZMQ_URL")
 
 	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_DIRECT_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-direct.example.toml. Env: LEAF_DIRECT_CONFIG_FILE")
+
+	flag.BoolVar(&cfg.debug, "debug", envOr("LEAF_DIRECT_DEBUG", "false") == "true", "enable verbose [DEBUG]-tagged logging (share submit params, validation attempt/result, backend HTTP forward attempts, job lifecycle, connection lifecycle, vardiff retargets). OFF by default -- purely additive, never changes any existing log line. Env: LEAF_DIRECT_DEBUG (\"true\" to enable)")
 
 	flag.Parse()
 
@@ -391,6 +400,8 @@ type fileConfig struct {
 
 	TemplateRelaySubject *string `toml:"template_relay_subject"`
 	MoneroZMQURL         *string `toml:"monero_zmq_url"`
+
+	Debug *bool `toml:"debug"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -498,6 +509,8 @@ func applyConfigFile(cfg *config) error {
 
 	cfgfile.ApplyString(&cfg.templateRelaySubject, fc.TemplateRelaySubject, visited, "template-relay-subject", "LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT")
 	cfgfile.ApplyString(&cfg.moneroZMQURL, fc.MoneroZMQURL, visited, "monero-zmq-url", "LEAF_DIRECT_MONERO_ZMQ_URL")
+
+	cfgfile.ApplyBool(&cfg.debug, fc.Debug, visited, "debug", "LEAF_DIRECT_DEBUG")
 
 	return nil
 }
@@ -745,6 +758,16 @@ func main() {
 	}
 	logger := log.New(os.Stdout, "leaf-direct: ", log.LstdFlags|log.Lmicroseconds)
 
+	// debugLogger is constructed exactly once per process (never a
+	// global/package-level singleton -- see
+	// internal/leaflib/debuglog.go's doc comment) and threaded down
+	// via direct.ServerConfig.Debug and the backend transport's own
+	// Debug field below.
+	debugLogger := leaflib.NewDebugLogger(logger, cfg.debug)
+	if cfg.debug {
+		logger.Print("debug logging ENABLED (-debug/LEAF_DIRECT_DEBUG) -- verbose [DEBUG]-tagged output follows for share submits, validation, backend forwarding, job lifecycle, connection lifecycle, and vardiff retargets")
+	}
+
 	if isMoneroCoin(cfg.coin) {
 		if strings.TrimSpace(cfg.monerodURL) == "" {
 			logger.Fatal("LEAF_DIRECT_MONEROD_URL (or -monerod-url) is required when -coin=monero")
@@ -860,7 +883,7 @@ func main() {
 		Node: node, PayoutAddress: cfg.payoutAddress, Algo: resolveAlgo(cfg),
 		StaticDifficulty: ports[0].Difficulty, RefreshInterval: cfg.refreshInterval,
 		TipPollInterval: cfg.tipPollInterval, JobMaxAge: cfg.jobMaxAge, Logger: logger,
-		Network: cfg.network, Relay: blockRelay,
+		Network: cfg.network, Relay: blockRelay, Debug: debugLogger,
 	})
 
 	logger.Println("probing base node connectivity...")
@@ -915,6 +938,7 @@ func main() {
 		httpTr, err := transport.NewHTTPProtobufTransport(transport.HTTPProtobufTransportConfig{
 			BaseURL: cfg.backendBaseURL, AuthHeaderName: cfg.backendAuthHeader, AuthHeaderValue: cfg.backendAuthValue,
 			ShareTimeout: cfg.backendShareTimeout, BlockTimeout: cfg.backendBlockTimeout,
+			Debug: debugLogger,
 		})
 		if err != nil {
 			logger.Fatalf("failed to construct backend transport: %v", err)
@@ -958,6 +982,7 @@ func main() {
 		Network: networkFromString(cfg.network), Logger: logger, Vardiff: vardiffCfg,
 		Transport: backendTransport, MultiSubmit: multiSubmit, Relay: blockRelay,
 		Algo: resolveAlgo(cfg), PoolType: poolType, PoolID: int32(cfg.poolID),
+		Debug: debugLogger,
 	})
 	defer server.Shutdown()
 

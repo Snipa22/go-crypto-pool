@@ -151,6 +151,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/statsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -250,6 +251,14 @@ type config struct {
 	// backend.example.toml and internal/leaflib/cfgfile for the
 	// exact precedence rule (flag > env > file > hardcoded default).
 	configFile string
+
+	// debug is -debug/GCPOOL_DEBUG: enables the shared
+	// leaflib.DebugLogger (internal/leaflib/debuglog.go) for this
+	// process. OFF (false) by default -- purely additive, byte-
+	// identical existing log output when left off. Wired into
+	// unlocker.Config.Debug/disburse.Config.Debug/
+	// networkpoller.Config.Debug below (see run()).
+	debug bool
 }
 
 // loadConfig registers one flag per config field (mirroring the
@@ -307,6 +316,8 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.jwtSecret, "jwt-secret", envOr("GCPOOL_JWT_SECRET", ""), "(required) HMAC-SHA256 signing secret for internal/backend/authapi's JWTs (also reused as its password-hashing key -- see that package's doc comment). Env: GCPOOL_JWT_SECRET")
 
 	flag.StringVar(&cfg.configFile, "config", envOr("BACKEND_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below not explicitly set via CLI flag or environment variable. See backend.example.toml. Env: BACKEND_CONFIG_FILE")
+
+	flag.BoolVar(&cfg.debug, "debug", envOr("GCPOOL_DEBUG", "false") == "true", "enable verbose [DEBUG]-tagged logging for the block unlocker/disbursement engines/network-state poller's poll-cycle detail (what was checked, what changed). OFF by default -- purely additive, never changes any existing log line. Env: GCPOOL_DEBUG (\"true\" to enable)")
 
 	flag.Parse()
 
@@ -367,6 +378,8 @@ type fileConfig struct {
 	WalletStatsPollIntervalSeconds *int `toml:"wallet_stats_poll_interval_seconds"`
 
 	JWTSecret *string `toml:"jwt_secret"`
+
+	Debug *bool `toml:"debug"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -441,6 +454,8 @@ func applyConfigFile(cfg *config) error {
 	}
 
 	cfgfile.ApplyString(&cfg.jwtSecret, fc.JWTSecret, visited, "jwt-secret", "GCPOOL_JWT_SECRET")
+
+	cfgfile.ApplyBool(&cfg.debug, fc.Debug, visited, "debug", "GCPOOL_DEBUG")
 
 	return nil
 }
@@ -1154,9 +1169,10 @@ var tariAlgos = []string{"RXT", "C29", "SHA3X"}
 // unlocker.Config plus whether any verifier was actually configured
 // (ok == false means the caller should not start the unlocker at all
 // — see run()).
-func buildUnlockerConfig(cfg config) (out unlocker.Config, ok bool, err error) {
+func buildUnlockerConfig(cfg config, debug *leaflib.DebugLogger) (out unlocker.Config, ok bool, err error) {
 	out.Coins = map[string]unlocker.CoinConfig{}
 	out.PollInterval = cfg.unlockerPollInterval
+	out.Debug = debug
 
 	if cfg.tariGRPCAddr != "" {
 		verifier := chain.NewTariVerifier(cfg.tariGRPCAddr)
@@ -1202,8 +1218,9 @@ func sortedKeys(m map[string]unlocker.CoinConfig) []string {
 // InitNodeGRPC call's worth of address should be live per process),
 // and run() below only calls this function after buildUnlockerConfig
 // has already run.
-func buildNetworkPollerConfig(cfg config, network poolpb.Network, m *metrics.Metrics) (out networkpoller.Config, ok bool, err error) {
+func buildNetworkPollerConfig(cfg config, network poolpb.Network, m *metrics.Metrics, debug *leaflib.DebugLogger) (out networkpoller.Config, ok bool, err error) {
 	out.PollInterval = cfg.networkPollerPollInterval
+	out.Debug = debug
 	out.Metrics = m
 
 	netStr := networkDBString(network)
@@ -1417,7 +1434,7 @@ const (
 //	                                  credited to pool revenue
 //	                                  (payouts.force_payout_fee_atomic).
 //	                                  Default 0 (no extra fee).
-func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
+func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics, debug *leaflib.DebugLogger) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
 	if cfg.moneroWalletRPCAddr == "" {
 		return nil, nil, 0, false, nil
 	}
@@ -1434,6 +1451,7 @@ func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (e
 		MinPayoutAtomic:         cfg.disburseMinPayoutAtomic,
 		ForcePayoutFeeAtomic:    cfg.forcePayoutFeeAtomic,
 		Metrics:                 m,
+		Debug:                   debug,
 	}
 
 	return disburse.New(disburseRepositoryAdapter{repo: repo}, dcfg), walletClient, cfg.disbursePollInterval, true, nil
@@ -1478,7 +1496,7 @@ func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (e
 //	                                  different minimum payout, poll
 //	                                  cadence, or force-payout fee per
 //	                                  coin.
-func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
+func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics, debug *leaflib.DebugLogger) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
 	if cfg.tariWalletGRPCAddr == "" {
 		return nil, nil, 0, false, nil
 	}
@@ -1498,6 +1516,7 @@ func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics
 		MinPayoutAtomic:         cfg.disburseMinPayoutAtomic,
 		ForcePayoutFeeAtomic:    cfg.forcePayoutFeeAtomic,
 		Metrics:                 m,
+		Debug:                   debug,
 	}
 
 	return disburse.New(disburseRepositoryAdapter{repo: repo}, dcfg), walletClient, cfg.disbursePollInterval, true, nil
@@ -1656,6 +1675,23 @@ func run(cfg config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// debugLogger is constructed exactly once per process (never a
+	// global/package-level singleton -- see
+	// internal/leaflib/debuglog.go's doc comment) and threaded down
+	// via unlocker.Config.Debug/networkpoller.Config.Debug/
+	// disburse.Config.Debug below. Wraps log.Default() -- the SAME
+	// underlying writer/flags every existing log.Printf/log.Print
+	// call in this file already uses (this command has no
+	// per-instance *log.Logger of its own, unlike the 3 leaf
+	// binaries -- see this file's own doc comment on why every
+	// existing call site uses the global log package), so
+	// [DEBUG]-tagged lines interleave naturally with the existing
+	// log stream.
+	debugLogger := leaflib.NewDebugLogger(log.Default(), cfg.debug)
+	if cfg.debug {
+		log.Print("backend: debug logging ENABLED (-debug/GCPOOL_DEBUG) -- verbose [DEBUG]-tagged poll-cycle output follows for the block unlocker/disbursement engines/network-state poller")
+	}
+
 	pool, err := db.Open(ctx, db.Config{DSN: cfg.dbDSN})
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
@@ -1781,7 +1817,7 @@ func run(cfg config) error {
 		MaturityDepth:          cfg.unlockerTariMaturity,
 	})
 
-	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig(cfg)
+	unlockerCfg, unlockerEnabled, err := buildUnlockerConfig(cfg, debugLogger)
 	if err != nil {
 		return fmt.Errorf("configuring block unlocker: %w", err)
 	}
@@ -1812,7 +1848,7 @@ func run(cfg config) error {
 	// above, since that call is what performs this process' one
 	// real nodeGRPC.InitNodeGRPC call for GCPOOL_TARI_GRPC_ADDR (see
 	// buildNetworkPollerConfig's own doc comment).
-	networkPollerCfg, networkPollerEnabled, err := buildNetworkPollerConfig(cfg, network, m)
+	networkPollerCfg, networkPollerEnabled, err := buildNetworkPollerConfig(cfg, network, m, debugLogger)
 	if err != nil {
 		return fmt.Errorf("configuring network-state poller: %w", err)
 	}
@@ -1837,7 +1873,7 @@ func run(cfg config) error {
 		log.Print("backend: share retention/cleanup disabled (no GCPOOL_RETENTION_BLOCKS or GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS set); shares accumulate forever until an operator configures a retention window")
 	}
 
-	disburseEngine, moneroWalletClient, disburseInterval, disburseEnabled, err := buildDisburseEngine(cfg, repo, m)
+	disburseEngine, moneroWalletClient, disburseInterval, disburseEnabled, err := buildDisburseEngine(cfg, repo, m, debugLogger)
 	if err != nil {
 		return fmt.Errorf("configuring payout disbursement engine: %w", err)
 	}
@@ -1849,7 +1885,7 @@ func run(cfg config) error {
 		log.Print("backend: payout disbursement engine disabled (GCPOOL_MONERO_WALLET_RPC_ADDR not set); pending_balance will still accrue, it just won't be auto-paid out on-chain")
 	}
 
-	tariDisburseEngine, tariWalletClient, tariDisburseInterval, tariDisburseEnabled, err := buildTariDisburseEngine(cfg, repo, m)
+	tariDisburseEngine, tariWalletClient, tariDisburseInterval, tariDisburseEnabled, err := buildTariDisburseEngine(cfg, repo, m, debugLogger)
 	if err != nil {
 		return fmt.Errorf("configuring Tari payout disbursement engine: %w", err)
 	}

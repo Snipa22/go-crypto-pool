@@ -139,3 +139,10 @@ address_flags_file = ""
 # unset, in seconds. (default: 30)
 address_flags_poll_interval_seconds = 30
 
+# Enable verbose [DEBUG]-tagged logging: downstream submit params,
+# validation attempt/result, upstream forward attempts/responses, upstream
+# template lifecycle, connection lifecycle, and vardiff retarget events. OFF
+# by default -- purely additive, never changes any existing log line.
+# (default: false)
+debug = false
+
