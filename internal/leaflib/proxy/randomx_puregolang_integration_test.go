@@ -36,6 +36,27 @@ import (
 // hash computation end-to-end through Session.handleSubmit. This is
 // slow (a real pure-Go RandomX hash is ~hundreds of ms) by design --
 // see PureGoRandomXValidator's own doc comment.
+//
+// Read deadline note: this is the ONLY test in this package that
+// exercises a real, non-mocked RandomX hash -- every other test uses
+// the instant fakeValidator, which is why testClient.recvRaw()'s
+// shared default read deadline is (and should stay) 5 seconds. That
+// 5s default is not enough headroom here: this test computes a real
+// RandomX hash TWICE (once directly in the test body above to build a
+// genuinely-correct claimed result, and once again for real inside
+// Session.handleSubmit's own async-dispatched ValidateBlobSeedResult
+// call when the submit below is processed), and on CI's slower/shared
+// -race runner that pushes wall-clock time for the submit round-trip
+// over the 5s ceiling. This was confirmed against real CI logs: this
+// test failed on every one of 7 consecutive recent CI runs with
+// "read response: read pipe: i/o timeout" at ~10s wall-clock (i.e. it
+// burned through two successive 5s reads before failing), while
+// passing reliably locally in ~4s. Rather than widen the shared 5s
+// default (which would mask genuine hangs/deadlocks in every other,
+// fast, fakeValidator-based test in this package), the two submit
+// round-trips below that must wait on a real RandomX validation use
+// recvShareResponseWithTimeout with a generous, still-bounded 30s
+// deadline instead.
 func TestSession_RealPureGoRandomXValidator_BlockLevelFind_ForwardedUpstream(t *testing.T) {
 	blob := fakeBlob(76, 50)
 	seedHash := []byte("test-seed-hash-32-bytes-exactly!")
@@ -103,7 +124,10 @@ func TestSession_RealPureGoRandomXValidator_BlockLevelFind_ForwardedUpstream(t *
 		t.Fatalf("marshal submit params: %v", err)
 	}
 	c.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams})
-	resp := c.recvShareResponse()
+	// This waits on a real, non-mocked RandomX validation round-trip
+	// inside Session.handleSubmit -- use the longer, test-specific
+	// deadline (see doc comment above), not the package's 5s default.
+	resp := c.recvShareResponseWithTimeout(30 * time.Second)
 	if resp.Result == nil {
 		t.Fatalf("expected the real, correct RandomX proof to be accepted, got error=%v", resp.Error)
 	}
@@ -121,7 +145,9 @@ func TestSession_RealPureGoRandomXValidator_BlockLevelFind_ForwardedUpstream(t *
 		t.Fatalf("marshal submit params (wrong hash): %v", err)
 	}
 	c2.send(Request{ID: 2, JsonRPC: "2.0", Method: "submit", Params: submitParams2})
-	resp2 := c2.recvShareResponse()
+	// Also a real, non-mocked RandomX validation round-trip -- same
+	// longer deadline rationale as the positive case above.
+	resp2 := c2.recvShareResponseWithTimeout(30 * time.Second)
 	if resp2.Result != nil {
 		t.Fatal("expected a wrong claimed RandomX result to be rejected by the real pure-Go validator, not accepted")
 	}
