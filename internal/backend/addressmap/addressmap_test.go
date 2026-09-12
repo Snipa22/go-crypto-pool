@@ -107,7 +107,7 @@ func doGet(t *testing.T, mux *http.ServeMux, target string) *httptest.ResponseRe
 
 func TestUpsertThenGet_OK(t *testing.T) {
 	repo := newFakeRepo()
-	mux := NewHandler(repo).Mux()
+	mux := NewHandler(repo, Config{}).Mux()
 
 	rr := doPost(t, mux, "/api/v1/address-map", `{"xmr_address":"`+realXMRMainnetAddr+`","tari_address":"`+realTariEsmeraldaAddr+`"}`)
 	if rr.Code != http.StatusCreated {
@@ -132,7 +132,7 @@ func TestUpsertThenGet_OK(t *testing.T) {
 
 func TestUpsert_ReplacesExistingMapping(t *testing.T) {
 	repo := newFakeRepo()
-	mux := NewHandler(repo).Mux()
+	mux := NewHandler(repo, Config{}).Mux()
 
 	doPost(t, mux, "/api/v1/address-map", `{"xmr_address":"`+realXMRMainnetAddr+`","tari_address":"`+realTariEsmeraldaAddr+`"}`)
 	rr := doPost(t, mux, "/api/v1/address-map", `{"xmr_address":"`+realXMRMainnetAddr+`","tari_address":"`+realTariMainnetAddr+`"}`)
@@ -149,7 +149,7 @@ func TestUpsert_ReplacesExistingMapping(t *testing.T) {
 }
 
 func TestUpsert_MissingFields(t *testing.T) {
-	mux := NewHandler(newFakeRepo()).Mux()
+	mux := NewHandler(newFakeRepo(), Config{}).Mux()
 
 	cases := []string{
 		`{"tari_address":"` + realTariEsmeraldaAddr + `"}`,
@@ -166,7 +166,7 @@ func TestUpsert_MissingFields(t *testing.T) {
 }
 
 func TestGet_MissingParam(t *testing.T) {
-	mux := NewHandler(newFakeRepo()).Mux()
+	mux := NewHandler(newFakeRepo(), Config{}).Mux()
 	rr := doGet(t, mux, "/api/v1/address-map")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rr.Code)
@@ -174,7 +174,7 @@ func TestGet_MissingParam(t *testing.T) {
 }
 
 func TestGet_NotFound(t *testing.T) {
-	mux := NewHandler(newFakeRepo()).Mux()
+	mux := NewHandler(newFakeRepo(), Config{}).Mux()
 	rr := doGet(t, mux, "/api/v1/address-map?xmr_address="+realXMRTestnetAddr)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404, body = %s", rr.Code, rr.Body.String())
@@ -184,7 +184,7 @@ func TestGet_NotFound(t *testing.T) {
 func TestGet_RepositoryError(t *testing.T) {
 	repo := newFakeRepo()
 	repo.err = context.DeadlineExceeded
-	mux := NewHandler(repo).Mux()
+	mux := NewHandler(repo, Config{}).Mux()
 	rr := doGet(t, mux, "/api/v1/address-map?xmr_address="+realXMRMainnetAddr)
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rr.Code)

@@ -51,6 +51,8 @@ import (
 
 	tariaddress "github.com/Snipa22/go-tari-lib/address"
 	xmraddress "github.com/Snipa22/go-xmr-lib/support"
+
+	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 )
 
 // maxBodyBytes bounds how much of a POST body we will read. The
@@ -96,11 +98,28 @@ type Repository interface {
 // Handler implements the backend's address-mapping HTTP endpoints.
 type Handler struct {
 	repo Repository
+	cfg  Config
 }
 
-// NewHandler constructs a Handler backed by repo.
-func NewHandler(repo Repository) *Handler {
-	return &Handler{repo: repo}
+// Config configures a Handler.
+type Config struct {
+	// Metrics, if non-nil, is the metrics.Metrics instance
+	// handleUpsert increments (address_map_writes_total). If nil,
+	// metrics are simply not recorded. See
+	// PROD_HARDENING_REVIEW.md finding #19: per the audit, every
+	// address-map write is "the single most alert-worthy event" this
+	// backend can emit -- either a legitimate first-time mapping OR
+	// evidence someone tried (and, per the set-once upsert
+	// behavior, may have succeeded in overwriting) an existing
+	// XMR->Tari mapping.
+	Metrics *metrics.Metrics
+}
+
+// NewHandler constructs a Handler backed by repo, using cfg for
+// optional metrics wiring. Existing callers that only need the
+// pre-existing behavior can pass Config{}.
+func NewHandler(repo Repository, cfg Config) *Handler {
+	return &Handler{repo: repo, cfg: cfg}
 }
 
 // Mux builds a fresh *http.ServeMux with this Handler's routes
@@ -257,23 +276,38 @@ func (h *Handler) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := validateXMRAddress(req.XMRAddress); err != nil {
+		h.observeWrite(metrics.ResultRejected)
 		writeJSONErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := validateTariAddress(req.TariAddress); err != nil {
+		h.observeWrite(metrics.ResultRejected)
 		writeJSONErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	if err := h.repo.Upsert(r.Context(), req.XMRAddress, req.TariAddress); err != nil {
+		h.observeWrite(metrics.ResultError)
 		writeJSONErr(w, http.StatusInternalServerError, "upsert failed")
 		return
 	}
+	h.observeWrite(metrics.ResultAccepted)
 
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"xmr_address":  req.XMRAddress,
 		"tari_address": req.TariAddress,
 	})
+}
+
+// observeWrite increments Config.Metrics.AddressMapWritesTotal for
+// one POST /api/v1/address-map attempt, a no-op if no Metrics is
+// configured. See Config.Metrics' doc comment for why every write
+// here is worth counting regardless of outcome.
+func (h *Handler) observeWrite(result string) {
+	if h.cfg.Metrics == nil {
+		return
+	}
+	h.cfg.Metrics.AddressMapWritesTotal.WithLabelValues(result).Inc()
 }
 
 // getResponse is the JSON shape GET /api/v1/address-map returns.
