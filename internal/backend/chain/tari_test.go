@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 	"google.golang.org/grpc/codes"
@@ -152,5 +153,52 @@ func TestTariVerifier_NegativeHeight(t *testing.T) {
 	v := newTariVerifierWithRPC(&fakeTariRPC{})
 	if _, err := v.Verify(context.Background(), "aabbccdd", -1); err == nil {
 		t.Fatal("Verify: expected an error for a negative height")
+	}
+}
+
+// blockingTariRPC is a tariNodeRPC whose GetHeaderByHash blocks until
+// release is closed -- simulating a hung base node with no way to
+// cancel the underlying call (exactly the real go-tari-grpc-lib/v3
+// nodeGRPC package's own constraint, see Verify's doc comment).
+type blockingTariRPC struct {
+	release chan struct{}
+}
+
+func (f *blockingTariRPC) GetHeaderByHash(hash []byte) (*tari_generated.BlockHeaderResponse, error) {
+	<-f.release
+	return nil, errors.New("blockingTariRPC: released after the test observed the timeout")
+}
+
+func (f *blockingTariRPC) GetBlockByHeight(heights []uint64) ([]*tari_generated.Block, error) {
+	<-f.release
+	return nil, errors.New("blockingTariRPC: released after the test observed the timeout")
+}
+
+// TestTariVerifier_CtxCancellationBoundsCallerWait is the regression
+// test for PROD_HARDENING_REVIEW.md finding #20's TariVerifier.Verify
+// item: a canceled/timed-out ctx must unblock Verify's CALLER
+// promptly, even though the underlying nodeGRPC call it raced against
+// cannot itself be canceled and keeps running in the background (see
+// callWithContext's own doc comment).
+func TestTariVerifier_CtxCancellationBoundsCallerWait(t *testing.T) {
+	rpc := &blockingTariRPC{release: make(chan struct{})}
+	defer close(rpc.release) // let the leaked goroutine finish so the test doesn't leave anything running after it returns
+	v := newTariVerifierWithRPC(rpc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := v.Verify(ctx, "aabbccdd", 100)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Verify: expected an error when ctx is canceled while the underlying RPC is still blocked")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Verify: got error %v, want one wrapping context.DeadlineExceeded", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Verify: took %s to return after a 20ms ctx timeout against a permanently-blocked RPC -- ctx cancellation did not bound the caller's wait", elapsed)
 	}
 }
