@@ -681,11 +681,46 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// sustained backend stall, and losing one backend-accounting
 		// forward is far preferable to ever blocking real RandomX
 		// validation throughput for other sessions.
-		if ok := s.server.forwardPool.TrySubmit(func() { s.forwardShare(share) }); !ok {
-			s.server.logger.Printf("direct: forward pool saturated or unavailable, dropping share forward to backend for session %s", s.sessionID)
-		}
-
+		// BUG FIX (Alex, live production incident, 2026-09-12: every
+		// solo-pool_type block payout paying real zero to the real
+		// winning miner): forwardShare used to be dispatched HERE,
+		// unconditionally, BEFORE this method has any idea whether the
+		// submit that just passed validation also clears full network
+		// (block) difficulty -- so share.FoundBlock (its Go zero value,
+		// false) was already baked into the closure captured by
+		// TrySubmit and (soon after) actually sent to the backend by
+		// the time the block-find check below ever ran, for EVERY
+		// share this leaf ever forwarded, including the literal share
+		// that found the block. Downstream,
+		// internal/backend/db/repository.go's SoloShare(...) query
+		// requires found_block IS TRUE to identify the real winning
+		// miner for a solo-pool_type payout -- since that column was
+		// never true on any row, CalculateSolo silently never paid the
+		// real winner anything.
+		//
+		// Fix: forward the share exactly once, but only after this
+		// method actually knows the final answer to "is this a
+		// genuine, node-confirmed block find" for it -- ordinary
+		// (below-network-difficulty) shares are forwarded immediately
+		// below with FoundBlock left at its correct false zero value;
+		// a share that clears network difficulty is instead forwarded
+		// further down (see the `s.blockCount.Add(1)` block below),
+		// AFTER submitOK is confirmed true, with share.FoundBlock
+		// explicitly set to true first. This is correct for all four
+		// algo branches uniformly: the ALGO_RXM/ALGO_C29/ALGO_RXT/
+		// default cases above only differ in how `share` and
+		// `candidate` are built, not in this shared post-switch
+		// block-find/submitOK logic, so this single dispatch point
+		// covers every algo. A submit that clears network difficulty
+		// but is then rejected by every configured node (submitOK ==
+		// false, the "invalid block" paths below) is correctly NOT a
+		// genuine find -- forwardShare is still called for it (same as
+		// before this fix), just via the block-find-confirmed dispatch
+		// site below rather than here, and FoundBlock stays false.
 		if job.NetworkTargetDifficulty == 0 || diff < job.NetworkTargetDifficulty {
+			if ok := s.server.forwardPool.TrySubmit(func() { s.forwardShare(share) }); !ok {
+				s.server.logger.Printf("direct: forward pool saturated or unavailable, dropping share forward to backend for session %s", s.sessionID)
+			}
 			s.hashesAccumulated.Add(job.StaticDifficulty)
 			s.writeShareResponse(req.ID, true, "")
 			return
@@ -787,6 +822,23 @@ func (s *Session) handleSubmit(req solo.Request) {
 		s.server.logger.Printf("direct: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.address.Load(), job.Height, job.ID, diff, blockHashHex)
 		s.server.recordBlock(true)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
+
+		// THE FIX: this submission is now a confirmed, node-accepted
+		// genuine block find (submitOK == true, checked above) --
+		// flag the same share this session is about to forward so the
+		// backend's shares_<algo>_solo.found_block column actually
+		// reflects it, instead of staying permanently false (see the
+		// long comment at the original forwardShare dispatch site
+		// above for the full incident/rationale). Must happen before
+		// the TrySubmit dispatch just below, not after: forwardShare
+		// hands `share` off to a proto marshal on a separate worker
+		// goroutine, so mutating FoundBlock after dispatch would be a
+		// genuine data race with no ordering guarantee it lands before
+		// that goroutine reads/marshals the field.
+		share.FoundBlock = true
+		if ok := s.server.forwardPool.TrySubmit(func() { s.forwardShare(share) }); !ok {
+			s.server.logger.Printf("direct: forward pool saturated or unavailable, dropping share forward to backend for session %s", s.sessionID)
+		}
 		s.writeShareResponse(req.ID, true, "")
 
 		// Report the found block to the backend too (accounting/
