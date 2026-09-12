@@ -219,6 +219,104 @@ func TestHandleBlock_MissingRequiredField(t *testing.T) {
 	}
 }
 
+// TestHandleShare_FieldTooLong is the regression test for
+// PROD_HARDENING_REVIEW.md finding #17: a miner-supplied string field
+// beyond maxMinerStringLen must be rejected (400), never silently
+// persisted to the underlying unbounded TEXT column.
+func TestHandleShare_FieldTooLong(t *testing.T) {
+	tooLong := strings.Repeat("a", maxMinerStringLen+1)
+
+	cases := map[string]*poolpb.Share{
+		"payment_address too long": func() *poolpb.Share {
+			s := validShare()
+			s.PaymentAddress = tooLong
+			return s
+		}(),
+		"payment_id too long": func() *poolpb.Share {
+			s := validShare()
+			pid := tooLong
+			s.PaymentId = &pid
+			return s
+		}(),
+		"identifier too long": func() *poolpb.Share {
+			s := validShare()
+			s.Identifier = tooLong
+			return s
+		}(),
+	}
+
+	for name, share := range cases {
+		t.Run(name, func(t *testing.T) {
+			repo := &fakeRepo{}
+			h := NewHandler(repo, Config{})
+			rr := postProto(t, h.Mux(), "/api/v1/share", share, nil)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+			}
+			if len(repo.shares) != 0 {
+				t.Errorf("expected no insert, got %d", len(repo.shares))
+			}
+		})
+	}
+}
+
+// TestHandleBlock_HashTooLong mirrors TestHandleShare_FieldTooLong
+// for Block.Hash.
+func TestHandleBlock_HashTooLong(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{})
+	b := validBlock()
+	b.Hash = strings.Repeat("a", maxMinerStringLen+1)
+	rr := postProto(t, h.Mux(), "/api/v1/block", b, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(repo.blocks) != 0 {
+		t.Errorf("expected no insert, got %d", len(repo.blocks))
+	}
+}
+
+// TestHandleBlock_EmptyHash_IncrementsSpecificMetric is the
+// regression test for PROD_HARDENING_REVIEW.md finding #13: an empty
+// block hash must increment the dedicated
+// blocks_rejected_empty_hash_total counter, distinct from (and in
+// addition to) the generic blocks_total{result="rejected"} bucket
+// every other validateBlock rejection also increments.
+func TestHandleBlock_EmptyHash_IncrementsSpecificMetric(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{})
+	b := validBlock()
+	b.Hash = ""
+	rr := postProto(t, h.Mux(), "/api/v1/block", b, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+
+	body := scrapeMetrics(t, h)
+	wantSpecific := `blocks_rejected_empty_hash_total{algo="C29",network="MAINNET"} 1`
+	if !strings.Contains(body, wantSpecific) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", wantSpecific, body)
+	}
+	wantGeneric := `blocks_total{algo="C29",network="MAINNET",result="rejected"} 1`
+	if !strings.Contains(body, wantGeneric) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", wantGeneric, body)
+	}
+
+	// A DIFFERENT rejection reason (negative height) must NOT
+	// increment blocks_rejected_empty_hash_total at all -- proving
+	// this counter is specific to the empty-hash case, not a generic
+	// alias for every rejection.
+	repo2 := &fakeRepo{}
+	h2 := NewHandler(repo2, Config{})
+	b2 := validBlock()
+	b2.Height = -1
+	postProto(t, h2.Mux(), "/api/v1/block", b2, nil)
+	body2 := scrapeMetrics(t, h2)
+	if strings.Contains(body2, "blocks_rejected_empty_hash_total") {
+		t.Errorf("blocks_rejected_empty_hash_total must not appear for a non-empty-hash rejection, got:\n%s", body2)
+	}
+}
+
 func TestHandleShare_AuthWrongValue(t *testing.T) {
 	repo := &fakeRepo{}
 	h := NewHandler(repo, Config{AuthHeaderName: "Authorization", AuthHeaderValue: "Bearer good-token"})
