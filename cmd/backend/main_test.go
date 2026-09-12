@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -467,6 +468,189 @@ func TestLoadConfigPrecedence(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			runPrecedenceCase(t, tc)
+		})
+	}
+}
+
+// TestLoadConfig_FailsFastOnMalformedMoneyEnvVars is the regression
+// test for PROD_HARDENING_REVIEW.md finding #9: an unparseable value
+// for one of the money-critical env vars this file's loadConfig
+// treats specially (see checkedInt64/checkedDuration) must fail
+// loadConfig with a clear error naming the offending variable, never
+// silently fall back to that field's hardcoded default the way every
+// OTHER envOrXxx-backed flag in this file still does.
+func TestLoadConfig_FailsFastOnMalformedMoneyEnvVars(t *testing.T) {
+	cases := []struct {
+		name   string
+		env    map[string]string
+		wantIn string
+	}{
+		{
+			name:   "GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC",
+			env:    map[string]string{"GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC": "abc"},
+			wantIn: "GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC",
+		},
+		{
+			name:   "GCPOOL_FORCE_PAYOUT_FEE_ATOMIC",
+			env:    map[string]string{"GCPOOL_FORCE_PAYOUT_FEE_ATOMIC": "abc"},
+			wantIn: "GCPOOL_FORCE_PAYOUT_FEE_ATOMIC",
+		},
+		{
+			name:   "GCPOOL_UNLOCKER_POLL_INTERVAL",
+			env:    map[string]string{"GCPOOL_UNLOCKER_POLL_INTERVAL": "not-a-duration"},
+			wantIn: "GCPOOL_UNLOCKER_POLL_INTERVAL",
+		},
+		{
+			name:   "GCPOOL_UNLOCKER_TARI_MATURITY",
+			env:    map[string]string{"GCPOOL_UNLOCKER_TARI_MATURITY": "abc"},
+			wantIn: "GCPOOL_UNLOCKER_TARI_MATURITY",
+		},
+		{
+			name:   "GCPOOL_UNLOCKER_MONERO_MATURITY",
+			env:    map[string]string{"GCPOOL_UNLOCKER_MONERO_MATURITY": "abc"},
+			wantIn: "GCPOOL_UNLOCKER_MONERO_MATURITY",
+		},
+		{
+			name:   "GCPOOL_WALLET_RPC_TIMEOUT",
+			env:    map[string]string{"GCPOOL_WALLET_RPC_TIMEOUT": "not-a-duration"},
+			wantIn: "GCPOOL_WALLET_RPC_TIMEOUT",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			oldArgs := os.Args
+			oldCommandLine := flag.CommandLine
+			t.Cleanup(func() {
+				os.Args = oldArgs
+				flag.CommandLine = oldCommandLine
+			})
+			flag.CommandLine = flag.NewFlagSet("backend-test", flag.ContinueOnError)
+			os.Args = []string{"backend"}
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			_, err := loadConfig()
+			if err == nil {
+				t.Fatalf("loadConfig() with %s=%q: got nil error, want a fail-fast error naming that variable", tc.name, tc.env[tc.name])
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Errorf("loadConfig() error = %q, want it to mention %s", err.Error(), tc.wantIn)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_ValidMoneyEnvVarsStillWork proves the fail-fast
+// checks above don't reject genuinely valid values for the same env
+// vars -- a real, well-formed value must load normally.
+func TestLoadConfig_ValidMoneyEnvVarsStillWork(t *testing.T) {
+	runPrecedenceCase(t, precedenceCase{
+		name: "valid",
+		env: map[string]string{
+			"GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC": "1000",
+			"GCPOOL_FORCE_PAYOUT_FEE_ATOMIC":    "50",
+			"GCPOOL_UNLOCKER_POLL_INTERVAL":     "30s",
+			"GCPOOL_UNLOCKER_TARI_MATURITY":     "90",
+			"GCPOOL_UNLOCKER_MONERO_MATURITY":   "10",
+			"GCPOOL_WALLET_RPC_TIMEOUT":         "45s",
+		},
+		check: func(t *testing.T, cfg config) {
+			if cfg.disburseMinPayoutAtomic != 1000 {
+				t.Errorf("disburseMinPayoutAtomic = %d, want 1000", cfg.disburseMinPayoutAtomic)
+			}
+			if cfg.forcePayoutFeeAtomic != 50 {
+				t.Errorf("forcePayoutFeeAtomic = %d, want 50", cfg.forcePayoutFeeAtomic)
+			}
+			if cfg.unlockerPollInterval != 30*time.Second {
+				t.Errorf("unlockerPollInterval = %v, want 30s", cfg.unlockerPollInterval)
+			}
+			if cfg.unlockerTariMaturity != 90 {
+				t.Errorf("unlockerTariMaturity = %d, want 90", cfg.unlockerTariMaturity)
+			}
+			if cfg.unlockerMoneroMaturity != 10 {
+				t.Errorf("unlockerMoneroMaturity = %d, want 10", cfg.unlockerMoneroMaturity)
+			}
+			if cfg.walletRPCTimeout != 45*time.Second {
+				t.Errorf("walletRPCTimeout = %v, want 45s", cfg.walletRPCTimeout)
+			}
+		},
+	})
+}
+
+// TestValidateDonationConfig is the unit-level regression test for
+// PROD_HARDENING_REVIEW.md finding #10: a configured donation
+// percentage with no matching donation address must be refused at
+// startup.
+func TestValidateDonationConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     config
+		wantErr bool
+	}{
+		{
+			name:    "no donations configured at all -> ok",
+			cfg:     config{},
+			wantErr: false,
+		},
+		{
+			name: "dev donation percent > 0, coin dev address set -> ok",
+			cfg: config{
+				payoutDevDonationPercent: 10,
+				payoutCoinDevAddress:     "some-coin-dev-address",
+			},
+			wantErr: false,
+		},
+		{
+			name: "dev donation percent > 0, coin dev address EMPTY -> refused",
+			cfg: config{
+				payoutDevDonationPercent: 10,
+			},
+			wantErr: true,
+		},
+		{
+			name: "dev donation percent > 0, coin dev address WHITESPACE-ONLY -> refused",
+			cfg: config{
+				payoutDevDonationPercent: 10,
+				payoutCoinDevAddress:     "   ",
+			},
+			wantErr: true,
+		},
+		{
+			name: "pool dev donation percent > 0, pool dev address set -> ok",
+			cfg: config{
+				payoutPoolDevDonationPercent: 5,
+				payoutPoolDevAddress:         "some-pool-dev-address",
+			},
+			wantErr: false,
+		},
+		{
+			name: "pool dev donation percent > 0, pool dev address EMPTY -> refused",
+			cfg: config{
+				payoutPoolDevDonationPercent: 5,
+			},
+			wantErr: true,
+		},
+		{
+			name: "both donation percents zero, both addresses empty -> ok (nothing configured)",
+			cfg: config{
+				payoutCoinDevAddress: "",
+				payoutPoolDevAddress: "",
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDonationConfig(tc.cfg)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateDonationConfig(%+v) = nil, want error", tc.cfg)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateDonationConfig(%+v) = %v, want nil", tc.cfg, err)
+			}
 		})
 	}
 }

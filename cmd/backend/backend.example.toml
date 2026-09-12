@@ -17,6 +17,19 @@ db_dsn = ""
 # HTTP listen address. (default: ":8080")
 listen_addr = ":8080"
 
+# HTTP listen address for GET /metrics ONLY -- deliberately separate from
+# listen_addr above (see PROD_HARDENING_REVIEW.md finding #12: /metrics
+# exposes wallet_balance_atomic, the real hot-wallet balance, and must not
+# share a public listener with share/block ingestion). Defaults to
+# loopback-only, matching the leaf binaries' own metrics_listen_address
+# convention. Empty disables the /metrics endpoint entirely.
+# (default: "127.0.0.1:9602")
+metrics_listen_addr = "127.0.0.1:9602"
+
+# Max concurrent TCP connections the main HTTP listener (listen_addr) will
+# accept, 0 = unlimited. (default: 10000)
+max_connections = 10000
+
 # Shared-secret auth header name to require on /api/v1/share and
 # /api/v1/block, e.g. "Authorization". Must be set together with
 # auth_header_value.

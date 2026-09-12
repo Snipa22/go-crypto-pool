@@ -166,6 +166,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -176,6 +177,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/net/netutil"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/addressmap"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/api"
@@ -200,6 +202,16 @@ import (
 )
 
 const defaultListenAddr = ":8080"
+
+// defaultMetricsListenAddr is GET /metrics' own default HTTP listen
+// address -- loopback-only, matching the leaf binaries' own
+// -metrics-listen-address defaults (127.0.0.1:9600/9601). 9600/9601
+// are already taken by leaf-solo/leaf-direct+leaf-proxy respectively
+// (a single host could conceivably run one of each alongside this
+// backend), so 9602 is picked here to avoid a same-host collision by
+// default -- still just a placeholder port an operator is free to
+// override via -metrics-listen-addr/GCPOOL_METRICS_LISTEN_ADDR.
+const defaultMetricsListenAddr = "127.0.0.1:9602"
 
 // defaultUnlockerPollInterval/defaultTariMaturity/defaultMoneroMaturity
 // are this command's PLACEHOLDER defaults for the unlocker's env vars
@@ -241,6 +253,34 @@ type config struct {
 	authHeaderName  string
 	authHeaderValue string
 	network         string
+
+	// metricsListenAddr is GET /metrics' own HTTP listen address --
+	// deliberately SEPARATE from listenAddr (see this file's package
+	// doc comment / run()'s wiring). Defaults to loopback-only
+	// (127.0.0.1), matching the 3 leaf binaries' own
+	// -metrics-listen-address convention (cmd/leaf-solo,
+	// cmd/leaf-direct, cmd/leaf-proxy): an operator must explicitly
+	// set this to a wildcard/public address to expose /metrics
+	// publicly. Per PROD_HARDENING_REVIEW.md finding #12, /metrics
+	// exposes wallet_balance_atomic (the real hot-wallet balance) and
+	// previously shared the SAME public, wildcard-bindable listener
+	// as share/block ingestion -- this field is what fixes that.
+	// Empty disables the separate /metrics listener entirely
+	// (mirroring the leaf binaries' own "empty disables" convention)
+	// -- a deployment that sets this to "" gets no /metrics endpoint
+	// at all from this process, not a fallback onto listenAddr.
+	metricsListenAddr string
+
+	// maxConnections caps the number of simultaneously-open TCP
+	// connections the main (listenAddr) HTTP listener will accept,
+	// via a netutil.LimitListener wrapping the raw net.Listener (see
+	// run()'s wiring) -- 0 means unlimited. Per
+	// PROD_HARDENING_REVIEW.md finding #12: the leaf binaries already
+	// have an analogous cap for their own listeners
+	// (internal/leaflib/manager.go's ConnectionManager.MaxConnections,
+	// DefaultLeafMaxConnections), but this backend previously had
+	// none at all for its own public HTTP listener.
+	maxConnections int
 
 	// insecureAllowUnauthenticatedIngestion is the explicit,
 	// loudly-logged escape hatch that allows run() to start with
@@ -330,8 +370,46 @@ type config struct {
 func loadConfig() (config, error) {
 	cfg := config{}
 
+	// envErrs collects any fail-fast env-var parse error from
+	// checkedInt64/checkedDuration below (see those closures' doc
+	// comment) so loadConfig can register every flag first (flag.FlagSet
+	// requires that) and still refuse to start with a single, clear
+	// combined error if any of them failed to parse -- rather than
+	// silently falling back to a default the way envOrInt64/envOrDuration
+	// do for every other, non-money-critical knob in this file. See
+	// PROD_HARDENING_REVIEW.md finding #9.
+	var envErrs []error
+
+	// checkedInt64/checkedDuration are the fail-fast counterparts of
+	// envOrInt64/envOrDuration used ONLY for the money-critical knobs
+	// PROD_HARDENING_REVIEW.md finding #9 calls out by name
+	// (GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC, GCPOOL_FORCE_PAYOUT_FEE_ATOMIC,
+	// GCPOOL_UNLOCKER_*, GCPOOL_WALLET_RPC_TIMEOUT): a typo'd
+	// GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC=abc must fail startup loudly,
+	// never silently become 0. Every other envOrXxx call in this
+	// function is unchanged (still silently defaults) -- deliberately
+	// scoped to just these knobs per that finding's own "at minimum"
+	// wording, not a blanket behavior change for every flag in this
+	// file.
+	checkedInt64 := func(key string, def int64) int64 {
+		v, err := envOrInt64Checked(key, def)
+		if err != nil {
+			envErrs = append(envErrs, err)
+		}
+		return v
+	}
+	checkedDuration := func(key string, def time.Duration) time.Duration {
+		v, err := envOrDurationChecked(key, def)
+		if err != nil {
+			envErrs = append(envErrs, err)
+		}
+		return v
+	}
+
 	flag.StringVar(&cfg.dbDSN, "db-dsn", envOr("GCPOOL_DB_DSN", ""), "(required) Postgres DSN, e.g. \"postgres://user:pass@host:5432/db?sslmode=disable\". Env: GCPOOL_DB_DSN")
 	flag.StringVar(&cfg.listenAddr, "listen-addr", envOr("GCPOOL_LISTEN_ADDR", defaultListenAddr), "HTTP listen address. Env: GCPOOL_LISTEN_ADDR")
+	flag.StringVar(&cfg.metricsListenAddr, "metrics-listen-addr", envOr("GCPOOL_METRICS_LISTEN_ADDR", defaultMetricsListenAddr), "HTTP listen address for GET /metrics ONLY -- deliberately separate from -listen-addr (see PROD_HARDENING_REVIEW.md finding #12: /metrics exposes wallet_balance_atomic, the real hot-wallet balance, and must not share a public listener with share/block ingestion). Defaults to loopback-only, matching the leaf binaries' own -metrics-listen-address convention. Empty disables the /metrics endpoint entirely. Env: GCPOOL_METRICS_LISTEN_ADDR")
+	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("GCPOOL_MAX_CONNECTIONS", leaflib.DefaultLeafMaxConnections), "max concurrent TCP connections the main HTTP listener (-listen-addr) will accept, 0 = unlimited. Env: GCPOOL_MAX_CONNECTIONS")
 	flag.StringVar(&cfg.authHeaderName, "auth-header-name", envOr("GCPOOL_AUTH_HEADER_NAME", ""), "(required, unless -insecure-allow-unauthenticated-ingestion is set) shared-secret auth header name to require on /api/v1/share and /api/v1/block, e.g. \"Authorization\". Must be set together with -auth-header-value -- run() refuses to start if both are empty and the override flag below isn't set. Env: GCPOOL_AUTH_HEADER_NAME")
 	flag.StringVar(&cfg.authHeaderValue, "auth-header-value", envOr("GCPOOL_AUTH_HEADER_VALUE", ""), "(required, unless -insecure-allow-unauthenticated-ingestion is set) expected value for -auth-header-name above. Env: GCPOOL_AUTH_HEADER_VALUE")
 	flag.BoolVar(&cfg.insecureAllowUnauthenticatedIngestion, "insecure-allow-unauthenticated-ingestion", envOr("GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION", "false") == "true", "LOCAL/DEV USE ONLY: explicit, loudly-logged override that allows this command to start with -auth-header-name/-auth-header-value both unset, leaving /api/v1/share and /api/v1/block completely unauthenticated. Disabled by default -- with no flags/env set at all, run() refuses to start rather than silently accepting every share/block. Env: GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION (\"true\" to enable)")
@@ -340,9 +418,9 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.tariGRPCAddr, "tari-grpc-addr", envOr("GCPOOL_TARI_GRPC_ADDR", ""), "host:port of a real Tari base node's GRPC endpoint. When set, the block unlocker polls every pending ALGO_RXT/ALGO_C29/ALGO_SHA3X block against it to detect maturity/orphaning. When unset, those algos' blocks are simply never auto-unlocked. Env: GCPOOL_TARI_GRPC_ADDR")
 	flag.StringVar(&cfg.moneroRPCAddr, "monero-rpc-addr", envOr("GCPOOL_MONERO_RPC_ADDR", ""), "base URL of a real monerod JSON-RPC endpoint (e.g. \"http://127.0.0.1:18081\"). When set, the unlocker polls every pending ALGO_RXM block against it. Same opt-in behavior as -tari-grpc-addr above. Env: GCPOOL_MONERO_RPC_ADDR")
 
-	flag.DurationVar(&cfg.unlockerPollInterval, "unlocker-poll-interval", envOrDuration("GCPOOL_UNLOCKER_POLL_INTERVAL", defaultUnlockerPollInterval), "how often the unlocker re-checks pending blocks. Only consulted if at least one of -tari-grpc-addr/-monero-rpc-addr is set. Env: GCPOOL_UNLOCKER_POLL_INTERVAL")
-	flag.Int64Var(&cfg.unlockerTariMaturity, "unlocker-tari-maturity", envOrInt64("GCPOOL_UNLOCKER_TARI_MATURITY", defaultTariMaturity), "confirmations required before a Tari-family block (RXT/C29/SHA3X) is marked unlocked/payable. A PLACEHOLDER, operationally-tunable value, not a Tari protocol constant. Env: GCPOOL_UNLOCKER_TARI_MATURITY")
-	flag.Int64Var(&cfg.unlockerMoneroMaturity, "unlocker-monero-maturity", envOrInt64("GCPOOL_UNLOCKER_MONERO_MATURITY", defaultMoneroMaturity), "confirmations required before an RXM block is marked unlocked/payable, mirroring Monero's own CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW. Env: GCPOOL_UNLOCKER_MONERO_MATURITY")
+	flag.DurationVar(&cfg.unlockerPollInterval, "unlocker-poll-interval", checkedDuration("GCPOOL_UNLOCKER_POLL_INTERVAL", defaultUnlockerPollInterval), "how often the unlocker re-checks pending blocks. Only consulted if at least one of -tari-grpc-addr/-monero-rpc-addr is set. Env: GCPOOL_UNLOCKER_POLL_INTERVAL")
+	flag.Int64Var(&cfg.unlockerTariMaturity, "unlocker-tari-maturity", checkedInt64("GCPOOL_UNLOCKER_TARI_MATURITY", defaultTariMaturity), "confirmations required before a Tari-family block (RXT/C29/SHA3X) is marked unlocked/payable. A PLACEHOLDER, operationally-tunable value, not a Tari protocol constant. Env: GCPOOL_UNLOCKER_TARI_MATURITY")
+	flag.Int64Var(&cfg.unlockerMoneroMaturity, "unlocker-monero-maturity", checkedInt64("GCPOOL_UNLOCKER_MONERO_MATURITY", defaultMoneroMaturity), "confirmations required before an RXM block is marked unlocked/payable, mirroring Monero's own CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW. Env: GCPOOL_UNLOCKER_MONERO_MATURITY")
 
 	flag.DurationVar(&cfg.networkPollerPollInterval, "network-poller-poll-interval", envOrDuration("GCPOOL_NETWORK_POLLER_POLL_INTERVAL", defaultNetworkPollerInterval), "how often the network-state poller re-checks the real upstream chain(s) configured via -tari-grpc-addr/-monero-rpc-addr. Env: GCPOOL_NETWORK_POLLER_POLL_INTERVAL")
 
@@ -362,9 +440,9 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.moneroWalletRPCAddr, "monero-wallet-rpc-addr", envOr("GCPOOL_MONERO_WALLET_RPC_ADDR", ""), "base URL of a real monero-wallet-rpc endpoint (e.g. \"http://127.0.0.1:18083\"). When set, accrued pending_balance is periodically paid out via a real on-chain transfer. Env: GCPOOL_MONERO_WALLET_RPC_ADDR")
 	flag.StringVar(&cfg.moneroWalletRPCUser, "monero-wallet-rpc-user", envOr("GCPOOL_MONERO_WALLET_RPC_USER", ""), "HTTP Digest auth username matching whatever --rpc-login the real monero-wallet-rpc process was started with. Env: GCPOOL_MONERO_WALLET_RPC_USER")
 	flag.StringVar(&cfg.moneroWalletRPCPassword, "monero-wallet-rpc-password", envOr("GCPOOL_MONERO_WALLET_RPC_PASSWORD", ""), "HTTP Digest auth password matching -monero-wallet-rpc-user above. Env: GCPOOL_MONERO_WALLET_RPC_PASSWORD")
-	flag.DurationVar(&cfg.walletRPCTimeout, "wallet-rpc-timeout", envOrDuration("GCPOOL_WALLET_RPC_TIMEOUT", defaultWalletRPCTimeout), "timeout for real wallet RPC calls (monero-wallet-rpc HTTP client; Tari's read-only wallet GRPC lookups). Must be long enough that a slow-but-successful transfer isn't abandoned mid-flight -- an over-tight value turns a real payout into an AMBIGUOUS payout that HALTS disbursement until an operator resolves it by hand. Env: GCPOOL_WALLET_RPC_TIMEOUT")
-	flag.Int64Var(&cfg.disburseMinPayoutAtomic, "disburse-min-payout-atomic", envOrInt64("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC", 0), "minimum pending_balance (atomic units) required before a miner is paid out at all. Shared by both the Monero and Tari disbursement engines. Env: GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC")
-	flag.Int64Var(&cfg.forcePayoutFeeAtomic, "force-payout-fee-atomic", envOrInt64("GCPOOL_FORCE_PAYOUT_FEE_ATOMIC", 0), "flat atomic-unit fee charged against every force_payout=TRUE balance row paid out this cycle (see POST /user/forcePayment), deducted from the miner's payout and credited to pool revenue. Shared by both the Monero and Tari disbursement engines. 0 (default) means no extra fee. Env: GCPOOL_FORCE_PAYOUT_FEE_ATOMIC")
+	flag.DurationVar(&cfg.walletRPCTimeout, "wallet-rpc-timeout", checkedDuration("GCPOOL_WALLET_RPC_TIMEOUT", defaultWalletRPCTimeout), "timeout for real wallet RPC calls (monero-wallet-rpc HTTP client; Tari's read-only wallet GRPC lookups). Must be long enough that a slow-but-successful transfer isn't abandoned mid-flight -- an over-tight value turns a real payout into an AMBIGUOUS payout that HALTS disbursement until an operator resolves it by hand. Env: GCPOOL_WALLET_RPC_TIMEOUT")
+	flag.Int64Var(&cfg.disburseMinPayoutAtomic, "disburse-min-payout-atomic", checkedInt64("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC", 0), "minimum pending_balance (atomic units) required before a miner is paid out at all. Shared by both the Monero and Tari disbursement engines. Env: GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC")
+	flag.Int64Var(&cfg.forcePayoutFeeAtomic, "force-payout-fee-atomic", checkedInt64("GCPOOL_FORCE_PAYOUT_FEE_ATOMIC", 0), "flat atomic-unit fee charged against every force_payout=TRUE balance row paid out this cycle (see POST /user/forcePayment), deducted from the miner's payout and credited to pool revenue. Shared by both the Monero and Tari disbursement engines. 0 (default) means no extra fee. Env: GCPOOL_FORCE_PAYOUT_FEE_ATOMIC")
 	flag.IntVar(&cfg.disburseMaxDestinationsPerBatch, "disburse-max-destinations-per-batch", envOrInt("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH", defaultDisburseMaxDestinationsPerBatch), "cap on destinations per real Transfer call, for the Monero disbursement engine only (the Tari engine hardcodes 1, see buildTariDisburseEngine's doc comment). Env: GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH")
 	flag.DurationVar(&cfg.disbursePollInterval, "disburse-poll-interval", envOrDuration("GCPOOL_DISBURSE_POLL_INTERVAL", defaultDisbursePollInterval), "how often the disbursement engine(s) run a cycle. Shared by both the Monero and Tari disbursement engines. Env: GCPOOL_DISBURSE_POLL_INTERVAL")
 
@@ -381,6 +459,20 @@ func loadConfig() (config, error) {
 
 	flag.Parse()
 
+	// Fail fast on any unparseable money-critical env var (see
+	// checkedInt64/checkedDuration above) BEFORE ever touching
+	// -config/applyConfigFile below -- a malformed env var must
+	// surface as a startup error, not silently mask a valid TOML
+	// file value for the same field (see
+	// internal/leaflib/cfgfile.FieldSource: it treats "env var is
+	// non-empty" as "explicitly set", regardless of whether that
+	// value actually parsed, so letting a bad env var reach
+	// applyConfigFile would have it win over the file anyway --
+	// erroring out here instead means that never matters).
+	if len(envErrs) > 0 {
+		return cfg, fmt.Errorf("backend: invalid environment variable value(s): %w", errors.Join(envErrs...))
+	}
+
 	if err := applyConfigFile(&cfg); err != nil {
 		return cfg, err
 	}
@@ -395,11 +487,13 @@ func loadConfig() (config, error) {
 // seconds (go-toml/v2 does not natively decode into time.Duration)
 // and converted with time.Duration(v) * time.Second when applied.
 type fileConfig struct {
-	DBDSN           *string `toml:"db_dsn"`
-	ListenAddr      *string `toml:"listen_addr"`
-	AuthHeaderName  *string `toml:"auth_header_name"`
-	AuthHeaderValue *string `toml:"auth_header_value"`
-	Network         *string `toml:"network"`
+	DBDSN             *string `toml:"db_dsn"`
+	ListenAddr        *string `toml:"listen_addr"`
+	MetricsListenAddr *string `toml:"metrics_listen_addr"`
+	MaxConnections    *int    `toml:"max_connections"`
+	AuthHeaderName    *string `toml:"auth_header_name"`
+	AuthHeaderValue   *string `toml:"auth_header_value"`
+	Network           *string `toml:"network"`
 
 	InsecureAllowUnauthenticatedIngestion *bool `toml:"insecure_allow_unauthenticated_ingestion"`
 
@@ -463,6 +557,8 @@ func applyConfigFile(cfg *config) error {
 
 	cfgfile.ApplyString(&cfg.dbDSN, fc.DBDSN, visited, "db-dsn", "GCPOOL_DB_DSN")
 	cfgfile.ApplyString(&cfg.listenAddr, fc.ListenAddr, visited, "listen-addr", "GCPOOL_LISTEN_ADDR")
+	cfgfile.ApplyString(&cfg.metricsListenAddr, fc.MetricsListenAddr, visited, "metrics-listen-addr", "GCPOOL_METRICS_LISTEN_ADDR")
+	cfgfile.ApplyInt(&cfg.maxConnections, fc.MaxConnections, visited, "max-connections", "GCPOOL_MAX_CONNECTIONS")
 	cfgfile.ApplyString(&cfg.authHeaderName, fc.AuthHeaderName, visited, "auth-header-name", "GCPOOL_AUTH_HEADER_NAME")
 	cfgfile.ApplyString(&cfg.authHeaderValue, fc.AuthHeaderValue, visited, "auth-header-value", "GCPOOL_AUTH_HEADER_VALUE")
 	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "GCPOOL_NETWORK")
@@ -555,6 +651,27 @@ func envOrInt64(key string, def int64) int64 {
 	return def
 }
 
+// envOrInt64Checked mirrors envOrInt64 but, instead of silently
+// falling back to def on a parse failure, returns a non-nil error
+// describing exactly what failed to parse -- the fail-fast variant
+// loadConfig's checkedInt64 closure uses for the specific
+// money-critical env vars called out in PROD_HARDENING_REVIEW.md
+// finding #9. def is still returned alongside the error so a caller
+// that (incorrectly) ignored the error would see the same
+// pre-existing default-fallback behavior, but loadConfig never does
+// that -- it always surfaces the error.
+func envOrInt64Checked(key string, def int64) (int64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def, fmt.Errorf("%s: invalid integer value %q: %w", key, v, err)
+	}
+	return n, nil
+}
+
 func envOrUint64(key string, def uint64) uint64 {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
@@ -571,6 +688,21 @@ func envOrDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// envOrDurationChecked mirrors envOrDuration but fails loudly instead
+// of silently defaulting -- same rationale/callers as
+// envOrInt64Checked above.
+func envOrDurationChecked(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def, fmt.Errorf("%s: invalid duration value %q: %w", key, v, err)
+	}
+	return d, nil
 }
 
 func envOrFloat64(key string, def float64) float64 {
@@ -1086,6 +1218,7 @@ func (a unlockerRepositoryAdapter) PendingBlocks(ctx context.Context, algo strin
 			PoolType:   r.PoolType,
 			Difficulty: r.Difficulty,
 			Value:      r.Value,
+			InsertedAt: r.InsertedAt,
 		})
 	}
 	return out, nil
@@ -1390,6 +1523,10 @@ func buildPayoutCalculator(cfg config, repo *db.Repository, m *metrics.Metrics) 
 		return nil, false, nil
 	}
 
+	if err := validateDonationConfig(cfg); err != nil {
+		return nil, false, err
+	}
+
 	pcfg := payout.Config{
 		FeeAddress:             cfg.payoutFeeAddress,
 		CoinDevAddress:         cfg.payoutCoinDevAddress,
@@ -1404,6 +1541,35 @@ func buildPayoutCalculator(cfg config, repo *db.Repository, m *metrics.Metrics) 
 	}
 
 	return payout.New(payoutRepositoryAdapter{repo: repo}, pcfg), true, nil
+}
+
+// validateDonationConfig fails fast (returning a real error, never
+// just a log line) when a donation percentage is configured with no
+// address to send that donation to. Per PROD_HARDENING_REVIEW.md
+// finding #10: payout.seedPaymentData/applyDonations
+// (internal/backend/payout/payout.go) credit an EMPTY-STRING address
+// row whenever *DevDonationPercent > 0 but the matching
+// *DevAddress is unset -- and the resulting empty-address `balance`
+// row then makes its WHOLE disbursement batch fail every cycle
+// (wallet/monero_rpc.go's Transfer rejects an empty destination
+// address), silently blocking every OTHER miner co-batched with it.
+// There is no legitimate reason to configure a donation percentage
+// with nowhere to send it, so this is refused at startup rather than
+// left to poison a batch in production.
+func validateDonationConfig(cfg config) error {
+	if cfg.payoutDevDonationPercent > 0 && strings.TrimSpace(cfg.payoutCoinDevAddress) == "" {
+		return fmt.Errorf("GCPOOL_PAYOUT_DEV_DONATION_PERCENT is %v (> 0) but GCPOOL_PAYOUT_COIN_DEV_ADDRESS is empty -- "+
+			"refusing to start: an empty coin-dev donation address would credit a real balance row with payment_address='', "+
+			"which poisons its entire disbursement batch every cycle (see PROD_HARDENING_REVIEW.md finding #10)",
+			cfg.payoutDevDonationPercent)
+	}
+	if cfg.payoutPoolDevDonationPercent > 0 && strings.TrimSpace(cfg.payoutPoolDevAddress) == "" {
+		return fmt.Errorf("GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT is %v (> 0) but GCPOOL_PAYOUT_POOL_DEV_ADDRESS is empty -- "+
+			"refusing to start: an empty pool-dev donation address would credit a real balance row with payment_address='', "+
+			"which poisons its entire disbursement batch every cycle (see PROD_HARDENING_REVIEW.md finding #10)",
+			cfg.payoutPoolDevDonationPercent)
+	}
+	return nil
 }
 
 const defaultPPLNSShareMulti = 2
@@ -1892,6 +2058,56 @@ func runWalletStatsPoller(ctx context.Context, m *metrics.Metrics, targets []wal
 	}
 }
 
+// runPendingBalancePoller periodically queries repo for the current
+// outstanding pending_balance total per (algo, network) and reports
+// it on m.PendingBalanceOutstanding, until ctx is canceled. See
+// PROD_HARDENING_REVIEW.md finding #19: existing coverage tracks
+// payout/disburse/unlocker/wallet-balance ACTIVITY, but nothing
+// previously reported the outstanding liability itself.
+//
+// Every (algo, network) combination in db.ValidAlgos x db.ValidNetworks
+// is explicitly reset to 0 at the START of every poll, before the
+// real query results are applied on top -- otherwise a pair whose
+// balance later drains to exactly zero would simply stop appearing
+// in db.Repository.PendingBalanceTotals' result set (it only returns
+// rows with a positive sum) and its gauge would be left at a stale
+// non-zero value forever. This mirrors unlocker.observePending's own
+// same-pass-reset rationale for an identical staleness concern.
+func runPendingBalancePoller(ctx context.Context, repo *db.Repository, m *metrics.Metrics, interval time.Duration) {
+	if interval <= 0 {
+		log.Print("backend: pending-balance poller: interval <= 0, not starting")
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	pollOnce := func() {
+		for _, algo := range db.ValidAlgos {
+			for _, network := range db.ValidNetworks {
+				m.PendingBalanceOutstanding.WithLabelValues(algo, network).Set(0)
+			}
+		}
+		totals, err := repo.PendingBalanceTotals(ctx)
+		if err != nil {
+			log.Printf("backend: pending-balance poller: querying totals: %v", err)
+			return
+		}
+		for _, t := range totals {
+			m.PendingBalanceOutstanding.WithLabelValues(t.Algo, t.Network).Set(float64(t.Total))
+		}
+	}
+
+	pollOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pollOnce()
+		}
+	}
+}
+
 // validateIngestionAuthConfig enforces that the share/block ingestion
 // endpoints (POST /api/v1/share, POST /api/v1/block) are never started
 // unauthenticated by default. internal/backend/api.Handler's own
@@ -2009,7 +2225,7 @@ func run(cfg config) error {
 	// internal/backend/addressmap's package doc comment for why
 	// this is its own Handler/trust-boundary, independent of both
 	// the ingestion API and the miner stats API above.
-	addressMapHandler := addressmap.NewHandler(addressMapRepositoryAdapter{repo: repo})
+	addressMapHandler := addressmap.NewHandler(addressMapRepositoryAdapter{repo: repo}, addressmap.Config{Metrics: m})
 
 	// networkAPIHandler serves the real, read-only pool-wide network/
 	// topology endpoints (GET /api/v1/network/pools,
@@ -2072,6 +2288,7 @@ func run(cfg config) error {
 	authHandler, err := authapi.NewHandler(authRepositoryAdapter{repo: repo}, authapi.Config{
 		JWTSecret: cfg.jwtSecret,
 		Network:   network,
+		Metrics:   m,
 	})
 	if err != nil {
 		return fmt.Errorf("configuring authapi: %w", err)
@@ -2196,8 +2413,20 @@ func run(cfg config) error {
 		log.Print("backend: wallet-stats poller disabled (no wallet RPC configured for either coin)")
 	}
 
+	// pending-balance poller: unconditional, unlike every other
+	// poller above -- the outstanding pending_balance liability
+	// exists regardless of whether any wallet/unlocker/disburse
+	// feature is configured at all (see runPendingBalancePoller's
+	// doc comment). Reuses cfg.walletStatsPollInterval rather than
+	// introducing a new, separately-tunable knob for what is a very
+	// cheap, always-relevant query.
+	log.Printf("backend: pending-balance poller enabled, polling every %s", cfg.walletStatsPollInterval)
+	go runPendingBalancePoller(ctx, repo, m, cfg.walletStatsPollInterval)
+
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux)
+	// RegisterIngestionRoutes deliberately excludes GET /metrics --
+	// see metricsSrv below and PROD_HARDENING_REVIEW.md finding #12.
+	handler.RegisterIngestionRoutes(mux)
 	statsHandler.RegisterRoutes(mux)
 	addressMapHandler.RegisterRoutes(mux)
 	networkAPIHandler.RegisterRoutes(mux)
@@ -2206,27 +2435,103 @@ func run(cfg config) error {
 	authHandler.RegisterRoutes(mux)
 	legacyConfigHandler.RegisterRoutes(mux)
 
+	// HTTP server hardening (PROD_HARDENING_REVIEW.md finding #12):
+	// ReadHeaderTimeout alone (5s, unchanged from before this fix)
+	// only bounds reading the request LINE+HEADERS -- it does
+	// nothing to stop a slow body-trickle client from pinning a
+	// goroutine indefinitely, even though the body's SIZE is already
+	// capped (1 MiB via http.MaxBytesReader, see api/api.go's
+	// readBody). ReadTimeout (30s) bounds reading the WHOLE request
+	// (headers + body); WriteTimeout (30s) bounds writing the
+	// response -- every real response this process ever sends is a
+	// small JSON/protobuf body, so 30s is generous, not tight, for
+	// either direction. IdleTimeout (120s) bounds how long an idle
+	// keep-alive connection may sit between requests -- long enough
+	// for a legitimate low-frequency polling client (e.g. a leaf's
+	// own periodic GET /api/v1/leaf/address-flags poll), short
+	// enough that a client opening many idle connections cannot pin
+	// them open forever.
 	srv := &http.Server{
 		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// ln/netutil.LimitListener: the main listener's connection cap
+	// (PROD_HARDENING_REVIEW.md finding #12 -- the leaf binaries
+	// already have an analogous cap for their own listeners via
+	// internal/leaflib/manager.go's ConnectionManager.MaxConnections,
+	// this backend previously had none at all). Built via a raw
+	// net.Listen + srv.Serve(ln) rather than srv.ListenAndServe()
+	// specifically so the cap can wrap the listener itself.
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", listenAddr, err)
+	}
+	if cfg.maxConnections > 0 {
+		ln = netutil.LimitListener(ln, cfg.maxConnections)
+		log.Printf("backend: main HTTP listener connection cap ENABLED: max %d concurrent connection(s) on %s", cfg.maxConnections, listenAddr)
+	} else {
+		log.Print("backend: main HTTP listener connection cap DISABLED (-max-connections/GCPOOL_MAX_CONNECTIONS <= 0)")
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("backend: listening on %s", listenAddr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
 		errCh <- nil
 	}()
 
+	// metricsSrv serves GET /metrics ALONE, on its own listener,
+	// deliberately separate from srv above -- see
+	// defaultMetricsListenAddr's doc comment and
+	// PROD_HARDENING_REVIEW.md finding #12 for why: /metrics exposes
+	// wallet_balance_atomic (the real, current hot-wallet balance)
+	// and previously shared the SAME public, wildcard-bindable
+	// listener as share/block ingestion. Loopback-default, matching
+	// the leaf binaries' own -metrics-listen-address convention. An
+	// empty -metrics-listen-addr/GCPOOL_METRICS_LISTEN_ADDR disables
+	// this ENTIRELY -- GET /metrics is then not served by this
+	// process at all, not silently folded back onto the main
+	// listener.
+	var metricsSrv *http.Server
+	if cfg.metricsListenAddr != "" {
+		metricsMux := http.NewServeMux()
+		handler.RegisterMetricsRoute(metricsMux)
+		metricsSrv = &http.Server{
+			Addr:              cfg.metricsListenAddr,
+			Handler:           metricsMux,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		go func() {
+			log.Printf("backend: /metrics listening on %s (separate from the main %s ingestion/API listener -- see -metrics-listen-addr/GCPOOL_METRICS_LISTEN_ADDR)", cfg.metricsListenAddr, listenAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("backend: metrics HTTP server error: %v", err)
+			}
+		}()
+	} else {
+		log.Print("backend: /metrics HTTP listener DISABLED (-metrics-listen-addr/GCPOOL_METRICS_LISTEN_ADDR is empty) -- this process will not serve /metrics anywhere")
+	}
+
 	select {
 	case <-ctx.Done():
 		log.Print("backend: shutdown signal received, draining connections")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if metricsSrv != nil {
+			if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+				log.Printf("backend: shutting down metrics http server: %v", err)
+			}
+		}
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shutting down http server: %w", err)
 		}
