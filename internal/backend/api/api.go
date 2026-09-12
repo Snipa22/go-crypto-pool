@@ -192,9 +192,40 @@ func (h *Handler) Mux() *http.ServeMux {
 // (e.g. internal/backend/statsapi.Handler's read-only miner stats
 // routes, which cmd/backend mounts on the same listener) — this
 // package never registers anything under /api/v1/stats/.
+//
+// Registers BOTH the share/block ingestion routes AND GET /metrics
+// on the SAME mux — this is the right default for this package's own
+// tests and any caller that genuinely wants everything on one
+// listener. cmd/backend does NOT use this method for its production
+// wiring: per PROD_HARDENING_REVIEW.md finding #12 (/metrics exposes
+// wallet_balance_atomic, the real hot-wallet balance, and must not
+// share a public listener with share/block ingestion), it calls
+// RegisterIngestionRoutes and RegisterMetricsRoute separately against
+// two different muxes/listeners instead. See those two methods' own
+// doc comments.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	h.RegisterIngestionRoutes(mux)
+	h.RegisterMetricsRoute(mux)
+}
+
+// RegisterIngestionRoutes registers ONLY this Handler's share/block
+// ingestion routes (POST /api/v1/share, POST /api/v1/block) onto mux
+// — deliberately NOT GET /metrics (see RegisterMetricsRoute for
+// that). Exists so a caller that wants a physically separate
+// listener for /metrics (see cmd/backend's -metrics-listen-addr /
+// GCPOOL_METRICS_LISTEN_ADDR) can mount the ingestion surface on its
+// own public listener without this package needing to know anything
+// about listener topology itself.
+func (h *Handler) RegisterIngestionRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/share", h.instrumentInFlight(http.HandlerFunc(h.handleShare)))
 	mux.Handle("POST /api/v1/block", h.instrumentInFlight(http.HandlerFunc(h.handleBlock)))
+}
+
+// RegisterMetricsRoute registers ONLY GET /metrics onto mux — the
+// counterpart to RegisterIngestionRoutes above, for a caller that
+// wants /metrics served from a separate mux/listener than the
+// ingestion routes.
+func (h *Handler) RegisterMetricsRoute(mux *http.ServeMux) {
 	mux.Handle("GET /metrics", h.m.Handler())
 }
 
@@ -307,6 +338,14 @@ func (h *Handler) handleBlock(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateBlock(block); err != nil {
 		h.m.BlocksTotal.WithLabelValues(algo, network, metrics.ResultRejected).Inc()
+		if errors.Is(err, errEmptyBlockHash) {
+			// Distinct, clearly-named metric for THIS specific
+			// failure mode (PROD_HARDENING_REVIEW.md finding #13) --
+			// see errEmptyBlockHash's doc comment for why an empty
+			// hash is worth its own counter separate from the
+			// generic blocks_total{result="rejected"} bucket above.
+			h.m.BlocksRejectedEmptyHashTotal.WithLabelValues(algo, network).Inc()
+		}
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -378,6 +417,40 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 // payment address, and a non-negative block height. Deliberately not
 // exhaustive — this is not a full schema validator, just enough to
 // reject obviously-broken submissions before they hit the DB.
+// maxMinerStringLen caps every miner-supplied, address/worker-name-
+// shaped string field validateShare/validateBlock accept before it is
+// persisted to a `TEXT` column with no length constraint of its own
+// (see migrations/0001_initial_schema.up.sql's shares/blocks
+// columns). 256 bytes is a generous ceiling for anything actually
+// shaped like a real Monero/Tari address, payment ID, or worker/rig
+// identifier -- the longest real address this codebase validates
+// anywhere (see internal/backend/addressmap) is well under 128
+// bytes -- while still being far short of the 1 MiB overall
+// request-body cap (maxBodyBytes) that was previously the ONLY bound
+// on any individual field's length. PROD_HARDENING_REVIEW.md finding
+// #17.
+const maxMinerStringLen = 256
+
+// errEmptyBlockHash is validateBlock's sentinel for the specific
+// "hash is required" rejection reason -- kept distinct from a plain
+// errors.New so handleBlock can recognize it via errors.Is and bump
+// blocks_rejected_empty_hash_total (PROD_HARDENING_REVIEW.md finding
+// #13) in addition to the generic blocks_total{result="rejected"}
+// counter every other validateBlock failure also increments. This is
+// the backend-side half of that finding: internal/leaflib/direct's
+// realBlockHashHex can return "" when every accepting node reports an
+// empty SubmitBlockResponse.block_hash, which flows through as
+// Hash: "" and is rejected here -- previously with only a generic
+// log line, silently dropping that block's accounting. The leaf-side
+// fix (making that empty case louder at the source) is out of scope
+// for this change.
+var errEmptyBlockHash = errors.New("block: hash is required")
+
+// validateShare checks the fields that genuinely matter for a share to
+// be actionable: an explicit (non-unspecified) algo, a non-empty
+// payment address, and a non-negative block height. Deliberately not
+// exhaustive — this is not a full schema validator, just enough to
+// reject obviously-broken submissions before they hit the DB.
 func validateShare(s *poolpb.Share) error {
 	if s.GetAlgo() == poolpb.Algo_ALGO_UNSPECIFIED {
 		return errors.New("share: algo is required")
@@ -390,6 +463,15 @@ func validateShare(s *poolpb.Share) error {
 	}
 	if s.GetPaymentAddress() == "" {
 		return errors.New("share: payment_address is required")
+	}
+	if len(s.GetPaymentAddress()) > maxMinerStringLen {
+		return fmt.Errorf("share: payment_address exceeds %d bytes", maxMinerStringLen)
+	}
+	if s.PaymentId != nil && len(s.GetPaymentId()) > maxMinerStringLen {
+		return fmt.Errorf("share: payment_id exceeds %d bytes", maxMinerStringLen)
+	}
+	if len(s.GetIdentifier()) > maxMinerStringLen {
+		return fmt.Errorf("share: identifier exceeds %d bytes", maxMinerStringLen)
 	}
 	if s.GetBlockHeight() < 0 {
 		return errors.New("share: block_height must be non-negative")
@@ -410,7 +492,10 @@ func validateBlock(b *poolpb.Block) error {
 		return errors.New("block: pool_type is required")
 	}
 	if b.GetHash() == "" {
-		return errors.New("block: hash is required")
+		return errEmptyBlockHash
+	}
+	if len(b.GetHash()) > maxMinerStringLen {
+		return fmt.Errorf("block: hash exceeds %d bytes", maxMinerStringLen)
 	}
 	if b.GetHeight() < 0 {
 		return errors.New("block: height must be non-negative")
