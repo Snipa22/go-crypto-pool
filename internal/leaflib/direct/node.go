@@ -121,13 +121,27 @@ func (c *NodeClient) buildCoinbaseExtra() []byte {
 // tariJobFromResult mirrors solo/node.go's own unexported
 // tariJobFromResult exactly — builds a coin-agnostic *solo.Job from a
 // real Tari GetNewBlockResult.
+//
+// job_id must be a purely random, opaque wire token, NEVER derived
+// from BlockHash (or any other template content) — this used to call
+// leaflib.JobIDFromBlockHash, which was CONFIRMED unsafe: see
+// internal/leaflib/solo/monero_node.go's GetBlockTemplate doc comment
+// for the concrete real production incident (RXM's prevHash+height
+// colliding across two genuinely different templates at an unmoved
+// tip) that this fix applies here too, and
+// internal/leaflib/solo/node.go's tariJobFromResult doc comment for
+// why a content-derived ID was never doing real collision-avoidance
+// work in the first place, even for Tari/SHA3X, since
+// JobManager.RestampDifficulty (solo/job.go) deliberately reuses the
+// SAME job_id for the SAME template on purpose whenever only
+// difficulty changes.
 func tariJobFromResult(result *tari_generated.GetNewBlockResult, algo poolpb.Algo) (*solo.Job, error) {
 	if result == nil || result.GetBlock() == nil || result.GetBlock().GetHeader() == nil {
 		return nil, fmt.Errorf("direct: GetBlockTemplate returned an incomplete result")
 	}
-	id, err := leaflib.JobIDFromBlockHash(result.GetBlockHash())
+	id, err := leaflib.NewRandomHexID()
 	if err != nil {
-		return nil, fmt.Errorf("direct: deriving job id from block hash: %w", err)
+		return nil, fmt.Errorf("direct: generating random job id: %w", err)
 	}
 	return &solo.Job{
 		ID:                      id,

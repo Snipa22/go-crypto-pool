@@ -1347,8 +1347,10 @@ func (s *Session) pushJob(job *Job) {
 // jobPayload builds the real wire job object (protocol.go's JobPayload)
 // for job, ported exactly from go-tari-sha3x-solo-stratum's
 // minerTracking.MinerJob.GetJobJSON: Blob is hex(Header) (the merge
-// mining hash), JobID is the job's already block-hash-derived real
-// job_id (see job.go's jobIDFromBlockHash), Target is
+// mining hash), JobID is the job's own real job_id (a purely random,
+// opaque wire token — see node.go's tariJobFromResult/
+// monero_node.go's GetBlockTemplate; NOT content-derived, see those
+// functions' doc comments for why), Target is
 // diffToTarget(difficulty) little-endian-8-byte-then-hex encoded, and
 // XN is this session's own assigned extranonce (the same value on
 // every job pushed to this session, since xn is assigned once at

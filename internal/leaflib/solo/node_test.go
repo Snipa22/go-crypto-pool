@@ -8,10 +8,61 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 	"github.com/Snipa22/go-xmr-lib/support"
 
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
+
+// TestTariJobFromResult_JobIDsAreRandomNotContentDerived is the direct
+// regression test for the "SHA3X was only accidentally safe" finding:
+// tariJobFromResult used to derive job.ID from result.GetBlockHash()
+// alone (jobIDFromBlockHash). That happened to almost always produce
+// distinct IDs in production only because GRPCNodeClient.
+// buildCoinbaseExtra randomizes coinbase-extra (and therefore
+// BlockHash) on every real call -- an INCIDENTAL side effect, not a
+// designed guarantee (see tariJobFromResult's doc comment) -- and it
+// provided ZERO real protection against the confirmed RXM case where
+// two genuinely different templates DO share their content-derived
+// prefix (monero_node.go's GetBlockTemplate doc comment). This test
+// calls tariJobFromResult twice with a byte-IDENTICAL
+// *tari_generated.GetNewBlockResult (same BlockHash, same Height,
+// same everything) and requires the two returned *Job's IDs to still
+// be distinct -- which only holds now that job.ID is minted via
+// newRandomHexID instead.
+func TestTariJobFromResult_JobIDsAreRandomNotContentDerived(t *testing.T) {
+	blockHash := bytes.Repeat([]byte{0xAB}, 32)
+	result := &tari_generated.GetNewBlockResult{
+		BlockHash:       blockHash,
+		MergeMiningHash: bytes.Repeat([]byte{0xCD}, 32),
+		Block: &tari_generated.Block{
+			Header: &tari_generated.BlockHeader{Height: 12345},
+		},
+		MinerData: &tari_generated.MinerData{TargetDifficulty: 1000},
+	}
+
+	job1, err := tariJobFromResult(result, poolpb.Algo_ALGO_SHA3X)
+	if err != nil {
+		t.Fatalf("tariJobFromResult (1st call): %v", err)
+	}
+	job2, err := tariJobFromResult(result, poolpb.Algo_ALGO_SHA3X)
+	if err != nil {
+		t.Fatalf("tariJobFromResult (2nd call): %v", err)
+	}
+
+	if !bytes.Equal(job1.BlockHash, job2.BlockHash) {
+		t.Fatalf("test premise violated: job1.BlockHash != job2.BlockHash")
+	}
+	if job1.Height != job2.Height {
+		t.Fatalf("test premise violated: job1.Height != job2.Height")
+	}
+	if job1.ID == job2.ID {
+		t.Fatalf("job1.ID == job2.ID (%q) for two tariJobFromResult calls with byte-identical BlockHash/Height -- job_id must be a purely random, opaque token, never content-derived", job1.ID)
+	}
+	if job1.ID == "" || job2.ID == "" {
+		t.Fatalf("job1.ID=%q job2.ID=%q -- job.ID must never be empty", job1.ID, job2.ID)
+	}
+}
 
 // TestGRPCNodeClientBuildCoinbaseExtraContainsConfiguredTag verifies
 // the exact bytes GetBlockTemplate would submit as CoinbaseExtra

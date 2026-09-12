@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"math"
 
 	"github.com/holiman/uint256"
@@ -58,8 +57,13 @@ func RandomNonceBuf() []byte {
 
 // NewRandomHexID returns 8 cryptographically-random bytes,
 // hex-encoded. Used for the per-connection session/login "id" the
-// wire protocol hands a miner (solo.LoginResult.ID) — unrelated to a
-// job's real, block-hash-derived job_id (JobIDFromBlockHash below).
+// wire protocol hands a miner (solo.LoginResult.ID), AND (as of the
+// random-job-id fix — see solo/node.go's tariJobFromResult and
+// solo/monero_node.go's GetBlockTemplate doc comments for the full
+// real-production-bug rationale) for every freshly-minted Job's own
+// job_id: a purely random, opaque wire token that miners only ever
+// echo back verbatim in submit, never derived from a block
+// hash/prevHash/height/any other template content.
 func NewRandomHexID() (string, error) {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
@@ -82,19 +86,6 @@ func NewSessionXN() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
-}
-
-// JobIDFromBlockHash derives the real miner-facing job_id from a raw
-// block hash — ported exactly from go-tari-sha3x-solo-stratum's
-// minerTracking.GetJobJSON: fmt.Sprintf("%x", blockHash)[0:16], i.e.
-// the first 16 HEX CHARACTERS (8 bytes' worth) of the hex-encoded raw
-// hash, not the first 16 raw bytes.
-func JobIDFromBlockHash(blockHash []byte) (string, error) {
-	full := hex.EncodeToString(blockHash)
-	if len(full) < 16 {
-		return "", fmt.Errorf("leaflib: block hash too short to derive a job id: got %d hex chars, need at least 16 (raw hash %d bytes)", len(full), len(blockHash))
-	}
-	return full[:16], nil
 }
 
 // AlgoWireName maps a Job's stamped poolpb.Algo onto the real wire

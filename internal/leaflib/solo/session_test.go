@@ -1770,15 +1770,15 @@ func TestInvalidateAndRepushJobsSkipsDuplicatePush(t *testing.T) {
 
 // TestInvalidateAndRepushJobsStillPushesOnDifficultyChange is the
 // regression guard for the correctness nuance in this fix: job.ID is
-// derived purely from the block hash (job.go's Job.ID) and does NOT
-// depend on difficulty, but the wire "target" field does. A dedup
-// keyed on job.ID alone would incorrectly swallow a legitimate
-// vardiff-driven difficulty/target update sharing the same job.ID as
-// the previous push. This simulates exactly that: a vardiff retarget
-// changes the session's own currentDifficulty between two
-// invalidateAndRepushJobs ticks while the underlying job/template
-// (and therefore job.ID) stays the same -- the push must still be
-// sent, with the new target.
+// a purely random, opaque wire token (job.go's Job.ID) and does NOT
+// depend on difficulty (or template content of any kind), but the
+// wire "target" field does. A dedup keyed on job.ID alone would
+// incorrectly swallow a legitimate vardiff-driven difficulty/target
+// update sharing the same job.ID as the previous push. This simulates
+// exactly that: a vardiff retarget changes the session's own
+// currentDifficulty between two invalidateAndRepushJobs ticks while
+// the underlying job/template (and therefore job.ID) stays the same
+// -- the push must still be sent, with the new target.
 func TestInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T) {
 	h := newTestHarness(t, 1000, 1<<62)
 	sessionID, xn := login(t, h, "dedup-addr-2")

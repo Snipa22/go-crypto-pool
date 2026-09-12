@@ -628,6 +628,58 @@ func TestMoneroNodeClient_GetBlockTemplate_ReservationFitsIsMarkedUsable(t *test
 	}
 }
 
+// TestMoneroNodeClient_GetBlockTemplate_JobIDsAreRandomNotContentDerived
+// is the direct regression test for the real production bug this task
+// fixes: at an UNMOVED tip, JobManager.refreshLoop's periodic
+// InvalidateAll (job.go) forces a brand new GetBlockTemplate call
+// whose prevHash/height/everything else in the response are
+// IDENTICAL to the previous call's, but whose real
+// RawTemplateBlob/ReservedOffset/reservation region are a genuinely
+// different template. mockGetBlockTemplateServer returns the exact
+// SAME prev_hash/height/reserved_offset/blobs on every request (there
+// is no per-call variation at all in its response), simulating that
+// exact no-tip-movement rotation. Before this fix, moneroJobID derived
+// job.ID from prevHash+height alone, so two such calls collided on
+// job.ID -- silently causing JobHistory.Record (wireshape.go) to treat
+// the second, genuinely different template as a same-template
+// "refresh in place" of the first. This test proves two calls against
+// byte-identical server responses now produce two DISTINCT job.ID
+// values, which is the only correct behavior for a purely random,
+// opaque wire token.
+func TestMoneroNodeClient_GetBlockTemplate_JobIDsAreRandomNotContentDerived(t *testing.T) {
+	srv := mockGetBlockTemplateServer(t, 10)
+	defer srv.Close()
+
+	client := NewMoneroNodeClient(srv.URL)
+
+	job1, err := client.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("GetBlockTemplate (1st call): %v", err)
+	}
+	job2, err := client.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("GetBlockTemplate (2nd call): %v", err)
+	}
+
+	// Sanity-check the premise: both calls really did observe
+	// byte-identical prevHash/height (the mock server hardcodes both
+	// on every request) -- if this ever stops holding, the test below
+	// would no longer be exercising the real bug scenario.
+	if job1.Height != job2.Height {
+		t.Fatalf("test premise violated: job1.Height=%d != job2.Height=%d (mock server should return identical height every call)", job1.Height, job2.Height)
+	}
+	if !bytes.Equal(job1.BlockHash, job2.BlockHash) {
+		t.Fatalf("test premise violated: job1.BlockHash != job2.BlockHash (mock server should return identical prev_hash every call)")
+	}
+
+	if job1.ID == job2.ID {
+		t.Fatalf("job1.ID == job2.ID (%q) for two GetBlockTemplate calls with byte-identical prevHash/height/reservation -- job_id must be a purely random, opaque token, never content-derived (see this bug's real-production writeup on monero_node.go's GetBlockTemplate doc comment)", job1.ID)
+	}
+	if job1.ID == "" || job2.ID == "" {
+		t.Fatalf("job1.ID=%q job2.ID=%q -- job.ID must never be empty", job1.ID, job2.ID)
+	}
+}
+
 // TestMoneroNodeClient_GetBlockTemplate_ReservationUnavailableIncrementsMetric
 // confirms SetReservationUnavailableMetric's counter is actually
 // incremented once for a degraded call and NOT incremented for a
