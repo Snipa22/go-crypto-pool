@@ -102,6 +102,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -110,6 +111,16 @@ import (
 // short address string) is tiny; there is no legitimate reason for it
 // to approach this size.
 const maxBodyBytes = 1 << 16 // 64 KiB
+
+// maxMinerStringLen caps every miner-supplied, address/username-shaped
+// string field these handlers accept before it reaches a Repository
+// call that persists it to an unbounded `TEXT` column (users.username
+// via UpsertUserThreshold, in particular -- see db/users.go). Mirrors
+// internal/backend/api's identically-named/valued constant and
+// PROD_HARDENING_REVIEW.md finding #17's own reasoning: 256 bytes is
+// generous for anything actually shaped like a real address or
+// "<address>.<payment_id>" username, far short of maxBodyBytes.
+const maxMinerStringLen = 256
 
 // tokenTTL is how long a freshly signed or refreshed JWT is valid for
 // -- matches legacy's own 24h expiry exactly (see brief-auth.md).
@@ -174,6 +185,18 @@ type Config struct {
 	// body omits it (mirrors statsapi.Config.Network's role, per
 	// brief-auth.md's explicit instruction to do so).
 	Network poolpb.Network
+
+	// Metrics, if non-nil, is the metrics.Metrics instance this
+	// Handler's handlers increment (auth_attempts_total,
+	// force_payout_writes_total). If nil, metrics are simply not
+	// recorded. See PROD_HARDENING_REVIEW.md finding #19: per the
+	// audit, POST /authenticate and POST /user/forcePayment were
+	// previously entirely metric-invisible -- /authenticate
+	// attempt/failure counts are the standard credential-stuffing/
+	// brute-force signal, and every force-payout write moves real
+	// money ahead of a miner's normal payout schedule, so it is
+	// worth its own always-on counter regardless of outcome.
+	Metrics *metrics.Metrics
 }
 
 // Handler implements this package's HTTP endpoints.
@@ -229,6 +252,31 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeJSONErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// observeAuthAttempt increments Config.Metrics' auth_attempts_total
+// for one POST /authenticate attempt, a no-op if no Metrics is
+// configured. result is one of metrics.AuthResultSuccess/Failure. See
+// PROD_HARDENING_REVIEW.md finding #19.
+func (h *Handler) observeAuthAttempt(result string) {
+	if h.cfg.Metrics == nil {
+		return
+	}
+	h.cfg.Metrics.AuthAttemptsTotal.WithLabelValues(result).Inc()
+}
+
+// observeForcePayoutWrite increments Config.Metrics'
+// force_payout_writes_total for one POST /user/forcePayment attempt,
+// a no-op if no Metrics is configured. result is one of
+// metrics.ForcePayoutResultSuccess/Failure. Per the audit
+// (PROD_HARDENING_REVIEW.md finding #19), every force-payout write
+// moves real money ahead of a miner's normal payout schedule and is
+// worth its own always-on counter regardless of outcome.
+func (h *Handler) observeForcePayoutWrite(algo, network, result string) {
+	if h.cfg.Metrics == nil {
+		return
+	}
+	h.cfg.Metrics.ForcePayoutWritesTotal.WithLabelValues(algo, network, result).Inc()
 }
 
 // hashPassword computes the hex-encoded HMAC-SHA256 digest of
@@ -410,6 +458,12 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Username == "" || req.Password == "" {
+		h.observeAuthAttempt(metrics.AuthResultFailure)
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "msg": "Invalid username/password"})
+		return
+	}
+	if len(req.Username) > maxMinerStringLen {
+		h.observeAuthAttempt(metrics.AuthResultFailure)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "msg": "Invalid username/password"})
 		return
 	}
@@ -420,6 +474,7 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		// collapse to the same generic invalid-credentials response
 		// -- mirroring legacy's own behavior of never distinguishing
 		// "wrong username" from "wrong password" to a caller.
+		h.observeAuthAttempt(metrics.AuthResultFailure)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "msg": "Invalid username/password"})
 		return
 	}
@@ -427,15 +482,18 @@ func (h *Handler) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		// Deliberate deviation from legacy: NOT falling back to an
 		// email == password comparison here -- see this package's
 		// doc comment, deviation #1.
+		h.observeAuthAttempt(metrics.AuthResultFailure)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "msg": "Invalid username/password"})
 		return
 	}
 
 	want := h.hashPassword(req.Password)
 	if !hmac.Equal([]byte(*user.Pass), []byte(want)) {
+		h.observeAuthAttempt(metrics.AuthResultFailure)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"success": false, "msg": "Invalid username/password"})
 		return
 	}
+	h.observeAuthAttempt(metrics.AuthResultSuccess)
 
 	token, err := h.signToken(user.ID, user.Admin)
 	if err != nil {
@@ -586,6 +644,10 @@ func (h *Handler) handleForcePayment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "msg": "username is required"})
 		return
 	}
+	if len(req.Username) > maxMinerStringLen || len(req.Algo) > maxMinerStringLen || len(req.Network) > maxMinerStringLen {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "msg": "field exceeds maximum length"})
+		return
+	}
 
 	address, paymentID := splitUsername(req.Username)
 
@@ -604,9 +666,11 @@ func (h *Handler) handleForcePayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.repo.SetForcePayout(r.Context(), algo, network, address, paymentID); err != nil {
+		h.observeForcePayoutWrite(algo, network, metrics.ForcePayoutResultFailure)
 		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "msg": "Error in pushing update, username not found"})
 		return
 	}
+	h.observeForcePayoutWrite(algo, network, metrics.ForcePayoutResultSuccess)
 	writeJSON(w, http.StatusOK, map[string]string{"msg": "Payout scheduled"})
 }
 
@@ -629,6 +693,10 @@ func (h *Handler) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.Username == "" {
 		writeJSONErr(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	if len(req.Username) > maxMinerStringLen {
+		writeJSONErr(w, http.StatusBadRequest, "username exceeds maximum length")
 		return
 	}
 	threshold := int64(math.Round(req.Threshold))
@@ -654,6 +722,10 @@ func (h *Handler) handleGetUser(w http.ResponseWriter, r *http.Request) {
 	address := r.PathValue("address")
 	if address == "" {
 		writeJSONErr(w, http.StatusBadRequest, "address is required")
+		return
+	}
+	if len(address) > maxMinerStringLen {
+		writeJSONErr(w, http.StatusBadRequest, "address exceeds maximum length")
 		return
 	}
 
@@ -686,6 +758,10 @@ func (h *Handler) handleToggleEmailPublic(w http.ResponseWriter, r *http.Request
 	}
 	if req.Address == "" {
 		writeJSONErr(w, http.StatusBadRequest, "address is required")
+		return
+	}
+	if len(req.Address) > maxMinerStringLen {
+		writeJSONErr(w, http.StatusBadRequest, "address exceeds maximum length")
 		return
 	}
 
