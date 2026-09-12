@@ -29,29 +29,46 @@ type AddressMap struct {
 // has no mapping row.
 var ErrAddressMapNotFound = errors.New("db: address_map: no mapping for xmr_address")
 
-// UpsertAddressMap inserts a new xmrAddress -> tariAddress mapping, or
-// updates the existing one (stamping updated_at) if xmrAddress
-// already has a row -- see uq_address_map_xmr_address, which is what
-// makes ON CONFLICT well-defined here. Both addresses are required;
-// this function does not itself validate that they are well-formed
-// Monero/Tari addresses (that is the HTTP handler's job -- see
-// internal/backend/addressmap -- so this repository layer stays a
-// thin, reusable persistence primitive).
-func (r *Repository) UpsertAddressMap(ctx context.Context, xmrAddress, tariAddress string) error {
+// ErrAddressAlreadyMapped is returned by SetAddressMap when
+// xmrAddress already has a mapping row -- see that function's doc
+// comment: this closes the payout-redirection vector where a caller
+// who merely knows an xmr_address could otherwise hijack an
+// already-set tari_address destination.
+var ErrAddressAlreadyMapped = errors.New("db: address_map: xmr_address is already mapped")
+
+// SetAddressMap inserts a new xmrAddress -> tariAddress mapping if
+// (and only if) xmrAddress has no existing row. It is deliberately
+// set-once/no-overwrite -- per explicit product direction (see
+// FIX_BRIEF.md), once an xmr_address has a tari_address mapped, a
+// later call for the same xmr_address must NOT change it. Returns
+// ErrAddressAlreadyMapped (leaving the existing row completely
+// untouched -- not even updated_at is stamped) if xmrAddress already
+// has a mapping; this function was previously named UpsertAddressMap
+// and did overwrite on conflict -- renamed because it is no longer an
+// upsert. Both addresses are required; this function does not itself
+// validate that they are well-formed Monero/Tari addresses (that is
+// the HTTP handler's job -- see internal/backend/addressmap -- so
+// this repository layer stays a thin, reusable persistence
+// primitive).
+func (r *Repository) SetAddressMap(ctx context.Context, xmrAddress, tariAddress string) error {
 	if xmrAddress == "" {
-		return fmt.Errorf("db: UpsertAddressMap: xmr_address is required")
+		return fmt.Errorf("db: SetAddressMap: xmr_address is required")
 	}
 	if tariAddress == "" {
-		return fmt.Errorf("db: UpsertAddressMap: tari_address is required")
+		return fmt.Errorf("db: SetAddressMap: tari_address is required")
 	}
 
 	const stmt = `
 		INSERT INTO address_map (xmr_address, tari_address)
 		VALUES ($1, $2)
 		ON CONFLICT (xmr_address)
-		DO UPDATE SET tari_address = EXCLUDED.tari_address, updated_at = now()`
-	if _, err := r.pool.Exec(ctx, stmt, xmrAddress, tariAddress); err != nil {
-		return fmt.Errorf("db: upserting address_map for %s: %w", xmrAddress, err)
+		DO NOTHING`
+	tag, err := r.pool.Exec(ctx, stmt, xmrAddress, tariAddress)
+	if err != nil {
+		return fmt.Errorf("db: inserting address_map for %s: %w", xmrAddress, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAddressAlreadyMapped
 	}
 	return nil
 }

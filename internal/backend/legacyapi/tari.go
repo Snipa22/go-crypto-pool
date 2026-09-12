@@ -1,6 +1,6 @@
 // tari.go implements the SXMR merge-mining system's legacy-shaped
 // Tari-address endpoints, thin-wrapping internal/backend/addressmap's
-// existing upsert/get logic (addressmap.Repository) — see this
+// existing set/get logic (addressmap.Repository) — see this
 // package's doc comment for why this wrapper reshapes both the
 // request AND response bodies (legacy's camelCase xmrAddress/
 // tariAddress keys, not addressmap's own snake_case xmr_address/
@@ -37,8 +37,18 @@ type updateTariAddressRequest struct {
 // this reuse — see that package's doc comment on those two
 // functions) rather than re-derived here; this handler's only job is
 // picking which of legacy's two distinct failure messages to render
-// depending on which side failed, and translating a successful
-// Upsert into legacy's own {"msg": "<tariAddress>"} success shape.
+// depending on which side failed, and translating a successful Set
+// into legacy's own {"msg": "<tariAddress>"} success shape.
+//
+// Set is set-once/no-overwrite (see addressmap.Repository.Set /
+// FIX_BRIEF.md): a second call for an already-mapped xmr_address
+// returns addressmap.ErrAlreadyMapped, which this handler
+// deliberately folds into the SAME "Unable to insert address" 400
+// legacy already sends on any Set error, rather than inventing a new
+// response shape -- this keeps behavior identical to a legacy caller
+// (a 400, not a 200 overwrite), matching legacy's own plain INSERT
+// (no ON CONFLICT clause) failing/erroring on a duplicate
+// xmr_address (see lib/api.js:869/872).
 func (h *Handler) handleUpdateTariAddress(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxTariBodyBytes)
 
@@ -59,7 +69,7 @@ func (h *Handler) handleUpdateTariAddress(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := h.addrMap.Upsert(r.Context(), req.XMRAddress, req.TariAddress); err != nil {
+	if err := h.addrMap.Set(r.Context(), req.XMRAddress, req.TariAddress); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "msg": "Unable to insert address"})
 		return
 	}
