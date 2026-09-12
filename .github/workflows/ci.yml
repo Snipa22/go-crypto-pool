@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build, vet, fmt, test (race)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go test (race)
+        id: test
+        run: |
+          set -o pipefail
+          go test ./... -race -count=1 -v | tee test_output.log
+
+      - name: Test summary
+        if: always()
+        run: |
+          pass_count="$(grep -c '^--- PASS' test_output.log || true)"
+          fail_count="$(grep -c '^--- FAIL' test_output.log || true)"
+          if [ "${{ steps.test.outcome }}" = "success" ]; then
+            echo "Test summary: PASS (passed: ${pass_count}, failed: ${fail_count})"
+          else
+            echo "Test summary: FAIL (passed: ${pass_count}, failed: ${fail_count})"
+            exit 1
+          fi
