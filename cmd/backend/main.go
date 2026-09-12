@@ -99,10 +99,15 @@
 //	                         (coinbase spend maturity) — a sensible
 //	                         starting default, but still operator-
 //	                         tunable via this variable, not hardcoded.
-//	GCPOOL_PAYOUT_FEE_ADDRESS (optional) pool operator fee-collection
-//	                         payment address. When set, every block
-//	                         the unlocker marks matured also triggers
-//	                         a real internal/backend/payout.Calculator
+//	GCPOOL_PAYOUT_TARI_FEE_ADDRESS (optional) pool operator
+//	                         fee-collection payment address for
+//	                         Tari-family algos (RXT/C29/SHA3X).
+//	GCPOOL_PAYOUT_MONERO_FEE_ADDRESS (optional) pool operator
+//	                         fee-collection payment address for RXM.
+//	                         When either is set, every block the
+//	                         unlocker marks matured for that coin
+//	                         family also triggers a real
+//	                         internal/backend/payout.Calculator
 //	                         PPS/PPLNS/Solo payout cycle for that
 //	                         block, crediting miner balances. When
 //	                         unset, blocks still mature/unlock
@@ -110,10 +115,10 @@
 //	                         auto-paid out. See
 //	                         buildPayoutCalculator's doc comment for
 //	                         the rest of this feature's env vars
-//	                         (GCPOOL_PAYOUT_COIN_DEV_ADDRESS,
-//	                         GCPOOL_PAYOUT_POOL_DEV_ADDRESS,
+//	                         (GCPOOL_PAYOUT_TARI_DONATION_ADDRESS,
+//	                         GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS,
 //	                         GCPOOL_PAYOUT_{PPS,PPLNS,SOLO}_FEE_PERCENT,
-//	                         GCPOOL_PAYOUT_{,POOL_}DEV_DONATION_PERCENT,
+//	                         GCPOOL_PAYOUT_DONATION_PERCENT,
 //	                         GCPOOL_PAYOUT_PPLNS_SHARE_MULTI).
 //	GCPOOL_MONERO_WALLET_RPC_ADDR (optional) base URL of a real
 //	                         monero-wallet-rpc endpoint (e.g.
@@ -300,15 +305,15 @@ type config struct {
 
 	networkPollerPollInterval time.Duration
 
-	payoutFeeAddress             string
-	payoutCoinDevAddress         string
-	payoutPoolDevAddress         string
-	payoutPPSFeePercent          float64
-	payoutPPLNSFeePercent        float64
-	payoutSoloFeePercent         float64
-	payoutDevDonationPercent     float64
-	payoutPoolDevDonationPercent float64
-	payoutPPLNSShareMulti        float64
+	payoutTariFeeAddress        string
+	payoutMoneroFeeAddress      string
+	payoutTariDonationAddress   string
+	payoutMoneroDonationAddress string
+	payoutPPSFeePercent         float64
+	payoutPPLNSFeePercent       float64
+	payoutSoloFeePercent        float64
+	payoutDonationPercent       float64
+	payoutPPLNSShareMulti       float64
 
 	retentionPollInterval time.Duration
 	retentionBlocks       int64
@@ -424,14 +429,14 @@ func loadConfig() (config, error) {
 
 	flag.DurationVar(&cfg.networkPollerPollInterval, "network-poller-poll-interval", envOrDuration("GCPOOL_NETWORK_POLLER_POLL_INTERVAL", defaultNetworkPollerInterval), "how often the network-state poller re-checks the real upstream chain(s) configured via -tari-grpc-addr/-monero-rpc-addr. Env: GCPOOL_NETWORK_POLLER_POLL_INTERVAL")
 
-	flag.StringVar(&cfg.payoutFeeAddress, "payout-fee-address", envOr("GCPOOL_PAYOUT_FEE_ADDRESS", ""), "pool operator fee-collection payment address. When set, every block the unlocker marks matured also triggers a real payout cycle for that block, crediting miner balances. When unset, blocks still mature/unlock correctly, they are simply never auto-paid out. Env: GCPOOL_PAYOUT_FEE_ADDRESS")
-	flag.StringVar(&cfg.payoutCoinDevAddress, "payout-coin-dev-address", envOr("GCPOOL_PAYOUT_COIN_DEV_ADDRESS", ""), "coin developer donation address. Env: GCPOOL_PAYOUT_COIN_DEV_ADDRESS")
-	flag.StringVar(&cfg.payoutPoolDevAddress, "payout-pool-dev-address", envOr("GCPOOL_PAYOUT_POOL_DEV_ADDRESS", ""), "pool software developer donation address. Env: GCPOOL_PAYOUT_POOL_DEV_ADDRESS")
+	flag.StringVar(&cfg.payoutTariFeeAddress, "payout-tari-fee-address", envOr("GCPOOL_PAYOUT_TARI_FEE_ADDRESS", ""), "pool operator fee-collection payment address for Tari-family algos (RXT/C29/SHA3X). When set, every matured Tari-family block also triggers a real payout cycle for that block, crediting miner balances. When unset, Tari-family blocks still mature/unlock correctly, they are simply never auto-paid out. Env: GCPOOL_PAYOUT_TARI_FEE_ADDRESS")
+	flag.StringVar(&cfg.payoutMoneroFeeAddress, "payout-monero-fee-address", envOr("GCPOOL_PAYOUT_MONERO_FEE_ADDRESS", ""), "pool operator fee-collection payment address for RXM (Monero). When set, every matured RXM block also triggers a real payout cycle for that block, crediting miner balances. When unset, RXM blocks still mature/unlock correctly, they are simply never auto-paid out. Env: GCPOOL_PAYOUT_MONERO_FEE_ADDRESS")
+	flag.StringVar(&cfg.payoutTariDonationAddress, "payout-tari-donation-address", envOr("GCPOOL_PAYOUT_TARI_DONATION_ADDRESS", ""), "donation address for Tari-family (RXT/C29/SHA3X) payout cycles. Env: GCPOOL_PAYOUT_TARI_DONATION_ADDRESS")
+	flag.StringVar(&cfg.payoutMoneroDonationAddress, "payout-monero-donation-address", envOr("GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS", ""), "donation address for RXM (Monero) payout cycles. Env: GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS")
 	flag.Float64Var(&cfg.payoutPPSFeePercent, "payout-pps-fee-percent", envOrFloat64("GCPOOL_PAYOUT_PPS_FEE_PERCENT", 0), "PPS pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_PPS_FEE_PERCENT")
 	flag.Float64Var(&cfg.payoutPPLNSFeePercent, "payout-pplns-fee-percent", envOrFloat64("GCPOOL_PAYOUT_PPLNS_FEE_PERCENT", 0), "PPLNS pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_PPLNS_FEE_PERCENT")
 	flag.Float64Var(&cfg.payoutSoloFeePercent, "payout-solo-fee-percent", envOrFloat64("GCPOOL_PAYOUT_SOLO_FEE_PERCENT", 0), "Solo pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_SOLO_FEE_PERCENT")
-	flag.Float64Var(&cfg.payoutDevDonationPercent, "payout-dev-donation-percent", envOrFloat64("GCPOOL_PAYOUT_DEV_DONATION_PERCENT", 0), "donation split percentage (0-100) of each fee cut routed to -payout-coin-dev-address. Env: GCPOOL_PAYOUT_DEV_DONATION_PERCENT")
-	flag.Float64Var(&cfg.payoutPoolDevDonationPercent, "payout-pool-dev-donation-percent", envOrFloat64("GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT", 0), "donation split percentage (0-100) of each fee cut routed to -payout-pool-dev-address. Env: GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT")
+	flag.Float64Var(&cfg.payoutDonationPercent, "payout-donation-percent", envOrFloat64("GCPOOL_PAYOUT_DONATION_PERCENT", 0), "donation split percentage (0-100) of each fee cut routed to -payout-tari-donation-address/-payout-monero-donation-address, shared across coin families. Env: GCPOOL_PAYOUT_DONATION_PERCENT")
 	flag.Float64Var(&cfg.payoutPPLNSShareMulti, "payout-pplns-share-multi", envOrFloat64("GCPOOL_PAYOUT_PPLNS_SHARE_MULTI", defaultPPLNSShareMulti), "PPLNS window multiplier. A placeholder, operator-tunable value -- see payout.Config's doc comment. Env: GCPOOL_PAYOUT_PPLNS_SHARE_MULTI")
 
 	flag.DurationVar(&cfg.retentionPollInterval, "retention-poll-interval", envOrDuration("GCPOOL_RETENTION_POLL_INTERVAL", defaultRetentionPollInterval), "how often the retention job re-evaluates every target. Only consulted if at least one retention window is configured. Env: GCPOOL_RETENTION_POLL_INTERVAL")
@@ -506,15 +511,15 @@ type fileConfig struct {
 
 	NetworkPollerPollIntervalSeconds *int `toml:"network_poller_poll_interval_seconds"`
 
-	PayoutFeeAddress             *string  `toml:"payout_fee_address"`
-	PayoutCoinDevAddress         *string  `toml:"payout_coin_dev_address"`
-	PayoutPoolDevAddress         *string  `toml:"payout_pool_dev_address"`
-	PayoutPPSFeePercent          *float64 `toml:"payout_pps_fee_percent"`
-	PayoutPPLNSFeePercent        *float64 `toml:"payout_pplns_fee_percent"`
-	PayoutSoloFeePercent         *float64 `toml:"payout_solo_fee_percent"`
-	PayoutDevDonationPercent     *float64 `toml:"payout_dev_donation_percent"`
-	PayoutPoolDevDonationPercent *float64 `toml:"payout_pool_dev_donation_percent"`
-	PayoutPPLNSShareMulti        *float64 `toml:"payout_pplns_share_multi"`
+	PayoutTariFeeAddress        *string  `toml:"payout_tari_fee_address"`
+	PayoutMoneroFeeAddress      *string  `toml:"payout_monero_fee_address"`
+	PayoutTariDonationAddress   *string  `toml:"payout_tari_donation_address"`
+	PayoutMoneroDonationAddress *string  `toml:"payout_monero_donation_address"`
+	PayoutPPSFeePercent         *float64 `toml:"payout_pps_fee_percent"`
+	PayoutPPLNSFeePercent       *float64 `toml:"payout_pplns_fee_percent"`
+	PayoutSoloFeePercent        *float64 `toml:"payout_solo_fee_percent"`
+	PayoutDonationPercent       *float64 `toml:"payout_donation_percent"`
+	PayoutPPLNSShareMulti       *float64 `toml:"payout_pplns_share_multi"`
 
 	RetentionPollIntervalSeconds *int   `toml:"retention_poll_interval_seconds"`
 	RetentionBlocks              *int64 `toml:"retention_blocks"`
@@ -580,14 +585,14 @@ func applyConfigFile(cfg *config) error {
 		cfgfile.ApplyDuration(&cfg.networkPollerPollInterval, &d, visited, "network-poller-poll-interval", "GCPOOL_NETWORK_POLLER_POLL_INTERVAL")
 	}
 
-	cfgfile.ApplyString(&cfg.payoutFeeAddress, fc.PayoutFeeAddress, visited, "payout-fee-address", "GCPOOL_PAYOUT_FEE_ADDRESS")
-	cfgfile.ApplyString(&cfg.payoutCoinDevAddress, fc.PayoutCoinDevAddress, visited, "payout-coin-dev-address", "GCPOOL_PAYOUT_COIN_DEV_ADDRESS")
-	cfgfile.ApplyString(&cfg.payoutPoolDevAddress, fc.PayoutPoolDevAddress, visited, "payout-pool-dev-address", "GCPOOL_PAYOUT_POOL_DEV_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutTariFeeAddress, fc.PayoutTariFeeAddress, visited, "payout-tari-fee-address", "GCPOOL_PAYOUT_TARI_FEE_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutMoneroFeeAddress, fc.PayoutMoneroFeeAddress, visited, "payout-monero-fee-address", "GCPOOL_PAYOUT_MONERO_FEE_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutTariDonationAddress, fc.PayoutTariDonationAddress, visited, "payout-tari-donation-address", "GCPOOL_PAYOUT_TARI_DONATION_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutMoneroDonationAddress, fc.PayoutMoneroDonationAddress, visited, "payout-monero-donation-address", "GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS")
 	cfgfile.ApplyFloat64(&cfg.payoutPPSFeePercent, fc.PayoutPPSFeePercent, visited, "payout-pps-fee-percent", "GCPOOL_PAYOUT_PPS_FEE_PERCENT")
 	cfgfile.ApplyFloat64(&cfg.payoutPPLNSFeePercent, fc.PayoutPPLNSFeePercent, visited, "payout-pplns-fee-percent", "GCPOOL_PAYOUT_PPLNS_FEE_PERCENT")
 	cfgfile.ApplyFloat64(&cfg.payoutSoloFeePercent, fc.PayoutSoloFeePercent, visited, "payout-solo-fee-percent", "GCPOOL_PAYOUT_SOLO_FEE_PERCENT")
-	cfgfile.ApplyFloat64(&cfg.payoutDevDonationPercent, fc.PayoutDevDonationPercent, visited, "payout-dev-donation-percent", "GCPOOL_PAYOUT_DEV_DONATION_PERCENT")
-	cfgfile.ApplyFloat64(&cfg.payoutPoolDevDonationPercent, fc.PayoutPoolDevDonationPercent, visited, "payout-pool-dev-donation-percent", "GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT")
+	cfgfile.ApplyFloat64(&cfg.payoutDonationPercent, fc.PayoutDonationPercent, visited, "payout-donation-percent", "GCPOOL_PAYOUT_DONATION_PERCENT")
 	cfgfile.ApplyFloat64(&cfg.payoutPPLNSShareMulti, fc.PayoutPPLNSShareMulti, visited, "payout-pplns-share-multi", "GCPOOL_PAYOUT_PPLNS_SHARE_MULTI")
 
 	if fc.RetentionPollIntervalSeconds != nil {
@@ -1495,31 +1500,40 @@ func buildNetworkPollerConfig(cfg config, network poolpb.Network, m *metrics.Met
 // package doc comment for the underlying GCPOOL_PAYOUT_* env vars)
 // and returns a ready-to-use *payout.Calculator plus whether payout
 // calculation should actually be wired into the unlocker's
-// matured-block trigger (ok == false when cfg.payoutFeeAddress is
-// unset — a deployment that hasn't configured a fee address yet gets
-// correct chain-maturity tracking out of the unlocker alone, exactly
+// matured-block trigger (ok == false when NEITHER
+// cfg.payoutTariFeeAddress NOR cfg.payoutMoneroFeeAddress is set — a
+// deployment that hasn't configured any fee address yet gets correct
+// chain-maturity tracking out of the unlocker alone, exactly
 // mirroring buildUnlockerConfig's own opt-in story for
-// cfg.tariGRPCAddr/cfg.moneroRPCAddr).
+// cfg.tariGRPCAddr/cfg.moneroRPCAddr). A deployment may enable only
+// one coin family (e.g. Tari-only) by setting just that family's fee
+// address; the payout.Calculator itself refuses (via
+// payout.addressesForAlgo) to process an algo whose family's fee
+// address was never configured.
 //
-//	GCPOOL_PAYOUT_FEE_ADDRESS       (required to enable payout) pool
-//	                                operator fee-collection address.
-//	GCPOOL_PAYOUT_COIN_DEV_ADDRESS  (optional) coin developer donation
-//	                                address.
-//	GCPOOL_PAYOUT_POOL_DEV_ADDRESS  (optional) pool software developer
-//	                                donation address.
+//	GCPOOL_PAYOUT_TARI_FEE_ADDRESS   (required to enable Tari-family
+//	                                 payout) pool operator
+//	                                 fee-collection address for
+//	                                 RXT/C29/SHA3X.
+//	GCPOOL_PAYOUT_MONERO_FEE_ADDRESS (required to enable Monero
+//	                                 payout) pool operator
+//	                                 fee-collection address for RXM.
+//	GCPOOL_PAYOUT_TARI_DONATION_ADDRESS,
+//	GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS (optional) per-coin-family
+//	                                 donation addresses.
 //	GCPOOL_PAYOUT_PPS_FEE_PERCENT, GCPOOL_PAYOUT_PPLNS_FEE_PERCENT,
 //	GCPOOL_PAYOUT_SOLO_FEE_PERCENT (optional) per-pool-type operator
 //	                                fee percentage (0-100). Default 0.
-//	GCPOOL_PAYOUT_DEV_DONATION_PERCENT,
-//	GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT (optional) donation split
-//	                                percentage (0-100) of each fee cut.
+//	GCPOOL_PAYOUT_DONATION_PERCENT  (optional) donation split
+//	                                percentage (0-100) of each fee
+//	                                cut, shared across coin families.
 //	                                Default 0 (no donation split).
 //	GCPOOL_PAYOUT_PPLNS_SHARE_MULTI (optional) PPLNS window multiplier.
 //	                                Default 2 (a placeholder, operator-
 //	                                tunable value — see payout.Config's
 //	                                doc comment).
 func buildPayoutCalculator(cfg config, repo *db.Repository, m *metrics.Metrics) (calc *payout.Calculator, ok bool, err error) {
-	if cfg.payoutFeeAddress == "" {
+	if strings.TrimSpace(cfg.payoutTariFeeAddress) == "" && strings.TrimSpace(cfg.payoutMoneroFeeAddress) == "" {
 		return nil, false, nil
 	}
 
@@ -1528,16 +1542,16 @@ func buildPayoutCalculator(cfg config, repo *db.Repository, m *metrics.Metrics) 
 	}
 
 	pcfg := payout.Config{
-		FeeAddress:             cfg.payoutFeeAddress,
-		CoinDevAddress:         cfg.payoutCoinDevAddress,
-		PoolDevAddress:         cfg.payoutPoolDevAddress,
-		PPSFeePercent:          cfg.payoutPPSFeePercent,
-		PPLNSFeePercent:        cfg.payoutPPLNSFeePercent,
-		SoloFeePercent:         cfg.payoutSoloFeePercent,
-		DevDonationPercent:     cfg.payoutDevDonationPercent,
-		PoolDevDonationPercent: cfg.payoutPoolDevDonationPercent,
-		PPLNSShareMulti:        cfg.payoutPPLNSShareMulti,
-		Metrics:                m,
+		TariFeeAddress:        cfg.payoutTariFeeAddress,
+		MoneroFeeAddress:      cfg.payoutMoneroFeeAddress,
+		TariDonationAddress:   cfg.payoutTariDonationAddress,
+		MoneroDonationAddress: cfg.payoutMoneroDonationAddress,
+		PPSFeePercent:         cfg.payoutPPSFeePercent,
+		PPLNSFeePercent:       cfg.payoutPPLNSFeePercent,
+		SoloFeePercent:        cfg.payoutSoloFeePercent,
+		DonationPercent:       cfg.payoutDonationPercent,
+		PPLNSShareMulti:       cfg.payoutPPLNSShareMulti,
+		Metrics:               m,
 	}
 
 	return payout.New(payoutRepositoryAdapter{repo: repo}, pcfg), true, nil
@@ -1545,29 +1559,36 @@ func buildPayoutCalculator(cfg config, repo *db.Repository, m *metrics.Metrics) 
 
 // validateDonationConfig fails fast (returning a real error, never
 // just a log line) when a donation percentage is configured with no
-// address to send that donation to. Per PROD_HARDENING_REVIEW.md
-// finding #10: payout.seedPaymentData/applyDonations
-// (internal/backend/payout/payout.go) credit an EMPTY-STRING address
-// row whenever *DevDonationPercent > 0 but the matching
-// *DevAddress is unset -- and the resulting empty-address `balance`
-// row then makes its WHOLE disbursement batch fail every cycle
-// (wallet/monero_rpc.go's Transfer rejects an empty destination
-// address), silently blocking every OTHER miner co-batched with it.
-// There is no legitimate reason to configure a donation percentage
-// with nowhere to send it, so this is refused at startup rather than
-// left to poison a batch in production.
+// address to send that donation to, per coin family. Per
+// PROD_HARDENING_REVIEW.md finding #10: payout.seedPaymentData/
+// applyDonations (internal/backend/payout/payout.go) credit an
+// EMPTY-STRING address row whenever DonationPercent > 0 but the
+// matching family's *DonationAddress is unset -- and the resulting
+// empty-address `balance` row then makes its WHOLE disbursement
+// batch fail every cycle (wallet/monero_rpc.go's Transfer rejects an
+// empty destination address), silently blocking every OTHER miner
+// co-batched with it. There is no legitimate reason to configure a
+// donation percentage with nowhere to send it, so this is refused at
+// startup rather than left to poison a batch in production. Each
+// coin family is only checked if that family's payout is actually
+// enabled (its fee address is set) -- an operator running Tari-only
+// should not be forced to configure a Monero donation address they
+// will never use.
 func validateDonationConfig(cfg config) error {
-	if cfg.payoutDevDonationPercent > 0 && strings.TrimSpace(cfg.payoutCoinDevAddress) == "" {
-		return fmt.Errorf("GCPOOL_PAYOUT_DEV_DONATION_PERCENT is %v (> 0) but GCPOOL_PAYOUT_COIN_DEV_ADDRESS is empty -- "+
-			"refusing to start: an empty coin-dev donation address would credit a real balance row with payment_address='', "+
-			"which poisons its entire disbursement batch every cycle (see PROD_HARDENING_REVIEW.md finding #10)",
-			cfg.payoutDevDonationPercent)
+	if cfg.payoutDonationPercent <= 0 {
+		return nil
 	}
-	if cfg.payoutPoolDevDonationPercent > 0 && strings.TrimSpace(cfg.payoutPoolDevAddress) == "" {
-		return fmt.Errorf("GCPOOL_PAYOUT_POOL_DEV_DONATION_PERCENT is %v (> 0) but GCPOOL_PAYOUT_POOL_DEV_ADDRESS is empty -- "+
-			"refusing to start: an empty pool-dev donation address would credit a real balance row with payment_address='', "+
+	if strings.TrimSpace(cfg.payoutTariFeeAddress) != "" && strings.TrimSpace(cfg.payoutTariDonationAddress) == "" {
+		return fmt.Errorf("GCPOOL_PAYOUT_DONATION_PERCENT is %v (> 0) and GCPOOL_PAYOUT_TARI_FEE_ADDRESS is set, but GCPOOL_PAYOUT_TARI_DONATION_ADDRESS is empty -- "+
+			"refusing to start: an empty donation address would credit a real balance row with payment_address='', "+
 			"which poisons its entire disbursement batch every cycle (see PROD_HARDENING_REVIEW.md finding #10)",
-			cfg.payoutPoolDevDonationPercent)
+			cfg.payoutDonationPercent)
+	}
+	if strings.TrimSpace(cfg.payoutMoneroFeeAddress) != "" && strings.TrimSpace(cfg.payoutMoneroDonationAddress) == "" {
+		return fmt.Errorf("GCPOOL_PAYOUT_DONATION_PERCENT is %v (> 0) and GCPOOL_PAYOUT_MONERO_FEE_ADDRESS is set, but GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS is empty -- "+
+			"refusing to start: an empty donation address would credit a real balance row with payment_address='', "+
+			"which poisons its entire disbursement batch every cycle (see PROD_HARDENING_REVIEW.md finding #10)",
+			cfg.payoutDonationPercent)
 	}
 	return nil
 }
@@ -2305,8 +2326,8 @@ func run(cfg config) error {
 	legacyConfigHandler := legacyconfig.NewHandler(legacyConfigRepositoryAdapter{repo: repo}, networkAPIHandler, legacyconfig.Config{
 		PPSFeePercent:          cfg.payoutPPSFeePercent,
 		SoloFeePercent:         cfg.payoutSoloFeePercent,
-		DevDonationPercent:     cfg.payoutDevDonationPercent,
-		PoolDevDonationPercent: cfg.payoutPoolDevDonationPercent,
+		DevDonationPercent:     cfg.payoutDonationPercent,
+		PoolDevDonationPercent: cfg.payoutDonationPercent,
 		MinWalletPayoutAtomic:  cfg.disburseMinPayoutAtomic,
 		MaturityDepth:          cfg.unlockerTariMaturity,
 	})
@@ -2325,7 +2346,7 @@ func run(cfg config) error {
 		unlockerCfg.PayoutTrigger = payoutTrigger{calc: payoutCalc, network: networkDBString(network)}
 		log.Print("backend: payout calculation enabled, wired into the block unlocker's matured-block trigger")
 	} else {
-		log.Print("backend: payout calculation disabled (GCPOOL_PAYOUT_FEE_ADDRESS not set); blocks will still be marked matured/unlocked, just never auto-paid out")
+		log.Print("backend: payout calculation disabled (neither GCPOOL_PAYOUT_TARI_FEE_ADDRESS nor GCPOOL_PAYOUT_MONERO_FEE_ADDRESS set); blocks will still be marked matured/unlocked, just never auto-paid out")
 	}
 
 	if unlockerEnabled {

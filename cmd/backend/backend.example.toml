@@ -87,17 +87,24 @@ unlocker_monero_maturity = 60
 # configured via tari_grpc_addr/monero_rpc_addr, in seconds. (default: 60)
 network_poller_poll_interval_seconds = 60
 
-# Pool operator fee-collection payment address. When set, every block the
-# unlocker marks matured also triggers a real payout cycle for that block,
-# crediting miner balances. When unset, blocks still mature/unlock correctly,
-# they are simply never auto-paid out. (default: "")
-payout_fee_address = ""
+# Pool operator fee-collection payment address for Tari-family algos
+# (RXT/C29/SHA3X). When set, every matured Tari-family block also triggers a
+# real payout cycle for that block, crediting miner balances. When unset,
+# Tari-family blocks still mature/unlock correctly, they are simply never
+# auto-paid out. (default: "")
+payout_tari_fee_address = ""
 
-# Coin developer donation address. (default: "")
-payout_coin_dev_address = ""
+# Pool operator fee-collection payment address for RXM (Monero). When set,
+# every matured RXM block also triggers a real payout cycle for that block,
+# crediting miner balances. When unset, RXM blocks still mature/unlock
+# correctly, they are simply never auto-paid out. (default: "")
+payout_monero_fee_address = ""
 
-# Pool software developer donation address. (default: "")
-payout_pool_dev_address = ""
+# Donation address for Tari-family (RXT/C29/SHA3X) payout cycles. (default: "")
+payout_tari_donation_address = ""
+
+# Donation address for RXM (Monero) payout cycles. (default: "")
+payout_monero_donation_address = ""
 
 # PPS pool-type operator fee percentage (0-100). (default: 0)
 payout_pps_fee_percent = 0
@@ -109,12 +116,9 @@ payout_pplns_fee_percent = 0
 payout_solo_fee_percent = 0
 
 # Donation split percentage (0-100) of each fee cut routed to
-# payout_coin_dev_address. (default: 0)
-payout_dev_donation_percent = 0
-
-# Donation split percentage (0-100) of each fee cut routed to
-# payout_pool_dev_address. (default: 0)
-payout_pool_dev_donation_percent = 0
+# payout_tari_donation_address/payout_monero_donation_address, shared across
+# coin families. (default: 0)
+payout_donation_percent = 0
 
 # PPLNS window multiplier. A placeholder, operator-tunable value -- see
 # payout.Config's doc comment. (default: 2)
