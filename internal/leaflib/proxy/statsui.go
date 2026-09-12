@@ -27,6 +27,7 @@ var statsPageTemplate = template.Must(template.New("proxy-stats").Funcs(template
 		}
 		return time.Since(t).Round(time.Second).String()
 	},
+	"formatHashrate": formatHashrate,
 }).Parse(statsPageHTML))
 
 const statsPageHTML = `<!DOCTYPE html>
@@ -65,6 +66,7 @@ const statsPageHTML = `<!DOCTYPE html>
     <div class="card"><div class="value">{{.Stats.TotalShares}}</div><div class="label">Total shares (connected sessions)</div></div>
     <div class="card"><div class="value">{{.Stats.TotalBlocks}}</div><div class="label">Total upstream-forwarded (connected sessions)</div></div>
     <div class="card"><div class="value">{{.Stats.MinDifficulty}} / {{.Stats.MedianDifficulty}} / {{.Stats.MaxDifficulty}}</div><div class="label">Vardiff min / median / max</div></div>
+    <div class="card"><div class="value">{{formatHashrate .Stats.TotalEstimatedHashrate}}</div><div class="label">Global hashrate</div></div>
   </div>
 
   <h2>Miners by address{{if .AddressCapped}} (capped to {{.MaxAddressLabels}}, overflow in "other"){{end}}</h2>
@@ -82,7 +84,7 @@ const statsPageHTML = `<!DOCTYPE html>
   <h2>Connected sessions</h2>
   {{if .Stats.Sessions}}
   <table>
-    <tr><th>Session ID</th><th>Address</th><th>Worker</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Shares</th><th>Upstream-forwarded</th></tr>
+    <tr><th>Session ID</th><th>Address</th><th>Worker</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Upstream-forwarded</th></tr>
     {{range .Stats.Sessions}}
     <tr>
       <td>{{.SessionID}}</td>
@@ -92,6 +94,7 @@ const statsPageHTML = `<!DOCTYPE html>
       <td>{{formatTime .ConnectedAt}}</td>
       <td>{{connDuration .ConnectedAt}}</td>
       <td>{{.CurrentDifficulty}}</td>
+      <td>{{formatHashrate .EstimatedHashrate}}</td>
       <td>{{.ShareCount}}</td>
       <td>{{.BlockCount}}</td>
     </tr>
@@ -113,6 +116,29 @@ type statsPageData struct {
 	// HideRemoteAddress mirrors internal/leaflib/solo/statsui.go's
 	// identical field exactly — see that doc comment.
 	HideRemoteAddress bool
+}
+
+// formatHashrate renders a hashes/second estimate (see
+// leaflib.EstimateHashrateHz's doc comment for the underlying
+// formula) as a short, human-readable string with the standard
+// SI-ish H/s unit prefixes (H, KH, MH, GH, TH, PH per 1000), matching
+// the convention nearly every real mining pool stats page uses --
+// a small local copy of solo/statsui.go's own formatHashrate
+// (deliberately not shared/refactored into a common helper, per this
+// package's convention of keeping a minimal, fully-contained
+// footprint rather than introducing a cross-leaf dependency for one
+// small formatting function).
+func formatHashrate(hz float64) string {
+	if hz <= 0 {
+		return "0 H/s"
+	}
+	units := []string{"H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s"}
+	i := 0
+	for hz >= 1000 && i < len(units)-1 {
+		hz /= 1000
+		i++
+	}
+	return fmt.Sprintf("%.2f %s", hz, units[i])
 }
 
 // StatsHTMLHandler serves the basic stats UI page described above,

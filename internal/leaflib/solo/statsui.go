@@ -64,6 +64,7 @@ const statsPageHTML = `<!DOCTYPE html>
     <div class="card"><div class="value">{{.Stats.TotalShares}}</div><div class="label">Total shares (connected sessions)</div></div>
     <div class="card"><div class="value">{{.Stats.TotalBlocks}}</div><div class="label">Total blocks (connected sessions)</div></div>
     <div class="card"><div class="value">{{.Stats.MinDifficulty}} / {{.Stats.MedianDifficulty}} / {{.Stats.MaxDifficulty}}</div><div class="label">Vardiff min / median / max</div></div>
+    <div class="card"><div class="value">{{formatHashrate .Stats.TotalEstimatedHashrate}}</div><div class="label">Global hashrate</div></div>
   </div>
 
   <h2>Miners by address{{if .AddressCapped}} (capped to {{.MaxAddressLabels}}, overflow in "other"){{end}}</h2>

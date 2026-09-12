@@ -527,6 +527,13 @@ type SessionStat struct {
 	CurrentDifficulty uint64
 	ShareCount        uint64
 	BlockCount        uint64
+	// EstimatedHashrate is this session's real, per-session
+	// estimated hashrate in hashes/second, derived from its own
+	// difficulty-weighted accept-history accumulator and connection
+	// age — see leaflib.EstimateHashrateHz's doc comment for the
+	// full formula/rationale (industry-standard difficulty*2^32/time
+	// approximation, not a cryptographically exact hash count).
+	EstimatedHashrate float64
 }
 
 // AddressCount is one entry in Stats.MinersByAddress: a mining/payout
@@ -554,6 +561,12 @@ type Stats struct {
 	MaxDifficulty    uint64
 	MedianDifficulty uint64
 	Sessions         []SessionStat // per-session snapshot list, sorted by ConnectedAt
+
+	// TotalEstimatedHashrate is the sum of EstimatedHashrate across
+	// all sessions in this snapshot (hashes/second) — see
+	// SessionStat.EstimatedHashrate's doc comment for the underlying
+	// per-session formula.
+	TotalEstimatedHashrate float64
 
 	UpstreamConnected  bool
 	UpstreamReconnects uint64
@@ -601,6 +614,7 @@ func (s *Server) Stats() Stats {
 		if sess.mc.RemoteAddr() != nil {
 			remoteAddr = sess.mc.RemoteAddr().String()
 		}
+		hashrate := leaflib.EstimateHashrateHz(sess.hashesAccumulated.Load(), sess.connectedAt)
 		st.Sessions = append(st.Sessions, SessionStat{
 			SessionID:         sess.sessionID,
 			Address:           addr,
@@ -610,7 +624,9 @@ func (s *Server) Stats() Stats {
 			CurrentDifficulty: diff,
 			ShareCount:        sess.shareCount.Load(),
 			BlockCount:        sess.blockCount.Load(),
+			EstimatedHashrate: hashrate,
 		})
+		st.TotalEstimatedHashrate += hashrate
 	}
 
 	st.UniqueRemoteIPs = len(ipSet)

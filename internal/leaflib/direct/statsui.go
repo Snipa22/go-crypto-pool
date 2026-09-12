@@ -67,6 +67,12 @@ type Stats struct {
 	MedianDifficulty uint64
 	Sessions         []SessionStat // per-session snapshot list, sorted by ConnectedAt
 
+	// TotalEstimatedHashrate is the sum of EstimatedHashrate across
+	// all sessions in this snapshot (hashes/second) — see
+	// SessionStat.EstimatedHashrate's doc comment for the underlying
+	// per-session formula.
+	TotalEstimatedHashrate float64
+
 	// BackendHealthy is true when the last known real
 	// forwardShare/forwardBlock call to the backend succeeded (or no
 	// call has been made yet — "no known failure" is the honest
@@ -128,6 +134,7 @@ func (s *Server) Stats() Stats {
 		if sess.mc.RemoteAddr() != nil {
 			remoteAddr = sess.mc.RemoteAddr().String()
 		}
+		hashrate := leaflib.EstimateHashrateHz(sess.hashesAccumulated.Load(), sess.connectedAt)
 		st.Sessions = append(st.Sessions, SessionStat{
 			SessionID:         sess.sessionID,
 			Address:           addr,
@@ -138,8 +145,9 @@ func (s *Server) Stats() Stats {
 			CurrentDifficulty: diff,
 			ShareCount:        sess.shareCount.Load(),
 			BlockCount:        sess.blockCount.Load(),
-			EstimatedHashrate: leaflib.EstimateHashrateHz(sess.hashesAccumulated.Load(), sess.connectedAt),
+			EstimatedHashrate: hashrate,
 		})
+		st.TotalEstimatedHashrate += hashrate
 	}
 
 	st.UniqueRemoteIPs = len(ipSet)
@@ -294,6 +302,7 @@ const statsPageHTML = `<!DOCTYPE html>
     <div class="card"><div class="value">{{.Stats.TotalShares}}</div><div class="label">Total shares (connected sessions)</div></div>
     <div class="card"><div class="value">{{.Stats.TotalBlocks}}</div><div class="label">Total blocks (connected sessions)</div></div>
     <div class="card"><div class="value">{{.Stats.MinDifficulty}} / {{.Stats.MedianDifficulty}} / {{.Stats.MaxDifficulty}}</div><div class="label">Vardiff min / median / max</div></div>
+    <div class="card"><div class="value">{{formatHashrate .Stats.TotalEstimatedHashrate}}</div><div class="label">Global hashrate</div></div>
   </div>
 
   <h2>Backend transport health</h2>
