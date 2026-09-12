@@ -623,6 +623,8 @@ func (s *Session) handleSubmit(req Request) {
 		return
 	}
 
+	s.server.debugLogger.Debugf("solo: submit received: session=%s job_id=%s nonce=%s result=%s", s.sessionID, submit.JobID, submit.Nonce, submit.Result)
+
 	// SECURITY: session-ownership check FIRST, independently of xn —
 	// see this method's doc comment. job.ID must have actually been
 	// issued to THIS session (s.ownJob), never any other session's.
@@ -1004,6 +1006,7 @@ func (s *Session) handleSubmit(req Request) {
 		// daemon-backed v.Validate call unconditionally — there is no
 		// skip path left to gate.
 		valid, err := v.Validate(context.Background(), share)
+		s.server.debugLogger.Debugf("solo: validation attempt: session=%s job_id=%s algo=%v valid=%v err=%v", s.sessionID, job.ID, job.Algo, valid, err)
 		if err != nil && err != validator.ErrWrongProofType {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
 			return
@@ -1329,6 +1332,7 @@ func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// branch point exactly once, uniformly labeled by result, without
 	// touching any of the actual accept/reject decision logic above.
 	s.server.recordShare(accepted)
+	s.server.debugLogger.Debugf("solo: submit result: session=%s accepted=%v reason=%q", s.sessionID, accepted, errMsg)
 	leaflib.WriteShareResponse(s.writeJSON, leaflib.IsLegacyWireAlgo(s.server.jobManager.Algo()), id, accepted, errMsg)
 }
 

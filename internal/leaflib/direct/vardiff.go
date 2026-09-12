@@ -52,6 +52,7 @@ func (s *Session) maybeRetarget() {
 	}
 
 	newDiff, changed := leaflib.ComputeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, minDiff, cfg.MaxDifficulty)
+	s.server.debugLogger.Debugf("direct: vardiff check: session=%s xn=%s cur_diff=%d hashes=%d conn_seconds=%d changed=%v", s.sessionID, s.xn, curDiff, hashes, connSeconds, changed)
 	if !changed {
 		return
 	}

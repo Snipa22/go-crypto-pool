@@ -317,6 +317,8 @@ func (s *Session) handleSubmit(req solo.Request) {
 		return
 	}
 
+	s.server.debugLogger.Debugf("direct: submit received: session=%s job_id=%s nonce=%s result=%s", s.sessionID, submit.JobID, submit.Nonce, submit.Result)
+
 	job, ok := s.ownJob(submit.JobID)
 	if !ok {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("unknown or stale job_id: %s", submit.JobID))
@@ -548,8 +550,10 @@ func (s *Session) handleSubmit(req solo.Request) {
 		skipped := solo.IsRandomXFamily(job.Algo) && s.trust.ShouldSkipValidation()
 		if skipped {
 			valid = true
+			s.server.debugLogger.Debugf("direct: validation attempt: session=%s job_id=%s algo=%v SKIPPED (trusted-miner validation skip)", s.sessionID, job.ID, job.Algo)
 		} else {
 			valid, err = v.Validate(context.Background(), share)
+			s.server.debugLogger.Debugf("direct: validation attempt: session=%s job_id=%s algo=%v valid=%v err=%v", s.sessionID, job.ID, job.Algo, valid, err)
 			if err != nil && err != validator.ErrWrongProofType {
 				s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
 				return
@@ -873,6 +877,7 @@ func (s *Session) writeGeneralResponse(id int, errMsg, result string) {
 
 func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	s.server.recordShare(accepted)
+	s.server.debugLogger.Debugf("direct: submit result: session=%s accepted=%v reason=%q", s.sessionID, accepted, errMsg)
 	leaflib.WriteShareResponse(s.writeJSON, leaflib.IsLegacyWireAlgo(s.server.algo), id, accepted, errMsg)
 }
 

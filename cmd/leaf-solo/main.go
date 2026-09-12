@@ -227,6 +227,16 @@ type config struct {
 	// leaf-solo.example.toml and internal/leaflib/cfgfile for the
 	// exact precedence rule (flag > env > file > hardcoded default).
 	configFile string
+
+	// debug is -debug/LEAF_SOLO_DEBUG: enables the shared
+	// leaflib.DebugLogger (internal/leaflib/debuglog.go) for this
+	// process. OFF (false) by default -- purely additive when
+	// enabled, and produces byte-identical log output to the
+	// pre-existing behavior when left off (see that file's doc
+	// comment). Wired into solo.Server via
+	// Server.SetDebugLogger below, which threads it down to every
+	// Session this process creates.
+	debug bool
 }
 
 func loadConfig() (config, error) {
@@ -289,6 +299,8 @@ func loadConfig() (config, error) {
 
 	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_SOLO_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-solo.example.toml. Env: LEAF_SOLO_CONFIG_FILE")
 
+	flag.BoolVar(&cfg.debug, "debug", envOr("LEAF_SOLO_DEBUG", "false") == "true", "enable verbose [DEBUG]-tagged logging (share submit params, validation attempt/result, job lifecycle, connection lifecycle, vardiff retargets). OFF by default -- purely additive, never changes any existing log line. Env: LEAF_SOLO_DEBUG (\"true\" to enable)")
+
 	flag.Parse()
 
 	if err := applyConfigFile(&cfg); err != nil {
@@ -349,6 +361,8 @@ type fileConfig struct {
 	RelaySubject         *string `toml:"relay_subject"`
 	TemplateRelaySubject *string `toml:"template_relay_subject"`
 	MoneroZMQURL         *string `toml:"monero_zmq_url"`
+
+	Debug *bool `toml:"debug"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -440,6 +454,8 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.relaySubject, fc.RelaySubject, visited, "relay-subject", "LEAF_SOLO_RELAY_SUBJECT")
 	cfgfile.ApplyString(&cfg.templateRelaySubject, fc.TemplateRelaySubject, visited, "template-relay-subject", "LEAF_SOLO_TEMPLATE_RELAY_SUBJECT")
 	cfgfile.ApplyString(&cfg.moneroZMQURL, fc.MoneroZMQURL, visited, "monero-zmq-url", "LEAF_SOLO_MONERO_ZMQ_URL")
+
+	cfgfile.ApplyBool(&cfg.debug, fc.Debug, visited, "debug", "LEAF_SOLO_DEBUG")
 
 	return nil
 }
@@ -695,6 +711,22 @@ func main() {
 	}
 	logger := log.New(os.Stdout, "leaf-solo: ", log.LstdFlags|log.Lmicroseconds)
 
+	// debugLogger is constructed exactly once per process (never a
+	// global/package-level singleton -- see
+	// internal/leaflib/debuglog.go's doc comment) and threaded down
+	// via Server.SetDebugLogger below. Writes to the SAME
+	// stdout-backed logger as every other leaf-solo log line, so
+	// [DEBUG]-tagged lines interleave naturally with the existing
+	// log stream rather than going to a second destination. Passing
+	// cfg.debug=false here (the default) means every Debugf call
+	// downstream is a near-zero-cost no-op -- see DebugLogger.Debugf's
+	// own doc comment on why the enabled check runs BEFORE any
+	// formatting work.
+	debugLogger := leaflib.NewDebugLogger(logger, cfg.debug)
+	if cfg.debug {
+		logger.Print("debug logging ENABLED (-debug/LEAF_SOLO_DEBUG) -- verbose [DEBUG]-tagged output follows for share submits, validation, job lifecycle, connection lifecycle, and vardiff retargets")
+	}
+
 	if isMoneroCoin(cfg.coin) {
 		if strings.TrimSpace(cfg.monerodURL) == "" {
 			logger.Fatal("LEAF_SOLO_MONEROD_URL (or -monerod-url) is required when -coin=monero")
@@ -788,6 +820,7 @@ func main() {
 		Network:          cfg.network,
 		Relay:            templateRelay,
 		Logger:           logger,
+		Debug:            debugLogger,
 	})
 
 	logger.Println("probing base node connectivity...")
@@ -838,6 +871,8 @@ func main() {
 	// difficulty.
 	server := solo.NewServer(cm, jobManager, node, validators, networkFromString(cfg.network), logger, vardiffCfg)
 	defer server.Shutdown()
+
+	server.SetDebugLogger(debugLogger)
 
 	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2a): worker
 	// count is runtime.NumCPU() by DEFAULT (server.NewServer's own

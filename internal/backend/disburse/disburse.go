@@ -42,6 +42,7 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
 
 // PayableBalance is one payable `balance` row, as needed for
@@ -193,6 +194,15 @@ type Config struct {
 	// disbursement_cycle_duration_seconds). If nil, metrics are
 	// simply not recorded.
 	Metrics *metrics.Metrics
+
+	// Debug, if non-nil and enabled, adds verbose [DEBUG]-tagged
+	// logging to every RunOnce cycle -- what was checked (payable
+	// balance count) and what changed (batch decisions/outcomes) --
+	// see internal/leaflib/debuglog.go's doc comment and
+	// cmd/backend/main.go's -debug/GCPOOL_DEBUG wiring. nil (the
+	// default for every pre-existing caller/test) is a complete
+	// no-op.
+	Debug *leaflib.DebugLogger
 }
 
 // Engine runs disbursement cycles against a Repository/WalletClient
@@ -282,6 +292,7 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 		return result, fmt.Errorf("disburse: RunOnce: listing payable balances: %w", err)
 	}
 	result.Payable = len(rows)
+	e.cfg.Debug.Debugf("disburse: %s/%s: poll cycle checking %d payable balance row(s) (min payout atomic=%d)", algo, network, len(rows), e.cfg.MinPayoutAtomic)
 	if len(rows) == 0 {
 		return result, nil
 	}

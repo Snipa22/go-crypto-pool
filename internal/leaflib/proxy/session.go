@@ -600,6 +600,8 @@ func (s *Session) handleSubmit(req Request) {
 		return
 	}
 
+	s.server.debugLogger.Debugf("proxy: submit received: session=%s job_id=%s nonce=%s result=%s", s.sessionID, submit.JobID, submit.Nonce, submit.Result)
+
 	job, ok := s.ownJob(submit.JobID)
 	if !ok {
 		s.writeShareResponse(req.ID, false, fmt.Sprintf("unknown or stale job_id: %s", submit.JobID))
@@ -796,6 +798,7 @@ func (s *Session) handleSubmit(req Request) {
 	// (connection.go). Nothing here needed a NEW lock.
 	finishSubmit := func() {
 		valid, err := s.server.validator.ValidateBlobSeedResult(context.Background(), fullBlob, job.SeedHash, submit.Result)
+		s.server.debugLogger.Debugf("proxy: validation attempt: session=%s job_id=%s valid=%v err=%v", s.sessionID, job.ID, valid, err)
 		if err != nil {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
 			return
@@ -863,6 +866,7 @@ func (s *Session) handleSubmit(req Request) {
 		}
 
 		accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce)
+		s.server.debugLogger.Debugf("proxy: upstream forward: session=%s upstream_job_id=%s nonce=%s result=%s worker_nonce=%v pool_nonce=%v -> accepted=%v err=%v", s.sessionID, job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce, accepted, err)
 		if err != nil {
 			s.server.logger.Printf("proxy: upstream submit failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)
 			s.server.recordBlock(false)
@@ -917,6 +921,7 @@ func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	// direct.Session's own identical recordShare hook exactly (see
 	// solo/session.go's writeShareResponse doc comment).
 	s.server.recordShare(accepted)
+	s.server.debugLogger.Debugf("proxy: submit result: session=%s accepted=%v reason=%q", s.sessionID, accepted, errMsg)
 	leaflib.WriteShareResponse(s.writeJSON, false, id, accepted, errMsg)
 }
 
