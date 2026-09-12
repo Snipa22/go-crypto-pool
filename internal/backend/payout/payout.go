@@ -107,15 +107,24 @@ type Repository interface {
 // 0-100 range the legacy config used (legacy always divides by 100
 // itself, e.g. `global.config.payout.ppsFee / 100`).
 type Config struct {
-	// FeeAddress is the pool operator's fee-collection payment
-	// address — global.config.payout.feeAddress.
-	FeeAddress string
-	// CoinDevAddress is the coin developer donation address —
-	// global.coinFuncs.coinDevAddress.
-	CoinDevAddress string
-	// PoolDevAddress is the pool software developer donation address
-	// — global.coinFuncs.poolDevAddress.
-	PoolDevAddress string
+	// TariFeeAddress/MoneroFeeAddress are the pool operator's
+	// fee-collection payment addresses — global.config.payout.feeAddress
+	// in legacy, split per coin family because a single backend
+	// process pays out both Tari-family algos (RXT/C29/SHA3X) and
+	// Monero (RXM) simultaneously, and each family's payout address
+	// must be a valid address on that family's own chain. See
+	// addressesForAlgo for the algo -> family mapping.
+	TariFeeAddress   string
+	MoneroFeeAddress string
+	// TariDonationAddress/MoneroDonationAddress are the (single,
+	// unified) donation addresses per coin family — the coin-dev and
+	// pool-dev donation roles legacy kept separate
+	// (global.coinFuncs.coinDevAddress/poolDevAddress) are collapsed
+	// into one address and one percentage here, per operator
+	// direction: the split is the same everywhere, so there is no
+	// reason to route it through two addresses.
+	TariDonationAddress   string
+	MoneroDonationAddress string
 
 	// PPSFeePercent/PPLNSFeePercent/SoloFeePercent are each pool
 	// type's operator fee cut — global.config.payout.{pps,pplns,solo}Fee.
@@ -123,13 +132,12 @@ type Config struct {
 	PPLNSFeePercent float64
 	SoloFeePercent  float64
 
-	// DevDonationPercent/PoolDevDonationPercent are the share of each
-	// fee cut redirected to CoinDevAddress/PoolDevAddress —
-	// global.config.payout.devDonation / poolDevDonation. Zero means
-	// no donation split (the legacy `if (...DevDonation > 0)` guard,
-	// reproduced exactly).
-	DevDonationPercent     float64
-	PoolDevDonationPercent float64
+	// DonationPercent is the share of each fee cut redirected to
+	// TariDonationAddress/MoneroDonationAddress — replaces legacy's
+	// separate devDonation/poolDevDonation percentages with a single
+	// shared split. Zero means no donation split (the legacy
+	// `if (...Donation > 0)` guard, reproduced exactly).
+	DonationPercent float64
 
 	// PPLNSShareMulti is the PPLNS window multiplier —
 	// global.config.pplns.shareMulti (the "N" in PPLNS: the payout
@@ -171,31 +179,57 @@ func paymentKey(address string, paymentID *string) string {
 	return address
 }
 
-// seedPaymentData builds the fee/coin-dev/pool-dev seed entries every
-// legacy calculate*Payments function pre-populates paymentData with
-// before touching any share row. Exactly like the legacy object
-// literal, if two of cfg.FeeAddress/CoinDevAddress/PoolDevAddress are
-// equal (or empty), they collapse into the same map entry — that is
-// legacy's own behavior (paymentData is a plain object keyed by
-// address string), reproduced here rather than treated as a bug.
-func seedPaymentData(cfg Config) map[string]*Payment {
-	data := make(map[string]*Payment, 3)
+// addressesForAlgo maps an algo literal to the correct coin family's
+// fee/donation addresses. RXT/C29/SHA3X (see
+// internal/backend/db.ValidAlgos) are Tari-family and resolve to
+// cfg.Tari*Address; RXM is Monero and resolves to cfg.Monero*Address.
+// Any other algo string is refused with an error rather than
+// silently falling back to either family's addresses — a single
+// backend process pays out both families simultaneously, so a wrong
+// or unmapped algo here would misroute real funds, not just misfile
+// a log line.
+func addressesForAlgo(cfg Config, algo string) (feeAddr, donationAddr string, err error) {
+	switch algo {
+	case "RXT", "C29", "SHA3X":
+		return cfg.TariFeeAddress, cfg.TariDonationAddress, nil
+	case "RXM":
+		return cfg.MoneroFeeAddress, cfg.MoneroDonationAddress, nil
+	default:
+		return "", "", fmt.Errorf("payout: addressesForAlgo: unrecognized algo %q -- refusing to guess a coin family (expected one of RXT, C29, SHA3X, RXM)", algo)
+	}
+}
+
+// seedPaymentData builds the fee/donation seed entries every legacy
+// calculate*Payments function pre-populates paymentData with before
+// touching any share row, using the addresses of algo's coin family
+// (see addressesForAlgo). Exactly like the legacy object literal, if
+// a family's fee and donation addresses are equal (or both empty),
+// they collapse into the same map entry — that is legacy's own
+// behavior (paymentData is a plain object keyed by address string),
+// reproduced here rather than treated as a bug.
+func seedPaymentData(cfg Config, algo string) (map[string]*Payment, error) {
+	feeAddr, donationAddr, err := addressesForAlgo(cfg, algo)
+	if err != nil {
+		return nil, err
+	}
+	data := make(map[string]*Payment, 2)
 	seed := func(addr string) {
 		if _, ok := data[addr]; !ok {
 			data[addr] = &Payment{PoolType: "fees", PaymentAddress: addr}
 		}
 	}
-	seed(cfg.FeeAddress)
-	seed(cfg.CoinDevAddress)
-	seed(cfg.PoolDevAddress)
-	return data
+	seed(feeAddr)
+	seed(donationAddr)
+	return data, nil
 }
 
-// applyDonations reproduces the identical 6-line block that appears at
-// the tail of all three legacy handleIdentifier functions: split
-// feesToPay into coin-dev/pool-dev donations (each optionally floored
-// per doFloorDonations — see CalculatePPLNS vs CalculatePPS/CalculateSolo's
-// callers) and credit the remainder to cfg.FeeAddress.
+// applyDonations reproduces the identical block that appears at the
+// tail of all three legacy handleIdentifier functions: split
+// feesToPay into a donation (optionally floored per doFloorDonations
+// — see CalculatePPLNS vs CalculatePPS/CalculateSolo's callers) and
+// credit the remainder to algo's coin family's fee address (see
+// addressesForAlgo) — never another family's, even though a single
+// backend process runs Tari-family and Monero payouts side by side.
 //
 // assignFee controls whether the fee-address entry is incremented
 // (PPS/PPLNS: `... = ... + (feesToPay - donations)`) or overwritten
@@ -203,29 +237,26 @@ func seedPaymentData(cfg Config) map[string]*Payment {
 // legacy asymmetry (CalculateSolo's handleIdentifier is a single,
 // one-shot handler per block, so it overwrites rather than
 // accumulates).
-func applyDonations(cfg Config, data map[string]*Payment, feesToPay float64, floorDonations, assignFee bool) {
-	donations := 0.0
-	if cfg.DevDonationPercent > 0 {
-		devDonation := feesToPay * (cfg.DevDonationPercent / 100)
-		if floorDonations {
-			devDonation = math.Floor(devDonation)
-		}
-		donations += devDonation
-		data[cfg.CoinDevAddress].Amount += devDonation
+func applyDonations(cfg Config, algo string, data map[string]*Payment, feesToPay float64, floorDonations, assignFee bool) error {
+	feeAddr, donationAddr, err := addressesForAlgo(cfg, algo)
+	if err != nil {
+		return err
 	}
-	if cfg.PoolDevDonationPercent > 0 {
-		poolDevDonation := feesToPay * (cfg.PoolDevDonationPercent / 100)
+	donations := 0.0
+	if cfg.DonationPercent > 0 {
+		donation := feesToPay * (cfg.DonationPercent / 100)
 		if floorDonations {
-			poolDevDonation = math.Floor(poolDevDonation)
+			donation = math.Floor(donation)
 		}
-		donations += poolDevDonation
-		data[cfg.PoolDevAddress].Amount += poolDevDonation
+		donations += donation
+		data[donationAddr].Amount += donation
 	}
 	if assignFee {
-		data[cfg.FeeAddress].Amount = feesToPay - donations
+		data[feeAddr].Amount = feesToPay - donations
 	} else {
-		data[cfg.FeeAddress].Amount += feesToPay - donations
+		data[feeAddr].Amount += feesToPay - donations
 	}
+	return nil
 }
 
 // Calculator runs payout calculations against a Repository using a
@@ -254,7 +285,10 @@ func (c *Calculator) CalculatePPS(ctx context.Context, algo string, height, bloc
 		return nil, fmt.Errorf("payout: CalculatePPS: %w", err)
 	}
 
-	data := seedPaymentData(c.cfg)
+	data, err := seedPaymentData(c.cfg, algo)
+	if err != nil {
+		return nil, fmt.Errorf("payout: CalculatePPS: %w", err)
+	}
 	rewardTotal := float64(blockReward)
 	blockDiff := float64(blockDifficulty)
 
@@ -270,7 +304,9 @@ func (c *Calculator) CalculatePPS(ctx context.Context, algo string, height, bloc
 		data[key].Amount += amountToPay
 		// Legacy calculatePPSPayments never floors its donation split
 		// (unlike PPLNS below) — reproduced exactly.
-		applyDonations(c.cfg, data, feesToPay, false, false)
+		if err := applyDonations(c.cfg, algo, data, feesToPay, false, false); err != nil {
+			return nil, fmt.Errorf("payout: CalculatePPS: %w", err)
+		}
 	}
 	return data, nil
 }
@@ -291,7 +327,10 @@ func (c *Calculator) CalculatePPLNS(ctx context.Context, algo string, startHeigh
 		return nil, fmt.Errorf("payout: CalculatePPLNS: Config.PPLNSShareMulti must be non-zero")
 	}
 
-	data := seedPaymentData(c.cfg)
+	data, err := seedPaymentData(c.cfg, algo)
+	if err != nil {
+		return nil, fmt.Errorf("payout: CalculatePPLNS: %w", err)
+	}
 	rewardTotal := float64(blockReward)
 	blockDiff := float64(blockDifficulty)
 	totalPaid := 0.0
@@ -317,7 +356,9 @@ func (c *Calculator) CalculatePPLNS(ctx context.Context, algo string, startHeigh
 			data[key].Amount += amountToPay
 			// Legacy calculatePPLNSPayments DOES floor its donation
 			// split (unlike PPS/Solo above/below) — reproduced exactly.
-			applyDonations(c.cfg, data, feesToPay, true, false)
+			if err := applyDonations(c.cfg, algo, data, feesToPay, true, false); err != nil {
+				return nil, fmt.Errorf("payout: CalculatePPLNS: %w", err)
+			}
 		}
 		if totalPaid >= rewardTotal {
 			break
@@ -342,7 +383,10 @@ func (c *Calculator) CalculateSolo(ctx context.Context, algo string, height, blo
 	if err != nil {
 		return nil, fmt.Errorf("payout: CalculateSolo: %w", err)
 	}
-	data := seedPaymentData(c.cfg)
+	data, err := seedPaymentData(c.cfg, algo)
+	if err != nil {
+		return nil, fmt.Errorf("payout: CalculateSolo: %w", err)
+	}
 	if !found {
 		return data, nil
 	}
@@ -360,7 +404,9 @@ func (c *Calculator) CalculateSolo(ctx context.Context, algo string, height, blo
 	// Legacy calculateSoloPayments never floors its donation split
 	// (like PPS, unlike PPLNS) — reproduced exactly. The fee-address
 	// entry is also assigned, not accumulated, matching legacy.
-	applyDonations(c.cfg, data, feesToPay, false, true)
+	if err := applyDonations(c.cfg, algo, data, feesToPay, false, true); err != nil {
+		return nil, fmt.Errorf("payout: CalculateSolo: %w", err)
+	}
 	return data, nil
 }
 

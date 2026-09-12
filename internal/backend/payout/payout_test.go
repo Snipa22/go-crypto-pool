@@ -70,15 +70,15 @@ func (f *fakeRepo) CreditBalance(_ context.Context, algo, network, paymentAddres
 
 func testConfig() Config {
 	return Config{
-		FeeAddress:             "fee-addr",
-		CoinDevAddress:         "coindev-addr",
-		PoolDevAddress:         "pooldev-addr",
-		PPSFeePercent:          2,
-		PPLNSFeePercent:        1,
-		SoloFeePercent:         0.5,
-		DevDonationPercent:     10,
-		PoolDevDonationPercent: 5,
-		PPLNSShareMulti:        2,
+		TariFeeAddress:        "tari-fee-addr",
+		TariDonationAddress:   "tari-donation-addr",
+		MoneroFeeAddress:      "monero-fee-addr",
+		MoneroDonationAddress: "monero-donation-addr",
+		PPSFeePercent:         2,
+		PPLNSFeePercent:       1,
+		SoloFeePercent:        0.5,
+		DonationPercent:       15,
+		PPLNSShareMulti:       2,
 	}
 }
 
@@ -208,17 +208,13 @@ func TestCalculatePPS_SplitsByShareWeightAndFee(t *testing.T) {
 	if got := data["bob"].Amount; got != 39200 {
 		t.Fatalf("bob amount = %v, want 39200", got)
 	}
-	// total fees = 1200+800 = 2000; devDonation (unfloored) = 2000*0.10=200 each op;
-	// coindev gets 10% of each op's feesToPay individually: 1200*0.10=120, 800*0.10=80 -> 200
-	if got := data["coindev-addr"].Amount; got != 200 {
-		t.Fatalf("coindev amount = %v, want 200", got)
+	// total fees = 1200+800 = 2000; donation (unfloored) is 15% of each
+	// op's feesToPay individually: 1200*0.15=180, 800*0.15=120 -> 300
+	if got := data["monero-donation-addr"].Amount; got != 300 {
+		t.Fatalf("donation amount = %v, want 300", got)
 	}
-	// pooldev: 1200*0.05=60, 800*0.05=40 -> 100
-	if got := data["pooldev-addr"].Amount; got != 100 {
-		t.Fatalf("pooldev amount = %v, want 100", got)
-	}
-	// feeAddress: (1200-120-60) + (800-80-40) = 1020+680 = 1700
-	if got := data["fee-addr"].Amount; got != 1700 {
+	// feeAddress: (1200-180) + (800-120) = 1020+680 = 1700
+	if got := data["monero-fee-addr"].Amount; got != 1700 {
 		t.Fatalf("fee-addr amount = %v, want 1700", got)
 	}
 }
@@ -283,23 +279,19 @@ func TestCalculatePPLNS_CapsAtBlockRewardAndFloorsDonations(t *testing.T) {
 	if got := data["alice"].Amount; got != 99000 {
 		t.Fatalf("alice amount = %v, want 99000", got)
 	}
-	// donation split is floored for PPLNS: dev = floor(1000*0.10) = 100, pooldev = floor(1000*0.05) = 50
-	if got := data["coindev-addr"].Amount; got != 100 {
-		t.Fatalf("coindev amount = %v, want 100", got)
+	// donation split is floored for PPLNS: 15% of 1000 = 150
+	if got := data["tari-donation-addr"].Amount; got != 150 {
+		t.Fatalf("donation amount = %v, want 150", got)
 	}
-	if got := data["pooldev-addr"].Amount; got != 50 {
-		t.Fatalf("pooldev amount = %v, want 50", got)
-	}
-	if got := data["fee-addr"].Amount; got != 850 {
-		t.Fatalf("fee-addr amount = %v, want 850 (1000-100-50)", got)
+	if got := data["tari-fee-addr"].Amount; got != 850 {
+		t.Fatalf("fee-addr amount = %v, want 850 (1000-150)", got)
 	}
 }
 
 func TestCalculatePPLNS_WalksBackMultipleHeightsUntilRewardMet(t *testing.T) {
 	cfg := testConfig()
 	cfg.PPLNSFeePercent = 0
-	cfg.DevDonationPercent = 0
-	cfg.PoolDevDonationPercent = 0
+	cfg.DonationPercent = 0
 	repo := &fakeRepo{sharesByKey: map[string][]ShareRow{
 		// blockDifficulty=1000, shareMulti=1 => denominator 1000.
 		// Each height contributes floor(500/1000*1000) = 500 toward a 1200 reward,
@@ -324,8 +316,7 @@ func TestCalculatePPLNS_WalksBackMultipleHeightsUntilRewardMet(t *testing.T) {
 func TestCalculatePPLNS_StopsAtHeightOneNeverQueriesZero(t *testing.T) {
 	cfg := testConfig()
 	cfg.PPLNSFeePercent = 0
-	cfg.DevDonationPercent = 0
-	cfg.PoolDevDonationPercent = 0
+	cfg.DonationPercent = 0
 	cfg.PPLNSShareMulti = 1
 	// Reward far larger than any amount of shares can cover across
 	// heights 2..1, and a poison entry at height 0 that would blow up
@@ -361,15 +352,12 @@ func TestCalculateSolo_PaysFullRewardMinusFeeToFinder(t *testing.T) {
 	if got := data["alice"].Amount; got != 99500 {
 		t.Fatalf("alice amount = %v, want 99500", got)
 	}
-	// donations are unfloored for solo: dev=500*0.10=50, pooldev=500*0.05=25
-	if got := data["coindev-addr"].Amount; got != 50 {
-		t.Fatalf("coindev amount = %v, want 50", got)
+	// donation is unfloored for solo: 500*0.15=75
+	if got := data["monero-donation-addr"].Amount; got != 75 {
+		t.Fatalf("donation amount = %v, want 75", got)
 	}
-	if got := data["pooldev-addr"].Amount; got != 25 {
-		t.Fatalf("pooldev amount = %v, want 25", got)
-	}
-	// fee-addr is assigned (not accumulated): 500-50-25=425
-	if got := data["fee-addr"].Amount; got != 425 {
+	// fee-addr is assigned (not accumulated): 500-75=425
+	if got := data["monero-fee-addr"].Amount; got != 425 {
 		t.Fatalf("fee-addr amount = %v, want 425", got)
 	}
 }
@@ -383,10 +371,10 @@ func TestCalculateSolo_NoFinderYet_ReturnsSeedOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CalculateSolo: %v", err)
 	}
-	if len(data) != 3 {
-		t.Fatalf("expected only the 3 seed entries (fee/coindev/pooldev) when no finder row exists, got %d: %v", len(data), keysOf(data))
+	if len(data) != 2 {
+		t.Fatalf("expected only the 2 seed entries (fee/donation) when no finder row exists, got %d: %v", len(data), keysOf(data))
 	}
-	for _, addr := range []string{"fee-addr", "coindev-addr", "pooldev-addr"} {
+	for _, addr := range []string{"monero-fee-addr", "monero-donation-addr"} {
 		if data[addr].Amount != 0 {
 			t.Fatalf("seed entry %s should be untouched (amount 0), got %v", addr, data[addr].Amount)
 		}
@@ -445,4 +433,133 @@ func TestCalculatePPLNS_ZeroShareMultiIsRejected(t *testing.T) {
 	if _, err := c.CalculatePPLNS(context.Background(), "RXM", 1, 1000, 1000); err == nil {
 		t.Fatal("CalculatePPLNS: expected an error for PPLNSShareMulti=0 (would divide by zero)")
 	}
+}
+
+// TestAddressesForAlgo_UnknownAlgoIsAnError confirms an unmapped algo
+// string fails loudly rather than silently defaulting to either coin
+// family's addresses -- the whole point of addressesForAlgo existing
+// as a single, explicit lookup point.
+func TestAddressesForAlgo_UnknownAlgoIsAnError(t *testing.T) {
+	cfg := testConfig()
+	if _, _, err := addressesForAlgo(cfg, "DOGE"); err == nil {
+		t.Fatal("addressesForAlgo: expected an error for an unmapped algo, got nil")
+	}
+	// Every real algo literal used elsewhere in this codebase
+	// (internal/backend/db.ValidAlgos) must resolve cleanly.
+	for _, algo := range []string{"RXT", "C29", "SHA3X", "RXM"} {
+		if _, _, err := addressesForAlgo(cfg, algo); err != nil {
+			t.Fatalf("addressesForAlgo(%q): unexpected error: %v", algo, err)
+		}
+	}
+}
+
+// TestCalculatePPS_UnknownAlgoPropagatesError confirms the error from
+// addressesForAlgo actually surfaces through the public
+// Calculate{PPS,PPLNS,Solo} entry points rather than being swallowed.
+func TestCalculatePPS_UnknownAlgoPropagatesError(t *testing.T) {
+	cfg := testConfig()
+	c := New(&fakeRepo{}, cfg)
+	if _, err := c.CalculatePPS(context.Background(), "DOGE", 1, 1000, 1000); err == nil {
+		t.Fatal("CalculatePPS: expected an error for an unmapped algo, got nil")
+	}
+}
+
+func TestCalculatePPLNS_UnknownAlgoPropagatesError(t *testing.T) {
+	cfg := testConfig()
+	c := New(&fakeRepo{}, cfg)
+	if _, err := c.CalculatePPLNS(context.Background(), "DOGE", 1, 1000, 1000); err == nil {
+		t.Fatal("CalculatePPLNS: expected an error for an unmapped algo, got nil")
+	}
+}
+
+func TestCalculateSolo_UnknownAlgoPropagatesError(t *testing.T) {
+	cfg := testConfig()
+	c := New(&fakeRepo{}, cfg)
+	if _, err := c.CalculateSolo(context.Background(), "DOGE", 1, 1000); err == nil {
+		t.Fatal("CalculateSolo: expected an error for an unmapped algo, got nil")
+	}
+}
+
+// TestPayout_NeverCreditsTheOtherCoinFamilysAddress is the core
+// regression test for the multi-coin fee-routing bug: one backend
+// process runs Tari-family (RXT/C29/SHA3X) and Monero (RXM) payout
+// cycles side by side against a SHARED Config, and a Tari cycle must
+// never touch cfg.Monero*Address (or vice versa) -- both for the fee
+// address and the donation address, across all three calculation
+// modes.
+func TestPayout_NeverCreditsTheOtherCoinFamilysAddress(t *testing.T) {
+	cfg := testConfig()
+	repo := &fakeRepo{
+		sharesByKey: map[string][]ShareRow{
+			key("RXT", "PPS", 100):   {{Shares: 500, PaymentAddress: "tari-miner"}},
+			key("RXM", "PPS", 100):   {{Shares: 500, PaymentAddress: "monero-miner"}},
+			key("RXT", "PPLNS", 100): {{Shares: 500, PaymentAddress: "tari-miner"}},
+			key("RXM", "PPLNS", 100): {{Shares: 500, PaymentAddress: "monero-miner"}},
+		},
+		soloByKey: map[string]ShareRow{
+			key("RXT", "SOLO", 100): {Shares: 1, PaymentAddress: "tari-finder"},
+			key("RXM", "SOLO", 100): {Shares: 1, PaymentAddress: "monero-finder"},
+		},
+	}
+	c := New(repo, cfg)
+
+	assertOnlyTariAddresses := func(t *testing.T, data map[string]*Payment) {
+		t.Helper()
+		if _, ok := data[cfg.MoneroFeeAddress]; ok {
+			t.Fatalf("a Tari-family payout cycle credited the Monero fee address %q -- funds crossed coin families", cfg.MoneroFeeAddress)
+		}
+		if _, ok := data[cfg.MoneroDonationAddress]; ok {
+			t.Fatalf("a Tari-family payout cycle credited the Monero donation address %q -- funds crossed coin families", cfg.MoneroDonationAddress)
+		}
+		if _, ok := data[cfg.TariFeeAddress]; !ok {
+			t.Fatalf("a Tari-family payout cycle never credited its own fee address %q", cfg.TariFeeAddress)
+		}
+	}
+	assertOnlyMoneroAddresses := func(t *testing.T, data map[string]*Payment) {
+		t.Helper()
+		if _, ok := data[cfg.TariFeeAddress]; ok {
+			t.Fatalf("a Monero payout cycle credited the Tari fee address %q -- funds crossed coin families", cfg.TariFeeAddress)
+		}
+		if _, ok := data[cfg.TariDonationAddress]; ok {
+			t.Fatalf("a Monero payout cycle credited the Tari donation address %q -- funds crossed coin families", cfg.TariDonationAddress)
+		}
+		if _, ok := data[cfg.MoneroFeeAddress]; !ok {
+			t.Fatalf("a Monero payout cycle never credited its own fee address %q", cfg.MoneroFeeAddress)
+		}
+	}
+
+	for _, algo := range []string{"RXT", "C29", "SHA3X"} {
+		ppsData, err := c.CalculatePPS(context.Background(), algo, 100, 1000, 100000)
+		if err != nil {
+			t.Fatalf("CalculatePPS(%s): %v", algo, err)
+		}
+		assertOnlyTariAddresses(t, ppsData)
+	}
+	moneroPPS, err := c.CalculatePPS(context.Background(), "RXM", 100, 1000, 100000)
+	if err != nil {
+		t.Fatalf("CalculatePPS(RXM): %v", err)
+	}
+	assertOnlyMoneroAddresses(t, moneroPPS)
+
+	tariPPLNS, err := c.CalculatePPLNS(context.Background(), "RXT", 100, 1000, 100000)
+	if err != nil {
+		t.Fatalf("CalculatePPLNS(RXT): %v", err)
+	}
+	assertOnlyTariAddresses(t, tariPPLNS)
+	moneroPPLNS, err := c.CalculatePPLNS(context.Background(), "RXM", 100, 1000, 100000)
+	if err != nil {
+		t.Fatalf("CalculatePPLNS(RXM): %v", err)
+	}
+	assertOnlyMoneroAddresses(t, moneroPPLNS)
+
+	tariSolo, err := c.CalculateSolo(context.Background(), "RXT", 100, 100000)
+	if err != nil {
+		t.Fatalf("CalculateSolo(RXT): %v", err)
+	}
+	assertOnlyTariAddresses(t, tariSolo)
+	moneroSolo, err := c.CalculateSolo(context.Background(), "RXM", 100, 100000)
+	if err != nil {
+		t.Fatalf("CalculateSolo(RXM): %v", err)
+	}
+	assertOnlyMoneroAddresses(t, moneroSolo)
 }

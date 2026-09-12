@@ -582,7 +582,8 @@ func TestLoadConfig_ValidMoneyEnvVarsStillWork(t *testing.T) {
 // TestValidateDonationConfig is the unit-level regression test for
 // PROD_HARDENING_REVIEW.md finding #10: a configured donation
 // percentage with no matching donation address must be refused at
-// startup.
+// startup, checked per coin family (only for families whose fee
+// address is actually enabled).
 func TestValidateDonationConfig(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -595,48 +596,60 @@ func TestValidateDonationConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "dev donation percent > 0, coin dev address set -> ok",
+			name: "donation percent > 0, Tari enabled, Tari donation address set -> ok",
 			cfg: config{
-				payoutDevDonationPercent: 10,
-				payoutCoinDevAddress:     "some-coin-dev-address",
+				payoutDonationPercent:     10,
+				payoutTariFeeAddress:      "some-tari-fee-address",
+				payoutTariDonationAddress: "some-tari-donation-address",
 			},
 			wantErr: false,
 		},
 		{
-			name: "dev donation percent > 0, coin dev address EMPTY -> refused",
+			name: "donation percent > 0, Tari enabled, Tari donation address EMPTY -> refused",
 			cfg: config{
-				payoutDevDonationPercent: 10,
+				payoutDonationPercent: 10,
+				payoutTariFeeAddress:  "some-tari-fee-address",
 			},
 			wantErr: true,
 		},
 		{
-			name: "dev donation percent > 0, coin dev address WHITESPACE-ONLY -> refused",
+			name: "donation percent > 0, Tari enabled, Tari donation address WHITESPACE-ONLY -> refused",
 			cfg: config{
-				payoutDevDonationPercent: 10,
-				payoutCoinDevAddress:     "   ",
+				payoutDonationPercent:     10,
+				payoutTariFeeAddress:      "some-tari-fee-address",
+				payoutTariDonationAddress: "   ",
 			},
 			wantErr: true,
 		},
 		{
-			name: "pool dev donation percent > 0, pool dev address set -> ok",
+			name: "donation percent > 0, Monero enabled, Monero donation address set -> ok",
 			cfg: config{
-				payoutPoolDevDonationPercent: 5,
-				payoutPoolDevAddress:         "some-pool-dev-address",
+				payoutDonationPercent:       5,
+				payoutMoneroFeeAddress:      "some-monero-fee-address",
+				payoutMoneroDonationAddress: "some-monero-donation-address",
 			},
 			wantErr: false,
 		},
 		{
-			name: "pool dev donation percent > 0, pool dev address EMPTY -> refused",
+			name: "donation percent > 0, Monero enabled, Monero donation address EMPTY -> refused",
 			cfg: config{
-				payoutPoolDevDonationPercent: 5,
+				payoutDonationPercent:  5,
+				payoutMoneroFeeAddress: "some-monero-fee-address",
 			},
 			wantErr: true,
 		},
 		{
-			name: "both donation percents zero, both addresses empty -> ok (nothing configured)",
+			name: "donation percent > 0, NEITHER family enabled -> ok (nothing to route yet)",
 			cfg: config{
-				payoutCoinDevAddress: "",
-				payoutPoolDevAddress: "",
+				payoutDonationPercent: 10,
+			},
+			wantErr: false,
+		},
+		{
+			name: "donation percent zero, both fee addresses set, both donation addresses empty -> ok",
+			cfg: config{
+				payoutTariFeeAddress:   "some-tari-fee-address",
+				payoutMoneroFeeAddress: "some-monero-fee-address",
 			},
 			wantErr: false,
 		},
