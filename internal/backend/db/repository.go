@@ -401,7 +401,8 @@ func (r *Repository) CreditBalance(ctx context.Context, algo, network, paymentAd
 }
 
 // PayableBalance is one `balance` row whose pending_balance meets or
-// exceeds a disbursement cycle's minimum payout threshold — the
+// exceeds a disbursement cycle's minimum payout threshold (or was
+// explicitly force_payout = TRUE flagged, see below) — the
 // real-schema source internal/backend/disburse.Repository.PayableBalances
 // draws from to decide who gets paid this cycle.
 type PayableBalance struct {
@@ -409,15 +410,31 @@ type PayableBalance struct {
 	PaymentAddress string
 	PaymentID      *string
 	PendingBalance int64
+
+	// ForcePayout mirrors this row's `balance.force_payout` column
+	// (see migrations/0008_balance_force_payout.up.sql) exactly as
+	// PayableBalances read it. true means this row was included in
+	// the result EITHER because it genuinely met minPayout on its
+	// own OR solely because of the force_payout override below —
+	// disburse.Engine uses this to decide whether
+	// Config.ForcePayoutFeeAtomic applies to this row (see that
+	// package's runBatch), per this fee's explicit design: it
+	// applies to every force_payout row being paid, regardless of
+	// whether that row would also have qualified normally.
+	ForcePayout bool
 }
 
 // PayableBalances returns every `balance` row for (algo, network)
-// whose pending_balance >= minPayout, oldest (lowest id) first —
-// deterministic ordering so repeated disbursement cycles process the
-// same backlog in the same order rather than an unspecified one.
-// minPayout <= 0 returns every balance row with a positive pending
-// balance (a "no minimum" disbursement policy is a legitimate
-// operator choice, not a caller error).
+// with a positive pending_balance that is EITHER >= minPayout OR
+// flagged force_payout = TRUE (see migrations/0008_balance_force_payout.up.sql
+// and internal/backend/authapi's POST /user/forcePayment) — oldest
+// (lowest id) first, deterministic ordering so repeated disbursement
+// cycles process the same backlog in the same order rather than an
+// unspecified one. minPayout <= 0 returns every balance row with a
+// positive pending balance regardless of force_payout (a "no minimum"
+// disbursement policy is a legitimate operator choice, not a caller
+// error) — the force_payout override is purely additive on top of
+// the normal minPayout check, never a replacement for it.
 func (r *Repository) PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
 	if err := ValidateAlgo(algo); err != nil {
 		return nil, err
@@ -427,9 +444,10 @@ func (r *Repository) PayableBalances(ctx context.Context, algo, network string, 
 	}
 
 	const stmt = `
-		SELECT id, payment_address, payment_id, pending_balance
+		SELECT id, payment_address, payment_id, pending_balance, force_payout
 		FROM balance
-		WHERE algo = $1 AND network = $2 AND pending_balance > 0 AND pending_balance >= $3
+		WHERE algo = $1 AND network = $2 AND pending_balance > 0
+		  AND (pending_balance >= $3 OR force_payout = TRUE)
 		ORDER BY id ASC`
 	rows, err := r.pool.Query(ctx, stmt, algo, network, minPayout)
 	if err != nil {
@@ -440,7 +458,7 @@ func (r *Repository) PayableBalances(ctx context.Context, algo, network string, 
 	var out []PayableBalance
 	for rows.Next() {
 		var b PayableBalance
-		if err := rows.Scan(&b.ID, &b.PaymentAddress, &b.PaymentID, &b.PendingBalance); err != nil {
+		if err := rows.Scan(&b.ID, &b.PaymentAddress, &b.PaymentID, &b.PendingBalance, &b.ForcePayout); err != nil {
 			return nil, fmt.Errorf("db: scanning payable balance row: %w", err)
 		}
 		out = append(out, b)
@@ -457,8 +475,35 @@ func (r *Repository) PayableBalances(ctx context.Context, algo, network string, 
 // dependency-direction reason PayoutShare/ShareRow are kept separate
 // (see internal/backend/payout's doc comment).
 type DisburseEntry struct {
+	// BalanceID/Amount: which `balance` row this entry debits, and
+	// the FULL amount debited from its pending_balance — always the
+	// row's entire original PendingBalance as PayableBalances
+	// returned it, even for a force_payout row where the miner was
+	// actually sent less than this due to ForcePayoutFeeAtomic below
+	// (the miner's whole pending balance is resolved by this payout;
+	// the fee is a deduction from what they receive, not from what
+	// gets debited here — see disburse.go's runBatch).
 	BalanceID int64
 	Amount    int64
+
+	// ForcePayout mirrors this entry's originating PayableBalance.ForcePayout.
+	// When true, CompletePayoutSent resets this balance row's
+	// force_payout column back to FALSE in the same transaction as
+	// the debit — the flag requests exactly one early/manual payout
+	// (see migrations/0008_balance_force_payout.up.sql's "priority
+	// signal ... on its next cycle" framing), not a standing
+	// instruction to keep force-paying (and re-charging the fee on)
+	// every future accrual from this address forever.
+	ForcePayout bool
+
+	// ForcePayoutFeeAtomic is the pool-policy fee (see
+	// migrations/0009_payouts_force_payout_fee.up.sql) actually
+	// collected from THIS row's payout, in atomic units. Zero for
+	// any non-force_payout row, or if the operator has not opted
+	// into GCPOOL_FORCE_PAYOUT_FEE_ATOMIC at all. The sum of this
+	// field across every entry in one CompletePayoutSent call is
+	// what gets recorded in that call's `payouts` row.
+	ForcePayoutFeeAtomic int64
 }
 
 // RecordPendingPayout inserts a PENDING `payouts` row for one about-
@@ -487,15 +532,20 @@ func (r *Repository) RecordPendingPayout(ctx context.Context, algo, network stri
 
 // CompletePayoutSent atomically (single DB transaction) debits every
 // entry's amount from pending_balance and credits it to paid_balance
-// on the matching `balance` row, then flips the `payouts` row
-// identified by payoutID to SENT with the real tx_hash/fee the
-// Transfer RPC call reported. Both writes happen in the same
-// transaction specifically so a crash between them can never leave a
-// SENT payout with balances that were never actually debited (or
-// vice versa) — the real, irreversible on-chain transfer has already
-// happened by the time this is called (see disburse.go), so this
-// step is bookkeeping that must not itself introduce a new
-// consistency gap.
+// on the matching `balance` row, resets force_payout back to FALSE
+// for any entry that carries ForcePayout = TRUE (see DisburseEntry's
+// doc comment), sums every entry's ForcePayoutFeeAtomic into the
+// `payouts` row's own force_payout_fee_atomic column, then flips the
+// `payouts` row identified by payoutID to SENT with the real
+// tx_hash/real on-chain fee the Transfer RPC call reported. All of
+// this happens in the same transaction specifically so a crash
+// between any of these writes can never leave a SENT payout with
+// balances that were never actually debited/reset, or a fee that was
+// collected from a miner's payout but never landed in the pool's own
+// revenue ledger (or vice versa) — the real, irreversible on-chain
+// transfer has already happened by the time this is called (see
+// disburse.go), so this step is bookkeeping that must not itself
+// introduce a new consistency gap.
 func (r *Repository) CompletePayoutSent(ctx context.Context, payoutID int64, entries []DisburseEntry, txHash string, fee int64) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -503,14 +553,18 @@ func (r *Repository) CompletePayoutSent(ctx context.Context, payoutID int64, ent
 	}
 	defer tx.Rollback(ctx)
 
+	var totalForceFee int64
 	for _, e := range entries {
+		totalForceFee += e.ForcePayoutFeeAtomic
+
 		const debitStmt = `
 			UPDATE balance
 			SET pending_balance = pending_balance - $2,
 			    paid_balance = paid_balance + $2,
+			    force_payout = CASE WHEN $3 THEN FALSE ELSE force_payout END,
 			    updated_at = now()
 			WHERE id = $1`
-		tag, err := tx.Exec(ctx, debitStmt, e.BalanceID, e.Amount)
+		tag, err := tx.Exec(ctx, debitStmt, e.BalanceID, e.Amount, e.ForcePayout)
 		if err != nil {
 			return fmt.Errorf("db: completing payout %d: debiting balance %d: %w", payoutID, e.BalanceID, err)
 		}
@@ -521,9 +575,9 @@ func (r *Repository) CompletePayoutSent(ctx context.Context, payoutID int64, ent
 
 	const payoutStmt = `
 		UPDATE payouts
-		SET status = 'SENT', tx_hash = $2, fee = $3, completed_at = now()
+		SET status = 'SENT', tx_hash = $2, fee = $3, force_payout_fee_atomic = $4, completed_at = now()
 		WHERE id = $1`
-	tag, err := tx.Exec(ctx, payoutStmt, payoutID, txHash, fee)
+	tag, err := tx.Exec(ctx, payoutStmt, payoutID, txHash, fee, totalForceFee)
 	if err != nil {
 		return fmt.Errorf("db: completing payout %d: updating payouts row: %w", payoutID, err)
 	}
