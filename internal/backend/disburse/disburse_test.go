@@ -44,7 +44,11 @@ func key(algo, network string) string { return algo + "/" + network }
 func (f *fakeRepo) PayableBalances(_ context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
 	var out []PayableBalance
 	for _, b := range f.balances[key(algo, network)] {
-		if b.PendingBalance >= minPayout {
+		// Mirrors db.Repository.PayableBalances' real SQL: a row is
+		// payable if it meets minPayout on its own OR is
+		// force_payout-flagged, provided pending_balance > 0 either
+		// way.
+		if b.PendingBalance > 0 && (b.PendingBalance >= minPayout || b.ForcePayout) {
 			out = append(out, b)
 		}
 	}
@@ -264,5 +268,168 @@ func TestRunOnce_RequiresWalletAndMaxDestinations(t *testing.T) {
 	}
 	if _, err := New(repo, Config{Wallet: &fakeWallet{}}).RunOnce(context.Background(), "RXM", "TESTNET"); err == nil {
 		t.Fatal("RunOnce: expected an error when Config.MaxDestinationsPerBatch <= 0")
+	}
+}
+
+// TestRunOnce_ForcePayoutRowBelowThresholdIsPaidWithFeeDeducted covers
+// the core bug this package's PayableBalances/runBatch changes fix: a
+// force_payout row below the normal MinPayoutAtomic threshold is
+// still paid this cycle, and — per Alex's explicit fee requirement —
+// has ForcePayoutFeeAtomic deducted from its real Transfer
+// destination amount, while a normal (non-forced) row in the very
+// same batch is completely unaffected by the fee.
+func TestRunOnce_ForcePayoutRowBelowThresholdIsPaidWithFeeDeducted(t *testing.T) {
+	repo := &fakeRepo{balances: map[string][]PayableBalance{
+		key("RXM", "TESTNET"): {
+			// Below MinPayoutAtomic (100) but force_payout=TRUE --
+			// must still be included and paid.
+			{ID: 1, PaymentAddress: "forced", PendingBalance: 40, ForcePayout: true},
+			// A normal row, well above threshold, not forced.
+			{ID: 2, PaymentAddress: "normal", PendingBalance: 500, ForcePayout: false},
+		},
+	}}
+	w := &fakeWallet{unlocked: 10000, total: 10000, transferFee: 7}
+	cfg := testConfig(w)
+	cfg.ForcePayoutFeeAtomic = 10
+	e := New(repo, cfg)
+
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	if err != nil {
+		t.Fatalf("RunOnce: unexpected error: %v", err)
+	}
+	if result.Payable != 2 || result.BatchesSent != 1 {
+		t.Fatalf("RunOnce: got %+v, want both rows payable in one sent batch", result)
+	}
+
+	if len(w.transferCall) != 1 {
+		t.Fatalf("RunOnce: got %d Transfer calls, want exactly 1", len(w.transferCall))
+	}
+	dests := map[string]int64{}
+	for _, d := range w.transferCall[0].Destinations {
+		dests[d.Address] = d.Amount
+	}
+	if dests["forced"] != 30 {
+		t.Errorf("forced row: got Transfer destination amount %d, want 40-10=30", dests["forced"])
+	}
+	if dests["normal"] != 500 {
+		t.Errorf("normal row: got Transfer destination amount %d, want unaffected 500", dests["normal"])
+	}
+
+	if len(repo.sentCalls) != 1 {
+		t.Fatalf("RunOnce: got %d CompletePayoutSent calls, want 1", len(repo.sentCalls))
+	}
+	entries := map[int64]DebitEntry{}
+	for _, e := range repo.sentCalls[0].entries {
+		entries[e.BalanceID] = e
+	}
+	forcedEntry, ok := entries[1]
+	if !ok {
+		t.Fatalf("CompletePayoutSent: missing entry for forced balance id 1")
+	}
+	if !forcedEntry.ForcePayout || forcedEntry.ForcePayoutFeeAtomic != 10 || forcedEntry.Amount != 40 {
+		t.Errorf("forced entry: got %+v, want ForcePayout=true ForcePayoutFeeAtomic=10 Amount=40", forcedEntry)
+	}
+	normalEntry, ok := entries[2]
+	if !ok {
+		t.Fatalf("CompletePayoutSent: missing entry for normal balance id 2")
+	}
+	if normalEntry.ForcePayout || normalEntry.ForcePayoutFeeAtomic != 0 || normalEntry.Amount != 500 {
+		t.Errorf("normal entry: got %+v, want ForcePayout=false ForcePayoutFeeAtomic=0 Amount=500", normalEntry)
+	}
+}
+
+// TestRunOnce_ForcePayoutFeeAppliesEvenIfRowAlreadyClearedThreshold
+// covers Alex's explicit choice: the fee applies to EVERY
+// force_payout row paid this cycle, even one whose PendingBalance
+// already met MinPayoutAtomic on its own -- there is no "would have
+// qualified anyway" exemption.
+func TestRunOnce_ForcePayoutFeeAppliesEvenIfRowAlreadyClearedThreshold(t *testing.T) {
+	repo := &fakeRepo{balances: map[string][]PayableBalance{
+		key("RXM", "TESTNET"): {
+			{ID: 1, PaymentAddress: "forced-but-qualified", PendingBalance: 1000, ForcePayout: true},
+		},
+	}}
+	w := &fakeWallet{unlocked: 10000, total: 10000}
+	cfg := testConfig(w)
+	cfg.ForcePayoutFeeAtomic = 25
+	e := New(repo, cfg)
+
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); err != nil {
+		t.Fatalf("RunOnce: unexpected error: %v", err)
+	}
+	if len(w.transferCall) != 1 || len(w.transferCall[0].Destinations) != 1 {
+		t.Fatalf("RunOnce: got %d Transfer calls, want exactly 1 with 1 destination", len(w.transferCall))
+	}
+	if got := w.transferCall[0].Destinations[0].Amount; got != 975 {
+		t.Errorf("got Transfer destination amount %d, want 1000-25=975 even though the row already cleared MinPayoutAtomic on its own", got)
+	}
+}
+
+// TestRunOnce_ForcePayoutFeeEdgeCaseCapsAtOneAtomicUnit covers this
+// package's chosen edge-case behavior (see runBatch's doc comment):
+// when a force_payout row's PendingBalance is <= the configured
+// ForcePayoutFeeAtomic, the fee is capped so the miner still receives
+// at least 1 atomic unit, rather than sending zero/negative to the
+// real wallet RPC or silently skipping the row.
+func TestRunOnce_ForcePayoutFeeEdgeCaseCapsAtOneAtomicUnit(t *testing.T) {
+	repo := &fakeRepo{balances: map[string][]PayableBalance{
+		key("RXM", "TESTNET"): {
+			{ID: 1, PaymentAddress: "tiny-forced", PendingBalance: 5, ForcePayout: true},
+		},
+	}}
+	w := &fakeWallet{unlocked: 10000, total: 10000}
+	cfg := testConfig(w)
+	cfg.ForcePayoutFeeAtomic = 500 // way more than the 5-atomic-unit balance
+	e := New(repo, cfg)
+
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	if err != nil {
+		t.Fatalf("RunOnce: unexpected error: %v", err)
+	}
+	if result.BatchesSent != 1 {
+		t.Fatalf("RunOnce: got %+v, want the edge-case row still sent (not skipped)", result)
+	}
+	if len(w.transferCall) != 1 || len(w.transferCall[0].Destinations) != 1 {
+		t.Fatalf("RunOnce: got %d Transfer calls, want exactly 1 with 1 destination", len(w.transferCall))
+	}
+	if got := w.transferCall[0].Destinations[0].Amount; got != 1 {
+		t.Errorf("got Transfer destination amount %d, want capped to 1 atomic unit (never zero/negative)", got)
+	}
+	if len(repo.sentCalls) != 1 || len(repo.sentCalls[0].entries) != 1 {
+		t.Fatalf("RunOnce: got sentCalls=%+v, want 1 completion with 1 entry", repo.sentCalls)
+	}
+	entry := repo.sentCalls[0].entries[0]
+	if entry.Amount != 5 {
+		t.Errorf("got debited Amount %d, want the FULL original PendingBalance 5 debited regardless of the fee cap", entry.Amount)
+	}
+	if entry.ForcePayoutFeeAtomic != 4 {
+		t.Errorf("got ForcePayoutFeeAtomic %d, want the capped fee 5-1=4 (not the full configured 500)", entry.ForcePayoutFeeAtomic)
+	}
+}
+
+// TestRunOnce_ForcePayoutFeeDefaultZeroMeansNoFee confirms the
+// "zero means off" convention: a force_payout row is still paid in
+// full (no deduction at all) when ForcePayoutFeeAtomic is left at its
+// zero default.
+func TestRunOnce_ForcePayoutFeeDefaultZeroMeansNoFee(t *testing.T) {
+	repo := &fakeRepo{balances: map[string][]PayableBalance{
+		key("RXM", "TESTNET"): {
+			{ID: 1, PaymentAddress: "forced", PendingBalance: 40, ForcePayout: true},
+		},
+	}}
+	w := &fakeWallet{unlocked: 10000, total: 10000}
+	e := New(repo, testConfig(w)) // ForcePayoutFeeAtomic left at zero default
+
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); err != nil {
+		t.Fatalf("RunOnce: unexpected error: %v", err)
+	}
+	if len(w.transferCall) != 1 || len(w.transferCall[0].Destinations) != 1 {
+		t.Fatalf("RunOnce: got %d Transfer calls, want exactly 1 with 1 destination", len(w.transferCall))
+	}
+	if got := w.transferCall[0].Destinations[0].Amount; got != 40 {
+		t.Errorf("got Transfer destination amount %d, want the full 40 (no fee configured)", got)
+	}
+	if len(repo.sentCalls) != 1 || repo.sentCalls[0].entries[0].ForcePayoutFeeAtomic != 0 {
+		t.Fatalf("RunOnce: got sentCalls=%+v, want ForcePayoutFeeAtomic=0", repo.sentCalls)
 	}
 }

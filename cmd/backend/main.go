@@ -102,7 +102,8 @@
 //	                         (GCPOOL_MONERO_WALLET_RPC_{USER,PASSWORD},
 //	                         GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC,
 //	                         GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH,
-//	                         GCPOOL_DISBURSE_POLL_INTERVAL).
+//	                         GCPOOL_DISBURSE_POLL_INTERVAL,
+//	                         GCPOOL_FORCE_PAYOUT_FEE_ATOMIC).
 //	GCPOOL_JWT_SECRET        (required) HMAC-SHA256 signing secret for
 //	                         internal/backend/authapi's JWTs (also
 //	                         reused as its password-hashing key --
@@ -226,6 +227,7 @@ type config struct {
 	disburseMinPayoutAtomic         int64
 	disburseMaxDestinationsPerBatch int
 	disbursePollInterval            time.Duration
+	forcePayoutFeeAtomic            int64
 
 	tariWalletGRPCAddr   string
 	tariWalletFeePerGram uint64
@@ -293,6 +295,7 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.moneroWalletRPCUser, "monero-wallet-rpc-user", envOr("GCPOOL_MONERO_WALLET_RPC_USER", ""), "HTTP Digest auth username matching whatever --rpc-login the real monero-wallet-rpc process was started with. Env: GCPOOL_MONERO_WALLET_RPC_USER")
 	flag.StringVar(&cfg.moneroWalletRPCPassword, "monero-wallet-rpc-password", envOr("GCPOOL_MONERO_WALLET_RPC_PASSWORD", ""), "HTTP Digest auth password matching -monero-wallet-rpc-user above. Env: GCPOOL_MONERO_WALLET_RPC_PASSWORD")
 	flag.Int64Var(&cfg.disburseMinPayoutAtomic, "disburse-min-payout-atomic", envOrInt64("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC", 0), "minimum pending_balance (atomic units) required before a miner is paid out at all. Shared by both the Monero and Tari disbursement engines. Env: GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC")
+	flag.Int64Var(&cfg.forcePayoutFeeAtomic, "force-payout-fee-atomic", envOrInt64("GCPOOL_FORCE_PAYOUT_FEE_ATOMIC", 0), "flat atomic-unit fee charged against every force_payout=TRUE balance row paid out this cycle (see POST /user/forcePayment), deducted from the miner's payout and credited to pool revenue. Shared by both the Monero and Tari disbursement engines. 0 (default) means no extra fee. Env: GCPOOL_FORCE_PAYOUT_FEE_ATOMIC")
 	flag.IntVar(&cfg.disburseMaxDestinationsPerBatch, "disburse-max-destinations-per-batch", envOrInt("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH", defaultDisburseMaxDestinationsPerBatch), "cap on destinations per real Transfer call, for the Monero disbursement engine only (the Tari engine hardcodes 1, see buildTariDisburseEngine's doc comment). Env: GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH")
 	flag.DurationVar(&cfg.disbursePollInterval, "disburse-poll-interval", envOrDuration("GCPOOL_DISBURSE_POLL_INTERVAL", defaultDisbursePollInterval), "how often the disbursement engine(s) run a cycle. Shared by both the Monero and Tari disbursement engines. Env: GCPOOL_DISBURSE_POLL_INTERVAL")
 
@@ -356,6 +359,7 @@ type fileConfig struct {
 	DisburseMinPayoutAtomic         *int64 `toml:"disburse_min_payout_atomic"`
 	DisburseMaxDestinationsPerBatch *int   `toml:"disburse_max_destinations_per_batch"`
 	DisbursePollIntervalSeconds     *int   `toml:"disburse_poll_interval_seconds"`
+	ForcePayoutFeeAtomic            *int64 `toml:"force_payout_fee_atomic"`
 
 	TariWalletGRPCAddr   *string `toml:"tari_wallet_grpc_addr"`
 	TariWalletFeePerGram *uint64 `toml:"tari_wallet_fee_per_gram"`
@@ -421,6 +425,7 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.moneroWalletRPCUser, fc.MoneroWalletRPCUser, visited, "monero-wallet-rpc-user", "GCPOOL_MONERO_WALLET_RPC_USER")
 	cfgfile.ApplyString(&cfg.moneroWalletRPCPassword, fc.MoneroWalletRPCPassword, visited, "monero-wallet-rpc-password", "GCPOOL_MONERO_WALLET_RPC_PASSWORD")
 	cfgfile.ApplyInt64(&cfg.disburseMinPayoutAtomic, fc.DisburseMinPayoutAtomic, visited, "disburse-min-payout-atomic", "GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC")
+	cfgfile.ApplyInt64(&cfg.forcePayoutFeeAtomic, fc.ForcePayoutFeeAtomic, visited, "force-payout-fee-atomic", "GCPOOL_FORCE_PAYOUT_FEE_ATOMIC")
 	cfgfile.ApplyInt(&cfg.disburseMaxDestinationsPerBatch, fc.DisburseMaxDestinationsPerBatch, visited, "disburse-max-destinations-per-batch", "GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH")
 	if fc.DisbursePollIntervalSeconds != nil {
 		d := time.Duration(*fc.DisbursePollIntervalSeconds) * time.Second
@@ -1067,6 +1072,7 @@ func (a disburseRepositoryAdapter) PayableBalances(ctx context.Context, algo, ne
 			PaymentAddress: r.PaymentAddress,
 			PaymentID:      r.PaymentID,
 			PendingBalance: r.PendingBalance,
+			ForcePayout:    r.ForcePayout,
 		})
 	}
 	return out, nil
@@ -1079,7 +1085,12 @@ func (a disburseRepositoryAdapter) RecordPendingPayout(ctx context.Context, algo
 func (a disburseRepositoryAdapter) CompletePayoutSent(ctx context.Context, payoutID int64, entries []disburse.DebitEntry, txHash string, fee int64) error {
 	dbEntries := make([]db.DisburseEntry, 0, len(entries))
 	for _, e := range entries {
-		dbEntries = append(dbEntries, db.DisburseEntry{BalanceID: e.BalanceID, Amount: e.Amount})
+		dbEntries = append(dbEntries, db.DisburseEntry{
+			BalanceID:            e.BalanceID,
+			Amount:               e.Amount,
+			ForcePayout:          e.ForcePayout,
+			ForcePayoutFeeAtomic: e.ForcePayoutFeeAtomic,
+		})
 	}
 	return a.repo.CompletePayoutSent(ctx, payoutID, dbEntries, txHash, fee)
 }
@@ -1397,6 +1408,15 @@ const (
 //	                                  disbursement engine runs a cycle,
 //	                                  as a time.ParseDuration string.
 //	                                  Default "10m".
+//	GCPOOL_FORCE_PAYOUT_FEE_ATOMIC    (optional) flat atomic-unit fee
+//	                                  charged against every
+//	                                  force_payout=TRUE balance row
+//	                                  paid out this cycle (see POST
+//	                                  /user/forcePayment), deducted
+//	                                  from the miner's payout and
+//	                                  credited to pool revenue
+//	                                  (payouts.force_payout_fee_atomic).
+//	                                  Default 0 (no extra fee).
 func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
 	if cfg.moneroWalletRPCAddr == "" {
 		return nil, nil, 0, false, nil
@@ -1412,6 +1432,7 @@ func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (e
 		Wallet:                  walletClient,
 		MaxDestinationsPerBatch: cfg.disburseMaxDestinationsPerBatch,
 		MinPayoutAtomic:         cfg.disburseMinPayoutAtomic,
+		ForcePayoutFeeAtomic:    cfg.forcePayoutFeeAtomic,
 		Metrics:                 m,
 	}
 
@@ -1447,14 +1468,16 @@ func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (e
 //	                                  wallet.NewTariWalletGRPC's own
 //	                                  default is (see that package).
 //	GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC,
-//	GCPOOL_DISBURSE_POLL_INTERVAL     shared with the Monero engine's
+//	GCPOOL_DISBURSE_POLL_INTERVAL,
+//	GCPOOL_FORCE_PAYOUT_FEE_ATOMIC    shared with the Monero engine's
 //	                                  identically-named env vars (see
 //	                                  buildDisburseEngine) — both
 //	                                  engines read the same values,
 //	                                  since there is no real reason a
 //	                                  deployment would want a
-//	                                  different minimum payout or poll
-//	                                  cadence per coin.
+//	                                  different minimum payout, poll
+//	                                  cadence, or force-payout fee per
+//	                                  coin.
 func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
 	if cfg.tariWalletGRPCAddr == "" {
 		return nil, nil, 0, false, nil
@@ -1473,6 +1496,7 @@ func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics
 		// today.
 		MaxDestinationsPerBatch: 1,
 		MinPayoutAtomic:         cfg.disburseMinPayoutAtomic,
+		ForcePayoutFeeAtomic:    cfg.forcePayoutFeeAtomic,
 		Metrics:                 m,
 	}
 
