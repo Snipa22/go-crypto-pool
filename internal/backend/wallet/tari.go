@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 	"github.com/Snipa22/go-tari-grpc-lib/v3/walletGRPC"
@@ -63,6 +64,12 @@ type TariWalletGRPC struct {
 	// call whose TransferRequest.Priority is zero. See Transfer's
 	// doc comment on Priority reinterpretation.
 	feePerGram uint64
+	// readTimeout bounds the READ-ONLY wallet GRPC calls this type
+	// makes (GetBalance, and the GetTransactionInfo fee lookup
+	// inside Transfer). See WithTariReadTimeout for why it
+	// deliberately does NOT bound the fund-moving Transfer call
+	// itself. Zero means unbounded (the pre-existing behavior).
+	readTimeout time.Duration
 }
 
 // TariOption configures an optional TariWalletGRPC construction
@@ -70,7 +77,8 @@ type TariWalletGRPC struct {
 type TariOption func(*tariWalletGRPCOptions)
 
 type tariWalletGRPCOptions struct {
-	feePerGram uint64
+	feePerGram  uint64
+	readTimeout time.Duration
 }
 
 // WithFeePerGram overrides defaultFeePerGram as the fee-per-gram used
@@ -78,6 +86,43 @@ type tariWalletGRPCOptions struct {
 func WithFeePerGram(feePerGram uint64) TariOption {
 	return func(o *tariWalletGRPCOptions) {
 		o.feePerGram = feePerGram
+	}
+}
+
+// WithTariReadTimeout bounds how long this client waits on the
+// READ-ONLY Tari wallet GRPC calls it makes: GetBalance, and the
+// GetTransactionInfo fee/amount lookup Transfer falls back to. It is
+// the Tari-side counterpart of Monero's WithTimeout, wired from the
+// same cmd/backend knob (GCPOOL_WALLET_RPC_TIMEOUT /
+// -wallet-rpc-timeout). A non-positive d is ignored (unbounded, the
+// pre-existing behavior).
+//
+// WHY THIS DOES NOT BOUND Transfer — deliberate, not an oversight:
+// go-tari-grpc-lib/v3's walletGRPC package exposes only package-level
+// functions that each construct their own context.Background()
+// internally (see walletGRPC.SendTransactions), so there is no
+// supported way to attach a deadline to the real Transfer RPC. The
+// only thing this package could do unilaterally is run the call in a
+// goroutine and abandon it on a timer — which would not cancel the
+// in-flight RPC at all, it would merely stop looking at it while the
+// wallet quite possibly goes on to broadcast the transaction for
+// real. That MANUFACTURES the exact ambiguous "did the coin move?"
+// incident this codebase now has to halt disbursement over (see
+// migrations/0010_payouts_ambiguous_status.up.sql), trading a visible
+// hang for a money-critical unknown. A blocked Transfer is bad and
+// needs an operator; a fabricated ambiguous broadcast is worse and
+// needs an operator AND a block-explorer investigation. Read-only
+// lookups have no such hazard — abandoning a GetBalance costs
+// nothing — so they are bounded here. Giving Tari's Transfer a real,
+// cancellable deadline requires an upstream change to
+// go-tari-grpc-lib (a ctx-accepting SendTransactions); that is a
+// deliberate dependency decision, not something to fake here.
+func WithTariReadTimeout(d time.Duration) TariOption {
+	return func(o *tariWalletGRPCOptions) {
+		if d <= 0 {
+			return
+		}
+		o.readTimeout = d
 	}
 }
 
@@ -94,7 +139,7 @@ func NewTariWalletGRPC(address string, opts ...TariOption) *TariWalletGRPC {
 		opt(&o)
 	}
 	walletGRPC.InitWalletGRPC(address)
-	return &TariWalletGRPC{rpc: tariWalletRPCAdapter{}, feePerGram: o.feePerGram}
+	return &TariWalletGRPC{rpc: tariWalletRPCAdapter{}, feePerGram: o.feePerGram, readTimeout: o.readTimeout}
 }
 
 // newTariWalletGRPCWithRPC is the test seam: constructs a
@@ -105,6 +150,50 @@ func newTariWalletGRPCWithRPC(rpc tariWalletRPC, feePerGram uint64) *TariWalletG
 		feePerGram = defaultFeePerGram
 	}
 	return &TariWalletGRPC{rpc: rpc, feePerGram: feePerGram}
+}
+
+// callWithReadTimeout runs one read-only wallet GRPC call under
+// w.readTimeout (and under ctx), returning whichever of the two
+// expires first as an error. With readTimeout == 0 and a
+// non-cancellable ctx this degenerates to a plain synchronous call.
+//
+// The abandoned goroutine is safe here precisely because fn is
+// read-only: the underlying RPC keeps running to completion and
+// writes into a buffered channel nobody reads, which is garbage
+// collected once it returns. See WithTariReadTimeout's doc comment
+// for why the same trick is deliberately NOT applied to Transfer.
+func callWithReadTimeout[T any](ctx context.Context, timeout time.Duration, what string, fn func() (T, error)) (T, error) {
+	type outcome struct {
+		val T
+		err error
+	}
+	if timeout <= 0 && ctx.Done() == nil {
+		val, err := fn()
+		return val, err
+	}
+
+	done := make(chan outcome, 1)
+	go func() {
+		val, err := fn()
+		done <- outcome{val: val, err: err}
+	}()
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		timer = t.C
+	}
+
+	var zero T
+	select {
+	case o := <-done:
+		return o.val, o.err
+	case <-timer:
+		return zero, fmt.Errorf("wallet: tari: %s: timed out after %s", what, timeout)
+	case <-ctx.Done():
+		return zero, fmt.Errorf("wallet: tari: %s: %w", what, ctx.Err())
+	}
 }
 
 // Transfer implements WalletClient via a real Tari wallet GRPC
@@ -153,9 +242,20 @@ func newTariWalletGRPCWithRPC(rpc tariWalletRPC, feePerGram uint64) *TariWalletG
 // currently no way for a caller to learn which specific destinations
 // went through in that partial-failure case. Deployments that cannot
 // tolerate this should send one Destination per TransferRequest.
+//
+// ERROR CLASSIFICATION (see ErrNotBroadcast in wallet.go): only the
+// local, pre-flight refusals below (no destinations, more than one
+// destination, non-positive amount, empty address) and an
+// all-recipients-explicitly-rejected response are marked
+// NotBroadcast. Everything else is deliberately left unmarked and so
+// treated by callers as "coin may have moved" — in particular the
+// transfer-succeeded-but-GetTransactionInfo-failed path below, which
+// is one of the two real code paths that used to cause genuine
+// double payments (the recipient transfer IS broadcast there; only
+// the follow-up fee/amount lookup failed).
 func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (TransferResult, error) {
 	if len(req.Destinations) == 0 {
-		return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: at least one destination is required")
+		return TransferResult{}, NotBroadcast(fmt.Errorf("wallet: tari: Transfer: at least one destination is required"))
 	}
 	// SAFETY CONSTRAINT, deliberate and load-bearing, not a
 	// placeholder TODO: the real tari.rpc.Wallet/Transfer RPC
@@ -171,21 +271,18 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 	// partial failure (some recipients succeeded, one failed), the
 	// real, successfully-broadcast recipients would have already
 	// moved real on-chain coin, yet this call would still report a
-	// whole-batch error, and disburse.Engine would never debit any of
-	// them — causing a real DOUBLE-PAYMENT the next time that same
-	// batch is retried. Until WalletClient's interface is extended to
-	// carry real per-destination results (a genuine, deliberate
-	// design decision for whoever picks this up, not something to
-	// improvise here), the only safe thing this implementation can do
-	// is refuse more than one destination per call, which makes
-	// partial failure structurally impossible (a single destination
-	// either succeeds or fails, there is no "partial"). Callers
-	// needing to pay multiple Tari recipients must issue one
+	// whole-batch error. The engine now halts (rather than re-paying)
+	// on any such non-provably-unbroadcast error, but it still cannot
+	// tell WHICH destinations went through, so a human would have to
+	// untangle it — refusing more than one destination per call makes
+	// partial failure structurally impossible instead (a single
+	// destination either succeeds or fails, there is no "partial").
+	// Callers needing to pay multiple Tari recipients must issue one
 	// TransferRequest per destination — see
 	// disburse.Config.MaxDestinationsPerBatch's doc comment, which
 	// callers configuring a Tari WalletClient MUST set to 1.
 	if len(req.Destinations) > 1 {
-		return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: refusing %d destinations in one call — Tari's real Transfer RPC reports success/failure per recipient, but this WalletClient implementation only supports strictly all-or-nothing batches until the interface carries per-destination results; callers must issue one destination per TransferRequest for Tari (see this method's doc comment)", len(req.Destinations))
+		return TransferResult{}, NotBroadcast(fmt.Errorf("wallet: tari: Transfer: refusing %d destinations in one call — Tari's real Transfer RPC reports success/failure per recipient, but this WalletClient implementation only supports strictly all-or-nothing batches until the interface carries per-destination results; callers must issue one destination per TransferRequest for Tari (see this method's doc comment)", len(req.Destinations)))
 	}
 
 	feePerGram := w.feePerGram
@@ -201,10 +298,10 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 	recipients := make([]*tari_generated.PaymentRecipient, 0, len(req.Destinations))
 	for _, d := range req.Destinations {
 		if d.Amount <= 0 {
-			return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: destination %s has non-positive amount %d", d.Address, d.Amount)
+			return TransferResult{}, NotBroadcast(fmt.Errorf("wallet: tari: Transfer: destination %s has non-positive amount %d", d.Address, d.Amount))
 		}
 		if d.Address == "" {
-			return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: destination has an empty address")
+			return TransferResult{}, NotBroadcast(fmt.Errorf("wallet: tari: Transfer: destination has an empty address"))
 		}
 		recipients = append(recipients, &tari_generated.PaymentRecipient{
 			Address:      d.Address,
@@ -217,9 +314,16 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 
 	resp, err := w.rpc.Transfer(recipients)
 	if err != nil {
+		// NOT marked NotBroadcast: a GRPC-level error (deadline,
+		// connection reset, ...) says nothing about whether the
+		// wallet's transaction service already accepted and
+		// broadcast the transaction.
 		return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: %w", err)
 	}
 	if resp == nil || len(resp.Results) == 0 {
+		// Also NOT marked: the RPC returned without error, so the
+		// wallet may well have acted on the request even though it
+		// told us nothing useful about it.
 		return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: RPC reported success but returned no results")
 	}
 
@@ -247,10 +351,23 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 			// (the same real RPC the legacy
 			// walletGRPC.GetTransactionInfoByID helper wraps)
 			// rather than reporting a fabricated zero fee/amount.
-			info, err = w.rpc.GetTransactionInfo(result.GetTransactionId())
+			txID := result.GetTransactionId()
+			info, err = callWithReadTimeout(ctx, w.readTimeout, fmt.Sprintf("GetTransactionInfo(%d)", txID),
+				func() (*tari_generated.TransactionInfo, error) { return w.rpc.GetTransactionInfo(txID) })
 			if err != nil {
-				return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: recipient %s succeeded (tx id %d) but fetching its fee/amount via GetTransactionInfo failed: %w",
-					result.GetAddress(), result.GetTransactionId(), err)
+				// CRITICAL, and deliberately NOT marked
+				// NotBroadcast: this recipient's transfer already
+				// SUCCEEDED (it has a real transaction id, above)
+				// and the coin is gone. Only the follow-up
+				// fee/amount lookup failed. This exact path used to
+				// flow into FailPayout and get the same coin sent
+				// again next cycle — it must now surface as an
+				// ambiguous, halt-worthy error. The transaction id
+				// is included in the message precisely so the
+				// operator resolving the resulting AMBIGUOUS payout
+				// row has the hash to confirm on-chain.
+				return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: recipient %s succeeded (tx id %d) but fetching its fee/amount via GetTransactionInfo failed — the transfer WAS broadcast, do NOT treat this as a failed payout: %w",
+					result.GetAddress(), txID, err)
 			}
 		}
 		if info != nil {
@@ -260,8 +377,22 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 	}
 
 	if len(failures) > 0 {
-		return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: %d of %d recipient(s) failed (already-succeeded recipients, if any, were still broadcast for real): %s",
+		failErr := fmt.Errorf("wallet: tari: Transfer: %d of %d recipient(s) failed (already-succeeded recipients, if any, were still broadcast for real): %s",
 			len(failures), len(resp.Results), strings.Join(failures, "; "))
+		if len(txIDs) > 0 {
+			// Genuine partial failure: some recipients are already
+			// on-chain. Structurally impossible today (this method
+			// refuses >1 destination) but left explicit so the
+			// classification can never silently regress if that
+			// constraint is ever relaxed.
+			return TransferResult{}, failErr
+		}
+		// Every recipient was explicitly rejected by the wallet's
+		// own transaction service, with no transaction id issued for
+		// any of them — the wallet answered "I did not do it", which
+		// is the Tari analog of a hard RPC rejection and is safe to
+		// retry.
+		return TransferResult{}, NotBroadcast(failErr)
 	}
 	if len(txIDs) == 0 {
 		return TransferResult{}, fmt.Errorf("wallet: tari: Transfer: RPC reported success but no successful results were returned")
@@ -295,7 +426,7 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 //     consumed), not additional funds the wallet still owns on top of
 //     available_balance.
 func (w *TariWalletGRPC) GetBalance(ctx context.Context) (Balance, error) {
-	resp, err := w.rpc.GetBalance()
+	resp, err := callWithReadTimeout(ctx, w.readTimeout, "GetBalance", w.rpc.GetBalance)
 	if err != nil {
 		return Balance{}, fmt.Errorf("wallet: tari: GetBalance: %w", err)
 	}

@@ -132,6 +132,21 @@
 //	                         GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH,
 //	                         GCPOOL_DISBURSE_POLL_INTERVAL,
 //	                         GCPOOL_FORCE_PAYOUT_FEE_ATOMIC).
+//	GCPOOL_WALLET_RPC_TIMEOUT (optional) timeout for real wallet RPC
+//	                         calls -- the monero-wallet-rpc HTTP
+//	                         client's timeout, and the bound on
+//	                         Tari's READ-ONLY wallet GRPC lookups.
+//	                         Default "60s". This is money-critical,
+//	                         not cosmetic: a transfer RPC that takes
+//	                         longer than this is abandoned
+//	                         client-side while the wallet may still
+//	                         broadcast it for real, which the
+//	                         disbursement engine must then treat as
+//	                         AMBIGUOUS and halt on until an operator
+//	                         resolves it (see
+//	                         defaultWalletRPCTimeout and
+//	                         internal/backend/disburse). Set it
+//	                         generously.
 //	GCPOOL_JWT_SECRET        (required) HMAC-SHA256 signing secret for
 //	                         internal/backend/authapi's JWTs (also
 //	                         reused as its password-hashing key --
@@ -262,6 +277,12 @@ type config struct {
 	moneroWalletRPCUser     string
 	moneroWalletRPCPassword string
 
+	// walletRPCTimeout bounds the real wallet RPC calls both
+	// disbursement engines make -- see defaultWalletRPCTimeout and
+	// buildDisburseEngine's doc comment for why this is
+	// money-critical rather than a routine tuning knob.
+	walletRPCTimeout time.Duration
+
 	disburseMinPayoutAtomic         int64
 	disburseMaxDestinationsPerBatch int
 	disbursePollInterval            time.Duration
@@ -341,6 +362,7 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.moneroWalletRPCAddr, "monero-wallet-rpc-addr", envOr("GCPOOL_MONERO_WALLET_RPC_ADDR", ""), "base URL of a real monero-wallet-rpc endpoint (e.g. \"http://127.0.0.1:18083\"). When set, accrued pending_balance is periodically paid out via a real on-chain transfer. Env: GCPOOL_MONERO_WALLET_RPC_ADDR")
 	flag.StringVar(&cfg.moneroWalletRPCUser, "monero-wallet-rpc-user", envOr("GCPOOL_MONERO_WALLET_RPC_USER", ""), "HTTP Digest auth username matching whatever --rpc-login the real monero-wallet-rpc process was started with. Env: GCPOOL_MONERO_WALLET_RPC_USER")
 	flag.StringVar(&cfg.moneroWalletRPCPassword, "monero-wallet-rpc-password", envOr("GCPOOL_MONERO_WALLET_RPC_PASSWORD", ""), "HTTP Digest auth password matching -monero-wallet-rpc-user above. Env: GCPOOL_MONERO_WALLET_RPC_PASSWORD")
+	flag.DurationVar(&cfg.walletRPCTimeout, "wallet-rpc-timeout", envOrDuration("GCPOOL_WALLET_RPC_TIMEOUT", defaultWalletRPCTimeout), "timeout for real wallet RPC calls (monero-wallet-rpc HTTP client; Tari's read-only wallet GRPC lookups). Must be long enough that a slow-but-successful transfer isn't abandoned mid-flight -- an over-tight value turns a real payout into an AMBIGUOUS payout that HALTS disbursement until an operator resolves it by hand. Env: GCPOOL_WALLET_RPC_TIMEOUT")
 	flag.Int64Var(&cfg.disburseMinPayoutAtomic, "disburse-min-payout-atomic", envOrInt64("GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC", 0), "minimum pending_balance (atomic units) required before a miner is paid out at all. Shared by both the Monero and Tari disbursement engines. Env: GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC")
 	flag.Int64Var(&cfg.forcePayoutFeeAtomic, "force-payout-fee-atomic", envOrInt64("GCPOOL_FORCE_PAYOUT_FEE_ATOMIC", 0), "flat atomic-unit fee charged against every force_payout=TRUE balance row paid out this cycle (see POST /user/forcePayment), deducted from the miner's payout and credited to pool revenue. Shared by both the Monero and Tari disbursement engines. 0 (default) means no extra fee. Env: GCPOOL_FORCE_PAYOUT_FEE_ATOMIC")
 	flag.IntVar(&cfg.disburseMaxDestinationsPerBatch, "disburse-max-destinations-per-batch", envOrInt("GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH", defaultDisburseMaxDestinationsPerBatch), "cap on destinations per real Transfer call, for the Monero disbursement engine only (the Tari engine hardcodes 1, see buildTariDisburseEngine's doc comment). Env: GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH")
@@ -406,6 +428,8 @@ type fileConfig struct {
 	MoneroWalletRPCAddr     *string `toml:"monero_wallet_rpc_addr"`
 	MoneroWalletRPCUser     *string `toml:"monero_wallet_rpc_user"`
 	MoneroWalletRPCPassword *string `toml:"monero_wallet_rpc_password"`
+
+	WalletRPCTimeoutSeconds *int `toml:"wallet_rpc_timeout_seconds"`
 
 	DisburseMinPayoutAtomic         *int64 `toml:"disburse_min_payout_atomic"`
 	DisburseMaxDestinationsPerBatch *int   `toml:"disburse_max_destinations_per_batch"`
@@ -479,6 +503,10 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.moneroWalletRPCAddr, fc.MoneroWalletRPCAddr, visited, "monero-wallet-rpc-addr", "GCPOOL_MONERO_WALLET_RPC_ADDR")
 	cfgfile.ApplyString(&cfg.moneroWalletRPCUser, fc.MoneroWalletRPCUser, visited, "monero-wallet-rpc-user", "GCPOOL_MONERO_WALLET_RPC_USER")
 	cfgfile.ApplyString(&cfg.moneroWalletRPCPassword, fc.MoneroWalletRPCPassword, visited, "monero-wallet-rpc-password", "GCPOOL_MONERO_WALLET_RPC_PASSWORD")
+	if fc.WalletRPCTimeoutSeconds != nil {
+		d := time.Duration(*fc.WalletRPCTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.walletRPCTimeout, &d, visited, "wallet-rpc-timeout", "GCPOOL_WALLET_RPC_TIMEOUT")
+	}
 	cfgfile.ApplyInt64(&cfg.disburseMinPayoutAtomic, fc.DisburseMinPayoutAtomic, visited, "disburse-min-payout-atomic", "GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC")
 	cfgfile.ApplyInt64(&cfg.forcePayoutFeeAtomic, fc.ForcePayoutFeeAtomic, visited, "force-payout-fee-atomic", "GCPOOL_FORCE_PAYOUT_FEE_ATOMIC")
 	cfgfile.ApplyInt(&cfg.disburseMaxDestinationsPerBatch, fc.DisburseMaxDestinationsPerBatch, visited, "disburse-max-destinations-per-batch", "GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH")
@@ -1108,11 +1136,12 @@ func (a payoutRepositoryAdapter) CreditBalance(ctx context.Context, algo, networ
 }
 
 // disburseRepositoryAdapter adapts *db.Repository (whose
-// PayableBalances/RecordPendingPayout/CompletePayoutSent/FailPayout
-// operate on db.PayableBalance/db.DisburseEntry) to
+// PayableBalances/UnresolvedPayouts/RecordPendingPayout/
+// CompletePayoutSent/FailPayout/MarkPayoutAmbiguous operate on
+// db.PayableBalance/db.DisburseEntry/db.UnresolvedPayout) to
 // disburse.Repository (which operates on disburse.PayableBalance/
-// disburse.DebitEntry), mirroring payoutRepositoryAdapter's role
-// above.
+// disburse.DebitEntry/disburse.UnresolvedPayout), mirroring
+// payoutRepositoryAdapter's role above.
 type disburseRepositoryAdapter struct {
 	repo *db.Repository
 }
@@ -1135,25 +1164,70 @@ func (a disburseRepositoryAdapter) PayableBalances(ctx context.Context, algo, ne
 	return out, nil
 }
 
-func (a disburseRepositoryAdapter) RecordPendingPayout(ctx context.Context, algo, network string, balanceIDs []int64, amount int64) (int64, error) {
-	return a.repo.RecordPendingPayout(ctx, algo, network, balanceIDs, amount)
+func (a disburseRepositoryAdapter) UnresolvedPayouts(ctx context.Context, algo, network string) ([]disburse.UnresolvedPayout, error) {
+	rows, err := a.repo.UnresolvedPayouts(ctx, algo, network)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]disburse.UnresolvedPayout, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, disburse.UnresolvedPayout{
+			ID:         r.ID,
+			Status:     r.Status,
+			Amount:     r.Amount,
+			BalanceIDs: r.BalanceIDs,
+			TxHash:     derefString(r.TxHash),
+			Error:      derefString(r.Error),
+			Created:    r.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
+// derefString flattens a *string column (payouts.tx_hash/error are
+// both nullable) to a plain string for the disburse package's own
+// non-pointer UnresolvedPayout fields -- those are log/report-only
+// there, where "" and NULL are equivalent, so carrying the pointer
+// through would add a nil check at every use site for no gain.
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func (a disburseRepositoryAdapter) RecordPendingPayout(ctx context.Context, algo, network string, entries []disburse.DebitEntry, amount int64) (int64, error) {
+	return a.repo.RecordPendingPayout(ctx, algo, network, disburseEntriesToDB(entries), amount)
 }
 
 func (a disburseRepositoryAdapter) CompletePayoutSent(ctx context.Context, payoutID int64, entries []disburse.DebitEntry, txHash string, fee int64) error {
-	dbEntries := make([]db.DisburseEntry, 0, len(entries))
+	return a.repo.CompletePayoutSent(ctx, payoutID, disburseEntriesToDB(entries), txHash, fee)
+}
+
+func (a disburseRepositoryAdapter) FailPayout(ctx context.Context, payoutID int64, errMsg string) error {
+	return a.repo.FailPayout(ctx, payoutID, errMsg)
+}
+
+func (a disburseRepositoryAdapter) MarkPayoutAmbiguous(ctx context.Context, payoutID int64, txHash, errMsg string) error {
+	return a.repo.MarkPayoutAmbiguous(ctx, payoutID, txHash, errMsg)
+}
+
+// disburseEntriesToDB converts disburse.DebitEntry to db.DisburseEntry
+// -- shared by RecordPendingPayout and CompletePayoutSent above,
+// which deliberately persist the IDENTICAL entry set (the pre-attempt
+// record and the post-success debit must never disagree, see
+// disburse.runBatch).
+func disburseEntriesToDB(entries []disburse.DebitEntry) []db.DisburseEntry {
+	out := make([]db.DisburseEntry, 0, len(entries))
 	for _, e := range entries {
-		dbEntries = append(dbEntries, db.DisburseEntry{
+		out = append(out, db.DisburseEntry{
 			BalanceID:            e.BalanceID,
 			Amount:               e.Amount,
 			ForcePayout:          e.ForcePayout,
 			ForcePayoutFeeAtomic: e.ForcePayoutFeeAtomic,
 		})
 	}
-	return a.repo.CompletePayoutSent(ctx, payoutID, dbEntries, txHash, fee)
-}
-
-func (a disburseRepositoryAdapter) FailPayout(ctx context.Context, payoutID int64, errMsg string) error {
-	return a.repo.FailPayout(ctx, payoutID, errMsg)
+	return out
 }
 
 // retentionRepositoryAdapter adapts a raw *pgxpool.Pool (rather than
@@ -1431,6 +1505,29 @@ const (
 	defaultDisbursePollInterval            = 10 * time.Minute
 	defaultWalletStatsPollInterval         = 1 * time.Minute
 	defaultDisburseMaxDestinationsPerBatch = 15
+
+	// defaultWalletRPCTimeout is the default for
+	// GCPOOL_WALLET_RPC_TIMEOUT / -wallet-rpc-timeout, matching
+	// wallet.DefaultTimeout.
+	//
+	// This is NOT an ordinary tuning knob. Until this flag existed,
+	// the Monero wallet RPC client had a hardcoded 30s HTTP timeout
+	// with no override wired anywhere in this command -- and a real
+	// monero-wallet-rpc `transfer` call can exceed 30s while still
+	// broadcasting the transaction for real. That produced a client
+	// -side timeout error for a payout that genuinely happened,
+	// which the disbursement engine recorded as FAILED and re-sent
+	// on the next cycle: a real double payment. The engine no longer
+	// makes that assumption (any non-provably-unbroadcast error is
+	// now AMBIGUOUS and halts disbursement -- see
+	// internal/backend/disburse and
+	// migrations/0010_payouts_ambiguous_status.up.sql), but an
+	// over-tight timeout still converts perfectly good payouts into
+	// halted incidents needing manual resolution. 60s is chosen to
+	// be comfortably longer than a real transfer on a busy wallet,
+	// while still bounded so a dead wallet RPC cannot hang the
+	// disbursement loop forever.
+	defaultWalletRPCTimeout = wallet.DefaultTimeout
 )
 
 // buildDisburseEngine reads cfg's moneroWalletRPC*/disburse* fields
@@ -1476,12 +1573,21 @@ const (
 //	                                  credited to pool revenue
 //	                                  (payouts.force_payout_fee_atomic).
 //	                                  Default 0 (no extra fee).
+//	GCPOOL_WALLET_RPC_TIMEOUT         (optional) timeout for the real
+//	                                  monero-wallet-rpc HTTP client.
+//	                                  Default 60s. Money-critical --
+//	                                  see defaultWalletRPCTimeout's
+//	                                  doc comment: too short and a
+//	                                  slow-but-successful transfer
+//	                                  becomes an AMBIGUOUS payout
+//	                                  that halts disbursement until
+//	                                  an operator resolves it.
 func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics, debug *leaflib.DebugLogger) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
 	if cfg.moneroWalletRPCAddr == "" {
 		return nil, nil, 0, false, nil
 	}
 
-	var opts []wallet.Option
+	opts := []wallet.Option{wallet.WithTimeout(cfg.walletRPCTimeout)}
 	if cfg.moneroWalletRPCUser != "" || cfg.moneroWalletRPCPassword != "" {
 		opts = append(opts, wallet.WithDigestAuth(cfg.moneroWalletRPCUser, cfg.moneroWalletRPCPassword))
 	}
@@ -1538,12 +1644,31 @@ func buildDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics, de
 //	                                  different minimum payout, poll
 //	                                  cadence, or force-payout fee per
 //	                                  coin.
+//	GCPOOL_WALLET_RPC_TIMEOUT         shared with the Monero engine,
+//	                                  but applied only to Tari's
+//	                                  READ-ONLY wallet GRPC lookups
+//	                                  (GetBalance, and Transfer's
+//	                                  GetTransactionInfo fee
+//	                                  fallback). It deliberately does
+//	                                  NOT bound Tari's fund-moving
+//	                                  Transfer call -- see
+//	                                  wallet.WithTariReadTimeout's doc
+//	                                  comment: go-tari-grpc-lib's
+//	                                  walletGRPC builds its own
+//	                                  context.Background() internally,
+//	                                  so the only "timeout" available
+//	                                  would be abandoning an in-flight
+//	                                  transfer without cancelling it,
+//	                                  which manufactures exactly the
+//	                                  ambiguous "did the coin move?"
+//	                                  incident this whole change
+//	                                  exists to avoid.
 func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics, debug *leaflib.DebugLogger) (engine *disburse.Engine, walletClient wallet.WalletClient, interval time.Duration, ok bool, err error) {
 	if cfg.tariWalletGRPCAddr == "" {
 		return nil, nil, 0, false, nil
 	}
 
-	var opts []wallet.TariOption
+	opts := []wallet.TariOption{wallet.WithTariReadTimeout(cfg.walletRPCTimeout)}
 	if cfg.tariWalletFeePerGram != 0 {
 		opts = append(opts, wallet.WithFeePerGram(cfg.tariWalletFeePerGram))
 	}
@@ -1564,16 +1689,81 @@ func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics
 	return disburse.New(disburseRepositoryAdapter{repo: repo}, dcfg), walletClient, cfg.disbursePollInterval, true, nil
 }
 
+// startDisburseLoop runs the money-critical startup check for one
+// disbursement engine and then starts its RunLoop for only the
+// (algo, network) targets that passed.
+//
+// The check (disburse.Engine.CheckTargets) refuses any pair that
+// already has an unresolved PENDING or AMBIGUOUS `payouts` row. Both
+// statuses mean "a real Transfer was attempted and this process does
+// not know whether coin moved":
+//
+//   - PENDING -- recorded immediately before the Transfer RPC call
+//     and never resolved, i.e. the previous process died mid-call.
+//     Before this change nothing anywhere read PENDING rows, so a
+//     crash mid-transfer silently left the balance payable and the
+//     next cycle sent the same coin again.
+//   - AMBIGUOUS -- the Transfer (or the bookkeeping write after a
+//     SUCCESSFUL Transfer) failed in a way that cannot rule out a
+//     real broadcast. See
+//     migrations/0010_payouts_ambiguous_status.up.sql.
+//
+// Resuming disbursement for such a pair on restart is precisely how
+// the same coin gets sent twice, so this refuses to start the loop
+// for it and tells the operator exactly what is stuck and which
+// command resolves it. Other pairs are unaffected: one stuck algo
+// must not stop payouts for the rest.
+//
+// A failure to RUN the check at all is fatal for the whole process
+// (returned as an error, not logged-and-continued): "I could not
+// determine whether a payout is unresolved" is not "there are none",
+// and guessing wrong moves real money.
+func startDisburseLoop(ctx context.Context, engine *disburse.Engine, label string, targets []disburse.Target, interval time.Duration) error {
+	safe, blocked, err := engine.CheckTargets(ctx, targets)
+	if err != nil {
+		return fmt.Errorf("%s: startup check for unresolved payouts failed: %w", label, err)
+	}
+
+	for _, b := range blocked {
+		log.Printf("backend: %s: REFUSING to start disbursement for %s/%s: %d unresolved payout row(s) block it",
+			label, b.Target.Algo, b.Target.Network, len(b.Unresolved))
+		for _, p := range b.Unresolved {
+			log.Printf("backend: %s: %s/%s: payout id=%d status=%s amount=%d balance_ids=%v tx_hash=%q created=%s error=%q",
+				label, b.Target.Algo, b.Target.Network, p.ID, p.Status, p.Amount, p.BalanceIDs, p.TxHash,
+				p.Created.UTC().Format(time.RFC3339), p.Error)
+		}
+		log.Printf("backend: %s: %s/%s: WHY: an unresolved PENDING/AMBIGUOUS payout means a real on-chain transfer was attempted and this backend does not know whether the coin actually moved. "+
+			"Paying those balances again would double-spend real funds, so disbursement for this algo/network stays stopped until a human resolves it.",
+			label, b.Target.Algo, b.Target.Network)
+		log.Printf("backend: %s: %s/%s: HOW TO RESOLVE: (1) `backend payout show -id=<id>` to inspect the row; "+
+			"(2) confirm on-chain/in wallet history whether that transfer really broadcast; "+
+			"(3a) it DID: `backend payout resolve-sent -id=<id> -tx-hash=<hash> [-fee=<atomic>] -reason=... -by=... -yes` (records it and debits the balances -- the miner is NOT paid twice); "+
+			"(3b) it did NOT: `backend payout resolve-not-sent -id=<id> -reason=... -by=... -yes` (leaves balances untouched so they become payable again). "+
+			"Then restart the backend to resume disbursement for this algo/network.",
+			label, b.Target.Algo, b.Target.Network)
+	}
+
+	if len(safe) == 0 {
+		log.Printf("backend: %s: no (algo, network) targets are clear to disburse for; disbursement loop not started", label)
+		return nil
+	}
+	log.Printf("backend: %s enabled, polling every %s for %v", label, interval, safe)
+	go engine.RunLoop(ctx, safe, interval)
+	return nil
+}
+
 // main runs the backend server by default (no args, or any args not
-// starting with "block") -- unchanged from before this file's own
-// "block" subcommand was added, so existing deployments invoking this
-// binary with no arguments keep working exactly as before.
+// matching one of the manual ops subcommands below) -- unchanged from
+// before those subcommands were added, so existing deployments
+// invoking this binary with no arguments keep working exactly as
+// before.
 //
 // `backend block invalidate ...` / `backend block relock ...` are a
 // separate, manual ops-triggered CLI path (see blockcli.go) that never
 // starts the HTTP server or any background poll loop -- they open a
 // DB connection, make one SetBlockStatus call, print the result, and
-// exit.
+// exit. `backend payout ...` (see payoutcli.go) follows the same
+// pattern for resolving unresolved/ambiguous payouts.
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "block" {
 		if err := runBlockCommand(os.Args[2:]); err != nil {
@@ -1595,6 +1785,12 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
 		if err := runMigrateCommand(os.Args[2:]); err != nil {
+			log.Fatalf("backend: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "payout" {
+		if err := runPayoutCommand(os.Args[2:]); err != nil {
 			log.Fatalf("backend: %v", err)
 		}
 		return
@@ -1960,8 +2156,9 @@ func run(cfg config) error {
 	}
 	if disburseEnabled {
 		targets := []disburse.Target{{Algo: "RXM", Network: networkDBString(network)}}
-		log.Printf("backend: payout disbursement engine enabled, polling every %s for %v", disburseInterval, targets)
-		go disburseEngine.RunLoop(ctx, targets, disburseInterval)
+		if err := startDisburseLoop(ctx, disburseEngine, "payout disbursement engine", targets, disburseInterval); err != nil {
+			return err
+		}
 	} else {
 		log.Print("backend: payout disbursement engine disabled (GCPOOL_MONERO_WALLET_RPC_ADDR not set); pending_balance will still accrue, it just won't be auto-paid out on-chain")
 	}
@@ -1975,8 +2172,9 @@ func run(cfg config) error {
 		for _, algo := range tariAlgos {
 			targets = append(targets, disburse.Target{Algo: algo, Network: networkDBString(network)})
 		}
-		log.Printf("backend: Tari payout disbursement engine enabled, polling every %s for %v (max 1 destination/batch, see buildTariDisburseEngine)", tariDisburseInterval, targets)
-		go tariDisburseEngine.RunLoop(ctx, targets, tariDisburseInterval)
+		if err := startDisburseLoop(ctx, tariDisburseEngine, "Tari payout disbursement engine (max 1 destination/batch, see buildTariDisburseEngine)", targets, tariDisburseInterval); err != nil {
+			return err
+		}
 	} else {
 		log.Print("backend: Tari payout disbursement engine disabled (GCPOOL_TARI_WALLET_GRPC_ADDR not set); pending_balance will still accrue, it just won't be auto-paid out on-chain")
 	}

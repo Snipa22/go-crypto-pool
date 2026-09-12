@@ -366,7 +366,8 @@ func TestIntegrationDisbursementLifecycle(t *testing.T) {
 		t.Fatalf("PayableBalances(min=100): got %+v, want exactly alice (bob is below the threshold)", payable)
 	}
 
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", []int64{payable[0].ID}, payable[0].PendingBalance)
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+		[]db.DisburseEntry{{BalanceID: payable[0].ID, Amount: payable[0].PendingBalance}}, payable[0].PendingBalance)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
 	}
@@ -403,7 +404,8 @@ func TestIntegrationDisbursementLifecycle(t *testing.T) {
 	// bob is still owed 50 and never touched by the above -- a second,
 	// separate cycle attempt for him that fails must not touch his
 	// balance at all.
-	payoutID2, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", []int64{payable[0].ID + 1}, 50)
+	payoutID2, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+		[]db.DisburseEntry{{BalanceID: payable[0].ID + 1, Amount: 50}}, 50)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout(bob): %v", err)
 	}
@@ -543,17 +545,17 @@ func TestIntegrationCompletePayoutSentForcePayoutFeeLedgerAndReset(t *testing.T)
 		t.Fatalf("PayableBalances: expected both forced and normal rows, got %+v", payable)
 	}
 
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", []int64{forcedID, normalID}, 30+500)
-	if err != nil {
-		t.Fatalf("RecordPendingPayout: %v", err)
-	}
-
 	// The forced row's real Transfer destination amount was 40-10=30
 	// (fee of 10 deducted); the debit still uses its FULL original
 	// PendingBalance (40).
 	entries := []db.DisburseEntry{
 		{BalanceID: forcedID, Amount: 40, ForcePayout: true, ForcePayoutFeeAtomic: 10},
 		{BalanceID: normalID, Amount: 500, ForcePayout: false, ForcePayoutFeeAtomic: 0},
+	}
+
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", entries, 30+500)
+	if err != nil {
+		t.Fatalf("RecordPendingPayout: %v", err)
 	}
 	if err := repo.CompletePayoutSent(ctx, payoutID, entries, "txhash-forced-batch", 5); err != nil {
 		t.Fatalf("CompletePayoutSent: %v", err)

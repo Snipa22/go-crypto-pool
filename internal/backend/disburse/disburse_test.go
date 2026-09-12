@@ -11,20 +11,36 @@ import (
 // fakeRepo is an in-memory Repository test double, mirroring
 // unlocker/payout's fakeRepo style.
 type fakeRepo struct {
-	balances     map[string][]PayableBalance // keyed by "algo/network"
-	pendingCalls []pendingCall
-	sentCalls    []sentCall
-	failCalls    []failCall
-	nextPayoutID int64
-	recordErr    error
-	completeErr  error
-	failErr      error
+	balances       map[string][]PayableBalance // keyed by "algo/network"
+	unresolved     map[string][]UnresolvedPayout
+	pendingCalls   []pendingCall
+	sentCalls      []sentCall
+	failCalls      []failCall
+	ambiguousCalls []ambiguousCall
+	nextPayoutID   int64
+	recordErr      error
+	completeErr    error
+	failErr        error
+	ambiguousErr   error
+	unresolvedErr  error
 }
 
 type pendingCall struct {
 	algo, network string
-	balanceIDs    []int64
+	entries       []DebitEntry
 	amount        int64
+}
+
+// balanceIDs mirrors what db.Repository.RecordPendingPayout derives
+// from entries for the real payouts.balance_ids column, so tests can
+// assert on it the same way they used to when the engine passed a
+// bare []int64.
+func (p pendingCall) balanceIDs() []int64 {
+	out := make([]int64, 0, len(p.entries))
+	for _, e := range p.entries {
+		out = append(out, e.BalanceID)
+	}
+	return out
 }
 
 type sentCall struct {
@@ -39,6 +55,12 @@ type failCall struct {
 	errMsg   string
 }
 
+type ambiguousCall struct {
+	payoutID int64
+	txHash   string
+	errMsg   string
+}
+
 func key(algo, network string) string { return algo + "/" + network }
 
 func (f *fakeRepo) PayableBalances(_ context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
@@ -47,21 +69,100 @@ func (f *fakeRepo) PayableBalances(_ context.Context, algo, network string, minP
 		// Mirrors db.Repository.PayableBalances' real SQL: a row is
 		// payable if it meets minPayout on its own OR is
 		// force_payout-flagged, provided pending_balance > 0 either
-		// way.
-		if b.PendingBalance > 0 && (b.PendingBalance >= minPayout || b.ForcePayout) {
-			out = append(out, b)
+		// way -- AND is not referenced by an unresolved payout (the
+		// real query's NOT EXISTS anti-join, modeled here by
+		// frozenBalanceIDs below).
+		if b.PendingBalance <= 0 {
+			continue
 		}
+		if b.PendingBalance < minPayout && !b.ForcePayout {
+			continue
+		}
+		if f.frozenBalanceIDs(algo, network)[b.ID] {
+			continue
+		}
+		out = append(out, b)
 	}
 	return out, nil
 }
 
-func (f *fakeRepo) RecordPendingPayout(_ context.Context, algo, network string, balanceIDs []int64, amount int64) (int64, error) {
+// frozenBalanceIDs models db.Repository.PayableBalances' real
+// in-flight exclusion: every balance row referenced by an unresolved
+// (PENDING/AMBIGUOUS) payout for this (algo, network) is frozen out
+// of the payable set until that payout is resolved.
+func (f *fakeRepo) frozenBalanceIDs(algo, network string) map[int64]bool {
+	frozen := map[int64]bool{}
+	for _, p := range f.unresolved[key(algo, network)] {
+		for _, id := range p.BalanceIDs {
+			frozen[id] = true
+		}
+	}
+	return frozen
+}
+
+func (f *fakeRepo) UnresolvedPayouts(_ context.Context, algo, network string) ([]UnresolvedPayout, error) {
+	if f.unresolvedErr != nil {
+		return nil, f.unresolvedErr
+	}
+	return f.unresolved[key(algo, network)], nil
+}
+
+func (f *fakeRepo) RecordPendingPayout(_ context.Context, algo, network string, entries []DebitEntry, amount int64) (int64, error) {
 	if f.recordErr != nil {
 		return 0, f.recordErr
 	}
 	f.nextPayoutID++
-	f.pendingCalls = append(f.pendingCalls, pendingCall{algo, network, balanceIDs, amount})
+	f.pendingCalls = append(f.pendingCalls, pendingCall{algo, network, entries, amount})
+	// Mirror the real repository: a PENDING row is durably recorded
+	// BEFORE the transfer is attempted, and PENDING is an unresolved
+	// status, so it freezes these balances immediately.
+	f.addUnresolved(algo, network, UnresolvedPayout{
+		ID:         f.nextPayoutID,
+		Status:     "PENDING",
+		Amount:     amount,
+		BalanceIDs: pendingCall{entries: entries}.balanceIDs(),
+	})
 	return f.nextPayoutID, nil
+}
+
+func (f *fakeRepo) addUnresolved(algo, network string, p UnresolvedPayout) {
+	if f.unresolved == nil {
+		f.unresolved = map[string][]UnresolvedPayout{}
+	}
+	f.unresolved[key(algo, network)] = append(f.unresolved[key(algo, network)], p)
+}
+
+// resolveUnresolved removes payoutID from the unresolved set,
+// mirroring what CompletePayoutSent (-> SENT) and FailPayout
+// (-> FAILED) do to the real row's status.
+func (f *fakeRepo) resolveUnresolved(payoutID int64) {
+	for k, ps := range f.unresolved {
+		kept := ps[:0]
+		for _, p := range ps {
+			if p.ID != payoutID {
+				kept = append(kept, p)
+			}
+		}
+		f.unresolved[k] = kept
+	}
+}
+
+// setAmbiguous flips payoutID's unresolved entry to AMBIGUOUS,
+// mirroring MarkPayoutAmbiguous on the real row: still unresolved, so
+// still freezing its balances and still halting the next cycle.
+func (f *fakeRepo) setAmbiguous(payoutID int64, txHash, errMsg string) {
+	for k, ps := range f.unresolved {
+		for i := range ps {
+			if ps[i].ID == payoutID {
+				ps[i].Status = "AMBIGUOUS"
+				ps[i].Error = errMsg
+				if txHash != "" {
+					ps[i].TxHash = txHash
+				}
+			}
+		}
+		f.unresolved[k] = ps
+	}
 }
 
 func (f *fakeRepo) CompletePayoutSent(_ context.Context, payoutID int64, entries []DebitEntry, txHash string, fee int64) error {
@@ -69,7 +170,29 @@ func (f *fakeRepo) CompletePayoutSent(_ context.Context, payoutID int64, entries
 		return f.completeErr
 	}
 	f.sentCalls = append(f.sentCalls, sentCall{payoutID, entries, txHash, fee})
+	// A SENT row is resolved: it no longer freezes anything. The
+	// test double also debits the balances so a follow-up cycle sees
+	// the same state a real DB would.
+	f.resolveUnresolved(payoutID)
+	f.debit(entries)
 	return nil
+}
+
+// debit models CompletePayoutSent's real balance write, so a test can
+// run a SECOND cycle and observe that an already-paid row is no
+// longer payable.
+func (f *fakeRepo) debit(entries []DebitEntry) {
+	for _, e := range entries {
+		for k, rows := range f.balances {
+			for i := range rows {
+				if rows[i].ID == e.BalanceID {
+					rows[i].PendingBalance -= e.Amount
+					rows[i].ForcePayout = false
+				}
+			}
+			f.balances[k] = rows
+		}
+	}
 }
 
 func (f *fakeRepo) FailPayout(_ context.Context, payoutID int64, errMsg string) error {
@@ -77,6 +200,17 @@ func (f *fakeRepo) FailPayout(_ context.Context, payoutID int64, errMsg string) 
 		return f.failErr
 	}
 	f.failCalls = append(f.failCalls, failCall{payoutID, errMsg})
+	// FAILED is a resolved status: the balances become payable again.
+	f.resolveUnresolved(payoutID)
+	return nil
+}
+
+func (f *fakeRepo) MarkPayoutAmbiguous(_ context.Context, payoutID int64, txHash, errMsg string) error {
+	if f.ambiguousErr != nil {
+		return f.ambiguousErr
+	}
+	f.ambiguousCalls = append(f.ambiguousCalls, ambiguousCall{payoutID, txHash, errMsg})
+	f.setAmbiguous(payoutID, txHash, errMsg)
 	return nil
 }
 
@@ -237,13 +371,21 @@ func TestRunOnce_SkipsWholeCycleOnInsufficientUnlockedBalance(t *testing.T) {
 	}
 }
 
-func TestRunOnce_FailedTransferNeverDebitsBalance(t *testing.T) {
+// TestRunOnce_ProvablyUnbroadcastTransferFailsAndStaysPayable covers
+// the ONLY Transfer-error shape that is still allowed to mark a
+// payout FAILED and leave the balance payable for the next cycle: one
+// the wallet client explicitly marked wallet.ErrNotBroadcast, i.e.
+// proven never to have hit the chain (see that sentinel's doc
+// comment). Everything else must go AMBIGUOUS instead — see
+// TestRunOnce_AmbiguousTransferErrorFreezesBalanceAndHalts.
+func TestRunOnce_ProvablyUnbroadcastTransferFailsAndStaysPayable(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
 		key("RXM", "TESTNET"): {
 			{ID: 1, PaymentAddress: "alice", PendingBalance: 500},
 		},
 	}}
-	w := &fakeWallet{unlocked: 10000, total: 10000, transferErr: errors.New("not enough unlocked money")}
+	w := &fakeWallet{unlocked: 10000, total: 10000,
+		transferErr: wallet.NotBroadcast(errors.New("monero wallet rpc error -37: not enough unlocked money"))}
 	e := New(repo, testConfig(w))
 
 	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
@@ -253,11 +395,27 @@ func TestRunOnce_FailedTransferNeverDebitsBalance(t *testing.T) {
 	if result.BatchesFailed != 1 || result.BatchesSent != 0 || result.TotalSent != 0 {
 		t.Fatalf("RunOnce: got %+v, want 1 failed batch and zero sent", result)
 	}
+	if result.BatchesAmbiguous != 0 || result.Halted != 0 {
+		t.Fatalf("RunOnce: got %+v, want a provably-unbroadcast error to be FAILED, not ambiguous/halting", result)
+	}
 	if len(repo.sentCalls) != 0 {
 		t.Fatalf("RunOnce: got %d CompletePayoutSent calls, want 0 for a failed transfer", len(repo.sentCalls))
 	}
 	if len(repo.failCalls) != 1 {
 		t.Fatalf("RunOnce: got %d FailPayout calls, want exactly 1", len(repo.failCalls))
+	}
+	if len(repo.ambiguousCalls) != 0 {
+		t.Fatalf("RunOnce: got %d MarkPayoutAmbiguous calls, want 0", len(repo.ambiguousCalls))
+	}
+
+	// The whole point of FAILED: the balance is payable again next
+	// cycle, and the next cycle is NOT halted.
+	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", 100)
+	if err != nil {
+		t.Fatalf("PayableBalances: %v", err)
+	}
+	if len(payable) != 1 || payable[0].ID != 1 {
+		t.Fatalf("got payable=%+v, want alice's balance payable again after a provably-unbroadcast failure", payable)
 	}
 }
 

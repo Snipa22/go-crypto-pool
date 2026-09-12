@@ -203,3 +203,64 @@ func TestNew_MultipleInstancesDoNotPanic(t *testing.T) {
 		}
 	}
 }
+
+// TestDisbursementAmbiguityMetrics_RegisterAndRender covers the three
+// collectors added for the wallet-transfer double-payment fix. The
+// audit explicitly flagged that whole class of incident as
+// metric-invisible: a payout the engine wrongly recorded as FAILED
+// (and then re-sent) produced no signal at all beyond a log line.
+// These are now the alertable surface, so this test asserts they
+// register, carry the documented labels, and actually render.
+func TestDisbursementAmbiguityMetrics_RegisterAndRender(t *testing.T) {
+	m := New("test")
+
+	m.DisbursementAmbiguousPayoutsTotal.WithLabelValues("RXM", "MAINNET", AmbiguousCauseTransfer).Inc()
+	m.DisbursementAmbiguousPayoutsTotal.WithLabelValues("RXT", "MAINNET", AmbiguousCauseBookkeeping).Inc()
+	m.DisbursementHaltsTotal.WithLabelValues("RXM", "MAINNET", HaltReasonUnresolvedPayouts).Inc()
+	m.DisbursementHaltsTotal.WithLabelValues("RXM", "MAINNET", HaltReasonAmbiguousBatch).Inc()
+	m.DisbursementUnresolvedPayouts.WithLabelValues("RXM", "MAINNET").Set(3)
+	// The batch-result label set must include the new "ambiguous"
+	// outcome, kept distinct from "failed" (one is a page-worthy
+	// incident, the other is routine).
+	m.DisbursementBatchesTotal.WithLabelValues("RXM", "MAINNET", DisbursementResultAmbiguous).Inc()
+
+	body := scrapeMetrics(t, m)
+
+	for _, want := range []string{
+		`disbursement_ambiguous_payouts_total{algo="RXM",cause="transfer_error",network="MAINNET"} 1`,
+		`disbursement_ambiguous_payouts_total{algo="RXT",cause="bookkeeping_error",network="MAINNET"} 1`,
+		`disbursement_halts_total{algo="RXM",network="MAINNET",reason="unresolved_payouts"} 1`,
+		`disbursement_halts_total{algo="RXM",network="MAINNET",reason="ambiguous_batch"} 1`,
+		`disbursement_unresolved_payouts{algo="RXM",network="MAINNET"} 3`,
+		`disbursement_batches_total{algo="RXM",network="MAINNET",result="ambiguous"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in /metrics output, got:\n%s", want, body)
+		}
+	}
+}
+
+// scrapeMetrics renders m's registry through the real promhttp
+// handler and returns the full exposition body.
+func scrapeMetrics(t *testing.T, m *Metrics) string {
+	t.Helper()
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var sb strings.Builder
+	buf := make([]byte, 8192)
+	for {
+		n, err := resp.Body.Read(buf)
+		sb.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+	return sb.String()
+}

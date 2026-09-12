@@ -77,13 +77,56 @@ const (
 
 // Result label values for disbursement_batches_total — whether one
 // real on-chain transfer batch (internal/backend/disburse.Engine)
-// was actually sent, failed at the wallet RPC layer, or was skipped
+// was actually sent, failed at the wallet RPC layer, was skipped
 // before ever attempting a Transfer call (e.g. insufficient unlocked
-// wallet balance for this cycle — see disburse.go's doc comment).
+// wallet balance for this cycle — see disburse.go's doc comment), or
+// ended AMBIGUOUS.
+//
+// "failed" and "ambiguous" are deliberately distinct and must not be
+// conflated in dashboards/alerts: "failed" means the wallet provably
+// never broadcast anything and the balance is safely retried next
+// cycle (routine, not necessarily actionable), whereas "ambiguous"
+// means real coin MAY already have moved, the balance has been frozen
+// out of PayableBalances, and disbursement for that (algo, network)
+// is halted pending a human. An ambiguous batch is always a
+// page-worthy incident; a failed one usually is not.
 const (
-	DisbursementResultSent    = "sent"
-	DisbursementResultFailed  = "failed"
-	DisbursementResultSkipped = "skipped"
+	DisbursementResultSent      = "sent"
+	DisbursementResultFailed    = "failed"
+	DisbursementResultSkipped   = "skipped"
+	DisbursementResultAmbiguous = "ambiguous"
+)
+
+// Cause label values for disbursement_ambiguous_payouts_total — which
+// of the two real code paths pushed a payout into the AMBIGUOUS state
+// (see internal/backend/disburse's runBatch and
+// migrations/0010_payouts_ambiguous_status.up.sql).
+const (
+	// AmbiguousCauseTransfer — the wallet's Transfer call returned an
+	// error that could not be proven pre-broadcast (a timeout, a
+	// transport failure, Tari's transfer-succeeded-but-fee-lookup-
+	// failed path, ...). Whether coin moved is unknown.
+	AmbiguousCauseTransfer = "transfer_error"
+	// AmbiguousCauseBookkeeping — the Transfer SUCCEEDED (there is a
+	// real tx_hash) but the local CompletePayoutSent write that
+	// debits balances and records it failed. Coin definitely moved;
+	// the ledger does not know it yet.
+	AmbiguousCauseBookkeeping = "bookkeeping_error"
+)
+
+// Reason label values for disbursement_halts_total — why a
+// disbursement cycle (or a whole (algo, network)'s loop, at startup)
+// refused to pay anything out.
+const (
+	// HaltReasonUnresolvedPayouts — an unresolved (PENDING or
+	// AMBIGUOUS) payout row already existed for this (algo,
+	// network) when the cycle/process started, so nothing was
+	// attempted at all.
+	HaltReasonUnresolvedPayouts = "unresolved_payouts"
+	// HaltReasonAmbiguousBatch — a batch went AMBIGUOUS partway
+	// through this cycle, so the remaining batches were abandoned
+	// rather than attempted.
+	HaltReasonAmbiguousBatch = "ambiguous_batch"
 )
 
 // Metrics holds every Prometheus collector the backend registers, plus
@@ -145,6 +188,44 @@ type Metrics struct {
 	// batch's Transfer call + bookkeeping), labeled by algo and
 	// network.
 	DisbursementCycleDuration *prometheus.HistogramVec
+
+	// DisbursementAmbiguousPayoutsTotal counts every payout pushed
+	// into the AMBIGUOUS state — "real coin may already have moved
+	// on-chain, a human must check" — labeled by algo, network, and
+	// cause (see AmbiguousCause* above).
+	//
+	// This class of incident was previously entirely
+	// metric-invisible: the engine recorded the payout FAILED,
+	// re-paid the same balance next cycle, and the only trace was a
+	// log line. ANY non-zero increment here is a page-worthy event:
+	// by construction it means disbursement for that (algo, network)
+	// is now halted and real funds are in an unknown state.
+	DisbursementAmbiguousPayoutsTotal *prometheus.CounterVec
+	// DisbursementHaltsTotal counts every disbursement cycle that
+	// refused to pay anything out because of an unresolved payout,
+	// labeled by algo, network, and reason (see HaltReason* above).
+	// Incremented once per halted cycle (so it climbs steadily for
+	// as long as an incident stays unresolved, making "how long has
+	// this been stuck" directly queryable) and once per (algo,
+	// network) blocked by cmd/backend's startup check.
+	DisbursementHaltsTotal *prometheus.CounterVec
+	// DisbursementUnresolvedPayouts is the current number of
+	// unresolved (PENDING or AMBIGUOUS) `payouts` rows for an (algo,
+	// network) — a Gauge, i.e. live state, not a cumulative count.
+	// Zero is the only healthy value; anything above zero means
+	// disbursement for that pair is halted until an operator
+	// resolves the rows (`backend payout list-unresolved`, then
+	// `backend payout resolve-sent` / `resolve-not-sent`).
+	//
+	// Freshness note, deliberate: this is refreshed by every
+	// disbursement cycle for pairs whose loop is running, and set
+	// once at startup for pairs cmd/backend's startup check REFUSED
+	// to start a loop for. For those blocked pairs the value stays
+	// put until the process is restarted — which is correct, since
+	// the loop itself also stays halted until then: a persistent
+	// non-zero reading is exactly the "this pair is stuck and needs
+	// a human" signal wanted, not a stale artifact.
+	DisbursementUnresolvedPayouts *prometheus.GaugeVec
 
 	// WalletBalance is the hot wallet's real, currently-reported
 	// balance, labeled by algo, network, and kind
@@ -314,6 +395,21 @@ func New(version string) *Metrics {
 		Name:    "disbursement_cycle_duration_seconds",
 		Help:    "Wall-clock time for one full disbursement cycle (balance query + every batch's Transfer call + bookkeeping), by algo and network.",
 		Buckets: prometheus.DefBuckets,
+	}, []string{"algo", "network"})
+
+	m.DisbursementAmbiguousPayoutsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "disbursement_ambiguous_payouts_total",
+		Help: "Total number of payouts entering the AMBIGUOUS state (real coin may already have moved on-chain; disbursement halted pending manual resolution), by algo, network, and cause (transfer_error/bookkeeping_error). Any increment is a page-worthy incident.",
+	}, []string{"algo", "network", "cause"})
+
+	m.DisbursementHaltsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "disbursement_halts_total",
+		Help: "Total number of disbursement halts triggered by an unresolved (PENDING/AMBIGUOUS) payout row, by algo, network, and reason (unresolved_payouts/ambiguous_batch).",
+	}, []string{"algo", "network", "reason"})
+
+	m.DisbursementUnresolvedPayouts = registerGaugeVec(reg, prometheus.GaugeOpts{
+		Name: "disbursement_unresolved_payouts",
+		Help: "Current number of unresolved (PENDING or AMBIGUOUS) payouts rows blocking disbursement, by algo and network. Zero is the only healthy value.",
 	}, []string{"algo", "network"})
 
 	m.WalletBalance = registerGaugeVec(reg, prometheus.GaugeOpts{

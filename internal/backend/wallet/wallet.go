@@ -13,7 +13,67 @@
 // is chain.ChainVerifier's only caller.
 package wallet
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrNotBroadcast marks a Transfer error as a DEFINITIVE
+// pre-broadcast failure: the implementation can prove no transaction
+// was created or relayed, so the caller's balances are safe to retry
+// unchanged on a later cycle.
+//
+// This sentinel exists because the absence of it is what actually
+// matters. internal/backend/disburse used to assume EVERY Transfer
+// error meant "no coin moved" and marked the payout FAILED, which
+// left the balance payable and re-sent the same coin next cycle. Two
+// real code paths broke that assumption outright: a
+// slow-but-successful monero-wallet-rpc `transfer` that still
+// broadcasts after the HTTP client gives up (see monero_rpc.go), and
+// Tari's transfer-succeeded-but-fee-lookup-failed path (see
+// tari.go). So the contract is now inverted and fail-safe:
+//
+//	errors.Is(err, ErrNotBroadcast) == true   ->  provably nothing
+//	                                              moved; safe to
+//	                                              retry (FAILED).
+//	errors.Is(err, ErrNotBroadcast) == false  ->  MAY have moved;
+//	                                              treat as ambiguous,
+//	                                              halt, require a
+//	                                              human (AMBIGUOUS).
+//
+// Every implementation must therefore mark ONLY the errors it can
+// genuinely prove happened before anything hit the wire (or that the
+// wallet itself explicitly answered "I did not do it"), and leave
+// everything else unmarked. An unmarked error is the safe default; a
+// wrongly-marked one is a double payment. Use NotBroadcast to mark.
+var ErrNotBroadcast = errors.New("wallet: transfer definitively not broadcast")
+
+// NotBroadcast wraps err so errors.Is(err, ErrNotBroadcast) reports
+// true, without altering its message. Returns nil for a nil err.
+//
+// Only use this where non-broadcast is PROVABLE — see
+// ErrNotBroadcast's doc comment. "The call returned an error so
+// probably nothing happened" is not proof and must not be marked.
+func NotBroadcast(err error) error {
+	if err == nil {
+		return nil
+	}
+	return notBroadcastError{err: err}
+}
+
+// notBroadcastError is NotBroadcast's tiny wrapper type: transparent
+// to Error()/Unwrap() (so existing error text and wrapped-error
+// chains are unchanged) and matched by errors.Is against
+// ErrNotBroadcast via its own Is method.
+type notBroadcastError struct {
+	err error
+}
+
+func (e notBroadcastError) Error() string { return e.err.Error() }
+
+func (e notBroadcastError) Unwrap() error { return e.err }
+
+func (e notBroadcastError) Is(target error) bool { return target == ErrNotBroadcast }
 
 // Destination is one payee/amount pair for a single Transfer call —
 // the wallet-side analog of internal/backend/payout.Payment, but
@@ -101,10 +161,23 @@ type Balance struct {
 type WalletClient interface {
 	// Transfer submits one real on-chain transaction paying every
 	// Destination in req, returning the real transaction hash/fee
-	// once the wallet has actually broadcast it. A non-nil error
-	// means no transaction was created at all (or the RPC call
-	// itself failed) — callers must not credit/debit anything on
-	// error.
+	// once the wallet has actually broadcast it.
+	//
+	// A non-nil error does NOT mean nothing happened. It means only
+	// one of two things, which the caller MUST distinguish via
+	// errors.Is(err, ErrNotBroadcast):
+	//
+	//   - marked ErrNotBroadcast: no transaction was created or
+	//     relayed, provably. The caller may safely leave balances
+	//     payable and retry.
+	//   - NOT marked: the outcome is UNKNOWN — real coin may
+	//     already have moved on-chain (a timed-out but successful
+	//     RPC, a partially-applied multi-recipient call, a
+	//     post-broadcast lookup failure, ...). The caller must NOT
+	//     credit/debit anything AND must NOT make those balances
+	//     payable again; it has to halt and escalate to a human.
+	//     See internal/backend/disburse's runBatch and
+	//     migrations/0010_payouts_ambiguous_status.up.sql.
 	Transfer(ctx context.Context, req TransferRequest) (TransferResult, error)
 
 	// GetBalance returns the wallet's current real balance.
