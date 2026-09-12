@@ -55,6 +55,8 @@ func resetSchema(t *testing.T, pool *pgxpool.Pool) {
 		"DROP TABLE IF EXISTS ports CASCADE",
 		"DROP TABLE IF EXISTS pools CASCADE",
 		"DROP TABLE IF EXISTS payouts CASCADE",
+		"DROP TABLE IF EXISTS block_payout_credits CASCADE",
+		"DROP TABLE IF EXISTS block_payouts CASCADE",
 		"DROP TABLE IF EXISTS balance CASCADE",
 		"DROP TABLE IF EXISTS miner_identifiers CASCADE",
 		"DROP TABLE IF EXISTS blocks CASCADE",

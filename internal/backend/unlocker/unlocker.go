@@ -74,21 +74,34 @@ type Block struct {
 }
 
 // PayoutTrigger is invoked once for every block RunOnce/checkBlock
-// resolves as matured, after the corresponding SetBlockStatus(valid=
-// true, unlocked=true) call has already succeeded — i.e. this is the
-// hook that wires internal/backend/payout.Calculator's real PPS/
-// PPLNS/Solo payout math onto "a block just became payable", without
-// this package needing to import internal/backend/payout directly
-// (same narrow-interface pattern as Repository above).
+// resolves as matured, BEFORE that block's
+// SetBlockStatus(valid=true, unlocked=true) call is made — see
+// checkBlock's doc comment for why that ordering is load-bearing and
+// not merely cosmetic.
 //
 // A TriggerPayout error is logged and counted (see
-// Config.Metrics.PayoutCyclesTotal) but never changes checkBlock's
-// own outcome or reverts the block's now-matured/unlocked status —
-// the chain-maturity determination and the payout calculation are
-// deliberately independent failure domains: a payout bug must not
-// make this codebase forget that a block matured, and a stuck payout
-// can always be retried out-of-band (e.g. a manual admin re-run)
-// without re-verifying the chain.
+// Config.Metrics.PayoutCyclesTotal / UnlockerOutcomePayoutFailed) and
+// DELIBERATELY ABORTS the status write for that block: the block stays
+// valid=TRUE, unlocked=FALSE, which is exactly Repository.PendingBlocks'
+// own selection predicate, so the next poll pass picks it up and
+// retries the whole matured-block path automatically.
+//
+// This is the opposite of what this package used to do. It previously
+// marked the block matured/unlocked FIRST and treated a payout failure
+// as an independent failure domain to be logged and forgotten — which
+// meant the block immediately dropped out of PendingBlocks and its
+// payout was never retried by anything, with no durable marker that it
+// was owed. A crash between the two calls lost the payout the same way.
+// The only recovery was an operator noticing and running `backend block
+// relock` by hand — which, on the old non-idempotent payout path, then
+// double-credited every miner a partial run had already paid.
+//
+// Implementations MUST therefore be idempotent per block: the retry
+// above will call TriggerPayout again for a block whose payout may
+// already have committed (e.g. the payout succeeded and only the status
+// write failed). internal/backend/payout.Calculator is, via the
+// `block_payouts` claim ledger — see
+// migrations/0011_block_payouts.up.sql.
 type PayoutTrigger interface {
 	TriggerPayout(ctx context.Context, b Block) error
 }
@@ -222,16 +235,27 @@ type PassResult struct {
 	Orphaned int
 	Pending  int
 	Errors   int
+	// PayoutRetries counts blocks this pass confirmed mature on the
+	// real chain but deliberately LEFT PENDING because their payout
+	// run did not succeed — see checkBlock's outcomePayoutRetry
+	// branch. Such a block is not an Errors (its chain status is
+	// settled, not unknown) and is emphatically not Matured (nothing
+	// was written for it); it is money owed that the next pass will
+	// retry. A steadily non-zero count here means the same block(s)
+	// are failing every tick and need a human.
+	PayoutRetries int
 }
 
 // RunOnce performs exactly one poll pass: for every algo configured in
 // cfg.Coins, fetches its pending blocks and verifies each one against
 // that algo's ChainVerifier, writing back a status update for every
 // block whose chain status resolved definitively (matured or
-// orphaned). Blocks whose ChainVerifier.Verify call itself errored, or
-// which are simply not yet found or not yet mature, are left pending
-// untouched — see checkBlock's doc comment for the exact decision
-// table.
+// orphaned). Blocks whose ChainVerifier.Verify call itself errored,
+// which are simply not yet found or not yet mature, or which matured
+// but whose payout run failed, are left pending untouched — see
+// checkBlock's doc comment for the exact decision table (and, for
+// that last case, why leaving the block pending is what makes the
+// payout automatically retried instead of silently dropped).
 //
 // Every block still pending at the end of this pass (whether because
 // checkBlock returned an error or because it genuinely is not yet
@@ -312,6 +336,9 @@ func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 				total.Matured++
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: matured, marking unlocked", algo, b.ID, b.Height, b.Hash)
 				u.observeOutcome(algo, metrics.UnlockerOutcomeMatured)
+			case outcome == outcomePayoutRetry:
+				total.PayoutRetries++
+				u.observeOutcome(algo, metrics.UnlockerOutcomePayoutFailed)
 			case outcome == outcomeOrphaned:
 				total.Orphaned++
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: orphaned, marking invalid+unlocked", algo, b.ID, b.Height, b.Hash)
@@ -414,9 +441,14 @@ const (
 	outcomePending blockOutcome = iota
 	outcomeMatured
 	outcomeOrphaned
+	// outcomePayoutRetry — the block IS mature on the real chain, but
+	// its payout run failed, so nothing was written and the block was
+	// deliberately left in the pending queue for the next pass. See
+	// checkBlock's decision table.
+	outcomePayoutRetry
 )
 
-// checkBlock verifies one pending block and, for the two outcomes that
+// checkBlock verifies one pending block and, for the outcomes that
 // resolve its status definitively, writes that resolution back via
 // u.repo.SetBlockStatus. The decision table:
 //
@@ -435,12 +467,15 @@ const (
 //     recovery path in this pass — an operator can always fix a row
 //     by hand if a coin's chain somehow un-orphans a block later,
 //     which none of the coins this codebase supports actually do).
-//   - Verify succeeds, Found, not Orphaned, Confirmations >=
-//     coinCfg.MaturityDepth: outcomeMatured — SetBlockStatus(valid=
-//     true, unlocked=true) marks it mature/payable.
+//     No payout is triggered for an orphan, obviously.
 //   - Verify succeeds, Found, not Orphaned, Confirmations <
 //     coinCfg.MaturityDepth: outcomePending, nil — still confirming,
 //     retried next pass.
+//   - Verify succeeds, Found, not Orphaned, Confirmations >=
+//     coinCfg.MaturityDepth: MATURED. The payout runs FIRST, and only
+//     if it succeeds is SetBlockStatus(valid=true, unlocked=true)
+//     written (outcomeMatured). If the payout fails, nothing is
+//     written at all and the block stays pending (outcomePayoutRetry).
 //
 // coinCfg here is the CALLER-RESOLVED CoinConfig for b: RunOnce picks
 // it from Config.MergeMineChainVerifiers[b.MergeMineChain] when
@@ -448,7 +483,54 @@ const (
 // see resolveCoinConfig's doc comment. checkBlock itself has no
 // awareness of that routing; it just verifies against whichever
 // Verifier it was handed.
-
+//
+// # Why the payout runs before the status write
+//
+// `unlocked = TRUE` is this schema's only "this block has been dealt
+// with" marker: Repository.PendingBlocks selects `valid = TRUE AND
+// unlocked = FALSE`, so setting it is what removes a block from every
+// future automatic pass. This code used to set it BEFORE triggering
+// the payout and then merely log a payout failure — which meant a
+// failed (or crashed-through) payout left the block permanently
+// invisible, its miners never credited, and no durable record anywhere
+// that anything was owed. Recovery required an operator to notice and
+// run `backend block relock` by hand.
+//
+// Running the payout first inverts that: the terminal marker is only
+// ever written once the money side genuinely succeeded, so the two
+// possible interruption points are both safe.
+//
+//   - Payout fails or the process dies during it: no status write, the
+//     block is still in PendingBlocks, the next pass retries it. No
+//     manual intervention needed, and nothing was credited (the payout
+//     itself is one all-or-nothing transaction — see
+//     migrations/0013_block_payouts.up.sql).
+//   - Payout commits but the status write fails or the process dies
+//     before it: the next pass retries, the payout is a recorded no-op
+//     (db.ErrBlockPayoutPending's sibling case — the ledger row is
+//     APPLIED, so nobody is credited twice), and the status write is
+//     simply re-attempted.
+//
+// The chosen shape is deliberately "don't flip block state to a
+// terminal handled condition until the payout genuinely succeeded",
+// rather than adding a separate "payout pending" sub-state column: the
+// existing (valid=TRUE, unlocked=FALSE) pair ALREADY means exactly
+// "mature-or-not, not yet handled", and PendingBlocks already
+// re-selects it every tick. A new sub-state would add a second,
+// redundant encoding of the same fact plus a second retry loop to
+// maintain, and its only advantage over this — not re-querying the
+// chain on retry — is one cheap RPC per poll tick per stuck block.
+//
+// The cost of this shape, stated plainly: a block whose payout fails
+// PERMANENTLY (an unsupported PROP pool_type, a reward the chain never
+// reports, an unresolved PENDING ledger row) is re-verified and
+// re-attempted on every poll tick forever, and stays un-unlocked. That
+// is loud (a log line plus unlocker_blocks_total{outcome=
+// "payout_failed"} and payout_cycles_total{result="error"} on every
+// tick) and it is the correct trade: real money owed to miners must
+// not be able to silently disappear because a payout raised an error
+// once.
+//
 // resolveCoinConfig picks the right CoinConfig for block b:
 // b.MergeMineChain non-nil (a secondary merge-mined-chain leg, e.g.
 // "TARI") routes to Config.MergeMineChainVerifiers[*b.MergeMineChain];
@@ -469,7 +551,6 @@ func (u *Unlocker) resolveCoinConfig(b Block) (CoinConfig, bool) {
 	cfg, ok := u.cfg.Coins[b.Algo]
 	return cfg, ok
 }
-
 func (u *Unlocker) checkBlock(ctx context.Context, b Block, coinCfg CoinConfig) (blockOutcome, error) {
 	if coinCfg.Verifier == nil {
 		return outcomePending, fmt.Errorf("no ChainVerifier configured for this algo")
@@ -491,9 +572,7 @@ func (u *Unlocker) checkBlock(ctx context.Context, b Block, coinCfg CoinConfig) 
 	if result.Confirmations < coinCfg.MaturityDepth {
 		return outcomePending, nil
 	}
-	if err := u.repo.SetBlockStatus(ctx, b.ID, true, true); err != nil {
-		return outcomePending, fmt.Errorf("marking matured block unlocked: %w", err)
-	}
+
 	if u.cfg.PayoutTrigger != nil {
 		// Use the REAL, CURRENT reward the chain just reported in
 		// this same Verify call (result.Reward), not whatever value
@@ -505,14 +584,24 @@ func (u *Unlocker) checkBlock(ctx context.Context, b Block, coinCfg CoinConfig) 
 		// reasoning.
 		b.Value = &result.Reward
 		if err := u.cfg.PayoutTrigger.TriggerPayout(ctx, b); err != nil {
-			// Deliberately does not change the return outcome/error
-			// here — the block itself has already matured/unlocked
-			// successfully (see PayoutTrigger's doc comment on why
-			// this is a separate failure domain). Just log it; the
-			// trigger implementation itself is responsible for its
-			// own PayoutCyclesTotal error accounting.
-			u.logf("unlocker: %s: block id=%d height=%d hash=%s: payout trigger failed: %v", b.Algo, b.ID, b.Height, b.Hash, err)
+			// Do NOT write the status. Leaving the block at
+			// valid=TRUE/unlocked=FALSE keeps it in PendingBlocks,
+			// so the next poll pass retries this whole path
+			// automatically — see this function's doc comment on why
+			// that, and not a logged-and-forgotten payout, is the
+			// correct handling of money owed.
+			u.logf("unlocker: %s: block id=%d height=%d hash=%s: MATURE on chain but its payout FAILED, so it is deliberately left pending (valid=TRUE, unlocked=FALSE) and will be retried on the next poll pass — no miner has been credited for it yet, and it is NOT being silently dropped: %v",
+				b.Algo, b.ID, b.Height, b.Hash, err)
+			return outcomePayoutRetry, nil
 		}
+	}
+
+	if err := u.repo.SetBlockStatus(ctx, b.ID, true, true); err != nil {
+		// The payout above already committed. That is safe to leave
+		// as-is precisely because it is idempotent per block: the
+		// next pass re-runs it as a recorded no-op and re-attempts
+		// this write.
+		return outcomePending, fmt.Errorf("marking matured block unlocked (its payout already applied; the next poll pass will re-attempt this write and re-running the payout is a no-op): %w", err)
 	}
 	return outcomeMatured, nil
 }

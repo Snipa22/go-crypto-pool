@@ -1236,8 +1236,9 @@ func (a unlockerRepositoryAdapter) SetBlockStatus(ctx context.Context, id int64,
 }
 
 // payoutRepositoryAdapter adapts *db.Repository (whose SharesAtHeight/
-// SoloShare/CreditBalance operate on db.PayoutShare) to
-// payout.Repository (which operates on payout.ShareRow), mirroring
+// SoloShare/ApplyBlockPayout operate on db.PayoutShare/
+// db.BlockPayoutRun) to payout.Repository (which operates on
+// payout.ShareRow/payout.BlockPayoutRun), mirroring
 // repositoryAdapter/unlockerRepositoryAdapter's role above.
 type payoutRepositoryAdapter struct {
 	repo *db.Repository
@@ -1271,8 +1272,39 @@ func (a payoutRepositoryAdapter) SoloShare(ctx context.Context, algo string, hei
 	}, found, nil
 }
 
-func (a payoutRepositoryAdapter) CreditBalance(ctx context.Context, algo, network, paymentAddress string, paymentID *string, amount int64) error {
-	return a.repo.CreditBalance(ctx, algo, network, paymentAddress, paymentID, amount)
+// ApplyBlockPayout hands one whole matured-block payout run to
+// db.Repository.ApplyBlockPayout's single transaction. Note there is
+// deliberately no CreditBalance passthrough on this adapter any more:
+// payout.Repository no longer exposes a per-payee credit call at all,
+// because a credit outside a claimed, all-or-nothing block run is the
+// money bug migrations/0011_block_payouts.up.sql exists to close.
+func (a payoutRepositoryAdapter) ApplyBlockPayout(ctx context.Context, run payout.BlockPayoutRun) (payout.BlockPayoutOutcome, error) {
+	credits := make([]db.BlockCredit, 0, len(run.Credits))
+	for _, c := range run.Credits {
+		credits = append(credits, db.BlockCredit{
+			PayoutBucket:   c.PayoutBucket,
+			PaymentAddress: c.PaymentAddress,
+			PaymentID:      c.PaymentID,
+			Amount:         c.Amount,
+		})
+	}
+	out, err := a.repo.ApplyBlockPayout(ctx, db.BlockPayoutRun{
+		BlockID:  run.BlockID,
+		Algo:     run.Algo,
+		Network:  run.Network,
+		PoolType: run.PoolType,
+		Height:   run.Height,
+		Reward:   run.Reward,
+		Credits:  credits,
+	})
+	if err != nil {
+		return payout.BlockPayoutOutcome{}, err
+	}
+	return payout.BlockPayoutOutcome{
+		AlreadyApplied: out.AlreadyApplied,
+		TotalPaid:      out.TotalPaid,
+		Credited:       out.Credited,
+	}, nil
 }
 
 // disburseRepositoryAdapter adapts *db.Repository (whose
@@ -1402,14 +1434,29 @@ func (a retentionRepositoryAdapter) DropOldPartitions(ctx context.Context, algo,
 // below). network is fixed at construction time (this backend's own
 // configured network — see GCPOOL_NETWORK), matching every other
 // network-scoped write path in this command.
+//
+// b.ID (the real `blocks.id`) is passed straight through as the
+// payout run's idempotency key — see payout.MaturedBlock and
+// migrations/0011_block_payouts.up.sql. An AlreadyApplied result is
+// NOT an error: it is the expected outcome when the unlocker retries
+// a block whose payout committed but whose status write did not, and
+// returning nil here is what lets that retry finally mark the block
+// unlocked.
 type payoutTrigger struct {
 	calc    *payout.Calculator
 	network string
 }
 
 func (t payoutTrigger) TriggerPayout(ctx context.Context, b unlocker.Block) error {
-	_, err := t.calc.RunForMaturedBlock(ctx, b.Algo, t.network, b.PoolType, b.Height, b.Difficulty, b.Value)
-	return err
+	result, err := t.calc.RunForMaturedBlock(ctx, b.ID, b.Algo, t.network, b.PoolType, b.Height, b.Difficulty, b.Value)
+	if err != nil {
+		return err
+	}
+	if result.AlreadyApplied {
+		log.Printf("backend: payout for block id=%d (%s/%s height=%d) was ALREADY applied (%d entries, %d atomic units) — credited nothing this time, as intended",
+			b.ID, b.Algo, b.PoolType, b.Height, result.Credited, result.TotalPaid)
+	}
+	return nil
 }
 
 // tariAlgos is every algo string mined against a Tari base node —
@@ -1952,6 +1999,51 @@ func startDisburseLoop(ctx context.Context, engine *disburse.Engine, label strin
 	return nil
 }
 
+// logUnresolvedBlockPayouts is the startup survey for stuck
+// matured-block payouts, the block-payout sibling of
+// startDisburseLoop's unresolved-`payouts` check.
+//
+// A PENDING `block_payouts` row means a payout run was claimed for
+// that block and has no recorded outcome, i.e. an unknown subset of
+// its miners may already hold its credit. db.Repository.ApplyBlockPayout
+// refuses to run for such a block, so the unlocker will retry and
+// fail it on every poll tick until a human resolves it (see
+// migrations/0011_block_payouts.up.sql).
+//
+// Unlike the disbursement check, this deliberately does NOT stop
+// anything from starting: a stuck block payout is scoped to that ONE
+// block and is already blocked at the database level by its own claim
+// row. Halting the whole unlocker (and so every other block's
+// maturity tracking and payout) over it would be strictly worse. So
+// this surfaces the incident loudly at startup — the one moment an
+// operator is definitely reading logs — and lets the rest of the
+// process run.
+//
+// A failure to RUN the survey is likewise logged rather than fatal,
+// for the same reason: it blocks nothing, so it cannot cause the
+// double-credit it reports on.
+func logUnresolvedBlockPayouts(ctx context.Context, repo *db.Repository) {
+	rows, err := repo.UnresolvedBlockPayouts(ctx, "", "")
+	if err != nil {
+		log.Printf("backend: WARNING: could not check for unresolved block payouts: %v — inspect manually with `backend block-payout list-unresolved`", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	log.Printf("backend: WARNING: %d block payout(s) are UNRESOLVED (PENDING) — each of those blocks is BLOCKED from any further automatic payout and will fail on every unlocker poll tick until a human resolves it", len(rows))
+	for _, b := range rows {
+		log.Printf("backend: unresolved block payout: block_id=%d algo=%s network=%s pool_type=%s height=%d reward=%d claimed=%s error=%q",
+			b.BlockID, b.Algo, b.Network, b.PoolType, b.Height, b.Reward, b.CreatedAt.UTC().Format(time.RFC3339), derefString(b.Error))
+	}
+	log.Print("backend: WHY: a PENDING block_payouts row means that block's payout run was claimed but never recorded an outcome, so an unknown subset of its miners may already hold its credit. " +
+		"Re-running the payout blindly would credit those miners a second time, so it is refused until the truth is established.")
+	log.Print("backend: HOW TO RESOLVE: (1) `backend block-payout show -block-id=<id>` to see the itemised credits that run did record; " +
+		"(2) check those miners' balances against that ledger; " +
+		"(3a) the recorded credits are correct and complete: `backend block-payout resolve-credited -block-id=<id> -reason=... -by=... -yes` (marks it APPLIED, credits nobody again); " +
+		"(3b) nothing landed, or you have already reversed what did: `backend block-payout resolve-not-credited -block-id=<id> -reason=... -by=... -yes` (hands the block back to the unlocker to pay out from scratch).")
+}
+
 // main runs the backend server by default (no args, or any args not
 // matching one of the manual ops subcommands below) -- unchanged from
 // before those subcommands were added, so existing deployments
@@ -1962,11 +2054,19 @@ func startDisburseLoop(ctx context.Context, engine *disburse.Engine, label strin
 // separate, manual ops-triggered CLI path (see blockcli.go) that never
 // starts the HTTP server or any background poll loop -- they open a
 // DB connection, make one SetBlockStatus call, print the result, and
-// exit. `backend payout ...` (see payoutcli.go) follows the same
-// pattern for resolving unresolved/ambiguous payouts.
+// exit. `backend payout ...` (see payoutcli.go) and `backend
+// block-payout ...` (see blockpayoutcli.go) follow the same pattern
+// for resolving unresolved/ambiguous disbursement payouts and stuck
+// matured-block payouts respectively.
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "block" {
 		if err := runBlockCommand(os.Args[2:]); err != nil {
+			log.Fatalf("backend: %v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "block-payout" {
+		if err := runBlockPayoutCommand(os.Args[2:]); err != nil {
 			log.Fatalf("backend: %v", err)
 		}
 		return
@@ -2358,6 +2458,11 @@ func run(cfg config) error {
 	if payoutEnabled {
 		unlockerCfg.PayoutTrigger = payoutTrigger{calc: payoutCalc, network: networkDBString(network)}
 		log.Print("backend: payout calculation enabled, wired into the block unlocker's matured-block trigger")
+		// Surface any block whose payout is claimed-but-unresolved
+		// before the unlocker starts hammering it. See this
+		// function's doc comment for why this reports rather than
+		// halts.
+		logUnresolvedBlockPayouts(ctx, repo)
 	} else {
 		log.Print("backend: payout calculation disabled (neither GCPOOL_PAYOUT_TARI_FEE_ADDRESS nor GCPOOL_PAYOUT_MONERO_FEE_ADDRESS set); blocks will still be marked matured/unlocked, just never auto-paid out")
 	}

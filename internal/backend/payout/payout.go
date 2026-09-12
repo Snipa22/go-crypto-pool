@@ -44,6 +44,18 @@
 //     Apply, at the very end, rounds each payment to the nearest
 //     integer atomic unit before writing it — a spot the legacy code
 //     never needed because MySQL happily stored the float as-is.
+//   - Legacy pushed each payment onto a fire-and-forget
+//     createBalanceQueue/balanceQueue pair — one independent
+//     upsert-increment per payee, with no record anywhere that a given
+//     block's payout had run. Apply here does NOT reproduce that: it
+//     hands the whole run to Repository.ApplyBlockPayout, which
+//     claims a per-block idempotency ledger row and applies every
+//     credit in ONE database transaction. See
+//     migrations/0011_block_payouts.up.sql and
+//     internal/backend/db/blockpayout.go for the full writeup of why
+//     — the short version is that the legacy shape's partial failures
+//     left an unknown subset of miners credited, and the only
+//     available retry then credited all of them a second time.
 //   - Legacy calculateSoloPayments silently indexes row.pool_type on a
 //     possibly-undefined `row` (result.rows[0]) if no found_block=true
 //     row exists for the height yet — a latent crash bug, not a
@@ -57,6 +69,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
@@ -92,13 +105,72 @@ type Repository interface {
 	// why that's handled explicitly here rather than left to crash).
 	SoloShare(ctx context.Context, algo string, height int64) (row ShareRow, found bool, err error)
 
-	// CreditBalance adds amount (may be zero — see Apply) to the
-	// pending balance for (algo, network, paymentAddress, paymentID),
-	// creating that balance row first if it does not exist yet. This
-	// is the real-schema equivalent of legacy's
-	// createBalanceQueue+balanceQueue pair (account-ensure, then
-	// increment) collapsed into one upsert.
-	CreditBalance(ctx context.Context, algo, network, paymentAddress string, paymentID *string, amount int64) error
+	// ApplyBlockPayout durably claims one matured block's payout run
+	// and applies every credit in it, in a single database
+	// transaction. It is the ONLY balance-writing method this package
+	// depends on, deliberately: there is no plain "credit this one
+	// address" call in this interface any more, because a per-payee
+	// credit that is not part of a claimed, all-or-nothing block run
+	// is exactly the money-critical bug
+	// migrations/0011_block_payouts.up.sql exists to close. See
+	// db.Repository.ApplyBlockPayout's doc comment for the full
+	// contract (claim semantics, the APPLIED no-op, the PENDING hard
+	// refusal, and the row-level idempotency backstop underneath).
+	ApplyBlockPayout(ctx context.Context, run BlockPayoutRun) (BlockPayoutOutcome, error)
+}
+
+// BlockCredit is one payee's credit within a single block's payout
+// run, as handed to Repository.ApplyBlockPayout. Mirrors
+// db.BlockCredit field-for-field.
+type BlockCredit struct {
+	// PayoutBucket is the originating Payment.PoolType tag: "fees",
+	// "pps", "pplns" or "solo".
+	PayoutBucket   string
+	PaymentAddress string
+	PaymentID      *string
+	// Amount is the credit in atomic units — Payment.Amount rounded
+	// by Apply. May legitimately be zero (see Apply's doc comment).
+	Amount int64
+}
+
+// MaturedBlock identifies the one just-matured `blocks` row a payout
+// run belongs to. ID is the idempotency key the whole ledger hangs
+// off (see Repository.ApplyBlockPayout), which is why it is carried
+// explicitly through Apply/RunForMaturedBlock rather than derived
+// from (algo, height) — two different blocks can share a height
+// across networks/forks, and "which row did we pay out" must never be
+// a guess.
+type MaturedBlock struct {
+	ID       int64
+	Algo     string
+	Network  string
+	PoolType string
+	Height   int64
+	Reward   int64
+}
+
+// BlockPayoutRun is one complete payout run as
+// Repository.ApplyBlockPayout should record and apply it. Mirrors
+// db.BlockPayoutRun field-for-field.
+type BlockPayoutRun struct {
+	BlockID  int64
+	Algo     string
+	Network  string
+	PoolType string
+	Height   int64
+	Reward   int64
+	Credits  []BlockCredit
+}
+
+// BlockPayoutOutcome summarizes one Repository.ApplyBlockPayout call.
+// Mirrors db.BlockPayoutOutcome field-for-field.
+type BlockPayoutOutcome struct {
+	// AlreadyApplied is true when this block's payout had already
+	// been applied by an earlier, committed run — this call credited
+	// nothing. TotalPaid/Credited then describe that original run.
+	AlreadyApplied bool
+	TotalPaid      int64
+	Credited       int
 }
 
 // Config holds every payout-cycle knob the legacy code read from
@@ -421,35 +493,119 @@ type ApplyResult struct {
 	// (including zero-amount fee/dev/pool-dev seed entries — legacy
 	// pushes every paymentData key onto balanceQueue unconditionally).
 	Credited int
+	// AlreadyApplied is true when this block's payout had already
+	// been applied by an earlier, committed run, so this call
+	// credited NOTHING. TotalPaid/Credited then describe that
+	// original run, not this (no-op) one. This is the normal, healthy
+	// outcome of the unlocker retrying a block whose payout
+	// succeeded but whose status write did not — see
+	// unlocker.checkBlock.
+	AlreadyApplied bool
 }
 
-// Apply credits every entry in data via Repository.CreditBalance —
-// the real-schema equivalent of legacy's
-// `Object.keys(paymentData).forEach(key => balanceQueue.push(...))`
-// loop that closes out every calculate*Payments function. Every entry
-// is credited, even ones whose Amount rounds to zero (matching
-// legacy's unconditional push, which exists specifically to guarantee
-// every payee's balance row is created/touched even in a zero-payout
-// cycle).
-func (c *Calculator) Apply(ctx context.Context, algo, network string, data map[string]*Payment) (ApplyResult, error) {
-	var result ApplyResult
+// Apply durably applies every entry in data as one atomic,
+// idempotent payout run for block b.
+//
+// This replaced a straight `for each payment { CreditBalance(...) }`
+// loop — the faithful port of legacy's
+// `Object.keys(paymentData).forEach(key => balanceQueue.push(...))`.
+// That shape was a real money bug, not a stylistic one: each
+// increment committed independently, so an error partway through left
+// an UNKNOWN subset of miners credited with no record of which, and
+// the only retry available (a manual `backend block relock`) then
+// credited every already-paid miner a second time. See
+// migrations/0011_block_payouts.up.sql for the full writeup.
+//
+// What happens instead: the payments are flattened into a
+// deterministically ordered credit list and handed, whole, to
+// Repository.ApplyBlockPayout, which claims a per-block
+// `block_payouts` ledger row and applies all of the credits in ONE
+// database transaction. So:
+//
+//   - Failure anywhere mid-run credits NOBODY (full rollback), and
+//     the next attempt re-runs cleanly.
+//   - A block whose run already committed is a safe no-op
+//     (ApplyResult.AlreadyApplied), never a second credit.
+//   - A block left in a claimed-but-unresolved PENDING state is
+//     REFUSED with an error rather than silently retried (see
+//     db.ErrBlockPayoutPending) — "an unknown subset of these miners
+//     may already hold this credit" must reach a human, not a retry
+//     loop.
+//
+// Every entry is still credited, even ones whose Amount rounds to
+// zero — matching legacy's unconditional push, which exists
+// specifically to guarantee every payee's balance row is
+// created/touched even in a zero-payout cycle.
+//
+// The credit list is sorted by (payment address, payment id) rather
+// than left in Go map order. That is not only for reproducible logs
+// and tests: a fixed, global ordering means two transactions
+// crediting overlapping payee sets always take their `balance` row
+// locks in the same order, which is what keeps them from deadlocking
+// each other.
+func (c *Calculator) Apply(ctx context.Context, b MaturedBlock, data map[string]*Payment) (ApplyResult, error) {
+	credits := make([]BlockCredit, 0, len(data))
 	for _, p := range data {
-		amount := int64(math.Round(p.Amount))
-		if err := c.repo.CreditBalance(ctx, algo, network, p.PaymentAddress, p.PaymentID, amount); err != nil {
-			return result, fmt.Errorf("payout: Apply: crediting %s: %w", p.PaymentAddress, err)
-		}
-		result.TotalPaid += amount
-		result.Credited++
+		credits = append(credits, BlockCredit{
+			PayoutBucket:   p.PoolType,
+			PaymentAddress: p.PaymentAddress,
+			PaymentID:      p.PaymentID,
+			Amount:         int64(math.Round(p.Amount)),
+		})
 	}
-	return result, nil
+	sort.Slice(credits, func(i, j int) bool {
+		if credits[i].PaymentAddress != credits[j].PaymentAddress {
+			return credits[i].PaymentAddress < credits[j].PaymentAddress
+		}
+		return derefPaymentID(credits[i].PaymentID) < derefPaymentID(credits[j].PaymentID)
+	})
+
+	outcome, err := c.repo.ApplyBlockPayout(ctx, BlockPayoutRun{
+		BlockID:  b.ID,
+		Algo:     b.Algo,
+		Network:  b.Network,
+		PoolType: b.PoolType,
+		Height:   b.Height,
+		Reward:   b.Reward,
+		Credits:  credits,
+	})
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("payout: Apply: block %d (%s/%s height %d): %w", b.ID, b.Algo, b.Network, b.Height, err)
+	}
+	return ApplyResult{
+		TotalPaid:      outcome.TotalPaid,
+		Credited:       outcome.Credited,
+		AlreadyApplied: outcome.AlreadyApplied,
+	}, nil
+}
+
+// derefPaymentID flattens a nullable payment_id for Apply's sort
+// comparison only. NULL and "" sort together, which is correct here:
+// they are the same `balance` row identity (uq_balance_identity keys
+// on COALESCE(payment_id, ”)).
+func derefPaymentID(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // RunForMaturedBlock is the single entry point unlocker.PayoutTrigger
 // implementations call (see cmd/backend's adapter): given one
-// just-matured block's algo/network/pool_type/height/difficulty/
+// just-matured block's id/algo/network/pool_type/height/difficulty/
 // reward, it dispatches to the matching Calculate{PPS,PPLNS,Solo}
-// function, Applies the result, and instruments the whole cycle on
-// cfg.Metrics (a no-op if cfg.Metrics is nil).
+// function, Applies the result as one atomic idempotent run keyed on
+// that block id, and instruments the whole cycle on cfg.Metrics (a
+// no-op if cfg.Metrics is nil).
+//
+// blockID is the `blocks.id` of the matured row and is REQUIRED: it
+// is the idempotency key the `block_payouts` ledger hangs off (see
+// Apply and migrations/0011_block_payouts.up.sql). A run for a block
+// whose payout already committed returns
+// ApplyResult.AlreadyApplied = true with a nil error — a safe,
+// expected no-op, counted separately on payout_cycles_total (see
+// metrics.PayoutResultAlreadyApplied) so a dashboard can tell a real
+// payout cycle from a retry that correctly did nothing.
 //
 // poolType "PROP" is not a caller error — PROP blocks exist in this
 // schema's pool_type enum (see migrations) but this package has no
@@ -462,7 +618,7 @@ func (c *Calculator) Apply(ctx context.Context, algo, network string, data map[s
 // migrations) means this block's real reward hasn't been recorded
 // yet; RunForMaturedBlock refuses to guess and returns an error
 // rather than silently paying out zero.
-func (c *Calculator) RunForMaturedBlock(ctx context.Context, algo, network, poolType string, height, blockDifficulty int64, blockReward *int64) (result ApplyResult, err error) {
+func (c *Calculator) RunForMaturedBlock(ctx context.Context, blockID int64, algo, network, poolType string, height, blockDifficulty int64, blockReward *int64) (result ApplyResult, err error) {
 	start := time.Now()
 	defer func() {
 		if c.cfg.Metrics == nil {
@@ -470,11 +626,18 @@ func (c *Calculator) RunForMaturedBlock(ctx context.Context, algo, network, pool
 		}
 		c.cfg.Metrics.PayoutCycleDuration.WithLabelValues(algo, poolType).Observe(time.Since(start).Seconds())
 		outcome := metrics.PayoutResultSuccess
-		if err != nil {
+		switch {
+		case err != nil:
 			outcome = metrics.PayoutResultError
+		case result.AlreadyApplied:
+			outcome = metrics.PayoutResultAlreadyApplied
 		}
 		c.cfg.Metrics.PayoutCyclesTotal.WithLabelValues(algo, poolType, outcome).Inc()
-		if err == nil {
+		// Only a run that actually credited balances adds to the
+		// credited total — an AlreadyApplied no-op credited nothing,
+		// and counting its (historical) total again would double the
+		// metric on every unlocker retry.
+		if err == nil && !result.AlreadyApplied {
 			c.cfg.Metrics.PayoutAmountCreditedTotal.WithLabelValues(algo, network).Add(float64(result.TotalPaid))
 		}
 	}()
@@ -499,6 +662,13 @@ func (c *Calculator) RunForMaturedBlock(ctx context.Context, algo, network, pool
 		return ApplyResult{}, err
 	}
 
-	result, err = c.Apply(ctx, algo, network, data)
+	result, err = c.Apply(ctx, MaturedBlock{
+		ID:       blockID,
+		Algo:     algo,
+		Network:  network,
+		PoolType: poolType,
+		Height:   height,
+		Reward:   reward,
+	}, data)
 	return result, err
 }
