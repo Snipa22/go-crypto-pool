@@ -468,7 +468,7 @@ const (
 	c29SubmitCycleSize = 42
 )
 
-// claimedRandomXFamilyDifficulty derives the difficulty implied by an
+// ClaimedRandomXFamilyDifficulty derives the difficulty implied by an
 // RXT/RXM miner's own CLAIMED result hash (submit.Result) using the
 // SAME real, algo-appropriate, already-existing formula
 // BuildCandidateBlock's own NodeClient implementations use to derive
@@ -486,6 +486,18 @@ const (
 // for both algos this leaf actually serves — see this repo's
 // DISPATCH_BRIEF.md (2026-09-10) for the explicit instruction to
 // verify this rather than assuming proxy's formula transfers.
+//
+// Exported (FIX_BRIEF.md, finding #14) specifically so
+// internal/leaflib/direct — which already imports this package
+// directly for solo.Job/solo.IsRandomXFamily/solo.SubmitProof/etc,
+// unlike leaf-proxy, which deliberately avoids coupling to solo at
+// all (see proxy/difficulty.go's own doc comment) — can reuse this
+// EXACT function for its own cheap pre-dispatch claimed-difficulty
+// filter, rather than re-implementing a second, potentially-
+// diverging copy of the RXT/RXM branch above (leaf-direct, unlike
+// leaf-proxy, handles BOTH algos and so cannot get away with a single
+// Monero-only formula the way proxy's own littleEndianDifficulty
+// does).
 //
 // DISPATCH_BRIEF (2026-09-10, Alex): this is what lets handleSubmit
 // decide "is this an ordinary sub-block share, or a genuine block-
@@ -519,7 +531,7 @@ const (
 // genuinely all-zero real RandomX hash has never been observed in
 // practice and would previously have still failed BuildCandidateBlock's
 // own identical zero-hash guard once Validate happened to pass).
-func claimedRandomXFamilyDifficulty(algo poolpb.Algo, resultHex string) (uint64, error) {
+func ClaimedRandomXFamilyDifficulty(algo poolpb.Algo, resultHex string) (uint64, error) {
 	hashBytes, err := hex.DecodeString(resultHex)
 	if err != nil {
 		return 0, fmt.Errorf("claimed result hash is not valid hex: %w", err)
@@ -530,7 +542,7 @@ func claimedRandomXFamilyDifficulty(algo poolpb.Algo, resultHex string) (uint64,
 	case poolpb.Algo_ALGO_RXM:
 		return moneroDifficultyFromHash(hashBytes)
 	default:
-		return 0, fmt.Errorf("claimedRandomXFamilyDifficulty: algo %v is not a RandomX-family algo", algo)
+		return 0, fmt.Errorf("ClaimedRandomXFamilyDifficulty: algo %v is not a RandomX-family algo", algo)
 	}
 }
 
@@ -1127,7 +1139,7 @@ func (s *Session) handleSubmit(req Request) {
 	// are completely unaffected by this — finishSubmit still always
 	// runs INLINE for them below, exactly as before this change.
 	//
-	// For ALGO_RXT/ALGO_RXM, claimedRandomXFamilyDifficulty (above)
+	// For ALGO_RXT/ALGO_RXM, ClaimedRandomXFamilyDifficulty (above)
 	// derives the miner's claimed difficulty from its own submitted
 	// result hash alone — a cheap, pure-CPU computation, no network
 	// I/O — and that alone now decides which of two paths this submit
@@ -1222,10 +1234,10 @@ func (s *Session) handleSubmit(req Request) {
 	// comment). Its default worker count is now runtime.NumCPU(), not
 	// a hardcoded 8 — see asyncvalidation.go's own doc comment (Fix 2a).
 	if IsRandomXFamily(job.Algo) {
-		claimedDiff, err := claimedRandomXFamilyDifficulty(job.Algo, submit.Result)
+		claimedDiff, err := ClaimedRandomXFamilyDifficulty(job.Algo, submit.Result)
 		if err != nil {
 			// Malformed hex, or a degenerate all-zero claimed hash —
-			// see claimedRandomXFamilyDifficulty's own doc comment for
+			// see ClaimedRandomXFamilyDifficulty's own doc comment for
 			// why this is treated as an outright reject, matching how
 			// either case was already eventually rejected before this
 			// change (Validate's own hex-decode-failure branch, or
@@ -1266,14 +1278,37 @@ func (s *Session) handleSubmit(req Request) {
 		// Genuine block-find candidate: the real, expensive path,
 		// still dispatched off the read loop exactly as before this
 		// change (see asyncvalidation.go).
-		if ok := s.server.randomxPool.Submit(finishSubmit); !ok {
-			// Pool already stopped (server shutting down) — respond
-			// with a real rejection rather than leaving this submit
-			// unanswered (task constraint: "no orphaned unresolved
-			// submits"). This is not a cryptographic rejection of the
-			// miner's share; a reconnect against a fresh instance will
-			// process it normally.
-			s.writeShareResponse(req.ID, false, "pool is shutting down, please reconnect")
+		//
+		// HARDENING FIX (FIX_BRIEF.md, finding #15): TrySubmit, NOT
+		// Submit -- this call runs directly on Session.Run's own read
+		// loop (handleSubmit is called synchronously from it), so a
+		// blocking Submit here would let one saturated/flooding
+		// session's own dispatch block every OTHER session's next
+		// read-loop iteration too (the shared pool is server-scoped,
+		// see asyncvalidation.go's own "WHY SERVER-SCOPED" doc
+		// comment) once the bounded queue and every worker are
+		// simultaneously busy -- a real, if bounded, cross-session
+		// interference finding #15 identified. TrySubmit's "reject
+		// this ONE submit rather than block" contract confines the
+		// cost of a genuinely saturated pool to the single session
+		// that hit it, exactly mirroring the reasoning
+		// direct/session.go's forwardPool dispatch already uses (see
+		// TrySubmit's own doc comment) -- generalized here to the
+		// primary randomxPool dispatch itself, across all three leaf
+		// modes (see direct/session.go's and proxy/session.go's
+		// identical change).
+		if ok := s.server.randomxPool.TrySubmit(finishSubmit); !ok {
+			// Pool already stopped (server shutting down), OR its
+			// bounded queue is genuinely saturated and every worker
+			// is busy right now -- respond with a real rejection
+			// rather than leaving this submit unanswered or blocking
+			// this read loop waiting for room (task constraint: "no
+			// orphaned unresolved submits"). This is not a
+			// cryptographic rejection of the miner's share; a retry
+			// (this submit) or a reconnect (if the pool was actually
+			// stopped) will process normally once room/a fresh
+			// instance is available.
+			s.writeShareResponse(req.ID, false, "validation pool is saturated or shutting down, please retry")
 		}
 		return
 	}

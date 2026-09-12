@@ -829,8 +829,63 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// running finishSubmit INLINE, synchronously, since their validators
 	// have no network-latency bottleneck to fix.
 	if solo.IsRandomXFamily(job.Algo) {
-		if ok := s.server.randomxPool.Submit(finishSubmit); !ok {
-			s.writeShareResponse(req.ID, false, "pool is shutting down, please reconnect")
+		// HARDENING FIX (FIX_BRIEF.md, finding #14): cheap pre-dispatch
+		// filter, mirroring solo.Session's own identical filter exactly
+		// (see solo/session.go's handleSubmit and
+		// solo.ClaimedRandomXFamilyDifficulty's doc comment) -- reject
+		// a submit outright, WITHOUT ever paying a real randomx-service
+		// round-trip via s.server.randomxPool, when its own claimed
+		// result hash is malformed hex or a degenerate all-zero hash
+		// (division by zero has no sound difficulty), or when its
+		// claimed difficulty doesn't even meet this job's own
+		// configured StaticDifficulty. Every garbage RXT/RXM submit
+		// from a hostile direct-connected miner used to cost a real
+		// validator round-trip regardless (bounded only by the
+		// existing invalidShareGuard consecutive-invalid-share
+		// disconnect threshold, applied further down inside
+		// finishSubmit) -- this filter removes that cost for the
+		// obviously-garbage case before it ever reaches the shared,
+		// bounded pool at all.
+		//
+		// DELIBERATELY NARROWER than solo's own identical-looking
+		// filter: solo additionally SKIPS the real validator entirely
+		// for an ordinary, non-block-crossing claim (see that
+		// package's DISPATCH_BRIEF.md Fix 4 doc comment) -- safe there
+		// only because solo mode has no share table/backend/payouts
+		// riding on an ordinary share's value at all. leaf-direct is
+		// the opposite: "GENUINE DIFFERENCE FROM leaf-solo" above,
+		// EVERY validated share (not just block-level finds) is
+		// forwarded to the real backend for payout accounting -- so a
+		// claim that clears this cheap floor must still always get a
+		// REAL, daemon-confirmed validator call via finishSubmit below,
+		// regardless of whether it turns out to be an ordinary share
+		// or a genuine block find. Porting solo's own block-vs-
+		// ordinary split here too would let an unvalidated claim reach
+		// forwardShare/backend accounting, which is exactly the real-
+		// money risk this leaf's validation exists to prevent.
+		claimedDiff, err := solo.ClaimedRandomXFamilyDifficulty(job.Algo, submit.Result)
+		if err != nil {
+			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
+			return
+		}
+		if claimedDiff < job.StaticDifficulty {
+			s.writeShareResponse(req.ID, false, "share does not meet the job's configured difficulty")
+			return
+		}
+
+		// HARDENING FIX (FIX_BRIEF.md, finding #15): TrySubmit, NOT
+		// Submit -- this call runs directly on Session.Run's own read
+		// loop (handleSubmit is called synchronously from it), so a
+		// blocking Submit here would let one saturated/flooding
+		// session's own dispatch block every OTHER session's next
+		// read-loop iteration too, once the shared, server-scoped
+		// pool's bounded queue and every worker are simultaneously
+		// busy -- see solo/session.go's identical change for the full
+		// rationale (this leaf's own forwardPool dispatch, above,
+		// already used this exact TrySubmit-and-reject pattern for the
+		// same reason).
+		if ok := s.server.randomxPool.TrySubmit(finishSubmit); !ok {
+			s.writeShareResponse(req.ID, false, "validation pool is saturated or shutting down, please retry")
 		}
 		return
 	}
