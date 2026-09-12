@@ -28,9 +28,20 @@ type writeRequest struct {
 //   - A single dedicated writer goroutine (fed by a channel) so that no
 //     two goroutines ever call the underlying net.Conn.Write concurrently.
 //     This is the fix for bug class 4 (unsynchronized concurrent writes).
-//   - A rolling idle-timeout applied via SetDeadline around every I/O op,
-//     reset on every successful op. This is the fix for bug class 2
-//     (no deadlines).
+//   - Independent rolling read- and write-idle deadlines, each reset on
+//     every successful op of its own direction. This is the fix for bug
+//     class 2 (no deadlines) AND for a follow-on zombie-session defect
+//     found in production (leaf-direct-rxm, session c4ef91306259e925,
+//     frozen 68+ hours): the two deadlines used to be a single combined
+//     net.Conn.SetDeadline call, which meant an outbound-only write (e.g.
+//     an unsolicited job broadcast pushed to every session regardless of
+//     whether its peer is still alive) silently re-armed the INBOUND idle
+//     deadline too, so a genuinely dead/half-open peer that never sent a
+//     byte back could never be reaped as long as the server kept pushing
+//     writes to it. Read progress now only extends the read deadline, and
+//     writes now only extend the write deadline, so a dead peer is
+//     reaped on schedule regardless of how much unsolicited outbound
+//     traffic the server pushes at it.
 //   - A context.Context + sync.Once-guarded Close path that is safe to
 //     invoke exactly once no matter how many goroutines call it or how
 //     many times, and that never blocks on an unbuffered handoff. This is
@@ -79,7 +90,8 @@ func newManagedConnection(parentCtx context.Context, id uint64, conn net.Conn, i
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	mc.armDeadline()
+	mc.armReadDeadline()
+	mc.armWriteDeadline()
 
 	mc.writerWG.Add(1)
 	go mc.writerLoop()
@@ -111,15 +123,35 @@ func (mc *ManagedConnection) RemoteAddr() net.Addr { return mc.remote }
 // any shared/global scheduler.
 func (mc *ManagedConnection) Context() context.Context { return mc.ctx }
 
-// armDeadline resets the rolling idle deadline on the underlying socket.
-// Called after every successful read and write, plus once at connection
-// setup. If idleTimeout is zero, deadlines are disabled (not recommended
-// in production, but useful for tests that want manual control).
-func (mc *ManagedConnection) armDeadline() {
+// armReadDeadline resets the rolling INBOUND idle deadline on the
+// underlying socket. Called after every successful Read, plus once at
+// connection setup. It deliberately does NOT touch the write deadline:
+// only genuine inbound read progress should extend the "this connection
+// is alive" window (see the production zombie-session incident described
+// on ManagedConnection above — outbound writes must not be able to mask
+// a dead peer). If idleTimeout is zero, deadlines are disabled (not
+// recommended in production, but useful for tests that want manual
+// control).
+func (mc *ManagedConnection) armReadDeadline() {
 	if mc.idleTimeout <= 0 {
 		return
 	}
-	_ = mc.conn.SetDeadline(time.Now().Add(mc.idleTimeout))
+	_ = mc.conn.SetReadDeadline(time.Now().Add(mc.idleTimeout))
+}
+
+// armWriteDeadline resets the rolling OUTBOUND idle deadline on the
+// underlying socket. Called before attempting a write and again after a
+// successful write, plus once at connection setup. This still ensures
+// Write can't hang forever on a genuinely stalled/full peer, but it is
+// independent of the read deadline: a successful write must never extend
+// how long a non-responsive peer's read-idle window is considered alive.
+// If idleTimeout is zero, deadlines are disabled (not recommended in
+// production, but useful for tests that want manual control).
+func (mc *ManagedConnection) armWriteDeadline() {
+	if mc.idleTimeout <= 0 {
+		return
+	}
+	_ = mc.conn.SetWriteDeadline(time.Now().Add(mc.idleTimeout))
 }
 
 // Read reads from the underlying connection, applying and re-arming the
@@ -133,7 +165,7 @@ func (mc *ManagedConnection) Read(p []byte) (int, error) {
 	if err != nil {
 		return n, err
 	}
-	mc.armDeadline()
+	mc.armReadDeadline()
 	return n, nil
 }
 
@@ -191,10 +223,10 @@ func (mc *ManagedConnection) doWrite(req writeRequest) {
 		req.done <- ErrConnectionClosed
 		return
 	}
-	mc.armDeadline()
+	mc.armWriteDeadline()
 	_, err := mc.conn.Write(req.payload)
 	if err == nil {
-		mc.armDeadline()
+		mc.armWriteDeadline()
 	}
 	req.done <- err
 }

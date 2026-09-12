@@ -2,6 +2,7 @@ package leaflib
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -152,4 +153,131 @@ func TestWriteAlsoEnforcesDeadline(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Write never returned an error — write deadline was not enforced (bug class 2 regression)")
 	}
+}
+
+// TestIdleReadTimeoutNotExtendedByOutboundWrites regression-guards the
+// production zombie-session defect (leaf-direct-rxm, session
+// c4ef91306259e925, frozen 68+ hours): a connection whose local side
+// keeps successfully WRITING (e.g. leaf-direct's periodic unsolicited
+// job-push broadcasts) while genuinely receiving NOTHING back must still
+// have its read-idle deadline fire. Before the read/write deadline split,
+// every successful outbound write re-armed the single combined
+// net.Conn.SetDeadline, which meant the inbound read deadline could never
+// fire as long as writes kept succeeding — masking a genuinely dead
+// peer.
+func TestIdleReadTimeoutNotExtendedByOutboundWrites(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			accepted <- c
+		}
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	var serverRaw net.Conn
+	select {
+	case serverRaw = <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never accepted connection")
+	}
+
+	cm := NewConnectionManager(context.Background(), ManagerConfig{
+		IdleTimeout: 150 * time.Millisecond,
+	})
+	defer cm.Shutdown()
+
+	mc, err := cm.Accept(context.Background(), serverRaw)
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+
+	// The client keeps draining whatever the server writes to it (so the
+	// server's writes keep succeeding rather than eventually blocking on
+	// a full send buffer) but never itself writes a single byte back —
+	// simulating a dead/half-open peer that a real TCP stack has not yet
+	// surfaced a FIN/RST for.
+	drainDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, clientConn)
+		close(drainDone)
+	}()
+
+	// Kick off a read loop on the server side, exactly like
+	// TestIdleTimeoutClosesSilentConnection does — this is what should
+	// observe the idle-read-timeout error.
+	readErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, err := mc.Read(buf)
+		readErrCh <- err
+	}()
+
+	// Simulate leaf-direct's periodic unsolicited job-push broadcasts:
+	// repeatedly write small payloads on an interval shorter than the
+	// idle timeout, from a separate goroutine, while the client never
+	// sends anything back. Crucially, these writes must keep going for
+	// LONGER than the bounded wait below asserts on — otherwise a buggy,
+	// coupled-deadline implementation would still "pass" simply because
+	// the writes eventually stop and the read deadline lapses shortly
+	// after, which wouldn't actually prove that the read deadline is
+	// independent of ongoing writes. Here we keep writing every 50ms for
+	// up to 2s, well beyond the bounded wait, so the pre-fix combined
+	// SetDeadline would still be getting re-armed by every write
+	// throughout that entire window.
+	stopWrites := make(chan struct{})
+	writesDone := make(chan struct{})
+	go func() {
+		defer close(writesDone)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		payload := []byte("job-push-broadcast")
+		for i := 0; i < 40; i++ {
+			select {
+			case <-stopWrites:
+				return
+			case <-ticker.C:
+				if err := mc.Write(payload); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopWrites)
+		<-writesDone
+	}()
+
+	// Despite those ongoing successful outbound writes, the read-idle
+	// timeout must still fire because the peer has never sent anything
+	// back — within a bounded wait of a couple of idle-timeout periods
+	// (150ms configured above), which is well BEFORE the write goroutine
+	// above stops on its own. Against the pre-fix coupled-deadline code,
+	// this wait deliberately expires (and the test fails) because the
+	// ongoing writes keep re-arming the shared deadline throughout this
+	// entire window; only the read/write deadline split lets Read fire
+	// on schedule regardless of those writes.
+	select {
+	case err := <-readErrCh:
+		if err == nil {
+			t.Fatal("expected a deadline/closed error from Read, got nil")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Read never observed a deadline error while writes were still ongoing — outbound writes masked the read-idle timeout (zombie-session regression)")
+	}
+
+	mc.Close("idle timeout")
+	clientConn.Close()
+	<-drainDone
 }
