@@ -83,13 +83,32 @@ import (
 // processes on the same host). AsyncValidationQueueSize (256) is
 // unaffected by this change and keeps its original justification:
 // generous headroom for a genuine, sustained multi-thousand-share/sec
-// flood to be absorbed for a moment without the dispatching Submit call
-// itself blocking, while still being a small, fixed, memory-bounded
-// number -- once the queue is genuinely full, Submit blocks the CALLER
-// (real backpressure, not a silent drop and not more goroutines), and since
-// Submit is itself always called from within a spawned dispatch already
-// off the read loop (see session.go's handleSubmit), that backpressure
-// never blocks Session.Run's own scanner.Scan() loop.
+// flood to be absorbed for a moment without a dispatching call
+// itself blocking or having to reject.
+//
+// FIX_BRIEF.md (finding #15) CORRECTION: an earlier revision of this
+// comment claimed "Submit is itself always called from within a
+// spawned dispatch already off the read loop ... that backpressure
+// never blocks Session.Run's own scanner.Scan() loop" -- that was
+// NOT an accurate description of the code as it actually stood
+// (solo/session.go's, direct/session.go's, and proxy/session.go's
+// own handleSubmit each called this pool's Submit directly, ON their
+// own Session.Run read loop, not from any goroutine already
+// dispatched off it) -- a genuinely saturated queue would have
+// blocked that CALLER's own read loop, which for a shared,
+// server-scoped pool (see "WHY SERVER-SCOPED" above) means one
+// flooding/hostile session could have briefly blocked OTHER
+// sessions' own next read-loop dispatch too. All three leaf modes'
+// own primary randomxPool dispatch call sites now use TrySubmit (see
+// that method's own doc comment below) specifically to avoid ever
+// blocking Session.Run's read loop this way -- Submit itself is
+// still available, still genuinely blocks the caller when the queue
+// is full (real backpressure, not a silent drop, and not more
+// goroutines), and remains correct to use from a caller that is
+// ITSELF already off the read loop and fine with waiting (e.g. a
+// deliberately synchronous batch/tooling caller, or this package's
+// own tests) -- callers that must never block a session's own read
+// loop should use TrySubmit instead.
 const AsyncValidationQueueSize = 256
 
 // DefaultAsyncValidationWorkers returns the DEFAULT worker count
@@ -283,9 +302,18 @@ func (p *AsyncValidationPool) runProtected(fn func()) {
 //
 // Submit blocks the CALLER (real backpressure, never a silent drop and
 // never additional goroutines) when the bounded queue is full and no worker
-// is free yet -- see this file's package doc comment for why that never
-// blocks Session.Run's own read loop in practice (Submit is always called
-// from a goroutine already dispatched off that loop).
+// is free yet.
+//
+// FIX_BRIEF.md (finding #15) CORRECTION: this doc comment used to
+// claim "Submit is always called from a goroutine already dispatched
+// off [Session.Run's read] loop" -- that was inaccurate (see this
+// file's package-level doc comment above for the full correction).
+// None of solo/direct/proxy's own primary randomxPool dispatch call
+// sites use Submit anymore (they use TrySubmit, specifically to never
+// block that read loop); Submit remains available, with its real
+// blocking-backpressure contract intact, for a caller that is
+// genuinely off any session's read loop and can afford to wait for
+// queue room (e.g. this package's own tests).
 //
 // FIX 9 (DISPATCH_BRIEF.md 2026-09-10): submitBlockedTotal counts every
 // time this call could NOT take the fast, non-blocking path below (i.e.
@@ -325,8 +353,8 @@ func (p *AsyncValidationPool) Submit(fn func()) bool {
 // case (identical "not run and never will be" contract as Submit's
 // false return).
 //
-// Fix 12 (DISPATCH_BRIEF.md 2026-09-10): this exists specifically for
-// a caller that is ITSELF already running on one of a DIFFERENT
+// Fix 12 (DISPATCH_BRIEF.md 2026-09-10): originally added specifically
+// for a caller that is ITSELF already running on one of a DIFFERENT
 // AsyncValidationPool's own worker goroutines (direct/session.go's
 // finishSubmit, running on Server.randomxPool, dispatching
 // forwardShare/forwardBlock onto the separate Server.forwardPool) --
@@ -341,6 +369,19 @@ func (p *AsyncValidationPool) Submit(fn func()) bool {
 // stall, in which case dropping (and logging) that one forward is far
 // preferable to ever blocking real RandomX validation throughput for
 // other sessions.
+//
+// FIX_BRIEF.md (finding #15) EXTENSION: this same non-blocking
+// contract is now ALSO used at all three leaf modes' own PRIMARY
+// randomxPool dispatch call site (solo/direct/proxy's own
+// handleSubmit, right on Session.Run's read loop) for the identical
+// underlying reason, one level up: that call site is the shared
+// pool's own read-loop caller, and a blocking Submit there would let
+// one flooding/hostile session's saturated dispatch block every OTHER
+// session's own next read-loop iteration too, since the pool itself
+// is server-scoped (see this file's "WHY SERVER-SCOPED" doc comment)
+// -- rejecting (and informing) only the ONE session that hit a
+// genuinely saturated queue is preferable to blocking every
+// connected session's read loop on that session's behalf.
 func (p *AsyncValidationPool) TrySubmit(fn func()) bool {
 	select {
 	case p.jobs <- fn:
