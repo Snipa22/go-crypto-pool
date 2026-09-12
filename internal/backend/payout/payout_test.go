@@ -3,6 +3,7 @@ package payout
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
@@ -11,18 +12,35 @@ import (
 
 // fakeRepo is an in-memory Repository test double, mirroring
 // internal/backend/unlocker's fakeRepo style.
+//
+// ApplyBlockPayout below models the REAL db.Repository.ApplyBlockPayout
+// contract rather than just recording calls: it keeps a per-block
+// claim status and an itemised per-(block, payee) credit ledger, so
+// these unit tests exercise the same APPLIED-is-a-no-op /
+// PENDING-is-refused / all-or-nothing semantics the Postgres
+// implementation enforces. The real thing is covered end to end
+// against a live database in
+// internal/backend/db/blockpayout_integration_test.go.
 type fakeRepo struct {
 	// sharesByKey is keyed by "algo/poolType/height".
 	sharesByKey map[string][]ShareRow
 	soloByKey   map[string]ShareRow
-	credits     []creditCall
-	creditErr   error
-}
 
-type creditCall struct {
-	algo, network, paymentAddress string
-	paymentID                     *string
-	amount                        int64
+	// runs records every ApplyBlockPayout call, in order, including
+	// ones that were refused or no-op'd.
+	runs []BlockPayoutRun
+	// applyErr, when non-nil, makes ApplyBlockPayout fail outright
+	// (the whole run credits nothing, mirroring the real
+	// single-transaction rollback).
+	applyErr error
+
+	// claims maps block id -> status ("PENDING"/"APPLIED"), and
+	// ledger maps block id -> payee key -> credited amount. Together
+	// they are this double's stand-in for the `block_payouts` /
+	// `block_payout_credits` tables.
+	claims  map[int64]string
+	ledger  map[int64]map[string]int64
+	applied map[int64]BlockPayoutOutcome
 }
 
 func key(algo, poolType string, height int64) string {
@@ -60,12 +78,73 @@ func (f *fakeRepo) SoloShare(_ context.Context, algo string, height int64) (Shar
 	return row, ok, nil
 }
 
-func (f *fakeRepo) CreditBalance(_ context.Context, algo, network, paymentAddress string, paymentID *string, amount int64) error {
-	if f.creditErr != nil {
-		return f.creditErr
+// errFakePending mirrors db.ErrBlockPayoutPending's role for this
+// double (the payout package deliberately does not import
+// internal/backend/db, so it cannot use the real sentinel).
+var errFakePending = errors.New("fake: block payout is PENDING and requires manual resolution")
+
+func (f *fakeRepo) ApplyBlockPayout(_ context.Context, run BlockPayoutRun) (BlockPayoutOutcome, error) {
+	f.runs = append(f.runs, run)
+	if f.applyErr != nil {
+		return BlockPayoutOutcome{}, f.applyErr
 	}
-	f.credits = append(f.credits, creditCall{algo, network, paymentAddress, paymentID, amount})
-	return nil
+	if f.claims == nil {
+		f.claims = map[int64]string{}
+		f.ledger = map[int64]map[string]int64{}
+		f.applied = map[int64]BlockPayoutOutcome{}
+	}
+	switch f.claims[run.BlockID] {
+	case "APPLIED":
+		out := f.applied[run.BlockID]
+		out.AlreadyApplied = true
+		return out, nil
+	case "PENDING":
+		return BlockPayoutOutcome{}, errFakePending
+	}
+
+	if f.ledger[run.BlockID] == nil {
+		f.ledger[run.BlockID] = map[string]int64{}
+	}
+	var out BlockPayoutOutcome
+	for _, c := range run.Credits {
+		k := c.PaymentAddress + "|" + derefPaymentID(c.PaymentID)
+		if _, already := f.ledger[run.BlockID][k]; already {
+			continue
+		}
+		f.ledger[run.BlockID][k] = c.Amount
+		out.TotalPaid += c.Amount
+		out.Credited++
+	}
+	f.claims[run.BlockID] = "APPLIED"
+	f.applied[run.BlockID] = out
+	return out, nil
+}
+
+// creditedAddresses returns every payment address this double has
+// credited for blockID, for assertions that used to inspect a
+// per-CreditBalance call log.
+func (f *fakeRepo) creditedAddresses(blockID int64) []string {
+	out := make([]string, 0, len(f.ledger[blockID]))
+	for k := range f.ledger[blockID] {
+		out = append(out, strings.SplitN(k, "|", 2)[0])
+	}
+	return out
+}
+
+func (f *fakeRepo) creditedAddress(blockID int64, address string) bool {
+	for _, a := range f.creditedAddresses(blockID) {
+		if a == address {
+			return true
+		}
+	}
+	return false
+}
+
+// testMaturedBlock is the MaturedBlock shape most tests below use --
+// only ID actually matters to the idempotency ledger, the rest is
+// just the run's recorded context.
+func testMaturedBlock(id int64, algo, network, poolType string, height, reward int64) MaturedBlock {
+	return MaturedBlock{ID: id, Algo: algo, Network: network, PoolType: poolType, Height: height, Reward: reward}
 }
 
 func testConfig() Config {
@@ -97,35 +176,99 @@ func TestRunForMaturedBlock_DispatchesByPoolTypeAndApplies(t *testing.T) {
 	}
 	c := New(repo, testConfig())
 
-	result, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PPS", 100, 1000, &reward)
+	result, err := c.RunForMaturedBlock(context.Background(), 11, "RXM", "TESTNET", "PPS", 100, 1000, &reward)
 	if err != nil {
 		t.Fatalf("RunForMaturedBlock(PPS): %v", err)
 	}
 	if result.Credited == 0 || result.TotalPaid == 0 {
 		t.Fatalf("RunForMaturedBlock(PPS): got %+v, want a non-trivial credited result", result)
 	}
-	foundAlice := false
-	for _, cc := range repo.credits {
-		if cc.paymentAddress == "alice" {
-			foundAlice = true
-		}
+	if result.AlreadyApplied {
+		t.Fatalf("RunForMaturedBlock(PPS): got AlreadyApplied=true on a block's first run, want false")
 	}
-	if !foundAlice {
-		t.Fatalf("RunForMaturedBlock(PPS): expected a CreditBalance call for alice, got %+v", repo.credits)
+	if !repo.creditedAddress(11, "alice") {
+		t.Fatalf("RunForMaturedBlock(PPS): expected alice to be credited, got %v", repo.creditedAddresses(11))
 	}
 
-	repo.credits = nil
-	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "SOLO", 100, 1000, &reward); err != nil {
+	if _, err := c.RunForMaturedBlock(context.Background(), 12, "RXM", "TESTNET", "SOLO", 100, 1000, &reward); err != nil {
 		t.Fatalf("RunForMaturedBlock(SOLO): %v", err)
 	}
-	foundSolo := false
-	for _, cc := range repo.credits {
-		if cc.paymentAddress == "solo-winner" {
-			foundSolo = true
-		}
+	if !repo.creditedAddress(12, "solo-winner") {
+		t.Fatalf("RunForMaturedBlock(SOLO): expected solo-winner to be credited, got %v", repo.creditedAddresses(12))
 	}
-	if !foundSolo {
-		t.Fatalf("RunForMaturedBlock(SOLO): expected a CreditBalance call for solo-winner, got %+v", repo.credits)
+}
+
+// TestRunForMaturedBlock_SecondRunForSameBlockIsANoOp is the unit-level
+// regression test for finding #5's core money bug: re-running a
+// matured block's payout (which the unlocker now does automatically on
+// retry, and which `backend block relock` has always been able to
+// trigger) must credit NOBODY a second time.
+//
+// The equivalent test against a real Postgres instance, asserting
+// actual `balance` rows are unchanged, is
+// TestIntegrationApplyBlockPayoutIsIdempotent in
+// internal/backend/db.
+func TestRunForMaturedBlock_SecondRunForSameBlockIsANoOp(t *testing.T) {
+	reward := int64(100000)
+	repo := &fakeRepo{sharesByKey: map[string][]ShareRow{
+		key("RXM", "PPS", 100): {{Shares: 1000, PaymentAddress: "alice"}},
+	}}
+	c := New(repo, testConfig())
+
+	first, err := c.RunForMaturedBlock(context.Background(), 42, "RXM", "TESTNET", "PPS", 100, 1000, &reward)
+	if err != nil {
+		t.Fatalf("RunForMaturedBlock (first): %v", err)
+	}
+	if first.AlreadyApplied || first.TotalPaid == 0 {
+		t.Fatalf("RunForMaturedBlock (first): got %+v, want a real credited run", first)
+	}
+
+	second, err := c.RunForMaturedBlock(context.Background(), 42, "RXM", "TESTNET", "PPS", 100, 1000, &reward)
+	if err != nil {
+		t.Fatalf("RunForMaturedBlock (second): got an error, want a clean no-op: %v", err)
+	}
+	if !second.AlreadyApplied {
+		t.Fatal("RunForMaturedBlock (second): got AlreadyApplied=false, want true — a second run for the same block must not credit anything")
+	}
+	// The ledger must still hold exactly the first run's credits, at
+	// exactly the first run's amounts.
+	if got := len(repo.ledger[42]); got != first.Credited {
+		t.Fatalf("credit ledger for block 42 has %d entries after two runs, want %d (the first run's)", got, first.Credited)
+	}
+	var total int64
+	for _, amount := range repo.ledger[42] {
+		total += amount
+	}
+	if total != first.TotalPaid {
+		t.Fatalf("credit ledger for block 42 totals %d after two runs, want %d (unchanged)", total, first.TotalPaid)
+	}
+}
+
+// TestRunForMaturedBlock_PendingClaimIsRefusedNotRetried confirms a
+// block left in a claimed-but-unresolved PENDING state is surfaced as
+// an error rather than silently re-credited. Blindly re-running such
+// a block IS the double-credit bug (an unknown subset of its miners
+// may already hold the credit), so this must fail loud and reach a
+// human — see db.ErrBlockPayoutPending and
+// cmd/backend/blockpayoutcli.go.
+func TestRunForMaturedBlock_PendingClaimIsRefusedNotRetried(t *testing.T) {
+	reward := int64(100000)
+	repo := &fakeRepo{
+		sharesByKey: map[string][]ShareRow{
+			key("RXM", "PPS", 100): {{Shares: 1000, PaymentAddress: "alice"}},
+		},
+		claims:  map[int64]string{7: "PENDING"},
+		ledger:  map[int64]map[string]int64{},
+		applied: map[int64]BlockPayoutOutcome{},
+	}
+	c := New(repo, testConfig())
+
+	result, err := c.RunForMaturedBlock(context.Background(), 7, "RXM", "TESTNET", "PPS", 100, 1000, &reward)
+	if !errors.Is(err, errFakePending) {
+		t.Fatalf("RunForMaturedBlock: got err=%v result=%+v, want the PENDING refusal to propagate", err, result)
+	}
+	if len(repo.ledger[7]) != 0 {
+		t.Fatalf("a refused PENDING block must credit nothing, got ledger %+v", repo.ledger[7])
 	}
 }
 
@@ -134,7 +277,7 @@ func TestRunForMaturedBlock_DispatchesByPoolTypeAndApplies(t *testing.T) {
 // than silently treated as a zero-reward payout cycle.
 func TestRunForMaturedBlock_NilRewardIsAnError(t *testing.T) {
 	c := New(&fakeRepo{}, testConfig())
-	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PPS", 100, 1000, nil); err == nil {
+	if _, err := c.RunForMaturedBlock(context.Background(), 1, "RXM", "TESTNET", "PPS", 100, 1000, nil); err == nil {
 		t.Fatal("RunForMaturedBlock: got nil error for a nil blockReward, want an error")
 	}
 }
@@ -146,7 +289,7 @@ func TestRunForMaturedBlock_NilRewardIsAnError(t *testing.T) {
 func TestRunForMaturedBlock_UnsupportedPoolTypeIsAnError(t *testing.T) {
 	reward := int64(1000)
 	c := New(&fakeRepo{}, testConfig())
-	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PROP", 100, 1000, &reward); err == nil {
+	if _, err := c.RunForMaturedBlock(context.Background(), 1, "RXM", "TESTNET", "PROP", 100, 1000, &reward); err == nil {
 		t.Fatal("RunForMaturedBlock: got nil error for pool_type PROP, want an error")
 	}
 }
@@ -164,20 +307,38 @@ func TestRunForMaturedBlock_RecordsMetrics(t *testing.T) {
 	cfg.Metrics = m
 	c := New(repo, cfg)
 
-	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PPS", 5, 100, &reward); err != nil {
+	if _, err := c.RunForMaturedBlock(context.Background(), 5, "RXM", "TESTNET", "PPS", 5, 100, &reward); err != nil {
 		t.Fatalf("RunForMaturedBlock: %v", err)
 	}
 
 	if got := testutil.ToFloat64(m.PayoutCyclesTotal.WithLabelValues("RXM", "PPS", metrics.PayoutResultSuccess)); got != 1 {
 		t.Fatalf("PayoutCyclesTotal success = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(m.PayoutAmountCreditedTotal.WithLabelValues("RXM", "TESTNET")); got <= 0 {
-		t.Fatalf("PayoutAmountCreditedTotal = %v, want > 0", got)
+	credited := testutil.ToFloat64(m.PayoutAmountCreditedTotal.WithLabelValues("RXM", "TESTNET"))
+	if credited <= 0 {
+		t.Fatalf("PayoutAmountCreditedTotal = %v, want > 0", credited)
+	}
+
+	// A re-run of the SAME block credits nothing, so it must be
+	// counted as already_applied (not success) and must NOT add to
+	// payout_amount_credited_total again — otherwise every unlocker
+	// retry would inflate the pool's credited total.
+	if _, err := c.RunForMaturedBlock(context.Background(), 5, "RXM", "TESTNET", "PPS", 5, 100, &reward); err != nil {
+		t.Fatalf("RunForMaturedBlock (re-run): %v", err)
+	}
+	if got := testutil.ToFloat64(m.PayoutCyclesTotal.WithLabelValues("RXM", "PPS", metrics.PayoutResultAlreadyApplied)); got != 1 {
+		t.Fatalf("PayoutCyclesTotal already_applied = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.PayoutCyclesTotal.WithLabelValues("RXM", "PPS", metrics.PayoutResultSuccess)); got != 1 {
+		t.Fatalf("PayoutCyclesTotal success = %v after a no-op re-run, want it still 1", got)
+	}
+	if got := testutil.ToFloat64(m.PayoutAmountCreditedTotal.WithLabelValues("RXM", "TESTNET")); got != credited {
+		t.Fatalf("PayoutAmountCreditedTotal = %v after a no-op re-run, want it unchanged at %v", got, credited)
 	}
 
 	// A failing cycle (unsupported pool_type) must be counted as an
 	// error, not a success, and must not add to amount credited.
-	if _, err := c.RunForMaturedBlock(context.Background(), "RXM", "TESTNET", "PROP", 5, 100, &reward); err == nil {
+	if _, err := c.RunForMaturedBlock(context.Background(), 6, "RXM", "TESTNET", "PROP", 5, 100, &reward); err == nil {
 		t.Fatal("expected an error for pool_type PROP")
 	}
 	if got := testutil.ToFloat64(m.PayoutCyclesTotal.WithLabelValues("RXM", "PROP", metrics.PayoutResultError)); got != 1 {
@@ -390,7 +551,7 @@ func TestApply_CreditsEveryEntryIncludingZero(t *testing.T) {
 		"alice":    {PaymentAddress: "alice", Amount: 123.6}, // rounds to 124
 		"fee-addr": {PaymentAddress: "fee-addr", Amount: 0},  // must still be credited (0)
 	}
-	result, err := c.Apply(context.Background(), "RXM", "MAINNET", data)
+	result, err := c.Apply(context.Background(), testMaturedBlock(3, "RXM", "MAINNET", "PPS", 100, 1000), data)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -400,22 +561,65 @@ func TestApply_CreditsEveryEntryIncludingZero(t *testing.T) {
 	if result.TotalPaid != 124 {
 		t.Fatalf("TotalPaid = %d, want 124", result.TotalPaid)
 	}
-	if len(repo.credits) != 2 {
-		t.Fatalf("expected 2 CreditBalance calls, got %d", len(repo.credits))
+	if len(repo.ledger[3]) != 2 {
+		t.Fatalf("expected 2 itemised credits, got %d", len(repo.ledger[3]))
+	}
+}
+
+// TestApply_SendsOneRunCarryingTheBlockIdentityAndSortedCredits pins
+// the two properties Apply's contract with the repository depends on:
+// the run is handed over as ONE call (never a credit-per-payee loop —
+// that shape was the money bug, see Apply's doc comment), and its
+// credits are in a deterministic global order so concurrent
+// transactions take their balance row locks consistently.
+func TestApply_SendsOneRunCarryingTheBlockIdentityAndSortedCredits(t *testing.T) {
+	repo := &fakeRepo{}
+	c := New(repo, testConfig())
+
+	data := map[string]*Payment{
+		"charlie": {PoolType: "pps", PaymentAddress: "charlie", Amount: 3},
+		"alice":   {PoolType: "pps", PaymentAddress: "alice", Amount: 1},
+		"bob":     {PoolType: "fees", PaymentAddress: "bob", Amount: 2},
+	}
+	if _, err := c.Apply(context.Background(), testMaturedBlock(9, "RXT", "TESTNET", "PPLNS", 777, 55555), data); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(repo.runs) != 1 {
+		t.Fatalf("Apply made %d ApplyBlockPayout call(s), want exactly 1 (the whole run must be one atomic unit)", len(repo.runs))
+	}
+	run := repo.runs[0]
+	if run.BlockID != 9 || run.Algo != "RXT" || run.Network != "TESTNET" || run.PoolType != "PPLNS" || run.Height != 777 || run.Reward != 55555 {
+		t.Fatalf("Apply sent run %+v, want the MaturedBlock identity carried through verbatim", run)
+	}
+	var gotOrder []string
+	for _, cr := range run.Credits {
+		gotOrder = append(gotOrder, cr.PaymentAddress)
+	}
+	want := []string{"alice", "bob", "charlie"}
+	if strings.Join(gotOrder, ",") != strings.Join(want, ",") {
+		t.Fatalf("Apply sent credits in order %v, want them sorted %v (deterministic lock ordering)", gotOrder, want)
+	}
+	// The payout-calculation bucket tag must survive into the ledger
+	// record — it is what tells an operator which calculation paid a
+	// given miner during an incident.
+	for _, cr := range run.Credits {
+		if cr.PaymentAddress == "bob" && cr.PayoutBucket != "fees" {
+			t.Fatalf("Apply sent PayoutBucket=%q for bob, want the Payment.PoolType tag \"fees\"", cr.PayoutBucket)
+		}
 	}
 }
 
 func TestApply_PropagatesRepositoryError(t *testing.T) {
 	cfg := testConfig()
 	wantErr := errors.New("boom")
-	repo := &fakeRepo{creditErr: wantErr}
+	repo := &fakeRepo{applyErr: wantErr}
 	c := New(repo, cfg)
 
-	_, err := c.Apply(context.Background(), "RXM", "MAINNET", map[string]*Payment{
+	_, err := c.Apply(context.Background(), testMaturedBlock(4, "RXM", "MAINNET", "PPS", 100, 1000), map[string]*Payment{
 		"alice": {PaymentAddress: "alice", Amount: 1},
 	})
-	if err == nil {
-		t.Fatal("Apply: expected an error to propagate from CreditBalance, got nil")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Apply: got err=%v, want the repository error to propagate", err)
 	}
 }
 

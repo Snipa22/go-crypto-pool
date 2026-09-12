@@ -15,6 +15,10 @@ type fakeRepo struct {
 	pendingErr   error
 	statusCalls  []statusCall
 	statusErrFor map[int64]error
+	// onStatus, if non-nil, is called on every successful
+	// SetBlockStatus — used by the ordering test below to record when
+	// the status write happens relative to the payout.
+	onStatus func()
 }
 
 type statusCall struct {
@@ -34,6 +38,9 @@ func (f *fakeRepo) SetBlockStatus(_ context.Context, id int64, valid, unlocked b
 		return err
 	}
 	f.statusCalls = append(f.statusCalls, statusCall{id: id, valid: valid, unlocked: unlocked})
+	if f.onStatus != nil {
+		f.onStatus()
+	}
 	return nil
 }
 
@@ -57,10 +64,16 @@ func (f *fakeVerifier) Verify(_ context.Context, hashHex string, _ int64) (chain
 type fakePayoutTrigger struct {
 	calls []Block
 	err   error
+	// onCall, if non-nil, is called on every invocation — used by the
+	// ordering test below.
+	onCall func()
 }
 
 func (f *fakePayoutTrigger) TriggerPayout(_ context.Context, b Block) error {
 	f.calls = append(f.calls, b)
+	if f.onCall != nil {
+		f.onCall()
+	}
 	return f.err
 }
 
@@ -207,6 +220,129 @@ func TestSetBlockStatusFailureIsCountedAsError(t *testing.T) {
 	result := u.RunOnce(context.Background())
 	if result.Errors != 1 || result.Matured != 0 {
 		t.Fatalf("RunOnce: got %+v, want 1 error / 0 matured when SetBlockStatus fails", result)
+	}
+}
+
+// TestRunOnce_PayoutFailureLeavesBlockPendingForAutomaticRetry is the
+// direct regression test for finding #5's unlocker half: a matured
+// block whose payout fails must NOT be marked unlocked.
+//
+// The old code marked it valid=TRUE/unlocked=TRUE first and then
+// merely logged a payout failure, which dropped the block out of
+// PendingBlocks (`valid = TRUE AND unlocked = FALSE`) forever — the
+// payout was never retried by anything and no durable marker existed
+// that it was owed. Now nothing is written at all, so the block stays
+// in the pending queue and the next pass retries it.
+func TestRunOnce_PayoutFailureLeavesBlockPendingForAutomaticRetry(t *testing.T) {
+	reward := int64(600000000000)
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{ID: 8, Algo: "RXM", Hash: "deadbeef", Height: 100, PoolType: "SOLO", Difficulty: 1, Value: &reward}},
+	}}
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{
+		"deadbeef": {Found: true, Confirmations: 60, Reward: reward},
+	}}
+	trigger := &fakePayoutTrigger{err: errors.New("payout exploded")}
+	u := New(repo, Config{Coins: map[string]CoinConfig{
+		"RXM": {Verifier: verifier, MaturityDepth: 60},
+	}, PayoutTrigger: trigger})
+
+	result := u.RunOnce(context.Background())
+	if result.PayoutRetries != 1 || result.Matured != 0 {
+		t.Fatalf("RunOnce: got %+v, want 1 payout retry / 0 matured", result)
+	}
+	if len(repo.statusCalls) != 0 {
+		t.Fatalf("RunOnce: got statusCalls=%+v, want NONE — marking the block unlocked would drop it out of PendingBlocks and lose the payout forever", repo.statusCalls)
+	}
+
+	// The next pass must pick the very same block up again and retry
+	// the payout, with no operator intervention. Let the payout
+	// succeed this time and confirm the block is finally unlocked.
+	trigger.err = nil
+	result = u.RunOnce(context.Background())
+	if result.Matured != 1 || result.PayoutRetries != 0 {
+		t.Fatalf("RunOnce (retry pass): got %+v, want 1 matured / 0 payout retries", result)
+	}
+	if len(trigger.calls) != 2 {
+		t.Fatalf("TriggerPayout called %d times across both passes, want 2 (the failure must be retried automatically)", len(trigger.calls))
+	}
+	if len(repo.statusCalls) != 1 || repo.statusCalls[0] != (statusCall{id: 8, valid: true, unlocked: true}) {
+		t.Fatalf("RunOnce (retry pass): got statusCalls=%+v, want a single {id:8 valid:true unlocked:true} call once the payout succeeded", repo.statusCalls)
+	}
+}
+
+// TestRunOnce_PayoutRunsBeforeTheStatusWrite pins the ordering itself,
+// independently of either call failing: `unlocked = TRUE` is this
+// schema's only "handled" marker, so it must never be written before
+// the money side has actually succeeded. See checkBlock's doc comment.
+func TestRunOnce_PayoutRunsBeforeTheStatusWrite(t *testing.T) {
+	var order []string
+	repo := &fakeRepo{
+		pending: map[string][]Block{
+			"RXM": {{ID: 9, Algo: "RXM", Hash: "deadbeef", Height: 100, PoolType: "SOLO", Difficulty: 1}},
+		},
+		onStatus: func() { order = append(order, "status") },
+	}
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{
+		"deadbeef": {Found: true, Confirmations: 60, Reward: 1},
+	}}
+	trigger := &fakePayoutTrigger{onCall: func() { order = append(order, "payout") }}
+	u := New(repo, Config{Coins: map[string]CoinConfig{
+		"RXM": {Verifier: verifier, MaturityDepth: 60},
+	}, PayoutTrigger: trigger})
+
+	if result := u.RunOnce(context.Background()); result.Matured != 1 {
+		t.Fatalf("RunOnce: got %+v, want 1 matured", result)
+	}
+	if len(order) != 2 || order[0] != "payout" || order[1] != "status" {
+		t.Fatalf("call order = %v, want [payout status] — the status write must come strictly after a successful payout", order)
+	}
+}
+
+// TestRunOnce_OrphanedBlockNeverTriggersAPayout confirms the reorder
+// did not accidentally start paying out reorged blocks: an orphan is
+// still marked invalid+unlocked with no payout attempted at all.
+func TestRunOnce_OrphanedBlockNeverTriggersAPayout(t *testing.T) {
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXT": {{ID: 10, Algo: "RXT", Hash: "aabbcc", Height: 50, PoolType: "PPLNS"}},
+	}}
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{
+		"aabbcc": {Found: true, Orphaned: true, Reward: 999},
+	}}
+	trigger := &fakePayoutTrigger{}
+	u := New(repo, Config{Coins: map[string]CoinConfig{
+		"RXT": {Verifier: verifier, MaturityDepth: 6},
+	}, PayoutTrigger: trigger})
+
+	if result := u.RunOnce(context.Background()); result.Orphaned != 1 {
+		t.Fatalf("RunOnce: got %+v, want 1 orphaned", result)
+	}
+	if len(trigger.calls) != 0 {
+		t.Fatalf("TriggerPayout called %d times for an orphaned block, want 0", len(trigger.calls))
+	}
+}
+
+// TestRunOnce_PayoutTriggerReceivesTheRealBlockID confirms the
+// `blocks.id` reaches the trigger: it is the idempotency key the
+// whole `block_payouts` ledger hangs off (see payout.MaturedBlock), so
+// a zero/wrong id here would silently defeat the entire mechanism.
+func TestRunOnce_PayoutTriggerReceivesTheRealBlockID(t *testing.T) {
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{ID: 4242, Algo: "RXM", Hash: "deadbeef", Height: 100, PoolType: "SOLO", Difficulty: 1}},
+	}}
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{
+		"deadbeef": {Found: true, Confirmations: 60, Reward: 7},
+	}}
+	trigger := &fakePayoutTrigger{}
+	u := New(repo, Config{Coins: map[string]CoinConfig{
+		"RXM": {Verifier: verifier, MaturityDepth: 60},
+	}, PayoutTrigger: trigger})
+
+	u.RunOnce(context.Background())
+	if len(trigger.calls) != 1 {
+		t.Fatalf("TriggerPayout called %d times, want 1", len(trigger.calls))
+	}
+	if got := trigger.calls[0].ID; got != 4242 {
+		t.Fatalf("TriggerPayout received block ID=%d, want 4242 (the payout idempotency key)", got)
 	}
 }
 

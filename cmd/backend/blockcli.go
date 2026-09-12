@@ -39,6 +39,22 @@
 //     real ChainVerifier.Verify decision table against it, same as
 //     any newly-inserted block.
 //
+//     NOTE ON PAYOUTS: relocking a block whose payout ALREADY ran no
+//     longer re-credits anybody. The matured-block payout path is now
+//     idempotent per block (a `block_payouts` claim ledger written in
+//     the same transaction as the credits -- see
+//     migrations/0011_block_payouts.up.sql), so the re-triggered
+//     payout for an APPLIED block is a recorded no-op and the block
+//     is simply marked unlocked again. That was NOT true before: this
+//     subcommand used to be the documented recovery path for a
+//     dropped payout, and using it on a block whose payout had
+//     partially run credited every already-paid miner a second time.
+//     It also is no longer NEEDED for that purpose -- the unlocker
+//     retries a failed payout automatically now (see
+//     internal/backend/unlocker's checkBlock). If a block's payout is
+//     genuinely stuck, the tool for it is `backend block-payout`, not
+//     this one.
+//
 // Both subcommands are deliberately NOT wired into any HTTP endpoint
 // or automatic trigger -- see this file's own flag set: -yes is
 // mandatory (bare -id alone prints what WOULD change and exits

@@ -59,20 +59,49 @@ const (
 // deliberately NOT one of these values: a block left pending is, by
 // definition, not a terminal outcome yet and generates no event here
 // (see unlocker.checkBlock's decision table) — only Verify errors,
-// maturation, and orphaning are.
+// maturation, orphaning, and a matured block whose payout could not
+// be applied are.
 const (
 	UnlockerOutcomeMatured  = "matured"
 	UnlockerOutcomeOrphaned = "orphaned"
 	UnlockerOutcomeError    = "error"
+	// UnlockerOutcomePayoutFailed — the block is confirmed mature on
+	// the real chain, but its payout run did not succeed, so the
+	// block was deliberately LEFT PENDING (valid=TRUE,
+	// unlocked=FALSE) for the next poll pass to retry rather than
+	// marked unlocked with its payout dropped. See
+	// unlocker.checkBlock's doc comment; the payout itself is
+	// idempotent (migrations/0011_block_payouts.up.sql), which is
+	// what makes that automatic retry safe.
+	//
+	// This is distinct from "error" on purpose: an "error" block's
+	// chain status is still unknown, a "payout_failed" block's is
+	// settled and it is real money that is stuck. A sustained
+	// non-zero rate here is an actionable incident — the same block
+	// is being retried every poll tick and no miner has been
+	// credited for it.
+	UnlockerOutcomePayoutFailed = "payout_failed"
 )
 
 // Result label values for payout_cycles_total — whether one
 // matured-block payout calculation (Calculate{PPS,PPLNS,Solo} +
 // Apply, see internal/backend/payout.Calculator) completed and
-// credited balances, or failed partway through.
+// credited balances, correctly did nothing because that block's
+// payout had already been applied, or failed partway through.
 const (
 	PayoutResultSuccess = "success"
 	PayoutResultError   = "error"
+	// PayoutResultAlreadyApplied — the block's `block_payouts` ledger
+	// row was already APPLIED, so this cycle credited nothing and
+	// rolled back without touching a balance (see
+	// db.Repository.ApplyBlockPayout). Healthy, expected traffic:
+	// it is what the unlocker's retry of a block whose payout
+	// committed but whose status write did not looks like. Counted
+	// separately from "success" so a dashboard is not misled into
+	// reading retries as real payout cycles, and so
+	// payout_amount_credited_total (which such a cycle deliberately
+	// does NOT add to) still reconciles against the "success" count.
+	PayoutResultAlreadyApplied = "already_applied"
 )
 
 // Result label values for auth_attempts_total — whether one POST
