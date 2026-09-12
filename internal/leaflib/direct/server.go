@@ -590,7 +590,18 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficul
 // is a purely-secondary, best-effort side effect that can never affect
 // the returned outcome, per this feature's explicit design constraint
 // (see internal/leaflib/relay's doc comment).
-func (s *Server) submitBlockDirect(ctx context.Context, block *tari_generated.Block) ([]NodeSubmitResult, bool) {
+//
+// The returned hash is the REAL, base-node-confirmed chain hash for
+// the accepted block — realBlockHashHex extracts it from the
+// authoritative node results (see that function's doc comment: it
+// comes from tari_generated.SubmitBlockResponse.block_hash, the base
+// node's own SubmitBlock RPC response, NOT a locally computed
+// placeholder). It is computed exactly ONCE here and used for both
+// the relay publish below AND returned to the caller (handleSubmit)
+// for the backend report, so there is a single source of truth for
+// the real hash rather than two independent call sites each trying to
+// derive it.
+func (s *Server) submitBlockDirect(ctx context.Context, block *tari_generated.Block) ([]NodeSubmitResult, bool, string) {
 	var (
 		results []NodeSubmitResult
 		ok      bool
@@ -601,13 +612,14 @@ func (s *Server) submitBlockDirect(ctx context.Context, block *tari_generated.Bl
 		s.logger.Printf("direct: no MultiNodeSubmitter configured; block find cannot be submitted to any node")
 	}
 
+	hash := realBlockHashHex(results, s.logger)
+
 	// Best-effort NATS relay publish — never allowed to affect ok/
 	// results above, and never allowed to block this call meaningfully
 	// (relay.Publish itself has no long-blocking network wait; it is
 	// fire-and-forget at the NATS client level — see that method's doc
 	// comment).
 	if s.relay != nil {
-		hash, _ := blockHash(block)
 		algo := s.currentAlgoLabel()
 		data, err := marshalBlockForRelay(block)
 		if err != nil {
@@ -623,7 +635,7 @@ func (s *Server) submitBlockDirect(ctx context.Context, block *tari_generated.Bl
 		}
 	}
 
-	return results, ok
+	return results, ok, hash
 }
 
 // currentAlgoLabel returns the JobManager's configured algo as the

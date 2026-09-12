@@ -3,6 +3,7 @@ package direct
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -19,11 +20,12 @@ import (
 // node's own delay, not delay*N) rather than merely trusting the
 // implementation reads as parallel.
 type fakeTimedBlockClient struct {
-	delay    time.Duration
-	accept   bool
-	err      error
-	calls    atomic.Int64
-	startedC chan struct{} // optional: signalled the instant SubmitBlock is entered
+	delay     time.Duration
+	accept    bool
+	err       error
+	blockHash []byte // real SubmitBlockResponse.block_hash to return on accept
+	calls     atomic.Int64
+	startedC  chan struct{} // optional: signalled the instant SubmitBlock is entered
 }
 
 func (f *fakeTimedBlockClient) SubmitBlock(_ *tari_generated.Block) (*tari_generated.SubmitBlockResponse, error) {
@@ -38,7 +40,7 @@ func (f *fakeTimedBlockClient) SubmitBlock(_ *tari_generated.Block) (*tari_gener
 		}
 		return nil, errors.New("rejected")
 	}
-	return &tari_generated.SubmitBlockResponse{}, nil
+	return &tari_generated.SubmitBlockResponse{BlockHash: f.blockHash}, nil
 }
 
 func (f *fakeTimedBlockClient) Close() error { return nil }
@@ -208,6 +210,108 @@ func TestMultiNodeSubmitterAddresses(t *testing.T) {
 	if len(addrs) != 2 {
 		t.Fatalf("expected 2 addresses, got %d: %v", len(addrs), addrs)
 	}
+}
+
+// TestMultiNodeSubmitterCarriesRealBlockHash is the direct regression
+// test for the confirmed production bug (3667 RXT + 760 SHA3X blocks
+// stuck unlocked=false on testnet because blocks.hash held a garbage
+// "nonce-height" placeholder instead of the real chain hash): a fake
+// accepting node returns a specific, real-looking 32-byte
+// SubmitBlockResponse.block_hash, and this test asserts that exact
+// hash — NOT any nonce/height-derived string — is what ends up on the
+// accepted NodeSubmitResult.
+func TestMultiNodeSubmitterCarriesRealBlockHash(t *testing.T) {
+	realHash := []byte{
+		0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04,
+		0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+		0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+		0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+	}
+	clients := map[string]blockSubmitClient{
+		"accept-node:1": &fakeTimedBlockClient{accept: true, blockHash: realHash},
+	}
+	m := newMultiNodeSubmitterForTest(clients, discardLogger())
+
+	results, ok := m.SubmitBlock(context.Background(), &tari_generated.Block{})
+	if !ok {
+		t.Fatalf("expected success, got ok=false, results=%v", results)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !bytesEqual(results[0].BlockHash, realHash) {
+		t.Fatalf("expected NodeSubmitResult.BlockHash=%x (the base node's own SubmitBlockResponse.block_hash), got %x", realHash, results[0].BlockHash)
+	}
+
+	got := realBlockHashHex(results, discardLogger())
+	want := hex.EncodeToString(realHash)
+	if got != want {
+		t.Fatalf("realBlockHashHex: expected %q (real chain hash), got %q", want, got)
+	}
+}
+
+// TestMultiNodeSubmitterRejectedResultHasNoBlockHash confirms a
+// rejected/errored node's result never carries a BlockHash (there is
+// no response to read one from).
+func TestMultiNodeSubmitterRejectedResultHasNoBlockHash(t *testing.T) {
+	clients := map[string]blockSubmitClient{
+		"reject-node:1": &fakeTimedBlockClient{accept: false},
+	}
+	m := newMultiNodeSubmitterForTest(clients, discardLogger())
+	results, ok := m.SubmitBlock(context.Background(), &tari_generated.Block{})
+	if ok {
+		t.Fatalf("expected overall failure, got ok=true")
+	}
+	if len(results) != 1 || len(results[0].BlockHash) != 0 {
+		t.Fatalf("expected 1 result with an empty BlockHash, got %v", results)
+	}
+	if got := realBlockHashHex(results, discardLogger()); got != "" {
+		t.Errorf("realBlockHashHex: expected empty string when no accepted result carries a hash, got %q", got)
+	}
+}
+
+// TestRealBlockHashHexPicksFirstAcceptedHash confirms realBlockHashHex
+// picks the first accepted result's hash, ignoring rejected results
+// entirely, when multiple nodes are configured.
+func TestRealBlockHashHexPicksFirstAcceptedHash(t *testing.T) {
+	realHash := []byte{0xaa, 0xbb, 0xcc, 0xdd}
+	results := []NodeSubmitResult{
+		{Address: "reject-node:1", Accepted: false, Err: errors.New("rejected")},
+		{Address: "accept-node:1", Accepted: true, BlockHash: realHash},
+	}
+	got := realBlockHashHex(results, discardLogger())
+	want := hex.EncodeToString(realHash)
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+// TestRealBlockHashHexWarnsOnMismatchedAcceptedHashes confirms that
+// two accepted results reporting DIFFERENT hashes for the same call
+// still resolve to the first one found (a defensive anomaly case that
+// should never happen in practice — every accepting node should
+// report the identical real chain hash).
+func TestRealBlockHashHexWarnsOnMismatchedAcceptedHashes(t *testing.T) {
+	results := []NodeSubmitResult{
+		{Address: "node-a:1", Accepted: true, BlockHash: []byte{0x01}},
+		{Address: "node-b:1", Accepted: true, BlockHash: []byte{0x02}},
+	}
+	got := realBlockHashHex(results, discardLogger())
+	if got != "01" {
+		t.Fatalf("expected the first accepted result's hash (%q) to win, got %q", "01", got)
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // discardLogger returns a *log.Logger writing to io.Discard, so tests

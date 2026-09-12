@@ -734,7 +734,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 				return
 			}
 			var results []NodeSubmitResult
-			results, submitOK = s.server.submitBlockDirect(context.Background(), block)
+			results, submitOK, blockHashHex = s.server.submitBlockDirect(context.Background(), block)
 			if !submitOK {
 				s.hashesAccumulated.Add(job.StaticDifficulty)
 				s.server.logger.Printf("direct: BLOCK SUBMIT FAILED at every configured node for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, results)
@@ -742,7 +742,6 @@ func (s *Session) handleSubmit(req solo.Request) {
 				s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: rejected/failed at every configured node (%d configured)", len(results)))
 				return
 			}
-			blockHashHex, _ = blockHash(block)
 		}
 
 		if !submitOK {
@@ -824,10 +823,11 @@ func (s *Session) forwardShare(share *poolpb.Share) {
 // purposes (see handleSubmit's doc comment — the backend does not
 // need per-node dispatch detail, that's logged locally only).
 // blockHashHex is a coin-agnostic, already-hex-encoded identifying
-// hash for the found block (Tari: blockHash(block); Monero: sha256 of
-// the submitted candidate blob — see handleSubmit's coin-aware
-// dispatch), computed by the caller since this method no longer
-// assumes a *tari_generated.Block shape.
+// hash for the found block (Tari: the REAL base-node-confirmed hash
+// from realBlockHashHex/submitBlockDirect — see that function's doc
+// comment; Monero: sha256 of the submitted candidate blob — see
+// handleSubmit's coin-aware dispatch), computed by the caller since
+// this method no longer assumes a *tari_generated.Block shape.
 func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex string) {
 	if s.server.transport == nil {
 		return
@@ -845,23 +845,6 @@ func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex 
 		return
 	}
 	s.server.recordTransportSuccess("block")
-}
-
-// blockHash returns a hex-encoded identifying hash for block, for the
-// backend report and the relay message — best-effort: any marshal
-// error just yields an empty string rather than blocking the real
-// submit/report path on it.
-func blockHash(block *tari_generated.Block) (string, error) {
-	if block == nil || block.GetHeader() == nil {
-		return "", nil
-	}
-	// There is no single canonical "block hash" field readily
-	// available on tari_generated.Block pre-broadcast (the base node
-	// computes the real header hash); nonce+height+merge-mining-hash
-	// together are already unique per real find and sufficient for
-	// this leaf's own logging/dedup purposes.
-	h := block.GetHeader()
-	return fmt.Sprintf("%x-%d", h.GetNonce(), h.GetHeight()), nil
 }
 
 func (s *Session) recordJob(job *solo.Job) {
