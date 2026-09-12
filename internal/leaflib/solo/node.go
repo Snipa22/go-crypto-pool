@@ -535,13 +535,31 @@ func (c *GRPCNodeClient) buildCoinbaseExtra() []byte {
 // duplicate-small-helpers-across-packages convention — see
 // internal/leaflib/direct/wireutil.go's doc comment) by
 // direct.NodeClient's own GetBlockTemplate.
+//
+// job_id must be a purely random, opaque wire token, NEVER derived
+// from BlockHash (or any other template content) — this used to call
+// jobIDFromBlockHash, which was CONFIRMED unsafe on two independent
+// axes (see monero_node.go's GetBlockTemplate doc comment for the
+// concrete production incident that surfaced this on RXM, whose
+// prevHash+height can repeat across genuinely distinct templates):
+// (1) two genuinely different templates can share a content-derived
+// ID, and (2) RestampDifficulty (job.go) deliberately reuses the
+// SAME job_id for the SAME template on purpose when only difficulty
+// changes, so a content-derived scheme was never doing real
+// collision-avoidance work in the first place — for SHA3X/Tari it
+// merely APPEARED safe because BlockHash happens to change almost
+// every GetNewBlockTemplateWithCoinbases call (coinbase-extra is
+// randomized per call, see buildCoinbaseExtra), which is an
+// incidental side effect, not a designed guarantee. newRandomHexID
+// (the same helper proxy/job.go's JobManager.NextJob already uses)
+// has no such reliance.
 func tariJobFromResult(result *tari_generated.GetNewBlockResult, algo poolpb.Algo) (*Job, error) {
 	if result == nil || result.GetBlock() == nil || result.GetBlock().GetHeader() == nil {
 		return nil, fmt.Errorf("solo: GetBlockTemplate returned an incomplete result")
 	}
-	id, err := jobIDFromBlockHash(result.GetBlockHash())
+	id, err := newRandomHexID()
 	if err != nil {
-		return nil, fmt.Errorf("solo: deriving job id from block hash: %w", err)
+		return nil, fmt.Errorf("solo: generating random job id: %w", err)
 	}
 	return &Job{
 		ID:                      id,

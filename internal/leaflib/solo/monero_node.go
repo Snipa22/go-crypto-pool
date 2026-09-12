@@ -342,8 +342,36 @@ func (c *MoneroNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress s
 		}
 	}
 
+	// job_id must be a purely random, opaque wire token -- NEVER
+	// derived from prevHash/height/any template content (see this
+	// package's former moneroJobID, removed as part of the real
+	// production bugfix documented on newRandomHexID's call sites
+	// throughout this codebase). The concrete bug this closes: at an
+	// UNMOVED tip, refreshLoop's periodic InvalidateAll (job.go)
+	// forces a brand new GetBlockTemplate call whose PrevHash/Height
+	// are IDENTICAL to the previous call's, but whose
+	// RawTemplateBlob/ReservedOffset/reservation region are a
+	// genuinely different template -- a prevHash+height-derived ID
+	// collided across that rotation, so JobHistory.Record
+	// (wireshape.go) treated the collision as "refresh in place" (the
+	// LEGITIMATE case it's designed for -- RestampDifficulty reusing
+	// an ID on purpose when only difficulty changed) and silently
+	// overwrote the session's job-history entry to point at the NEW
+	// template while a client's in-flight submit still referenced the
+	// OLD job_id. ownJob(id) then found an entry (the ID collided) but
+	// it pointed at the wrong RawTemplateBlob/ReservedOffset, so
+	// nonce-patching produced a hash that was never actually mined --
+	// RandomX re-validation correctly rejected it, presenting as
+	// periodic reject bursts at job rotation. A purely random ID has
+	// no such collision risk: two calls with byte-identical
+	// prevHash/height now always mint two byte-distinct job IDs.
+	id, err := newRandomHexID()
+	if err != nil {
+		return nil, fmt.Errorf("solo: monero: generating random job id: %w", err)
+	}
+
 	job := &Job{
-		ID:                      moneroJobID(result.PrevHash, result.Height),
+		ID:                      id,
 		Algo:                    algo,
 		Height:                  result.Height,
 		Header:                  hashingBlob,
@@ -391,18 +419,6 @@ type moneroTemplateData struct {
 	// existing convention of holding everything GetBlockTemplate
 	// parsed for this template.
 	ReservedOffset int
-}
-
-// moneroJobID derives a miner-facing job id from a Monero template's
-// prev_hash + height, mirroring node.go's jobIDFromBlockHash convention
-// (first 16 hex chars of a hash) while folding in height so that two
-// templates fetched back-to-back for the SAME prev_hash (e.g. after a
-// reserve-size/coinbase-extra change) don't collide.
-func moneroJobID(prevHashHex string, height uint64) string {
-	if len(prevHashHex) < 16 {
-		return fmt.Sprintf("%016x", height)
-	}
-	return prevHashHex[:16]
 }
 
 func (c *MoneroNodeClient) now() time.Time {

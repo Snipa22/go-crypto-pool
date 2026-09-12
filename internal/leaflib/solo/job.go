@@ -53,12 +53,25 @@ import (
 // already claimed a cached template" behavior) until the whole cache is
 // invalidated by tip movement.
 type Job struct {
-	// ID is the real miner-facing job_id: the first 16 hex characters
-	// of hex(BlockHash) — ported exactly from
+	// ID is the real miner-facing job_id: a purely random, opaque
+	// wire token (see node.go's tariJobFromResult / monero_node.go's
+	// GetBlockTemplate, both of which mint this via newRandomHexID).
+	// This is what goes on the wire in JobPayload.JobID and what
+	// miners echo back in SubmitRequest.JobID — nothing about its
+	// VALUE is protocol-meaningful, and it must NEVER be derived from
+	// BlockHash/prevHash/height/any other template content: a
+	// content-derived ID was confirmed, in real production, to
+	// collide across two genuinely different templates (see
+	// monero_node.go's GetBlockTemplate doc comment for the full
+	// incident writeup) while ALSO providing zero real
+	// collision-avoidance benefit even when it happened not to
+	// collide, since RestampDifficulty (below) deliberately reuses
+	// the SAME ID for the SAME template on purpose whenever only
+	// StaticDifficulty changes. This field previously held the first
+	// 16 hex characters of hex(BlockHash) — ported from
 	// go-tari-sha3x-solo-stratum's minerTracking.GetJobJSON
-	// (fmt.Sprintf("%x", job.BlockResult.BlockHash)[0:16]). This is
-	// what goes on the wire in JobPayload.JobID and what miners echo
-	// back in SubmitRequest.JobID.
+	// (fmt.Sprintf("%x", job.BlockResult.BlockHash)[0:16]) — that
+	// content-derived scheme is what was replaced.
 	ID     string
 	Height uint64
 
@@ -813,18 +826,22 @@ func syntheticTipDedupHash(algo, network string, height uint64) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// jobIDFromBlockHash, newRandomHexID, and newSessionXN are now thin
-// wrappers over internal/leaflib's identically named exported
-// functions (EXTRACTED there so internal/leaflib/direct — which used
-// to hand-derive a byte-for-byte duplicate of each of these in its
-// own wireutil.go — can reuse the exact same real implementations;
-// see leaflib/wireutil.go's doc comment for the full rationale). See
-// each leaflib function's own doc comment for the full ported
-// provenance; unchanged behavior, just relocated.
-func jobIDFromBlockHash(blockHash []byte) (string, error) {
-	return leaflib.JobIDFromBlockHash(blockHash)
-}
-
+// newRandomHexID and newSessionXN are now thin wrappers over
+// internal/leaflib's identically named exported functions (EXTRACTED
+// there so internal/leaflib/direct — which used to hand-derive a
+// byte-for-byte duplicate of each of these in its own wireutil.go —
+// can reuse the exact same real implementations; see
+// leaflib/wireutil.go's doc comment for the full rationale). See each
+// leaflib function's own doc comment for the full ported provenance;
+// unchanged behavior, just relocated.
+//
+// This package used to also carry a jobIDFromBlockHash thin wrapper
+// over leaflib.JobIDFromBlockHash, deriving a job's ID from its
+// BlockHash. That is now REMOVED: job_id must be a purely random,
+// opaque wire token, never content-derived — see node.go's
+// tariJobFromResult and monero_node.go's GetBlockTemplate doc
+// comments for the full real-production-bug rationale. Both this
+// package's own call sites now mint via newRandomHexID instead.
 func newRandomHexID() (string, error) {
 	return leaflib.NewRandomHexID()
 }

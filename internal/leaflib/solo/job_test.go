@@ -33,16 +33,17 @@ type fakeNodeClient struct {
 
 	// blockHashSeed is the fixed prefix of the synthetic block hash
 	// GetBlockTemplate returns; the real leading bytes matter for
-	// nothing here except uniqueness/determinism, since the reference
-	// GetJobJSON's job_id is derived from this real BlockHash field
-	// (see job.go's jobIDFromBlockHash). A per-call counter is appended
-	// so consecutive calls in the same test (e.g. two different xns at
-	// the same height) still get distinct job ids, mirroring how a real
-	// base node hands back a genuinely different block hash on every
-	// GetNewBlockResult even without a height change (this codebase's
-	// real GRPCNodeClient.GetBlockTemplate achieves this via a fresh
+	// nothing here except giving each call a distinct BlockHash the
+	// same way a real base node would (this codebase's real
+	// GRPCNodeClient.GetBlockTemplate achieves this via a fresh
 	// random coinbase-extra nonce buffer on every call — see node.go's
-	// doc comment).
+	// doc comment). tariJobFromResult itself now mints job.ID as a
+	// purely random, opaque token (newRandomHexID) rather than
+	// deriving it from BlockHash (see that function's doc comment for
+	// why a content-derived ID was removed), so distinct BlockHash
+	// values are no longer what guarantees distinct job IDs here —
+	// they're kept distinct anyway purely to keep this fake's overall
+	// synthetic template shape realistic.
 	blockHashSeed []byte
 
 	// vmKey is the synthetic RandomX seed/key GetBlockTemplate returns
