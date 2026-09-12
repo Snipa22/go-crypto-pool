@@ -1053,7 +1053,7 @@ func (a statsRepositoryAdapter) PoolSourceShareStatsSince(ctx context.Context, a
 }
 
 // addressMapRepositoryAdapter adapts *db.Repository (whose
-// UpsertAddressMap/GetAddressMap operate on db.AddressMap) to
+// SetAddressMap/GetAddressMap operate on db.AddressMap) to
 // addressmap.Repository (which operates on addressmap.Record),
 // mirroring statsRepositoryAdapter's role above for the SXMR
 // merge-mining XMR-to-Tari address mapping API.
@@ -1061,8 +1061,12 @@ type addressMapRepositoryAdapter struct {
 	repo *db.Repository
 }
 
-func (a addressMapRepositoryAdapter) Upsert(ctx context.Context, xmrAddress, tariAddress string) error {
-	return a.repo.UpsertAddressMap(ctx, xmrAddress, tariAddress)
+func (a addressMapRepositoryAdapter) Set(ctx context.Context, xmrAddress, tariAddress string) error {
+	err := a.repo.SetAddressMap(ctx, xmrAddress, tariAddress)
+	if err != nil && errors.Is(err, db.ErrAddressAlreadyMapped) {
+		return addressmap.ErrAlreadyMapped
+	}
+	return err
 }
 
 func (a addressMapRepositoryAdapter) Get(ctx context.Context, xmrAddress string) (addressmap.Record, error) {

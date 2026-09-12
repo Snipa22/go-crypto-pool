@@ -89,7 +89,7 @@ type fakeAddrMapRepo struct {
 	gotXMR, gotTari string
 }
 
-func (f *fakeAddrMapRepo) Upsert(_ context.Context, xmrAddress, tariAddress string) error {
+func (f *fakeAddrMapRepo) Set(_ context.Context, xmrAddress, tariAddress string) error {
 	if f.err != nil {
 		return f.err
 	}
@@ -740,6 +740,26 @@ func TestHandleUpdateTariAddress_UpsertFailure(t *testing.T) {
 	var resp map[string]any
 	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
 	if resp["msg"] != "Unable to insert address" {
+		t.Errorf("unexpected body: %+v", resp)
+	}
+}
+
+func TestHandleUpdateTariAddress_AlreadyMapped(t *testing.T) {
+	// Second call for an already-mapped xmr_address must render the
+	// exact SAME legacy 400 shape as any other Set failure -- see
+	// handleUpdateTariAddress's doc comment / FIX_BRIEF.md: legacy
+	// callers must see identical behavior to a plain duplicate-INSERT
+	// failure, not a new response shape.
+	h, d := newTestHandler(Config{})
+	d.addrMap.err = addressmap.ErrAlreadyMapped
+	body := `{"xmrAddress":"` + testXMRAddress + `","tariAddress":"` + testTariAddress + `"}`
+	rr := doPost(t, h.Mux(), "/user/updateTariAddress", body)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp["msg"] != "Unable to insert address" || resp["success"] != false {
 		t.Errorf("unexpected body: %+v", resp)
 	}
 }

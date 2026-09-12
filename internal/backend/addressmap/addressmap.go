@@ -20,12 +20,12 @@
 //
 //   - POST /api/v1/address-map
 //     Body: {"xmr_address": "...", "tari_address": "..."}
-//     Upserts the mapping for xmr_address (see
-//     Repository.UpsertAddressMap's doc comment on the upsert
-//     semantics: one XMR address maps to exactly one live Tari
-//     address at a time; re-POSTing the same xmr_address with a new
-//     tari_address simply replaces the destination). Returns 201 on
-//     success.
+//     Sets the mapping for xmr_address (see Repository.Set's doc
+//     comment on the set-once semantics: one XMR address maps to
+//     exactly one Tari address, for good; re-POSTing an xmr_address
+//     that already has a mapping is rejected, not applied). Returns
+//     201 on a genuinely first-time set, 409 if xmr_address is
+//     already mapped.
 //
 //   - GET /api/v1/address-map?xmr_address=<addr>
 //     Returns the current mapping for xmr_address, or 404 if none
@@ -86,12 +86,19 @@ type Record struct {
 // (and only this) error into a 404; any other error is a 500.
 var ErrNotFound = errors.New("addressmap: no mapping for that xmr_address")
 
+// ErrAlreadyMapped is the sentinel a Repository implementation must
+// return from Set when xmrAddress already has a mapping row -- see
+// db.Repository.SetAddressMap's doc comment for the set-once/
+// no-overwrite rationale (FIX_BRIEF.md). Handler translates this
+// (and only this) error into a 409; any other error is a 500.
+var ErrAlreadyMapped = errors.New("addressmap: xmr_address is already mapped")
+
 // Repository is the narrow persistence surface this package's
 // handlers depend on. *db.Repository satisfies this via the adapter
 // wired up in cmd/backend (see db/addressmap.go for the underlying
-// UpsertAddressMap/GetAddressMap methods); tests inject a fake.
+// SetAddressMap/GetAddressMap methods); tests inject a fake.
 type Repository interface {
-	Upsert(ctx context.Context, xmrAddress, tariAddress string) error
+	Set(ctx context.Context, xmrAddress, tariAddress string) error
 	Get(ctx context.Context, xmrAddress string) (Record, error)
 }
 
@@ -286,7 +293,20 @@ func (h *Handler) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.repo.Upsert(r.Context(), req.XMRAddress, req.TariAddress); err != nil {
+	if err := h.repo.Set(r.Context(), req.XMRAddress, req.TariAddress); err != nil {
+		if errors.Is(err, ErrAlreadyMapped) {
+			// 409 Conflict is more semantically correct here than a
+			// generic 400: the request is well-formed and valid, it
+			// just conflicts with existing server state (an
+			// already-set mapping) -- see FIX_BRIEF.md's set-once/
+			// no-overwrite instruction. This is this package's own
+			// native, non-legacy-shaped response; legacyapi's
+			// wrapper (handleUpdateTariAddress) intentionally keeps
+			// its own distinct legacy-shaped 400 for this same case.
+			h.observeWrite(metrics.ResultRejected)
+			writeJSONErr(w, http.StatusConflict, "xmr_address is already mapped to a tari_address")
+			return
+		}
 		h.observeWrite(metrics.ResultError)
 		writeJSONErr(w, http.StatusInternalServerError, "upsert failed")
 		return

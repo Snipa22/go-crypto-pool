@@ -61,20 +61,21 @@ func newFakeRepo() *fakeRepo {
 	return &fakeRepo{rows: map[string]Record{}}
 }
 
-func (f *fakeRepo) Upsert(_ context.Context, xmrAddress, tariAddress string) error {
+func (f *fakeRepo) Set(_ context.Context, xmrAddress, tariAddress string) error {
 	if f.err != nil {
 		return f.err
 	}
+	if _, existed := f.rows[xmrAddress]; existed {
+		return ErrAlreadyMapped
+	}
 	f.gotXMR, f.gotTari = xmrAddress, tariAddress
 	now := time.Unix(1000, 0)
-	rec, existed := f.rows[xmrAddress]
-	if !existed {
-		rec.CreatedAt = now
+	f.rows[xmrAddress] = Record{
+		XMRAddress:  xmrAddress,
+		TariAddress: tariAddress,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
-	rec.XMRAddress = xmrAddress
-	rec.TariAddress = tariAddress
-	rec.UpdatedAt = now
-	f.rows[xmrAddress] = rec
 	return nil
 }
 
@@ -130,21 +131,22 @@ func TestUpsertThenGet_OK(t *testing.T) {
 	}
 }
 
-func TestUpsert_ReplacesExistingMapping(t *testing.T) {
+func TestUpsert_SecondCallForSameXMRAddressIsRejected(t *testing.T) {
 	repo := newFakeRepo()
 	mux := NewHandler(repo, Config{}).Mux()
 
 	doPost(t, mux, "/api/v1/address-map", `{"xmr_address":"`+realXMRMainnetAddr+`","tari_address":"`+realTariEsmeraldaAddr+`"}`)
 	rr := doPost(t, mux, "/api/v1/address-map", `{"xmr_address":"`+realXMRMainnetAddr+`","tari_address":"`+realTariMainnetAddr+`"}`)
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("second upsert status = %d, body = %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("second set status = %d, want 409, body = %s", rr.Code, rr.Body.String())
 	}
 
+	// The original mapping must remain completely unchanged.
 	rr = doGet(t, mux, "/api/v1/address-map?xmr_address="+realXMRMainnetAddr)
 	var resp getResponse
 	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
-	if resp.TariAddress != realTariMainnetAddr {
-		t.Fatalf("expected replaced tari_address, got %q", resp.TariAddress)
+	if resp.TariAddress != realTariEsmeraldaAddr {
+		t.Fatalf("expected original tari_address to be preserved, got %q", resp.TariAddress)
 	}
 }
 
