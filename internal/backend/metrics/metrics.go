@@ -75,6 +75,29 @@ const (
 	PayoutResultError   = "error"
 )
 
+// Result label values for auth_attempts_total — whether one POST
+// /authenticate attempt (internal/backend/authapi) ended in a
+// successfully-issued JWT or a rejected credential check. See
+// PROD_HARDENING_REVIEW.md finding #19: this endpoint was previously
+// entirely metric-invisible, despite being the standard
+// credential-stuffing/brute-force target.
+const (
+	AuthResultSuccess = "success"
+	AuthResultFailure = "failure"
+)
+
+// Result label values for force_payout_writes_total — whether one
+// POST /user/forcePayment write (internal/backend/authapi) actually
+// flagged a real `balance` row's force_payout column, or failed (most
+// commonly: no matching balance row for that address/algo/network).
+// Per PROD_HARDENING_REVIEW.md finding #19, every force-payout write
+// moves real money ahead of a miner's normal payout schedule and is
+// worth its own always-on counter regardless of outcome.
+const (
+	ForcePayoutResultSuccess = "success"
+	ForcePayoutResultFailure = "failure"
+)
+
 // Result label values for disbursement_batches_total — whether one
 // real on-chain transfer batch (internal/backend/disburse.Engine)
 // was actually sent, failed at the wallet RPC layer, was skipped
@@ -142,6 +165,19 @@ type Metrics struct {
 	HTTPRequestsInFlight prometheus.Gauge
 	BuildInfo            *prometheus.GaugeVec
 
+	// BlocksRejectedEmptyHashTotal counts, separately from the
+	// generic BlocksTotal{result="rejected"} bucket, every block
+	// rejected specifically because it carried an empty/missing
+	// hash, by algo and network. See internal/backend/api's
+	// errEmptyBlockHash and PROD_HARDENING_REVIEW.md finding #13:
+	// internal/leaflib/direct's realBlockHashHex can return "" when
+	// every accepting node reports an empty
+	// SubmitBlockResponse.block_hash, silently dropping that block's
+	// accounting with only a leaf-side log line previously -- this
+	// metric makes that specific failure mode operator-visible on
+	// GET /metrics.
+	BlocksRejectedEmptyHashTotal *prometheus.CounterVec
+
 	// UnlockerBlocksTotal counts every terminal per-block outcome
 	// the poll loop in internal/backend/unlocker produces — matured,
 	// orphaned, or a Verify/SetBlockStatus error — labeled by algo
@@ -152,6 +188,29 @@ type Metrics struct {
 	// worth of one Unlocker.RunOnce pass (fetching + verifying every
 	// pending block for that algo), labeled by algo.
 	UnlockerPollDuration *prometheus.HistogramVec
+
+	// UnlockerPendingBlocks is the current number of blocks still
+	// pending (not yet resolved matured/orphaned) at the end of the
+	// most recent Unlocker.RunOnce pass, by algo and network. A
+	// Gauge, not a Counter -- this is live state, mirroring
+	// DisbursementUnresolvedPayouts' role on the disbursement side.
+	// Zero (or a small, expected-for-fresh-confirmations number) is
+	// healthy; a persistently large or growing value is exactly the
+	// "blocks stuck" failure mode PROD_HARDENING_REVIEW.md finding
+	// #11 flags as previously metric-invisible.
+	UnlockerPendingBlocks *prometheus.GaugeVec
+	// UnlockerPendingBlockOldestAgeSeconds is how long ago (in
+	// seconds) the OLDEST still-pending block for an (algo, network)
+	// was first seen by this backend (blocks.inserted_at), by algo
+	// and network. Only set when at least one pending block's
+	// InsertedAt is known — see unlocker.observePending. A steadily
+	// climbing value for a pair that should be maturing normally is
+	// the same "stuck pending" signal UnlockerPendingBlocks reports
+	// as a count, viewed as an age instead — the two are
+	// deliberately complementary (a single very-old block among
+	// otherwise-healthy ones raises this without necessarily
+	// raising the count much, and vice versa).
+	UnlockerPendingBlockOldestAgeSeconds *prometheus.GaugeVec
 
 	// PayoutCyclesTotal counts every payout calculation cycle
 	// (internal/backend/payout.Calculator's Calculate{PPS,PPLNS,
@@ -295,6 +354,44 @@ type Metrics struct {
 	// worth of one networkpoller poll pass, labeled by algo and
 	// network.
 	NetworkPollDuration *prometheus.HistogramVec
+
+	// AuthAttemptsTotal counts every POST /authenticate attempt
+	// (internal/backend/authapi), by result (success/failure — see
+	// AuthResult* above). Previously entirely metric-invisible (see
+	// PROD_HARDENING_REVIEW.md finding #19) despite being the
+	// standard credential-stuffing/brute-force target.
+	AuthAttemptsTotal *prometheus.CounterVec
+
+	// ForcePayoutWritesTotal counts every POST /user/forcePayment
+	// write (internal/backend/authapi), by algo, network, and result
+	// (success/failure — see ForcePayoutResult* above). Per the
+	// audit (PROD_HARDENING_REVIEW.md finding #19), every
+	// force-payout write moves real money ahead of a miner's normal
+	// payout schedule and is worth its own always-on counter
+	// regardless of outcome.
+	ForcePayoutWritesTotal *prometheus.CounterVec
+
+	// AddressMapWritesTotal counts every POST /api/v1/address-map
+	// write (internal/backend/addressmap), by result (success/error
+	// — using the same Result* vocabulary api.go's shares_total/
+	// blocks_total already use). Flagged by the audit
+	// (PROD_HARDENING_REVIEW.md finding #19) as "the single most
+	// alert-worthy event" this backend can emit: every address-map
+	// set is either a legitimate first-time mapping OR evidence
+	// someone tried (and, per the set-once upsert behavior, may have
+	// succeeded in overwriting) an existing XMR->Tari mapping.
+	AddressMapWritesTotal *prometheus.CounterVec
+
+	// PendingBalanceOutstanding is the current sum of every positive
+	// `balance.pending_balance` row, by algo and network — a Gauge,
+	// i.e. live state, refreshed periodically by cmd/backend's own
+	// pending-balance poller (see runPendingBalancePoller). Per
+	// PROD_HARDENING_REVIEW.md finding #19: existing coverage tracks
+	// payout/disburse/unlocker/wallet-balance activity, but nothing
+	// previously reported the OUTSTANDING liability itself -- how
+	// much this pool currently owes its miners in total, regardless
+	// of whether any payout/disbursement cycle has run recently.
+	PendingBalanceOutstanding *prometheus.GaugeVec
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -325,6 +422,11 @@ func New(version string) *Metrics {
 		Name: "blocks_total",
 		Help: "Total number of blocks submitted to the backend, by algo, network, and result (accepted/rejected/error).",
 	}, []string{"algo", "network", "result"})
+
+	m.BlocksRejectedEmptyHashTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "blocks_rejected_empty_hash_total",
+		Help: "Total number of blocks rejected specifically for carrying an empty/missing hash, by algo and network -- a distinct, more specific signal than blocks_total{result=\"rejected\"} for this one failure mode (see internal/leaflib/direct's realBlockHashHex).",
+	}, []string{"algo", "network"})
 
 	m.ShareInsertDuration = registerHistogram(reg, prometheus.HistogramOpts{
 		Name:    "share_insert_duration_seconds",
@@ -359,6 +461,16 @@ func New(version string) *Metrics {
 		Help:    "Wall-clock time for one algo's pending-block poll pass in the block unlocker, by algo.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"algo"})
+
+	m.UnlockerPendingBlocks = registerGaugeVec(reg, prometheus.GaugeOpts{
+		Name: "unlocker_pending_blocks",
+		Help: "Current number of blocks still pending (not yet resolved matured/orphaned) after the most recent block-unlocker poll pass, by algo and network.",
+	}, []string{"algo", "network"})
+
+	m.UnlockerPendingBlockOldestAgeSeconds = registerGaugeVec(reg, prometheus.GaugeOpts{
+		Name: "unlocker_pending_block_oldest_age_seconds",
+		Help: "Age, in seconds, of the oldest still-pending block for an (algo, network) pair, measured from when this backend first received it (blocks.inserted_at).",
+	}, []string{"algo", "network"})
 
 	m.PayoutCyclesTotal = registerCounterVec(reg, prometheus.CounterOpts{
 		Name: "payout_cycles_total",
@@ -457,6 +569,26 @@ func New(version string) *Metrics {
 		Name:    "network_poll_duration_seconds",
 		Help:    "Wall-clock time for one algo/network target's real upstream chain-state query in the network-state poller, by algo and network.",
 		Buckets: prometheus.DefBuckets,
+	}, []string{"algo", "network"})
+
+	m.AuthAttemptsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "auth_attempts_total",
+		Help: "Total number of POST /authenticate attempts, by result (success/failure).",
+	}, []string{"result"})
+
+	m.ForcePayoutWritesTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "force_payout_writes_total",
+		Help: "Total number of POST /user/forcePayment writes, by algo, network, and result (success/failure). Every write moves real money ahead of a miner's normal payout schedule.",
+	}, []string{"algo", "network", "result"})
+
+	m.AddressMapWritesTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "address_map_writes_total",
+		Help: "Total number of POST /api/v1/address-map writes, by result (accepted/rejected/error). Every write is either a legitimate first-time mapping or evidence of an attempted hijack of an existing XMR->Tari mapping.",
+	}, []string{"result"})
+
+	m.PendingBalanceOutstanding = registerGaugeVec(reg, prometheus.GaugeOpts{
+		Name: "pending_balance_outstanding",
+		Help: "Current sum of every positive balance.pending_balance row, by algo and network -- the total this pool currently owes its miners.",
 	}, []string{"algo", "network"})
 
 	return m
