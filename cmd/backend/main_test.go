@@ -46,6 +46,110 @@ func TestParseNetwork(t *testing.T) {
 	}
 }
 
+// TestValidateIngestionAuthConfig proves the fix-1-unauth-ingestion
+// startup policy end to end at the unit level (testing run()'s
+// os.Exit-triggering log.Fatalf path directly would be awkward, so
+// this is the extracted, directly-testable check run() calls before
+// it does anything else):
+//
+//   - no auth config and no override -> refuse to start (error)
+//   - no auth config but the override flag/env is set -> allowed to
+//     start
+//   - both auth header name/value set -> allowed to start regardless
+//     of the override
+func TestValidateIngestionAuthConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     config
+		wantErr bool
+	}{
+		{
+			name:    "no auth config, no override -> refuses to start",
+			cfg:     config{},
+			wantErr: true,
+		},
+		{
+			name: "no auth config, override set -> allowed to start",
+			cfg: config{
+				insecureAllowUnauthenticatedIngestion: true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "auth header name+value both set, no override -> allowed to start",
+			cfg: config{
+				authHeaderName:  "Authorization",
+				authHeaderValue: "Bearer secret",
+			},
+			wantErr: false,
+		},
+		{
+			name: "auth header name+value both set, override also set -> still allowed to start",
+			cfg: config{
+				authHeaderName:                        "Authorization",
+				authHeaderValue:                       "Bearer secret",
+				insecureAllowUnauthenticatedIngestion: true,
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateIngestionAuthConfig(tc.cfg)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateIngestionAuthConfig(%+v) = nil, want error", tc.cfg)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateIngestionAuthConfig(%+v) = %v, want nil", tc.cfg, err)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_InsecureAllowUnauthenticatedIngestion_FlagAndEnv proves
+// the new -insecure-allow-unauthenticated-ingestion flag/
+// GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION env var are wired into
+// loadConfig() following the same flag > env > hardcoded-default
+// precedence as every other bool-shaped setting in this file (see
+// cmd/leaf-direct/main.go's BoolVar convention this mirrors).
+func TestLoadConfig_InsecureAllowUnauthenticatedIngestion_FlagAndEnv(t *testing.T) {
+	t.Run("default is false", func(t *testing.T) {
+		runPrecedenceCase(t, precedenceCase{
+			name: "default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.insecureAllowUnauthenticatedIngestion {
+					t.Errorf("insecureAllowUnauthenticatedIngestion = true, want default false")
+				}
+			},
+		})
+	})
+
+	t.Run("env sets true", func(t *testing.T) {
+		runPrecedenceCase(t, precedenceCase{
+			name: "env",
+			env:  map[string]string{"GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION": "true"},
+			check: func(t *testing.T, cfg config) {
+				if !cfg.insecureAllowUnauthenticatedIngestion {
+					t.Errorf("insecureAllowUnauthenticatedIngestion = false, want true from env")
+				}
+			},
+		})
+	})
+
+	t.Run("flag sets true", func(t *testing.T) {
+		runPrecedenceCase(t, precedenceCase{
+			name: "flag",
+			args: []string{"-insecure-allow-unauthenticated-ingestion"},
+			check: func(t *testing.T, cfg config) {
+				if !cfg.insecureAllowUnauthenticatedIngestion {
+					t.Errorf("insecureAllowUnauthenticatedIngestion = false, want true from flag")
+				}
+			},
+		})
+	})
+}
+
 // precedenceCase drives one subtest of TestLoadConfigPrecedence. toml, if
 // non-empty, is written to a temp file and wired in via "-config=<path>";
 // env is applied with t.Setenv (auto-restored); args are appended after the

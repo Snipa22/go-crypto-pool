@@ -14,16 +14,44 @@
 //	GCPOOL_DB_DSN            (required) Postgres DSN, e.g.
 //	                         "postgres://user:pass@host:5432/db?sslmode=disable"
 //	GCPOOL_LISTEN_ADDR       (optional) HTTP listen address, default ":8080"
-//	GCPOOL_AUTH_HEADER_NAME  (optional) shared-secret auth header name to
-//	                         require on /api/v1/share and /api/v1/block,
-//	                         e.g. "Authorization". Must be set together
-//	                         with GCPOOL_AUTH_HEADER_VALUE, or not at all
-//	                         — see internal/backend/api.Config: both
-//	                         empty means no auth check is performed
-//	                         (matches the leaf transport's opt-in v1 auth
-//	                         story).
-//	GCPOOL_AUTH_HEADER_VALUE (optional) expected value for the header
-//	                         above.
+//	GCPOOL_AUTH_HEADER_NAME  (required, unless
+//	                         GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION
+//	                         is set — see below) shared-secret auth
+//	                         header name to require on /api/v1/share
+//	                         and /api/v1/block, e.g. "Authorization".
+//	                         Must be set together with
+//	                         GCPOOL_AUTH_HEADER_VALUE — see
+//	                         internal/backend/api.Config for the
+//	                         header-check itself. This command's own
+//	                         validateIngestionAuthConfig refuses to
+//	                         start (fail fast, non-zero exit) if this
+//	                         and GCPOOL_AUTH_HEADER_VALUE are not both
+//	                         set, UNLESS the explicit override below
+//	                         is passed — see PROD_HARDENING_REVIEW.md
+//	                         finding #1: share/block ingestion is the
+//	                         leaf-to-backend trust boundary carrying
+//	                         real payout-triggering data, so
+//	                         "unauthenticated by default" is a
+//	                         regression versus legacy's own
+//	                         always-on shared-secret model
+//	                         (nodejs-pool-sxmr's lib/remoteShare.js),
+//	                         not a preserved legacy behavior.
+//	GCPOOL_AUTH_HEADER_VALUE (required, unless overridden — see above)
+//	                         expected value for the header above.
+//	GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION
+//	                         (optional, "true" to enable) explicit,
+//	                         loudly-logged escape hatch that allows
+//	                         this command to start with
+//	                         GCPOOL_AUTH_HEADER_NAME/
+//	                         GCPOOL_AUTH_HEADER_VALUE both unset,
+//	                         leaving /api/v1/share and /api/v1/block
+//	                         completely unauthenticated. LOCAL/DEV USE
+//	                         ONLY — this is real-money-risk in any
+//	                         deployment reachable by anyone other than
+//	                         the operator's own trusted leaves. Default
+//	                         "false": with no flags/env set at all,
+//	                         this command refuses to start rather than
+//	                         silently accepting every share/block.
 //	GCPOOL_NETWORK           (required) the network this backend is
 //	                         configured for. Accepts "mainnet" or
 //	                         "testnet" (case-insensitive). There is no
@@ -199,6 +227,15 @@ type config struct {
 	authHeaderValue string
 	network         string
 
+	// insecureAllowUnauthenticatedIngestion is the explicit,
+	// loudly-logged escape hatch that allows run() to start with
+	// authHeaderName/authHeaderValue both unset (see
+	// validateIngestionAuthConfig and this file's package doc
+	// comment for GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION).
+	// Local/dev use only — false is the only safe production value,
+	// and false is this field's default.
+	insecureAllowUnauthenticatedIngestion bool
+
 	tariGRPCAddr  string
 	moneroRPCAddr string
 
@@ -274,8 +311,9 @@ func loadConfig() (config, error) {
 
 	flag.StringVar(&cfg.dbDSN, "db-dsn", envOr("GCPOOL_DB_DSN", ""), "(required) Postgres DSN, e.g. \"postgres://user:pass@host:5432/db?sslmode=disable\". Env: GCPOOL_DB_DSN")
 	flag.StringVar(&cfg.listenAddr, "listen-addr", envOr("GCPOOL_LISTEN_ADDR", defaultListenAddr), "HTTP listen address. Env: GCPOOL_LISTEN_ADDR")
-	flag.StringVar(&cfg.authHeaderName, "auth-header-name", envOr("GCPOOL_AUTH_HEADER_NAME", ""), "shared-secret auth header name to require on /api/v1/share and /api/v1/block, e.g. \"Authorization\". Must be set together with -auth-header-value, or not at all -- both empty means no auth check is performed. Env: GCPOOL_AUTH_HEADER_NAME")
-	flag.StringVar(&cfg.authHeaderValue, "auth-header-value", envOr("GCPOOL_AUTH_HEADER_VALUE", ""), "expected value for -auth-header-name above. Env: GCPOOL_AUTH_HEADER_VALUE")
+	flag.StringVar(&cfg.authHeaderName, "auth-header-name", envOr("GCPOOL_AUTH_HEADER_NAME", ""), "(required, unless -insecure-allow-unauthenticated-ingestion is set) shared-secret auth header name to require on /api/v1/share and /api/v1/block, e.g. \"Authorization\". Must be set together with -auth-header-value -- run() refuses to start if both are empty and the override flag below isn't set. Env: GCPOOL_AUTH_HEADER_NAME")
+	flag.StringVar(&cfg.authHeaderValue, "auth-header-value", envOr("GCPOOL_AUTH_HEADER_VALUE", ""), "(required, unless -insecure-allow-unauthenticated-ingestion is set) expected value for -auth-header-name above. Env: GCPOOL_AUTH_HEADER_VALUE")
+	flag.BoolVar(&cfg.insecureAllowUnauthenticatedIngestion, "insecure-allow-unauthenticated-ingestion", envOr("GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION", "false") == "true", "LOCAL/DEV USE ONLY: explicit, loudly-logged override that allows this command to start with -auth-header-name/-auth-header-value both unset, leaving /api/v1/share and /api/v1/block completely unauthenticated. Disabled by default -- with no flags/env set at all, run() refuses to start rather than silently accepting every share/block. Env: GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION (\"true\" to enable)")
 	flag.StringVar(&cfg.network, "network", envOr("GCPOOL_NETWORK", ""), "(required) the network this backend is configured for. Accepts \"mainnet\" or \"testnet\" (case-insensitive). There is no default -- startup fails fast if this is missing or does not parse to a valid network. Env: GCPOOL_NETWORK")
 
 	flag.StringVar(&cfg.tariGRPCAddr, "tari-grpc-addr", envOr("GCPOOL_TARI_GRPC_ADDR", ""), "host:port of a real Tari base node's GRPC endpoint. When set, the block unlocker polls every pending ALGO_RXT/ALGO_C29/ALGO_SHA3X block against it to detect maturity/orphaning. When unset, those algos' blocks are simply never auto-unlocked. Env: GCPOOL_TARI_GRPC_ADDR")
@@ -341,6 +379,8 @@ type fileConfig struct {
 	AuthHeaderValue *string `toml:"auth_header_value"`
 	Network         *string `toml:"network"`
 
+	InsecureAllowUnauthenticatedIngestion *bool `toml:"insecure_allow_unauthenticated_ingestion"`
+
 	TariGRPCAddr  *string `toml:"tari_grpc_addr"`
 	MoneroRPCAddr *string `toml:"monero_rpc_addr"`
 
@@ -402,6 +442,8 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.authHeaderName, fc.AuthHeaderName, visited, "auth-header-name", "GCPOOL_AUTH_HEADER_NAME")
 	cfgfile.ApplyString(&cfg.authHeaderValue, fc.AuthHeaderValue, visited, "auth-header-value", "GCPOOL_AUTH_HEADER_VALUE")
 	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "GCPOOL_NETWORK")
+
+	cfgfile.ApplyBool(&cfg.insecureAllowUnauthenticatedIngestion, fc.InsecureAllowUnauthenticatedIngestion, visited, "insecure-allow-unauthenticated-ingestion", "GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION")
 
 	cfgfile.ApplyString(&cfg.tariGRPCAddr, fc.TariGRPCAddr, visited, "tari-grpc-addr", "GCPOOL_TARI_GRPC_ADDR")
 	cfgfile.ApplyString(&cfg.moneroRPCAddr, fc.MoneroRPCAddr, visited, "monero-rpc-addr", "GCPOOL_MONERO_RPC_ADDR")
@@ -1654,12 +1696,51 @@ func runWalletStatsPoller(ctx context.Context, m *metrics.Metrics, targets []wal
 	}
 }
 
+// validateIngestionAuthConfig enforces that the share/block ingestion
+// endpoints (POST /api/v1/share, POST /api/v1/block) are never started
+// unauthenticated by default. internal/backend/api.Handler's own
+// checkAuth/authConfigured (see that package's doc comment) correctly
+// treats "AuthHeaderName and AuthHeaderValue both empty" as "no auth
+// check performed" once given that config — this function's job is
+// narrower and lives entirely at this command's startup-wiring layer:
+// it decides whether "both empty" is ever allowed to reach that
+// Handler as the RESOLVED config in the first place.
+//
+// Per PROD_HARDENING_REVIEW.md finding #1, the safe default is
+// "refuse to start" — the operator must either configure both
+// GCPOOL_AUTH_HEADER_NAME/GCPOOL_AUTH_HEADER_VALUE (production), or
+// explicitly pass -insecure-allow-unauthenticated-ingestion (env
+// GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION=true) to opt into
+// unauthenticated ingestion for local/dev use only. There is
+// deliberately no partial-config allowance here: exactly one of
+// AuthHeaderName/AuthHeaderValue being set is already handled (and
+// already effectively enforced, if oddly) by api.Handler's own
+// checkAuth once config reaches it — this function only ever blocks
+// startup on the fully-unauthenticated "both empty, no override"
+// case.
+func validateIngestionAuthConfig(cfg config) error {
+	if cfg.authHeaderName == "" && cfg.authHeaderValue == "" && !cfg.insecureAllowUnauthenticatedIngestion {
+		return errors.New("refusing to start: GCPOOL_AUTH_HEADER_NAME/GCPOOL_AUTH_HEADER_VALUE (or -auth-header-name/-auth-header-value) are not set. " +
+			"POST /api/v1/share and /api/v1/block are the leaf-to-backend trust boundary carrying real payout-triggering data and MUST be authenticated. " +
+			"Set both -auth-header-name/-auth-header-value (or their GCPOOL_AUTH_HEADER_NAME/GCPOOL_AUTH_HEADER_VALUE env vars), " +
+			"or pass -insecure-allow-unauthenticated-ingestion (env GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION=true) " +
+			"to explicitly opt into unauthenticated ingestion for LOCAL/DEV USE ONLY")
+	}
+	return nil
+}
+
 func run(cfg config) error {
 	if cfg.dbDSN == "" {
 		return errors.New("GCPOOL_DB_DSN (or -db-dsn) is required")
 	}
 	if strings.TrimSpace(cfg.jwtSecret) == "" {
 		return errors.New("GCPOOL_JWT_SECRET (or -jwt-secret) is required")
+	}
+	if err := validateIngestionAuthConfig(cfg); err != nil {
+		return err
+	}
+	if cfg.authHeaderName == "" && cfg.authHeaderValue == "" && cfg.insecureAllowUnauthenticatedIngestion {
+		log.Print("backend: WARNING: -insecure-allow-unauthenticated-ingestion (GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION) is set -- POST /api/v1/share and /api/v1/block are running COMPLETELY UNAUTHENTICATED. This is for local/dev use only. Anyone with network reach to this backend can submit fabricated shares/blocks and trigger real payouts. Do NOT use this in production.")
 	}
 
 	listenAddr := cfg.listenAddr

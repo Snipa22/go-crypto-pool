@@ -465,9 +465,9 @@ func TestMetrics_ShareOutcomes_RecordedWithRealLabels(t *testing.T) {
 	if !strings.Contains(body, wantAccepted) {
 		t.Errorf("expected %q in %s's /metrics output, got:\n%s", wantAccepted, "h", body)
 	}
-	wantRejected := `shares_total{algo="unknown",network="unknown",pool_type="unknown",result="rejected"} 1`
-	if !strings.Contains(body, wantRejected) {
-		t.Errorf("expected %q (bad-auth rejection) in /metrics output, got:\n%s", wantRejected, body)
+	wantUnauthorized := `shares_total{algo="unknown",network="unknown",pool_type="unknown",result="unauthorized"} 1`
+	if !strings.Contains(body, wantUnauthorized) {
+		t.Errorf("expected %q (bad-auth rejection) in /metrics output, got:\n%s", wantUnauthorized, body)
 	}
 
 	mismatchBody := scrapeMetrics(t, hMismatch)
@@ -511,6 +511,43 @@ func TestMetrics_BlockOutcomes_RecordedWithRealLabels(t *testing.T) {
 	wantError := `blocks_total{algo="C29",network="MAINNET",result="error"} 1`
 	if !strings.Contains(errBody, wantError) {
 		t.Errorf("expected %q in /metrics output, got:\n%s", wantError, errBody)
+	}
+}
+
+// TestMetrics_AuthRejections_CountedAsUnauthorized proves the
+// rejected-for-auth-specifically outcome on both /api/v1/share and
+// /api/v1/block is recorded with the distinct result="unauthorized"
+// label (metrics.ResultUnauthorized) on the existing shares_total/
+// blocks_total counters — not folded into the generic "rejected"
+// bucket, and not a brand new, parallel metric family.
+func TestMetrics_AuthRejections_CountedAsUnauthorized(t *testing.T) {
+	shareRepo := &fakeRepo{}
+	hShare := NewHandler(shareRepo, Config{AuthHeaderName: "Authorization", AuthHeaderValue: "Bearer good-token"})
+	rr := postProto(t, hShare.Mux(), "/api/v1/share", validShare(), nil)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("share: status = %d, want 401", rr.Code)
+	}
+
+	blockRepo := &fakeRepo{}
+	hBlock := NewHandler(blockRepo, Config{AuthHeaderName: "Authorization", AuthHeaderValue: "Bearer good-token"})
+	rrBlock := postProto(t, hBlock.Mux(), "/api/v1/block", validBlock(), map[string]string{"Authorization": "Bearer wrong-token"})
+	if rrBlock.Code != http.StatusUnauthorized {
+		t.Fatalf("block: status = %d, want 401", rrBlock.Code)
+	}
+
+	shareBody := scrapeMetrics(t, hShare)
+	wantShare := `shares_total{algo="unknown",network="unknown",pool_type="unknown",result="unauthorized"} 1`
+	if !strings.Contains(shareBody, wantShare) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", wantShare, shareBody)
+	}
+	if strings.Contains(shareBody, `shares_total{algo="unknown",network="unknown",pool_type="unknown",result="rejected"}`) {
+		t.Errorf("auth rejection must not also be counted as a generic \"rejected\" result:\n%s", shareBody)
+	}
+
+	blockBody := scrapeMetrics(t, hBlock)
+	wantBlock := `blocks_total{algo="unknown",network="unknown",result="unauthorized"} 1`
+	if !strings.Contains(blockBody, wantBlock) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", wantBlock, blockBody)
 	}
 }
 

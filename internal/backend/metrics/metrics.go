@@ -24,18 +24,25 @@ import (
 )
 
 // Result label values for shares_total/blocks_total. These map
-// directly onto the three outcomes the backend's HTTP handlers
-// actually distinguish today (see internal/backend/api's
-// handleShare/handleBlock): a share/block is either persisted
-// (Accepted), rejected before ever reaching the DB (auth failure,
-// malformed body, failed validation, network mismatch — all
-// Rejected), or it reached the DB and the insert itself failed
-// (Error). Do not add new values here without a corresponding new
-// code path in api.go that actually produces them.
+// directly onto the outcomes the backend's HTTP handlers actually
+// distinguish today (see internal/backend/api's handleShare/
+// handleBlock): a share/block is either persisted (Accepted),
+// rejected for failing the shared-secret auth check specifically
+// (Unauthorized — see PROD_HARDENING_REVIEW.md finding #1: this
+// exists so a real, queryable/alertable count of
+// rejected-for-auth ingestion attempts doesn't require standing up
+// a brand new, parallel metric family, since it reuses this same
+// counter/label shape), rejected before ever reaching the DB for
+// any OTHER reason (malformed body, failed validation, network
+// mismatch — all Rejected), or it reached the DB and the insert
+// itself failed (Error). Do not add new values here without a
+// corresponding new code path in api.go that actually produces
+// them.
 const (
-	ResultAccepted = "accepted"
-	ResultRejected = "rejected"
-	ResultError    = "error"
+	ResultAccepted     = "accepted"
+	ResultRejected     = "rejected"
+	ResultError        = "error"
+	ResultUnauthorized = "unauthorized"
 
 	// UnknownLabel is used for algo/network/pool_type when a
 	// share/block is rejected before it could be decoded far enough
