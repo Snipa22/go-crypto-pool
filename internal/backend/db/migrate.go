@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -50,16 +49,16 @@ const createSchemaMigrationsTableSQL = `
 // schema_migrations rows for them at all): for each migration not yet
 // recorded, ApplyMigrations attempts to apply it inside a transaction
 // as normal. If that fails specifically because the underlying
-// object(s) already exist (Postgres error code 42P07
-// "duplicate_table", detected via pgconn.PgError, with an "already
-// exists" substring match as a fallback), that is treated as evidence
-// this migration was already applied by the old, untracked code path:
-// the failed transaction is rolled back, and a backfill row for that
-// version is inserted into schema_migrations (in its own small
-// transaction) instead of treating it as a hard error. Any OTHER
-// error (syntax error, missing dependency, etc.) on a migration that
-// was never applied still causes ApplyMigrations to return a real
-// error, unchanged from before.
+// object(s) already exist (a real Postgres duplicate-object SQLSTATE
+// — see isAlreadyExistsError's own doc comment for the exact codes
+// matched), that is treated as evidence this migration was already
+// applied by the old, untracked code path: the failed transaction is
+// rolled back, and a backfill row for that version is inserted into
+// schema_migrations (in its own small transaction) instead of
+// treating it as a hard error. Any OTHER error (syntax error, missing
+// dependency, etc.) on a migration that was never applied still
+// causes ApplyMigrations to return a real error, unchanged from
+// before.
 func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, createSchemaMigrationsTableSQL); err != nil {
 		return fmt.Errorf("db: creating schema_migrations table: %w", err)
@@ -176,17 +175,38 @@ func backfillMigrationVersion(ctx context.Context, pool *pgxpool.Pool, name stri
 
 // isAlreadyExistsError reports whether err is a Postgres error
 // indicating some object a migration tried to create already exists
-// (SQLSTATE 42P07 "duplicate_table", or the analogous "already
-// exists" text as a fallback for any other duplicate-object error
-// class Postgres might report here) — the signal ApplyMigrations uses
-// to detect a migration that was already applied by the old,
-// untracked code path.
+// — the signal ApplyMigrations uses to detect a migration that was
+// already applied by the old, untracked code path.
+//
+// Matches ONLY the specific Postgres SQLSTATE error codes a
+// migration's own DDL can actually produce for "this already
+// exists": 42P07 duplicate_table (CREATE TABLE/INDEX/VIEW/SEQUENCE —
+// every migrations/*.up.sql CREATE statement in this repo), 42701
+// duplicate_column (ALTER TABLE ADD COLUMN — see e.g.
+// 0005_block_pool_id.up.sql/0008_balance_force_payout.up.sql), and
+// 42710 duplicate_object (ALTER TABLE ADD CONSTRAINT — see
+// 0010_payouts_ambiguous_status.up.sql). Deliberately NOT a loose
+// `strings.Contains(err.Error(), "already exists")` fallback
+// (PROD_HARDENING_REVIEW.md finding #20): that substring appears in
+// unrelated Postgres error messages too (e.g. a role, extension, or
+// database "already exists" error that has nothing to do with THIS
+// migration's own objects), so a genuinely-failed migration could be
+// misclassified as successfully-applied and silently skipped/
+// backfilled instead of surfacing as the real error it is. Matching
+// on the exact SQLSTATE class instead means only a real "this
+// specific object already exists" condition is ever treated as the
+// backfill case.
 func isAlreadyExistsError(err error) bool {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		if pgErr.Code == "42P07" {
-			return true
-		}
+	if !errors.As(err, &pgErr) {
+		return false
 	}
-	return strings.Contains(err.Error(), "already exists")
+	switch pgErr.Code {
+	case "42P07", // duplicate_table (also covers indexes/views/sequences)
+		"42701", // duplicate_column
+		"42710": // duplicate_object (e.g. a named constraint)
+		return true
+	default:
+		return false
+	}
 }

@@ -500,6 +500,149 @@ func TestIntegrationPayableBalancesForcePayoutOverride(t *testing.T) {
 	}
 }
 
+// TestIntegrationPayableBalancesExcludesEmptyAddressRows is the
+// direct repository-level regression test for
+// PROD_HARDENING_REVIEW.md finding #10's defense-in-depth clause: a
+// balance row with payment_address = ” (however it got there --
+// e.g. a pre-fix donation misconfiguration) must never be returned
+// by PayableBalances, no matter how large its pending_balance or
+// whether it is force_payout-flagged, since real WalletClient
+// implementations reject an empty destination address and fail the
+// WHOLE batch it's co-mixed into (see wallet/monero_rpc.go's
+// Transfer).
+func TestIntegrationPayableBalancesExcludesEmptyAddressRows(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+	repo := db.NewRepository(pool)
+
+	// The empty-address row: force_payout=TRUE and a large balance,
+	// so if the empty-address exclusion clause were missing, this
+	// row would otherwise clearly qualify. Repository.SetForcePayout
+	// itself refuses an empty address (defense in depth at that
+	// layer too), so this sets the column directly via raw SQL to
+	// simulate a pre-existing row that predates that validation
+	// (exactly the scenario this defense-in-depth clause exists
+	// for).
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "", nil, 1_000_000); err != nil {
+		t.Fatalf("CreditBalance(empty address): %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE balance SET force_payout = TRUE WHERE algo = 'RXM' AND network = 'TESTNET' AND payment_address = ''`); err != nil {
+		t.Fatalf("raw UPDATE force_payout for empty-address row: %v", err)
+	}
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "real-address", nil, 500); err != nil {
+		t.Fatalf("CreditBalance(real-address): %v", err)
+	}
+
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 0)
+	if err != nil {
+		t.Fatalf("PayableBalances: %v", err)
+	}
+	for _, p := range payable {
+		if p.PaymentAddress == "" {
+			t.Fatalf("PayableBalances: got an empty-address row included: %+v", payable)
+		}
+	}
+	if len(payable) != 1 || payable[0].PaymentAddress != "real-address" {
+		t.Fatalf("PayableBalances: got %+v, want exactly the real-address row", payable)
+	}
+}
+
+// TestIntegrationBalancePendingBalanceCannotGoNegative is the direct
+// regression test for PROD_HARDENING_REVIEW.md finding #20's
+// `CHECK (pending_balance >= 0)` constraint (see
+// migrations/0011_balance_nonnegative_check.up.sql): a raw UPDATE
+// that would drive pending_balance negative must be REJECTED by
+// Postgres itself, not silently applied.
+func TestIntegrationBalancePendingBalanceCannotGoNegative(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+	repo := db.NewRepository(pool)
+
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "double-debit-victim", nil, 100); err != nil {
+		t.Fatalf("CreditBalance: %v", err)
+	}
+
+	// Simulate a double-debit bug: debit MORE than the row's current
+	// pending_balance via the exact same raw SQL shape
+	// completePayoutSent uses (see repository.go).
+	_, err := pool.Exec(ctx, `UPDATE balance SET pending_balance = pending_balance - 200 WHERE algo = 'RXM' AND network = 'TESTNET' AND payment_address = 'double-debit-victim'`)
+	if err == nil {
+		t.Fatal("expected the CHECK (pending_balance >= 0) constraint to reject a debit driving pending_balance negative, got no error")
+	}
+	if !strings.Contains(err.Error(), "balance_pending_balance_nonnegative") {
+		t.Errorf("expected the error to reference the balance_pending_balance_nonnegative constraint, got: %v", err)
+	}
+
+	// The row must be untouched (the whole statement rolled back),
+	// not partially applied.
+	var pending int64
+	if err := pool.QueryRow(ctx, `SELECT pending_balance FROM balance WHERE algo = 'RXM' AND network = 'TESTNET' AND payment_address = 'double-debit-victim'`).Scan(&pending); err != nil {
+		t.Fatalf("querying pending_balance after rejected update: %v", err)
+	}
+	if pending != 100 {
+		t.Errorf("pending_balance after rejected update = %d, want unchanged 100", pending)
+	}
+}
+
+// TestIntegrationPendingBalanceTotals is the direct repository-level
+// test for PendingBalanceTotals (PROD_HARDENING_REVIEW.md finding
+// #19's outstanding-pending_balance gauge source): it must sum
+// positive pending_balance rows grouped by (algo, network), and never
+// return a zero/negative-only group at all.
+func TestIntegrationPendingBalanceTotals(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+	repo := db.NewRepository(pool)
+
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "addr-1", nil, 100); err != nil {
+		t.Fatalf("CreditBalance(addr-1): %v", err)
+	}
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "addr-2", nil, 250); err != nil {
+		t.Fatalf("CreditBalance(addr-2): %v", err)
+	}
+	if err := repo.CreditBalance(ctx, "RXT", "MAINNET", "addr-3", nil, 42); err != nil {
+		t.Fatalf("CreditBalance(addr-3): %v", err)
+	}
+	// A zero-balance row (e.g. fully paid out) must not contribute a
+	// spurious (algo, network) entry.
+	if err := repo.CreditBalance(ctx, "C29", "MAINNET", "addr-4", nil, 0); err != nil {
+		t.Fatalf("CreditBalance(addr-4, zero): %v", err)
+	}
+
+	totals, err := repo.PendingBalanceTotals(ctx)
+	if err != nil {
+		t.Fatalf("PendingBalanceTotals: %v", err)
+	}
+	byKey := map[string]int64{}
+	for _, tt := range totals {
+		byKey[tt.Algo+"/"+tt.Network] = tt.Total
+	}
+	if byKey["RXM/TESTNET"] != 350 {
+		t.Errorf("RXM/TESTNET total = %d, want 350", byKey["RXM/TESTNET"])
+	}
+	if byKey["RXT/MAINNET"] != 42 {
+		t.Errorf("RXT/MAINNET total = %d, want 42", byKey["RXT/MAINNET"])
+	}
+	if _, ok := byKey["C29/MAINNET"]; ok {
+		t.Errorf("expected no C29/MAINNET entry for an all-zero-balance group, got %d", byKey["C29/MAINNET"])
+	}
+	if len(totals) != 2 {
+		t.Fatalf("PendingBalanceTotals: got %d groups, want exactly 2: %+v", len(totals), totals)
+	}
+}
+
 // TestIntegrationCompletePayoutSentForcePayoutFeeLedgerAndReset
 // exercises CompletePayoutSent's new force_payout_fee_atomic
 // accounting: the fee portion of a batch containing both a
