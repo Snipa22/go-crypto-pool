@@ -425,3 +425,184 @@ func TestIntegrationDisbursementLifecycle(t *testing.T) {
 		t.Errorf("got status=%q error=%q, want FAILED/\"not enough unlocked money\"", failStatus, failErr)
 	}
 }
+
+// TestIntegrationPayableBalancesForcePayoutOverride is the direct
+// repository-level regression test for the bug fixed by this
+// change: a below-minPayout balance row flagged force_payout=TRUE
+// must be returned by PayableBalances anyway, while an
+// otherwise-identical below-minPayout row with force_payout=FALSE
+// must NOT be.
+func TestIntegrationPayableBalancesForcePayoutOverride(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+	repo := db.NewRepository(pool)
+
+	// Both rows are below the minPayout=100 threshold used below.
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "forced-below", nil, 40); err != nil {
+		t.Fatalf("CreditBalance(forced-below): %v", err)
+	}
+	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "forced-below", nil); err != nil {
+		t.Fatalf("SetForcePayout(forced-below): %v", err)
+	}
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "not-forced-below", nil, 40); err != nil {
+		t.Fatalf("CreditBalance(not-forced-below): %v", err)
+	}
+	// A normal, above-threshold row for good measure -- must also be
+	// returned, unaffected by any of the above.
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "normal-above", nil, 500); err != nil {
+		t.Fatalf("CreditBalance(normal-above): %v", err)
+	}
+
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	if err != nil {
+		t.Fatalf("PayableBalances: %v", err)
+	}
+	byAddr := map[string]db.PayableBalance{}
+	for _, p := range payable {
+		byAddr[p.PaymentAddress] = p
+	}
+	if _, ok := byAddr["not-forced-below"]; ok {
+		t.Errorf("PayableBalances: got a below-minPayout, non-force_payout row included: %+v", payable)
+	}
+	forced, ok := byAddr["forced-below"]
+	if !ok {
+		t.Fatalf("PayableBalances: expected the below-minPayout force_payout=TRUE row to be included, got %+v", payable)
+	}
+	if !forced.ForcePayout {
+		t.Errorf("PayableBalances: got ForcePayout=false for the forced row, want true: %+v", forced)
+	}
+	normal, ok := byAddr["normal-above"]
+	if !ok {
+		t.Fatalf("PayableBalances: expected the normal above-threshold row to still be included, got %+v", payable)
+	}
+	if normal.ForcePayout {
+		t.Errorf("PayableBalances: got ForcePayout=true for a row never flagged, want false: %+v", normal)
+	}
+	if len(payable) != 2 {
+		t.Fatalf("PayableBalances: got %d rows, want exactly 2 (forced-below, normal-above)", len(payable))
+	}
+
+	// minPayout <= 0 must still return every positive-balance row
+	// regardless of force_payout -- the override is additive, not a
+	// replacement for the existing "no minimum" behavior.
+	all, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 0)
+	if err != nil {
+		t.Fatalf("PayableBalances(min=0): %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("PayableBalances(min=0): got %d rows, want all 3 positive-balance rows", len(all))
+	}
+}
+
+// TestIntegrationCompletePayoutSentForcePayoutFeeLedgerAndReset
+// exercises CompletePayoutSent's new force_payout_fee_atomic
+// accounting: the fee portion of a batch containing both a
+// force_payout row and a normal row lands in the payouts row's
+// force_payout_fee_atomic column (summed across just the forced
+// entries), the forced row's balance has force_payout reset back to
+// FALSE (the flag is consumed, not permanent), and the normal row's
+// force_payout (already FALSE) and full accounting are untouched --
+// all within the single real transaction CompletePayoutSent uses.
+func TestIntegrationCompletePayoutSentForcePayoutFeeLedgerAndReset(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+	repo := db.NewRepository(pool)
+
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "forced", nil, 40); err != nil {
+		t.Fatalf("CreditBalance(forced): %v", err)
+	}
+	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "forced", nil); err != nil {
+		t.Fatalf("SetForcePayout(forced): %v", err)
+	}
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "normal", nil, 500); err != nil {
+		t.Fatalf("CreditBalance(normal): %v", err)
+	}
+
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	if err != nil {
+		t.Fatalf("PayableBalances: %v", err)
+	}
+	var forcedID, normalID int64
+	for _, p := range payable {
+		switch p.PaymentAddress {
+		case "forced":
+			forcedID = p.ID
+		case "normal":
+			normalID = p.ID
+		}
+	}
+	if forcedID == 0 || normalID == 0 {
+		t.Fatalf("PayableBalances: expected both forced and normal rows, got %+v", payable)
+	}
+
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", []int64{forcedID, normalID}, 30+500)
+	if err != nil {
+		t.Fatalf("RecordPendingPayout: %v", err)
+	}
+
+	// The forced row's real Transfer destination amount was 40-10=30
+	// (fee of 10 deducted); the debit still uses its FULL original
+	// PendingBalance (40).
+	entries := []db.DisburseEntry{
+		{BalanceID: forcedID, Amount: 40, ForcePayout: true, ForcePayoutFeeAtomic: 10},
+		{BalanceID: normalID, Amount: 500, ForcePayout: false, ForcePayoutFeeAtomic: 0},
+	}
+	if err := repo.CompletePayoutSent(ctx, payoutID, entries, "txhash-forced-batch", 5); err != nil {
+		t.Fatalf("CompletePayoutSent: %v", err)
+	}
+
+	// Forced row: full pending_balance debited, force_payout reset.
+	var forcedPending, forcedPaid int64
+	var forcedFlag bool
+	if err := pool.QueryRow(ctx, "SELECT pending_balance, paid_balance, force_payout FROM balance WHERE id = $1", forcedID).
+		Scan(&forcedPending, &forcedPaid, &forcedFlag); err != nil {
+		t.Fatalf("querying forced balance: %v", err)
+	}
+	if forcedPending != 0 || forcedPaid != 40 {
+		t.Errorf("forced balance: got pending=%d paid=%d, want 0/40", forcedPending, forcedPaid)
+	}
+	if forcedFlag {
+		t.Errorf("forced balance: got force_payout=true after CompletePayoutSent, want it reset to false (flag consumed)")
+	}
+
+	// Normal row: untouched by any force-payout logic.
+	var normalPending, normalPaid int64
+	var normalFlag bool
+	if err := pool.QueryRow(ctx, "SELECT pending_balance, paid_balance, force_payout FROM balance WHERE id = $1", normalID).
+		Scan(&normalPending, &normalPaid, &normalFlag); err != nil {
+		t.Fatalf("querying normal balance: %v", err)
+	}
+	if normalPending != 0 || normalPaid != 500 {
+		t.Errorf("normal balance: got pending=%d paid=%d, want 0/500", normalPending, normalPaid)
+	}
+	if normalFlag {
+		t.Errorf("normal balance: got force_payout=true, want false (was never set)")
+	}
+
+	// payouts row: real on-chain fee (5) and force_payout_fee_atomic
+	// (10, summed across just the forced entry) are recorded
+	// separately, never conflated.
+	var status, txHash string
+	var fee, forceFee int64
+	if err := pool.QueryRow(ctx, "SELECT status, tx_hash, fee, force_payout_fee_atomic FROM payouts WHERE id = $1", payoutID).
+		Scan(&status, &txHash, &fee, &forceFee); err != nil {
+		t.Fatalf("querying payout row: %v", err)
+	}
+	if status != "SENT" || txHash != "txhash-forced-batch" {
+		t.Errorf("got status=%q tx_hash=%q, want SENT/txhash-forced-batch", status, txHash)
+	}
+	if fee != 5 {
+		t.Errorf("got real on-chain fee=%d, want 5 (unaffected by the force-payout fee)", fee)
+	}
+	if forceFee != 10 {
+		t.Errorf("got force_payout_fee_atomic=%d, want 10 (only the forced entry's fee, summed)", forceFee)
+	}
+}

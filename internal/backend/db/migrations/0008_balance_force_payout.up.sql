@@ -17,6 +17,15 @@
 -- PayableBalances threshold check. That consumption logic is a
 -- separate, explicitly out-of-scope follow-up (see brief-auth.md).
 --
+-- UPDATE (see migrations/0009_payouts_force_payout_fee.up.sql): the
+-- follow-up above has landed -- Repository.PayableBalances now
+-- includes force_payout = TRUE rows regardless of the normal
+-- minPayout threshold, internal/backend/disburse.Engine actually pays
+-- them out, and each such row is charged the operator-configured
+-- GCPOOL_FORCE_PAYOUT_FEE_ATOMIC pool-policy fee (see 0009's doc
+-- comment). This column's own definition/default is unchanged by
+-- that follow-up.
+--
 -- Default FALSE for every existing row -- this is purely an opt-in
 -- signal an operator/miner sets going forward, never inferred from
 -- existing balance state.
