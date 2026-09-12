@@ -170,8 +170,19 @@ func TestDirectSessionRandomXConcurrentSubmitsDoNotSerializeOnReadLoop(t *testin
 	}
 	elapsed := time.Since(start)
 
+	// Fully sequential (the pre-fix bug) would take >= numShares*delay =
+	// 24*40ms = 960ms. A bounded worker pool with
+	// DefaultAsyncValidationWorkers() (runtime.NumCPU()) workers should
+	// take roughly ceil(24/numCPU)*40ms, comfortably under this bound on
+	// any real multi-core test runner. Assert only that elapsed isn't
+	// close to fully-serial (3/4 of serialBound) -- this gives generous
+	// headroom for a noisy/loaded CI runner (which has been observed to
+	// land right around serialBound/2, i.e. ~480ms, causing flaky
+	// failures with no real concurrency regression -- peakConcurrent was
+	// still > 1) while still being a meaningful regression guard against
+	// reintroducing full serialization.
 	serialBound := time.Duration(numShares) * delay
-	if elapsed >= serialBound/2 {
+	if elapsed >= serialBound*3/4 {
 		t.Fatalf("elapsed %v is not meaningfully less than the fully-serial bound %v -- leaf-direct's read loop may be blocking on each validation again", elapsed, serialBound)
 	}
 

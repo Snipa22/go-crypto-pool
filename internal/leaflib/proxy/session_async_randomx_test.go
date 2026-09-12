@@ -156,12 +156,16 @@ func TestSessionRandomXAsyncDispatch_DoesNotSerializeOnReadLoop(t *testing.T) {
 	// solo.DefaultAsyncValidationWorkers() (runtime.NumCPU(), NOT a
 	// fixed literal -- see solo/asyncvalidation.go's doc comment)
 	// workers should take roughly ceil(24/numCPU)*40ms, comfortably
-	// under this bound on any real multi-core test runner. Assert
-	// well under half the fully-serial bound -- generous enough to
-	// avoid CI flakiness while still being a real, meaningful
-	// regression guard against reintroducing full serialization.
+	// under this bound on any real multi-core test runner. Assert only
+	// that elapsed isn't close to fully-serial (3/4 of serialBound) --
+	// this gives generous headroom for a noisy/loaded CI runner (which
+	// has been observed to land right around serialBound/2, i.e.
+	// ~480ms, causing flaky failures with no real concurrency
+	// regression -- peakConcurrent was still > 1) while still being a
+	// real, meaningful regression guard against reintroducing full
+	// serialization.
 	serialBound := time.Duration(numShares) * delay
-	if elapsed >= serialBound/2 {
+	if elapsed >= serialBound*3/4 {
 		t.Fatalf("elapsed %v is not meaningfully less than the fully-serial bound %v -- read loop may be blocking on each validation again (the exact bug this fix addresses)", elapsed, serialBound)
 	}
 
