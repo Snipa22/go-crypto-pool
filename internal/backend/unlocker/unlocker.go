@@ -55,6 +55,13 @@ type Block struct {
 	PoolType   string
 	Difficulty int64
 	Value      *int64
+
+	// InsertedAt mirrors db.PendingBlock.InsertedAt -- this backend's
+	// own receipt time for this block row, used only by RunOnce's
+	// pending-blocks-age gauge (see PROD_HARDENING_REVIEW.md finding
+	// #11 and Config.Metrics' doc comment). checkBlock never reads
+	// this field itself.
+	InsertedAt time.Time
 }
 
 // PayoutTrigger is invoked once for every block RunOnce/checkBlock
@@ -194,6 +201,19 @@ type PassResult struct {
 // which are simply not yet found or not yet mature, are left pending
 // untouched — see checkBlock's doc comment for the exact decision
 // table.
+//
+// Every block still pending at the end of this pass (whether because
+// checkBlock returned an error or because it genuinely is not yet
+// resolved) is also folded into a per-(algo, network) pending-count +
+// oldest-pending-age observation (see observePending) — Config.Metrics'
+// unlocker_pending_blocks / unlocker_pending_block_oldest_age_seconds
+// gauges. This exists specifically so a stuck-pending situation (the
+// real "3667 blocks stuck" incident referenced in a prior commit
+// message) is visible on GET /metrics without needing a log-grep —
+// before this, RunOnce emitted no signal at all for the steady-state
+// "still pending" case (see UnlockerOutcome*'s own doc comment on why
+// "pending" was deliberately not one of the terminal outcomes
+// UnlockerBlocksTotal counts).
 func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 	var total PassResult
 	for algo, coinCfg := range u.cfg.Coins {
@@ -205,13 +225,39 @@ func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 			continue
 		}
 		u.cfg.Debug.Debugf("unlocker: %s: poll pass checking %d pending block(s) (maturity depth %d)", algo, len(pending), coinCfg.MaturityDepth)
+
+		// pendingByNetwork accumulates this pass's still-pending
+		// count/oldest-InsertedAt per real network label, so
+		// observePending below can reset a network's gauge back to
+		// 0 even when every block this pass saw for it resolved
+		// (matured/orphaned) -- see seenNetwork's doc comment.
+		pendingByNetwork := map[string]*pendingStats{}
+		seenNetwork := func(network string) *pendingStats {
+			s, ok := pendingByNetwork[network]
+			if !ok {
+				s = &pendingStats{}
+				pendingByNetwork[network] = s
+			}
+			return s
+		}
+
 		for _, b := range pending {
 			total.Checked++
+			// Recorded up front, before checkBlock resolves this
+			// block's outcome, so a network that had pending blocks
+			// entering this pass but ended it with zero remaining
+			// still gets an explicit 0 observation below rather than
+			// simply having no entry (and thus a stale, unreset
+			// gauge value) for it.
+			seenNetwork(b.Network)
 			switch outcome, err := u.checkBlock(ctx, b, coinCfg); {
 			case err != nil:
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: %v", algo, b.ID, b.Height, b.Hash, err)
 				total.Errors++
 				u.observeOutcome(algo, metrics.UnlockerOutcomeError)
+				// A Verify error leaves the block pending (see
+				// checkBlock's decision table) -- still counts here.
+				trackPending(seenNetwork(b.Network), b)
 			case outcome == outcomeMatured:
 				total.Matured++
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: matured, marking unlocked", algo, b.ID, b.Height, b.Hash)
@@ -223,7 +269,11 @@ func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 			default:
 				total.Pending++
 				u.cfg.Debug.Debugf("unlocker: %s: block id=%d height=%d hash=%s: still pending, no change", algo, b.ID, b.Height, b.Hash)
+				trackPending(seenNetwork(b.Network), b)
 			}
+		}
+		for network, s := range pendingByNetwork {
+			u.observePending(algo, network, *s)
 		}
 		if u.cfg.Metrics != nil {
 			u.cfg.Metrics.UnlockerPollDuration.WithLabelValues(algo).Observe(time.Since(pollStart).Seconds())
@@ -243,6 +293,46 @@ func (u *Unlocker) observeOutcome(algo, outcome string) {
 		return
 	}
 	u.cfg.Metrics.UnlockerBlocksTotal.WithLabelValues(algo, outcome).Inc()
+}
+
+// pendingStats accumulates RunOnce's per-(algo, network) still-pending
+// observation for one poll pass -- see trackPending/observePending.
+type pendingStats struct {
+	count  int
+	oldest time.Time // zero means "no InsertedAt data seen yet"
+}
+
+// trackPending folds block b into s: bumps the pending count and
+// tracks the OLDEST InsertedAt seen so far (the block that has been
+// stuck pending the longest is the one an operator most needs to
+// know about). A zero b.InsertedAt (e.g. a test fixture that never
+// set it) is deliberately never allowed to become s.oldest -- see
+// observePending's own guard against reporting an age derived from a
+// zero time.
+func trackPending(s *pendingStats, b Block) {
+	s.count++
+	if b.InsertedAt.IsZero() {
+		return
+	}
+	if s.oldest.IsZero() || b.InsertedAt.Before(s.oldest) {
+		s.oldest = b.InsertedAt
+	}
+}
+
+// observePending sets Config.Metrics' unlocker_pending_blocks gauge
+// to s.count and, if s.oldest carries real InsertedAt data, the
+// unlocker_pending_block_oldest_age_seconds gauge to how long ago
+// that oldest still-pending block was first seen by this backend. A
+// no-op if no Metrics is configured. See PROD_HARDENING_REVIEW.md
+// finding #11 and RunOnce's own doc comment for why this exists.
+func (u *Unlocker) observePending(algo, network string, s pendingStats) {
+	if u.cfg.Metrics == nil {
+		return
+	}
+	u.cfg.Metrics.UnlockerPendingBlocks.WithLabelValues(algo, network).Set(float64(s.count))
+	if !s.oldest.IsZero() {
+		u.cfg.Metrics.UnlockerPendingBlockOldestAgeSeconds.WithLabelValues(algo, network).Set(time.Since(s.oldest).Seconds())
+	}
 }
 
 // RunLoop calls RunOnce every cfg.PollInterval until ctx is canceled.
