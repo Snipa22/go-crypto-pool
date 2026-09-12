@@ -83,7 +83,35 @@ func newTariVerifierWithRPC(rpc tariNodeRPC) *TariVerifier {
 //     that height, so the two calls together are required to
 //     distinguish "confirmed and canonical" from "was real, now
 //     orphaned".
-func (v *TariVerifier) Verify(_ context.Context, hashHex string, height int64) (VerifyResult, error) {
+//
+// # ctx handling (PROD_HARDENING_REVIEW.md finding #20)
+//
+// v.rpc (nodeGRPC's package-level GetHeaderByHash/GetBlockByHeight)
+// does NOT accept a context.Context at all — checked against
+// go-tari-grpc-lib/v3's real nodeGRPC package this session: every one
+// of its exported functions builds its own context.Background()
+// internally for the underlying GRPC call, with no variant that
+// takes a caller-supplied context. So ctx genuinely CANNOT be
+// threaded into the GRPC call itself without modifying that external
+// dependency, which is out of scope here.
+//
+// What IS feasible without touching go-tari-grpc-lib, and what this
+// method does: run each blocking RPC call in its own goroutine and
+// race it against ctx via callWithContext below, so a canceled/
+// timed-out ctx unblocks THIS METHOD's caller (the unlocker's poll
+// pass) promptly instead of waiting on however long the underlying
+// GRPC call takes to fail or a genuinely hung base node's TCP-level
+// timeout. This bounds the CALLER's wait — the exact problem
+// statement ("a hung base node can stall an entire unlocker pass
+// with no way for the caller to bound it") — even though it cannot
+// cancel the in-flight GRPC call itself: that goroutine keeps running
+// (and its result is simply discarded) until the real call returns on
+// its own. This is a real, if partial, fix: it is a goroutine-per-
+// call-that-times-out leak under sustained base-node unavailability,
+// not a free win, but it is strictly better than the caller being
+// unable to bound its own wait at all, and it requires zero changes
+// to the external dependency.
+func (v *TariVerifier) Verify(ctx context.Context, hashHex string, height int64) (VerifyResult, error) {
 	if height < 0 {
 		return VerifyResult{}, fmt.Errorf("chain: tari: height must be non-negative, got %d", height)
 	}
@@ -92,8 +120,16 @@ func (v *TariVerifier) Verify(_ context.Context, hashHex string, height int64) (
 		return VerifyResult{}, fmt.Errorf("chain: tari: hash %q is not valid hex: %w", hashHex, err)
 	}
 
-	headerResp, err := v.rpc.GetHeaderByHash(hashBytes)
+	headerResp, err := callWithContext(ctx, func() (*tari_generated.BlockHeaderResponse, error) {
+		return v.rpc.GetHeaderByHash(hashBytes)
+	})
 	if err != nil {
+		// A ctx cancellation/deadline (see callWithContext) is not a
+		// GRPC status error, so isTariNotFound below correctly
+		// returns false for it and it falls through to the generic
+		// wrapped error path -- exactly what should happen: "ctx
+		// gave up waiting" must never be silently treated the same
+		// as "the base node confirmed it doesn't have this block".
 		if isTariNotFound(err) {
 			return VerifyResult{Found: false}, nil
 		}
@@ -107,7 +143,9 @@ func (v *TariVerifier) Verify(_ context.Context, hashHex string, height int64) (
 			hashHex, headerResp.GetHeader().GetHeight(), height)
 	}
 
-	canonicalBlocks, err := v.rpc.GetBlockByHeight([]uint64{uint64(height)})
+	canonicalBlocks, err := callWithContext(ctx, func() ([]*tari_generated.Block, error) {
+		return v.rpc.GetBlockByHeight([]uint64{uint64(height)})
+	})
 	if err != nil {
 		return VerifyResult{}, fmt.Errorf("chain: tari: GetBlocks(height=%d): %w", height, err)
 	}
@@ -136,6 +174,35 @@ func (v *TariVerifier) Verify(_ context.Context, hashHex string, height int64) (
 		CanonicalHash: canonicalHashHex,
 		Reward:        int64(headerResp.GetReward()),
 	}, nil
+}
+
+// callWithContext runs fn (a blocking call into a client with no
+// context support of its own, e.g. nodeGRPC's package-level
+// functions — see Verify's own doc comment) on a separate goroutine
+// and returns as soon as EITHER fn returns OR ctx is done, whichever
+// comes first. If ctx wins the race, fn's eventual result (if any) is
+// silently discarded — the goroutine is not, and cannot be, killed;
+// it simply keeps running until the real underlying call returns on
+// its own, mirroring exactly what would happen if the caller had
+// instead just given up waiting on a synchronous call with no way to
+// cancel it.
+func callWithContext[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	type result struct {
+		val T
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		val, err := fn()
+		ch <- result{val: val, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	case r := <-ch:
+		return r.val, r.err
+	}
 }
 
 // isTariNotFound reports whether err is the GRPC status this base
