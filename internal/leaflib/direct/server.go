@@ -37,9 +37,11 @@ package direct
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -180,6 +182,19 @@ type Server struct {
 	// through its own server back-reference (session.go's
 	// s.server.debugLogger). nil is a complete no-op.
 	debugLogger *leaflib.DebugLogger
+
+	// moneroHeaderResolver, if non-nil, is this Server's real
+	// monerod get_block_header_by_height client (monero_hash.go),
+	// used ONLY by session.go's handleSubmit to resolve the REAL,
+	// canonical Monero block hash for a genuine ALGO_RXM block find
+	// -- see resolveMoneroBlockHash's doc comment. nil for -coin=tari
+	// (Tari's own real hash comes from submitBlockDirect/
+	// realBlockHashHex instead) and, per FIX_BRIEF.md's explicit
+	// fallback-hardening requirement, a genuine -coin=monero
+	// misconfiguration if left nil (ServerConfig.MonerodURL empty) --
+	// resolveMoneroBlockHash returns a clear error rather than a
+	// placeholder in that case, never silently substituting one.
+	moneroHeaderResolver moneroBlockHeaderResolver
 }
 
 // defaultForwardPoolWorkers/defaultForwardPoolQueueSize size Fix 12's
@@ -284,6 +299,24 @@ type ServerConfig struct {
 	// (the default for every pre-existing caller/test) is a complete
 	// no-op.
 	Debug *leaflib.DebugLogger
+
+	// MonerodURL is this leaf's real monerod JSON-RPC base URL (the
+	// SAME address Node -- solo.NewMoneroNodeClient -- is already
+	// configured against, see cmd/leaf-direct/main.go's -monerod-url/
+	// LEAF_DIRECT_MONEROD_URL) -- used ONLY to construct this
+	// Server's own, independent moneroHeaderResolver
+	// (MoneroBlockHeaderClient, monero_hash.go), which
+	// session.go's handleSubmit queries via
+	// get_block_header_by_height to capture the REAL Monero block
+	// hash on a genuine ALGO_RXM block find (see FIX_BRIEF.md --
+	// sha256(candidate blob) is NOT a real Monero block ID and was
+	// silently orphaning every real RXM block found via this leaf).
+	// Empty for -coin=tari (ignored entirely); REQUIRED for
+	// -coin=monero -- leaving it empty for -coin=monero means
+	// resolveMoneroBlockHash always fails loudly rather than
+	// forwarding a placeholder hash, per this fix's explicit
+	// fallback-hardening requirement.
+	MonerodURL string
 }
 
 // NewServer constructs a Server.
@@ -316,6 +349,9 @@ func NewServer(cfg ServerConfig) *Server {
 		// the full rationale/sizing.
 		forwardPool: solo.NewAsyncValidationPool(defaultForwardPoolWorkers, solo.AsyncValidationQueueSize),
 		debugLogger: cfg.Debug,
+	}
+	if strings.TrimSpace(cfg.MonerodURL) != "" {
+		s.moneroHeaderResolver = NewMoneroBlockHeaderClient(cfg.MonerodURL)
 	}
 	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {
@@ -525,6 +561,52 @@ func (s *Server) recordTransportSuccess(kind string) {
 	s.transportOKSoFar.Store(true)
 	s.lastTransportKind.Store(kind)
 	s.lastTransportAt.Store(time.Now())
+}
+
+// resolveMoneroBlockHash resolves the REAL, canonical Monero block
+// hash at height via this Server's configured moneroHeaderResolver --
+// a real get_block_header_by_height call against the same monerod
+// this leaf's own solo.MoneroNodeClient already talks to (see
+// ServerConfig.MonerodURL and monero_hash.go). This is
+// session.go's handleSubmit's ONLY source of the real hash for a
+// genuine ALGO_RXM block find; sha256(candidate blob) is NOT a real
+// Monero block ID (see FIX_BRIEF.md).
+//
+// Returns an error -- NEVER a placeholder/empty string -- if no
+// resolver is configured (ServerConfig.MonerodURL was left empty for
+// a -coin=monero process, a genuine startup misconfiguration), the
+// RPC call itself fails, or the daemon reports an empty hash.
+// Callers (handleSubmit) must treat any error here as "the real hash
+// is not known right now" and must not silently forward a
+// placeholder-shaped hash downstream -- see this fix's explicit
+// fallback-hardening requirement (FIX_BRIEF.md item 3, mirroring the
+// same requirement already applied to the Tari side's own
+// realBlockHashHex/submitBlockDirect path).
+func (s *Server) resolveMoneroBlockHash(ctx context.Context, height uint64) (string, error) {
+	if s.moneroHeaderResolver == nil {
+		return "", fmt.Errorf("direct: no Monero block-header resolver configured (ServerConfig.MonerodURL empty -- see -monerod-url/LEAF_DIRECT_MONEROD_URL)")
+	}
+	hashHex, err := s.moneroHeaderResolver.GetBlockHeaderHashByHeight(ctx, height)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(hashHex) == "" {
+		return "", fmt.Errorf("direct: monerod returned an empty block_header.hash at height %d", height)
+	}
+	return hashHex, nil
+}
+
+// recordMoneroBlockHashUnresolved bumps the real
+// leaf_direct_block_hash_unresolved_total counter (FIX_BRIEF.md item
+// 3's explicit "fail loudly" requirement) whenever
+// resolveMoneroBlockHash could not confirm the real hash for an
+// otherwise-accepted ALGO_RXM block find. nil-safe like every other
+// record* helper on this type (metrics may not be enabled).
+func (s *Server) recordMoneroBlockHashUnresolved() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.DirectBlockHashUnresolvedTotal.Inc()
 }
 
 func (s *Server) invalidateAndRepushJobs() {

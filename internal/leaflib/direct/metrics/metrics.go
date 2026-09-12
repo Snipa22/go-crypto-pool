@@ -79,6 +79,19 @@ type Metrics struct {
 	// applies here too.
 	XNPReservationUnavailableTotal prometheus.Counter
 
+	// DirectBlockHashUnresolvedTotal counts real ALGO_RXM (Monero)
+	// block finds that were genuinely accepted by monerod's own
+	// submit_block RPC but whose real, canonical block hash could
+	// NOT be confirmed afterward via get_block_header_by_height (RPC
+	// failure, empty/non-OK response, or no resolver configured at
+	// all -- see server.go's resolveMoneroBlockHash). This is the
+	// explicit "fail loudly" signal FIX_BRIEF.md item 3 requires in
+	// place of ever silently forwarding a placeholder/empty hash
+	// downstream -- a non-zero rate here means real found blocks are
+	// NOT being reported to the backend and need manual
+	// reconciliation against the real monerod chain.
+	DirectBlockHashUnresolvedTotal prometheus.Counter
+
 	BuildInfo *prometheus.GaugeVec
 
 	maxAddressLabels int
@@ -117,6 +130,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 	m.XNPReservationUnavailableTotal = registerCounter(reg, prometheus.CounterOpts{
 		Name: "leaf_direct_xnp_reservation_unavailable_total",
 		Help: "Total number of Monero get_block_template responses whose real reserved_offset did not fit within the returned blocktemplate_blob, causing the XNP-proxy-shape job fields (reserved_offset/client_nonce_offset/client_pool_offset/blocktemplate_blob) to be omitted for that job rather than published out-of-bounds.",
+	})
+
+	m.DirectBlockHashUnresolvedTotal = registerCounter(reg, prometheus.CounterOpts{
+		Name: "leaf_direct_block_hash_unresolved_total",
+		Help: "Total number of real ALGO_RXM (Monero) block finds accepted by submit_block whose real canonical block hash could not be confirmed via get_block_header_by_height afterward -- these are NOT forwarded to the backend (no placeholder hash is ever substituted) and need manual reconciliation.",
 	})
 
 	m.BuildInfo = registerGaugeVec(reg, prometheus.GaugeOpts{

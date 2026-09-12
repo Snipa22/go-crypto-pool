@@ -977,12 +977,23 @@ func main() {
 		}
 	}()
 
+	// moneroHeaderURL is only set for -coin=monero -- it wires
+	// ServerConfig.MonerodURL so this Server's own, independent
+	// get_block_header_by_height resolver (monero_hash.go) can
+	// capture the REAL Monero block hash on a genuine ALGO_RXM block
+	// find instead of the old sha256(blob) placeholder (see
+	// FIX_BRIEF.md). Left empty for -coin=tari (ignored entirely).
+	var moneroHeaderURL string
+	if isMoneroCoin(cfg.coin) {
+		moneroHeaderURL = cfg.monerodURL
+	}
 	server := direct.NewServer(direct.ServerConfig{
 		ConnectionManager: cm, JobManager: jobManager, Node: node, Validators: validators,
 		Network: networkFromString(cfg.network), Logger: logger, Vardiff: vardiffCfg,
 		Transport: backendTransport, MultiSubmit: multiSubmit, Relay: blockRelay,
 		Algo: resolveAlgo(cfg), PoolType: poolType, PoolID: int32(cfg.poolID),
-		Debug: debugLogger,
+		Debug:      debugLogger,
+		MonerodURL: moneroHeaderURL,
 	})
 	defer server.Shutdown()
 
