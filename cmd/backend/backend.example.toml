@@ -125,6 +125,13 @@ monero_wallet_rpc_password = ""
 # (default: 0)
 disburse_min_payout_atomic = 0
 
+# Flat atomic-unit fee charged against every force_payout=TRUE balance row
+# paid out this cycle (see POST /user/forcePayment), deducted from the
+# miner's payout and credited to pool revenue
+# (payouts.force_payout_fee_atomic). Shared by both the Monero and Tari
+# disbursement engines. 0 (default) means no extra fee.
+force_payout_fee_atomic = 0
+
 # Cap on destinations per real Transfer call, for the Monero disbursement
 # engine only (the Tari engine hardcodes 1 -- see buildTariDisburseEngine's
 # doc comment). (default: 15)

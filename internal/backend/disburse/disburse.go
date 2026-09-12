@@ -54,6 +54,16 @@ type PayableBalance struct {
 	PaymentAddress string
 	PaymentID      *string
 	PendingBalance int64
+
+	// ForcePayout mirrors db.PayableBalance.ForcePayout — true if
+	// this row was returned by Repository.PayableBalances via the
+	// force_payout override (see that method's doc comment),
+	// regardless of whether it would also have qualified normally
+	// via the plain minPayout threshold. runBatch uses this to
+	// decide whether Config.ForcePayoutFeeAtomic applies to this
+	// row — per this fee's explicit design, it applies to every
+	// force_payout row being paid this cycle, full stop.
+	ForcePayout bool
 }
 
 // PayoutEntry is one balance row's contribution to a single real
@@ -100,8 +110,25 @@ type Repository interface {
 // call has already resolved those; the debit step only needs to know
 // which balance rows to touch and by how much).
 type DebitEntry struct {
+	// BalanceID/Amount: mirrors db.DisburseEntry's identically-named
+	// fields exactly — Amount is always the row's FULL original
+	// PendingBalance, even for a force_payout row where the real
+	// Transfer destination amount (see PayoutEntry.Amount) was less
+	// than this due to ForcePayoutFeeAtomic below.
 	BalanceID int64
 	Amount    int64
+
+	// ForcePayout mirrors the originating PayableBalance.ForcePayout
+	// — see db.DisburseEntry's identically-named field for why
+	// CompletePayoutSent needs this (resetting the force_payout
+	// column once consumed).
+	ForcePayout bool
+
+	// ForcePayoutFeeAtomic is the fee actually collected from this
+	// row's payout (see Config.ForcePayoutFeeAtomic and runBatch),
+	// zero for any non-force_payout row. Mirrors
+	// db.DisburseEntry.ForcePayoutFeeAtomic.
+	ForcePayoutFeeAtomic int64
 }
 
 // Config configures an Engine.
@@ -117,6 +144,25 @@ type Config struct {
 	// coin). Zero means "pay out anything positive" and is a
 	// legitimate, if unusual, operator choice, not rejected here.
 	MinPayoutAtomic int64
+
+	// ForcePayoutFeeAtomic is an operator-configured flat atomic-unit
+	// fee (GCPOOL_FORCE_PAYOUT_FEE_ATOMIC / --force-payout-fee-atomic)
+	// charged against every force_payout = TRUE row this engine pays
+	// out this cycle — Alex's explicit "we charge extra fees for
+	// manual payouts like that below the threshold for auto payout"
+	// requirement. Applies uniformly to every force_payout row,
+	// regardless of whether that row's PendingBalance would also
+	// have cleared MinPayoutAtomic on its own (deliberately not
+	// distinguished — simpler and correct per that requirement).
+	// Deducted from the amount actually wired to the miner (see
+	// runBatch), never from what gets debited from pending_balance,
+	// and credited to pool revenue (db's payouts.force_payout_fee_atomic)
+	// rather than reported as part of the real on-chain Transfer fee
+	// (which remains exactly what the wallet RPC reported — this fee
+	// is additive pool policy, not a real network cost). Zero (the
+	// default) means no extra fee — same "zero means off" convention
+	// as MinPayoutAtomic above.
+	ForcePayoutFeeAtomic int64
 
 	// MaxDestinationsPerBatch caps how many balance rows one single
 	// real Transfer RPC call covers. Real monero-wallet-rpc has no
@@ -318,19 +364,50 @@ func buildBatches(rows []PayableBalance, maxPerBatch int) [][]PayableBalance {
 
 // runBatch performs one real Transfer RPC call for batch and, only on
 // success, debits every entry's balance. Returns the real amount
-// sent and fee paid.
+// actually sent to miners (after any per-row force_payout fee
+// deduction, see below) and the real on-chain fee paid.
+//
+// For every row in batch with ForcePayout == true, e.cfg.ForcePayoutFeeAtomic
+// (if > 0) is subtracted from that row's real Transfer destination
+// amount — the extra fee Alex required for manual/forced payouts
+// below the normal threshold (see Config.ForcePayoutFeeAtomic's doc
+// comment: applies uniformly to every force_payout row this cycle,
+// not just ones that were genuinely below minPayout on their own).
+// Edge case: if a row's PendingBalance <= the configured fee, the fee
+// is capped to PendingBalance-1 for that row instead — this engine
+// always sends at least 1 atomic unit to a real wallet RPC rather
+// than a zero/negative amount, logging the cap so an operator can see
+// it happened (chosen over skipping the row entirely: skipping would
+// mean silently NOT honoring a miner's explicit forced-payout request
+// this cycle purely because of a configuration edge case, which is a
+// worse outcome than the miner receiving a token amount instead of
+// the full fee being collected).
 func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []PayableBalance) (sent, fee int64, err error) {
 	destinations := make([]wallet.Destination, 0, len(batch))
 	balanceIDs := make([]int64, 0, len(batch))
+	forceFees := make([]int64, len(batch))
 	var total int64
 	var paymentID string
 	if len(batch) == 1 && batch[0].PaymentID != nil {
 		paymentID = *batch[0].PaymentID
 	}
-	for _, r := range batch {
-		destinations = append(destinations, wallet.Destination{Address: r.PaymentAddress, Amount: r.PendingBalance})
+	for i, r := range batch {
+		amount := r.PendingBalance
+		var rowFee int64
+		if r.ForcePayout && e.cfg.ForcePayoutFeeAtomic > 0 {
+			rowFee = e.cfg.ForcePayoutFeeAtomic
+			if rowFee >= r.PendingBalance {
+				capped := r.PendingBalance - 1
+				e.logf("disburse: %s/%s: balance %d: force_payout fee %d >= pending_balance %d, capping fee to %d so the miner still receives >= 1 atomic unit",
+					algo, network, r.ID, e.cfg.ForcePayoutFeeAtomic, r.PendingBalance, capped)
+				rowFee = capped
+			}
+			amount = r.PendingBalance - rowFee
+		}
+		forceFees[i] = rowFee
+		destinations = append(destinations, wallet.Destination{Address: r.PaymentAddress, Amount: amount})
 		balanceIDs = append(balanceIDs, r.ID)
-		total += r.PendingBalance
+		total += amount
 	}
 
 	payoutID, err := e.repo.RecordPendingPayout(ctx, algo, network, balanceIDs, total)
@@ -352,8 +429,15 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 	}
 
 	entries := make([]DebitEntry, 0, len(batch))
-	for _, r := range batch {
-		entries = append(entries, DebitEntry{BalanceID: r.ID, Amount: r.PendingBalance})
+	var totalForceFee int64
+	for i, r := range batch {
+		entries = append(entries, DebitEntry{
+			BalanceID:            r.ID,
+			Amount:               r.PendingBalance,
+			ForcePayout:          r.ForcePayout,
+			ForcePayoutFeeAtomic: forceFees[i],
+		})
+		totalForceFee += forceFees[i]
 	}
 	if err := e.repo.CompletePayoutSent(ctx, payoutID, entries, result.TxHash, result.Fee); err != nil {
 		// The real transfer already happened on-chain at this point
@@ -365,6 +449,10 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 		return 0, 0, fmt.Errorf("transfer succeeded (tx_hash=%s amount=%d fee=%d) but recording it failed: %w", result.TxHash, result.Amount, result.Fee, err)
 	}
 
+	if totalForceFee > 0 {
+		e.logf("disburse: %s/%s: payout %d: collected %d atomic units in force_payout fees across %d destinations",
+			algo, network, payoutID, totalForceFee, len(batch))
+	}
 	e.logf("disburse: %s/%s: payout %d: sent %d atomic units (fee %d) to %d destinations, tx_hash=%s",
 		algo, network, payoutID, total, result.Fee, len(batch), result.TxHash)
 	return total, result.Fee, nil
