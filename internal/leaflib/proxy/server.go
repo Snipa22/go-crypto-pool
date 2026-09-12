@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,6 +65,23 @@ type UpstreamGenerationSource interface {
 	CurrentGeneration() uint64
 }
 
+// UpstreamSeedHashStats is an OPTIONAL capability a Server's real
+// UpstreamSubmitter may additionally implement to expose the real
+// job.SeedHash-decode-error counter (FIX_BRIEF.md, finding #18) --
+// implemented by the real UpstreamClient in production via
+// SeedHashDecodeErrorsTotal(). Deliberately NOT folded into the
+// UpstreamSubmitter interface itself, for the exact same reason
+// UpstreamHealth/UpstreamGenerationSource above aren't. Server
+// type-asserts for it in EnableMetrics and degrades gracefully (the
+// metric simply stays at zero) when the concrete upstream doesn't
+// implement it, e.g. in most existing tests.
+type UpstreamSeedHashStats interface {
+	// SeedHashDecodeErrorsTotal reports the real, monotonically-
+	// increasing count of upstream jobs received with a non-empty
+	// but unparseable seed_hash field.
+	SeedHashDecodeErrorsTotal() uint64
+}
+
 // Server ties together internal/leaflib.ConnectionManager (downstream
 // miner connection lifecycle — reused, not reimplemented), a
 // JobManager (issuing per-session Jobs from the real upstream pool's
@@ -110,9 +128,10 @@ type Server struct {
 	lastReconnectCount atomic.Uint64
 
 	// hideRemoteAddress mirrors internal/leaflib/solo/server.go's
-	// identical field exactly — see that doc comment. Defaults to
+	// identical field exactly — see that doc comment (including its
+	// FIX_BRIEF.md finding #20 atomic.Bool rationale). Defaults to
 	// false; set via SetHideRemoteAddress.
-	hideRemoteAddress bool
+	hideRemoteAddress atomic.Bool
 
 	// addressFlags is nil unless EnableAddressFlags has been called --
 	// mirrors internal/leaflib/solo/server.go's/
@@ -225,6 +244,25 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 			SubmitBlockedTotal: s.randomxPool.SubmitBlockedTotal(),
 		}
 	})
+	// FIX_BRIEF.md finding #18: real observability for both the
+	// process-wide malformed-blob circuit breaker (upstream.go's
+	// globalMalformedBlobBreaker -- a package-level singleton, not
+	// per-Server, see that type's own doc comment for why) and the
+	// per-UpstreamClient seed_hash-decode-error counter (via the
+	// UpstreamSeedHashStats optional-capability type-assertion, same
+	// pattern as UpstreamHealth/UpstreamGenerationSource above).
+	m.SetMalformedBlobBreakerSource(func() metrics.MalformedBlobBreakerStats {
+		return metrics.MalformedBlobBreakerStats{
+			OpensTotal: globalMalformedBlobBreaker.OpensTotal(),
+			Open:       globalMalformedBlobBreaker.IsOpen(),
+		}
+	})
+	m.SetSeedHashStatsSource(func() metrics.SeedHashStats {
+		if stats, ok := s.upstream.(UpstreamSeedHashStats); ok {
+			return metrics.SeedHashStats{DecodeErrorsTotal: stats.SeedHashDecodeErrorsTotal()}
+		}
+		return metrics.SeedHashStats{}
+	})
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	return m
@@ -233,7 +271,7 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 // SetHideRemoteAddress mirrors internal/leaflib/solo/server.go's
 // identical method exactly — see that doc comment.
 func (s *Server) SetHideRemoteAddress(hide bool) {
-	s.hideRemoteAddress = hide
+	s.hideRemoteAddress.Store(hide)
 }
 
 // SetDebugLogger opts this Server (and every Session it creates) into
@@ -476,6 +514,16 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener, startingDifficulty 
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficulty uint64) {
+	// HARDENING FIX (FIX_BRIEF.md, finding #20): mirrors
+	// solo.Server's own identical handleConn recovery exactly -- see
+	// that method's doc comment for the full rationale.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Printf("proxy: recovered from a panic in handleConn for remote=%s (closing only this connection; every other session and this leaf's own accept loop are unaffected): %v\n%s", conn.RemoteAddr(), r, debug.Stack())
+			_ = conn.Close()
+		}
+	}()
+
 	mc, err := s.cm.Accept(ctx, conn)
 	if err != nil {
 		if errors.Is(err, leaflib.ErrConnectionRejected) {
@@ -550,8 +598,28 @@ type SessionStat struct {
 	// estimated hashrate in hashes/second, derived from its own
 	// difficulty-weighted accept-history accumulator and connection
 	// age — see leaflib.EstimateHashrateHz's doc comment for the
-	// full formula/rationale (industry-standard difficulty*2^32/time
-	// approximation, not a cryptographically exact hash count).
+	// full formula (hashesAccumulated/elapsedSeconds; NO 2^32 or
+	// other multiplier is applied — an earlier revision of this
+	// comment incorrectly described a "difficulty*2^32/time"
+	// formula, which was a real, since-fixed bug in a previous
+	// version of EstimateHashrateHz itself, not the current,
+	// correct behavior; see that function's own doc comment for the
+	// fix history).
+	//
+	// SECURITY/TRUST CAVEAT (FIX_BRIEF.md, finding #16): this value
+	// (and the aggregate Stats.TotalEstimatedHashrate/"Global
+	// hashrate" card it feeds) is driven in part by
+	// Session.hashesAccumulated, which for any LOCALLY-credited
+	// share (below the real upstream pool's own requested share
+	// difficulty — see metrics.DecisionLocalCredit) is incremented
+	// from the miner's own SELF-CLAIMED result hash with ZERO
+	// cryptographic validation. A hostile miner can inflate this
+	// number arbitrarily with fabricated claims and no real work
+	// behind them — see Session.hashesAccumulated's own doc comment
+	// for the full rationale. Do not treat this as an authoritative,
+	// tamper-proof measurement; an upstream_forward share (see
+	// metrics.DecisionUpstreamForward) IS real-validated, but this
+	// aggregate figure does not distinguish the two.
 	EstimatedHashrate float64
 }
 
@@ -584,7 +652,9 @@ type Stats struct {
 	// TotalEstimatedHashrate is the sum of EstimatedHashrate across
 	// all sessions in this snapshot (hashes/second) — see
 	// SessionStat.EstimatedHashrate's doc comment for the underlying
-	// per-session formula.
+	// per-session formula AND its miner-spoofability caveat
+	// (FIX_BRIEF.md, finding #16) before treating this "Global
+	// hashrate" headline figure as authoritative.
 	TotalEstimatedHashrate float64
 
 	UpstreamConnected  bool
