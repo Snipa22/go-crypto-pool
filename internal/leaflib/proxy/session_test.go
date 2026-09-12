@@ -248,7 +248,23 @@ func (c *testClient) send(req Request) {
 
 func (c *testClient) recvRaw() []byte {
 	c.t.Helper()
-	_ = c.client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	return c.recvRawWithTimeout(5 * time.Second)
+}
+
+// recvRawWithTimeout is recvRaw but with a caller-chosen read deadline
+// instead of the package-wide 5-second default. Every test in this
+// package other than the real, non-mocked RandomX integration test
+// (randomx_puregolang_integration_test.go) uses the instant
+// fakeValidator test double, for which 5 seconds is comfortably more
+// than enough headroom -- so the default in recvRaw is intentionally
+// left untouched (widening it globally would mask genuine hangs or
+// deadlocks in every one of those fast tests). This variant exists
+// solely so that one genuinely-slower integration test can opt into a
+// longer, still-bounded deadline for its own real-validation
+// round-trip without affecting anything else in the package.
+func (c *testClient) recvRawWithTimeout(d time.Duration) []byte {
+	c.t.Helper()
+	_ = c.client.SetReadDeadline(time.Now().Add(d))
 	line, err := c.reader.ReadBytes('\n')
 	if err != nil {
 		c.t.Fatalf("read response: %v", err)
@@ -278,6 +294,18 @@ func (c *testClient) recvShareResponse() ShareResponse {
 	c.t.Helper()
 	var resp ShareResponse
 	if err := json.Unmarshal(c.recvRaw(), &resp); err != nil {
+		c.t.Fatalf("unmarshal share response: %v", err)
+	}
+	return resp
+}
+
+// recvShareResponseWithTimeout is recvShareResponse but with a
+// caller-chosen read deadline. See recvRawWithTimeout for why this
+// exists alongside (rather than replacing) the 5-second default.
+func (c *testClient) recvShareResponseWithTimeout(d time.Duration) ShareResponse {
+	c.t.Helper()
+	var resp ShareResponse
+	if err := json.Unmarshal(c.recvRawWithTimeout(d), &resp); err != nil {
 		c.t.Fatalf("unmarshal share response: %v", err)
 	}
 	return resp
