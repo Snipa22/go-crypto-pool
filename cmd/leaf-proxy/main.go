@@ -37,6 +37,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -46,6 +47,8 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -53,6 +56,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/proxy"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 )
 
@@ -69,21 +73,42 @@ type config struct {
 
 	listenAddress      string
 	startingDifficulty uint64
-	minDifficulty      uint64
-	maxDifficulty      uint64
-	vardiffTargetTime  int
-	vardiffInterval    time.Duration
-	jobMaxAge          time.Duration
+	// portsRaw is -ports/LEAF_PROXY_PORTS: an optional comma-separated
+	// list of address:difficulty[:desc][:tls] port tiers, mirroring
+	// cmd/leaf-direct's identical mechanism exactly (see
+	// resolvePorts/parsePortEntry below and solo.PortConfig's doc
+	// comment). Empty (the default) falls back to
+	// listenAddress/startingDifficulty as a single implicit tier --
+	// fully backward-compatible, zero behavior change for any
+	// deployment that doesn't set this.
+	portsRaw          string
+	minDifficulty     uint64
+	maxDifficulty     uint64
+	vardiffTargetTime int
+	vardiffInterval   time.Duration
+	jobMaxAge         time.Duration
 
 	// tlsListenAddress is -tls-listen-address/LEAF_PROXY_TLS_LISTEN_ADDRESS:
 	// a SECOND, optional downstream-facing listen address served over
 	// TLS, alongside (never instead of) the existing plain
 	// listenAddress above. Empty (the default) disables it entirely
 	// -- a complete no-op, zero behavior change for every existing
-	// deployment. leaf-proxy has no multi-port-tier mechanism (unlike
-	// leaf-solo/leaf-direct); this is deliberately a single extra
-	// listener, not a list, matching this binary's existing
-	// single-listen-address shape.
+	// deployment.
+	//
+	// DECISION (multi-port-tier support, this pass): this field now
+	// belongs ONLY to the old single-tier fallback path -- i.e. it
+	// is consulted ONLY when -ports/LEAF_PROXY_PORTS is UNSET, in
+	// which case it is added as a second, TLS-enabled port tier
+	// alongside the implicit listenAddress/startingDifficulty tier,
+	// byte-for-byte as it always has. -ports' own per-tier trailing
+	// ":tls" marker is now the GENERAL mechanism for configuring a
+	// TLS-enabled listener when multiple tiers are in play. Setting
+	// BOTH -ports and -tls-listen-address at the same time is a
+	// fatal startup misconfiguration (see main()'s explicit check
+	// below) rather than silently ignoring either one -- an operator
+	// who needs a TLS tier alongside explicit -ports entries should
+	// move it into a -ports entry (e.g. "...:tls") instead of also
+	// setting this flag.
 	tlsListenAddress string
 
 	// tlsCertFile / tlsKeyFile / tlsCertPersistPath mirror leaf-solo/
@@ -194,9 +219,10 @@ func loadConfig() (config, error) {
 	// does NOT contain "xmr-node-proxy".
 	flag.StringVar(&cfg.upstreamAgent, "upstream-agent", envOr("LEAF_PROXY_UPSTREAM_AGENT", "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0"), "mining-client agent string sent on upstream login -- defaults to an identifier containing the literal substring \"xmr-node-proxy\" (see this flag's doc comment) so the upstream pool grants the advanced xmr-node-proxy-client dialect and publishes client_nonce_offset/client_pool_offset, which this leaf needs to give downstream miners non-colliding blobs; the resulting raw blocktemplate_blob is safely handled via a real blocktemplate_blob->hashing-blob conversion path. Env: LEAF_PROXY_UPSTREAM_AGENT")
 
-	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_PROXY_LISTEN_ADDRESS", ":5555"), "downstream miner-facing TCP listen address. Env: LEAF_PROXY_LISTEN_ADDRESS")
-	flag.StringVar(&cfg.tlsListenAddress, "tls-listen-address", envOr("LEAF_PROXY_TLS_LISTEN_ADDRESS", ""), "optional SECOND downstream miner-facing TCP listen address, served over TLS using the shared self-signed-or-operator-supplied cert (see -tls-cert-file/-tls-key-file/-tls-cert-persist-path), alongside (never instead of) -listen-address. Empty (default) disables it entirely -- zero behavior change. Env: LEAF_PROXY_TLS_LISTEN_ADDRESS")
-	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_PROXY_STARTING_DIFFICULTY", 10000), "starting downstream share difficulty; vardiff adjusts it from here. Env: LEAF_PROXY_STARTING_DIFFICULTY")
+	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_PROXY_LISTEN_ADDRESS", ":5555"), "downstream miner-facing TCP listen address. Ignored as a listener source when -ports/LEAF_PROXY_PORTS is set (still used as -ports' own fallback default when -ports is unset -- see -ports' doc comment). Env: LEAF_PROXY_LISTEN_ADDRESS")
+	flag.StringVar(&cfg.tlsListenAddress, "tls-listen-address", envOr("LEAF_PROXY_TLS_LISTEN_ADDRESS", ""), "optional SECOND downstream miner-facing TCP listen address, served over TLS using the shared self-signed-or-operator-supplied cert (see -tls-cert-file/-tls-key-file/-tls-cert-persist-path), alongside (never instead of) -listen-address. Empty (default) disables it entirely -- zero behavior change. Only consulted when -ports/LEAF_PROXY_PORTS is UNSET -- setting both is a fatal startup misconfiguration (see -ports' doc comment). Env: LEAF_PROXY_TLS_LISTEN_ADDRESS")
+	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_PROXY_STARTING_DIFFICULTY", 10000), "starting downstream share difficulty; vardiff adjusts it from here. Ignored when -ports/LEAF_PROXY_PORTS is set (each port tier carries its own starting difficulty instead -- see -ports' doc comment). Env: LEAF_PROXY_STARTING_DIFFICULTY")
+	flag.StringVar(&cfg.portsRaw, "ports", envOr("LEAF_PROXY_PORTS", ""), "comma-separated list of address:difficulty[:desc][:tls] port tiers, e.g. '0.0.0.0:5555:1000:medium-plain,0.0.0.0:5556:1000:medium-tls:tls' (first entry plain, second entry the same difficulty on a different port with TLS enabled). The optional trailing ':tls' marker (case-insensitive) enables the shared self-signed TLS listener for that ONE port tier only -- see -tls-cert-file/-tls-key-file/-tls-cert-persist-path. When unset (the default), -listen-address/-starting-difficulty are used as a single implicit tier (plain, no TLS), and -tls-listen-address (if also set) is added as a second, TLS-enabled tier exactly as before this flag existed -- fully backward-compatible, zero behavior change for any deployment that doesn't set this. Setting BOTH -ports and -tls-listen-address is a fatal startup misconfiguration -- move any TLS tier into a -ports entry instead. Env: LEAF_PROXY_PORTS")
 	flag.Uint64Var(&cfg.minDifficulty, "min-difficulty", envOrUint64("LEAF_PROXY_MIN_DIFFICULTY", 100), "absolute floor vardiff will never retarget below. Env: LEAF_PROXY_MIN_DIFFICULTY")
 	flag.Uint64Var(&cfg.maxDifficulty, "max-difficulty", envOrUint64("LEAF_PROXY_MAX_DIFFICULTY", 1_000_000_000), "absolute ceiling vardiff will never retarget above. Env: LEAF_PROXY_MAX_DIFFICULTY")
 	flag.IntVar(&cfg.vardiffTargetTime, "vardiff-target-time", envOrInt("LEAF_PROXY_VARDIFF_TARGET_TIME", 30), "seconds between shares vardiff aims for. Env: LEAF_PROXY_VARDIFF_TARGET_TIME")
@@ -255,6 +281,7 @@ type fileConfig struct {
 	ListenAddress          *string `toml:"listen_address"`
 	TLSListenAddress       *string `toml:"tls_listen_address"`
 	StartingDifficulty     *uint64 `toml:"starting_difficulty"`
+	PortsRaw               *string `toml:"ports"`
 	MinDifficulty          *uint64 `toml:"min_difficulty"`
 	MaxDifficulty          *uint64 `toml:"max_difficulty"`
 	VardiffTargetTime      *int    `toml:"vardiff_target_time_seconds"`
@@ -311,6 +338,7 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.listenAddress, fc.ListenAddress, visited, "listen-address", "LEAF_PROXY_LISTEN_ADDRESS")
 	cfgfile.ApplyString(&cfg.tlsListenAddress, fc.TLSListenAddress, visited, "tls-listen-address", "LEAF_PROXY_TLS_LISTEN_ADDRESS")
 	cfgfile.ApplyUint64(&cfg.startingDifficulty, fc.StartingDifficulty, visited, "starting-difficulty", "LEAF_PROXY_STARTING_DIFFICULTY")
+	cfgfile.ApplyString(&cfg.portsRaw, fc.PortsRaw, visited, "ports", "LEAF_PROXY_PORTS")
 	cfgfile.ApplyUint64(&cfg.minDifficulty, fc.MinDifficulty, visited, "min-difficulty", "LEAF_PROXY_MIN_DIFFICULTY")
 	cfgfile.ApplyUint64(&cfg.maxDifficulty, fc.MaxDifficulty, visited, "max-difficulty", "LEAF_PROXY_MAX_DIFFICULTY")
 	cfgfile.ApplyInt(&cfg.vardiffTargetTime, fc.VardiffTargetTime, visited, "vardiff-target-time", "LEAF_PROXY_VARDIFF_TARGET_TIME")
@@ -403,6 +431,86 @@ func envOrDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// resolvePorts mirrors cmd/leaf-direct/main.go's identical function
+// exactly (see that file's doc comment on -ports/LEAF_DIRECT_PORTS
+// for the full rationale) -- this is leaf-proxy's own local copy,
+// renamed to reference LEAF_PROXY_PORTS in error messages. When
+// cfg.portsRaw is unset (the default), -listen-address/
+// -starting-difficulty are used as a single implicit tier (plain, no
+// TLS) -- fully backward-compatible with every deployment that
+// predates this feature.
+func resolvePorts(cfg config) ([]solo.PortConfig, error) {
+	if strings.TrimSpace(cfg.portsRaw) == "" {
+		return []solo.PortConfig{{Address: cfg.listenAddress, Difficulty: cfg.startingDifficulty, PortDesc: "default"}}, nil
+	}
+	entries := strings.Split(cfg.portsRaw, ",")
+	ports := make([]solo.PortConfig, 0, len(entries))
+	for i, raw := range entries {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		port, err := parsePortEntry(raw)
+		if err != nil {
+			return nil, fmt.Errorf("LEAF_PROXY_PORTS entry %d (%q): %w", i+1, raw, err)
+		}
+		ports = append(ports, port)
+	}
+	if len(ports) == 0 {
+		return nil, errors.New("LEAF_PROXY_PORTS was set but contained no usable entries")
+	}
+	return ports, nil
+}
+
+// parsePortEntry mirrors cmd/leaf-direct/main.go's identical function
+// exactly (see resolvePorts' doc comment above) -- this is
+// leaf-proxy's own local copy.
+func parsePortEntry(raw string) (solo.PortConfig, error) {
+	fields := strings.Split(raw, ":")
+
+	// Strip an optional trailing ":tls" marker FIRST, before any of
+	// the existing difficulty/desc peeling logic below runs. This
+	// makes the grammar a strict superset of the pre-existing one:
+	// any entry with no trailing ":tls" field is untouched by this
+	// block and parses exactly as before (byte-for-byte identical
+	// PortConfig{TLS: false, ...}).
+	var tlsEnabled bool
+	if len(fields) > 0 && strings.EqualFold(fields[len(fields)-1], "tls") {
+		tlsEnabled = true
+		fields = fields[:len(fields)-1]
+	}
+
+	if len(fields) < 2 {
+		return solo.PortConfig{}, errors.New(`expected "address:difficulty", "address:difficulty:desc", or either with a trailing ":tls"`)
+	}
+	var (
+		addressFields []string
+		difficulty    uint64
+		desc          string
+		err           error
+	)
+	if difficulty, err = strconv.ParseUint(fields[len(fields)-1], 10, 64); err == nil {
+		addressFields = fields[:len(fields)-1]
+	} else if len(fields) >= 3 {
+		difficulty, err = strconv.ParseUint(fields[len(fields)-2], 10, 64)
+		if err != nil {
+			return solo.PortConfig{}, fmt.Errorf("invalid difficulty: %w", err)
+		}
+		addressFields = fields[:len(fields)-2]
+		desc = fields[len(fields)-1]
+	} else {
+		return solo.PortConfig{}, fmt.Errorf("invalid difficulty: %w", err)
+	}
+	address := strings.Join(addressFields, ":")
+	if address == "" {
+		return solo.PortConfig{}, errors.New("address portion is empty")
+	}
+	if difficulty == 0 {
+		return solo.PortConfig{}, errors.New("difficulty must be > 0")
+	}
+	return solo.PortConfig{Address: address, Difficulty: difficulty, PortDesc: desc, TLS: tlsEnabled}, nil
 }
 
 func main() {
@@ -553,50 +661,99 @@ func main() {
 		logger.Printf("metrics/stats HTTP server disabled (-metrics-listen-address is empty)")
 	}
 
-	ln, err := net.Listen("tcp", cfg.listenAddress)
-	if err != nil {
-		logger.Fatalf("failed to listen on %s: %v", cfg.listenAddress, err)
+	// portsExplicitlySet mirrors cmd/leaf-direct's -ports/-tls-*
+	// mutual-exclusivity check (see -ports' and -tls-listen-address's
+	// own doc comments above for the full rationale): when -ports is
+	// explicitly set, -tls-listen-address is no longer consulted at
+	// all -- an operator setting BOTH is a fatal startup
+	// misconfiguration rather than either flag being silently
+	// ignored.
+	portsExplicitlySet := strings.TrimSpace(cfg.portsRaw) != ""
+	if portsExplicitlySet && cfg.tlsListenAddress != "" {
+		logger.Fatalf("-ports/LEAF_PROXY_PORTS and -tls-listen-address/LEAF_PROXY_TLS_LISTEN_ADDRESS cannot both be set: -ports' own per-tier \":tls\" marker is now the general mechanism for a TLS-enabled listener -- move any TLS tier into a -ports entry (e.g. \"0.0.0.0:5556:1000:tls\") instead of also setting -tls-listen-address")
 	}
-	logger.Printf("listening for downstream miners on %s (starting difficulty %d)", cfg.listenAddress, cfg.startingDifficulty)
 
-	// listeners mirrors leaf-direct/leaf-solo's own []net.Listener
-	// shape (see those binaries' identical multi-listener fan-out)
-	// even though leaf-proxy only ever has at most 2 listeners here:
-	// the always-present plain one, plus an optional TLS one below.
-	listeners := []net.Listener{ln}
+	ports, err := resolvePorts(cfg)
+	if err != nil {
+		logger.Fatalf("invalid port configuration: %v", err)
+	}
 
-	// Optional SECOND, TLS-wrapped downstream listener, alongside
-	// (never instead of) the plain one above -- a complete no-op
-	// when -tls-listen-address/LEAF_PROXY_TLS_LISTEN_ADDRESS is
-	// unset (the default), matching every other optional feature's
-	// contract in this repo.
-	if cfg.tlsListenAddress != "" {
-		cert, err := leaflib.LoadOrGenerateCert(cfg.tlsCertFile, cfg.tlsKeyFile, cfg.tlsCertPersistPath, cfg.tlsListenAddress, logger)
+	// -tls-listen-address, when set, is ONLY ever added here -- in
+	// the old single-tier fallback path (-ports unset) -- as a
+	// second, TLS-enabled port tier alongside the implicit
+	// listenAddress/startingDifficulty tier resolvePorts already
+	// returned above. This preserves byte-for-byte the exact
+	// pre-existing behavior for every deployment that doesn't use
+	// -ports.
+	if !portsExplicitlySet && cfg.tlsListenAddress != "" {
+		ports = append(ports, solo.PortConfig{Address: cfg.tlsListenAddress, Difficulty: cfg.startingDifficulty, PortDesc: "tls", TLS: true})
+	}
+
+	for _, p := range ports {
+		desc := p.PortDesc
+		if desc == "" {
+			desc = "-"
+		}
+		logger.Printf("port tier: address=%s starting-difficulty=%d desc=%s", p.Address, p.Difficulty, desc)
+	}
+
+	listeners := make([]net.Listener, 0, len(ports))
+
+	// One shared tls.Certificate for the whole process (see
+	// internal/leaflib.LoadOrGenerateCert's doc comment) -- only
+	// constructed at all if at least one resolved port tier has TLS
+	// enabled. If no port has TLS enabled, this is skipped entirely:
+	// no behavior change, no wasted work, matching "TLS is fully
+	// optional" (see -ports'/-tls-listen-address's own doc
+	// comments).
+	var tlsCert tls.Certificate
+	var tlsConfigured bool
+	for _, p := range ports {
+		if p.TLS {
+			tlsConfigured = true
+			break
+		}
+	}
+	if tlsConfigured {
+		cert, err := leaflib.LoadOrGenerateCert(cfg.tlsCertFile, cfg.tlsKeyFile, cfg.tlsCertPersistPath, cfg.listenAddress, logger)
 		if err != nil {
 			logger.Fatalf("failed to load/generate shared TLS certificate: %v", err)
 		}
-		plainTLSLn, err := net.Listen("tcp", cfg.tlsListenAddress)
+		tlsCert = cert
+	}
+
+	for _, p := range ports {
+		ln, err := net.Listen("tcp", p.Address)
 		if err != nil {
-			_ = ln.Close()
-			logger.Fatalf("failed to listen on %s: %v", cfg.tlsListenAddress, err)
+			for _, opened := range listeners {
+				_ = opened.Close()
+			}
+			logger.Fatalf("failed to listen on %s: %v", p.Address, err)
 		}
-		tlsLn := tls.NewListener(plainTLSLn, &tls.Config{Certificates: []tls.Certificate{cert}})
-		listeners = append(listeners, tlsLn)
-		logger.Printf("listening for downstream miners on %s (TLS) (starting difficulty %d)", cfg.tlsListenAddress, cfg.startingDifficulty)
-	} else {
-		logger.Printf("TLS downstream listener disabled (-tls-listen-address is empty)")
+		if p.TLS {
+			ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{tlsCert}})
+			logger.Printf("listening for downstream miners on %s (TLS) (starting difficulty %d)", p.Address, p.Difficulty)
+		} else {
+			logger.Printf("listening for downstream miners on %s (starting difficulty %d)", p.Address, p.Difficulty)
+		}
+		listeners = append(listeners, ln)
 	}
 
 	errCh := make(chan error, len(listeners))
-	for _, l := range listeners {
-		go func(l net.Listener) { errCh <- server.Serve(ctx, l, cfg.startingDifficulty) }(l)
+	var wg sync.WaitGroup
+	for i, ln := range listeners {
+		wg.Add(1)
+		go func(ln net.Listener, port solo.PortConfig) {
+			defer wg.Done()
+			errCh <- server.Serve(ctx, ln, port)
+		}(ln, ports[i])
 	}
 
 	select {
 	case <-ctx.Done():
 		logger.Println("shutdown signal received, draining connections...")
-		for _, l := range listeners {
-			_ = l.Close()
+		for _, ln := range listeners {
+			_ = ln.Close()
 		}
 		cm.Shutdown()
 	case err := <-errCh:

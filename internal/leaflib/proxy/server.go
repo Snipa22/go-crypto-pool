@@ -494,9 +494,15 @@ func (s *Server) recordBlock(accepted bool) {
 
 // Serve accepts downstream miner connections on ln until ctx is
 // cancelled or ln is closed, stamping every session accepted on ln
-// with startingDifficulty. Blocks; callers typically run it in its
-// own goroutine.
-func (s *Server) Serve(ctx context.Context, ln net.Listener, startingDifficulty uint64) error {
+// with port.Difficulty as its starting difficulty -- mirroring
+// internal/leaflib/direct/server.go's identical Serve(ctx, ln, port
+// solo.PortConfig) signature exactly, so cmd/leaf-proxy's own
+// multi-port-tier main() loop can be structurally identical to
+// cmd/leaf-direct's (see solo.PortConfig's doc comment for the
+// port-tier/starting-difficulty semantics this carries). handleConn
+// itself stays a bare uint64 -- only Serve takes the full PortConfig.
+// Blocks; callers typically run it in its own goroutine.
+func (s *Server) Serve(ctx context.Context, ln net.Listener, port solo.PortConfig) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -509,7 +515,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener, startingDifficulty 
 			}
 			return err
 		}
-		go s.handleConn(ctx, conn, startingDifficulty)
+		go s.handleConn(ctx, conn, port.Difficulty)
 	}
 }
 
