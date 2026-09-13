@@ -12,9 +12,12 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	xmrcrypto "github.com/Snipa22/go-xmr-lib/support/crypto"
 
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -167,10 +170,15 @@ type moneroRPCResponse struct {
 	Error   *moneroRPCError `json:"error"`
 }
 
-// call performs one real JSON-RPC 2.0 request against baseURL+"/json_rpc"
-// and unmarshals a successful result into out (which may be nil if the
-// caller doesn't need the result body, e.g. a bare status check).
-func (c *MoneroNodeClient) call(ctx context.Context, method string, params any, out any) error {
+// callRaw performs one real JSON-RPC 2.0 request against
+// baseURL+"/json_rpc" and returns the raw, still-undecoded "result"
+// payload on success (rpcResp.Error != nil is still surfaced as a
+// real, failing error here exactly as call() does) -- factored out of
+// call() (below) so SubmitBlockAuxChains can apply its own
+// wire-shape-tolerant decode to the raw bytes (see that method's own
+// doc comment) instead of being forced through call()'s single
+// generic json.Unmarshal-into-out shape.
+func (c *MoneroNodeClient) callRaw(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	reqBody, err := json.Marshal(moneroRPCRequest{
 		JSONRPC: "2.0",
 		ID:      "0",
@@ -178,35 +186,46 @@ func (c *MoneroNodeClient) call(ctx context.Context, method string, params any, 
 		Params:  params,
 	})
 	if err != nil {
-		return fmt.Errorf("solo: monero: marshaling %s request: %w", method, err)
+		return nil, fmt.Errorf("solo: monero: marshaling %s request: %w", method, err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/json_rpc", bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("solo: monero: building %s request: %w", method, err)
+		return nil, fmt.Errorf("solo: monero: building %s request: %w", method, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	httpResp, err := c.client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("solo: monero: %s request failed: %w", method, err)
+		return nil, fmt.Errorf("solo: monero: %s request failed: %w", method, err)
 	}
 	defer httpResp.Body.Close()
 
 	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return fmt.Errorf("solo: monero: reading %s response body: %w", method, err)
+		return nil, fmt.Errorf("solo: monero: reading %s response body: %w", method, err)
 	}
 
 	var rpcResp moneroRPCResponse
 	if err := json.Unmarshal(body, &rpcResp); err != nil {
-		return fmt.Errorf("solo: monero: decoding %s response (status %d): %w", method, httpResp.StatusCode, err)
+		return nil, fmt.Errorf("solo: monero: decoding %s response (status %d): %w", method, httpResp.StatusCode, err)
 	}
 	if rpcResp.Error != nil {
-		return rpcResp.Error
+		return nil, rpcResp.Error
+	}
+	return rpcResp.Result, nil
+}
+
+// call performs one real JSON-RPC 2.0 request against baseURL+"/json_rpc"
+// and unmarshals a successful result into out (which may be nil if the
+// caller doesn't need the result body, e.g. a bare status check).
+func (c *MoneroNodeClient) call(ctx context.Context, method string, params any, out any) error {
+	result, err := c.callRaw(ctx, method, params)
+	if err != nil {
+		return err
 	}
 	if out != nil {
-		if err := json.Unmarshal(rpcResp.Result, out); err != nil {
+		if err := json.Unmarshal(result, out); err != nil {
 			return fmt.Errorf("solo: monero: decoding %s result payload: %w", method, err)
 		}
 	}
@@ -437,16 +456,104 @@ func (c *MoneroNodeClient) GetTipInfo(ctx context.Context) (uint64, error) {
 	return result.Height, nil
 }
 
+// MoneroCandidate is this file's own opaque candidate-block payload —
+// what BuildCandidateBlock returns as its `candidate any` value for
+// ALGO_RXM, and the ONLY shape SubmitBlock/SubmitBlockAuxChains (below)
+// ever accept back (see NodeClient.BuildCandidateBlock's own doc
+// comment: "candidate is opaque to every caller outside this SAME
+// NodeClient implementation"). Before this fix, this shape was a bare
+// []byte (just TemplateBlob below); it is widened to a struct here
+// SOLELY so BlockHash can travel alongside it — no other behavior
+// change.
+type MoneroCandidate struct {
+	// TemplateBlob is the real, nonce-patched blocktemplate_blob bytes
+	// this candidate's SubmitBlock/SubmitBlockAuxChains actually
+	// submits to the daemon.
+	TemplateBlob []byte
+
+	// BlockHash is the REAL, canonical 32-byte Monero block ID for
+	// this SAME candidate, computed ENTIRELY LOCALLY by
+	// BuildCandidateBlock (see that method's own doc comment for the
+	// full derivation and its real, empirical verification against
+	// two live mainnet blocks) — no RPC round-trip to the daemon
+	// required. This is what closes the real, live-confirmed
+	// production bug (2026-09-12 live test against
+	// leaf-direct-monero-pplns.service/CT132: leaf-direct's own
+	// post-submit get_block_header_by_height call raced the local
+	// testnet daemon's own tip advancement and lost 150 of 152 real
+	// block finds — "MONERO BLOCK HASH UNRESOLVED", rpc error -2
+	// "Requested block height: X greater than current top block
+	// height: X-1"). Always exactly 32 bytes on success; callers
+	// (session.go's handleSubmit, both leaf-direct and leaf-solo)
+	// must treat an empty/short BlockHash as "the real hash is not
+	// known" and must never forward a placeholder/empty hash
+	// downstream — see BuildCandidateBlock's own doc comment.
+	BlockHash []byte
+}
+
 // BuildCandidateBlock implements NodeClient. It re-parses the real
 // nonce offset for job's OWN blockhashing_blob (not reusing any offset
 // value cached elsewhere), patches nonce into a COPY of the real
-// blocktemplate_blob bytes at that offset, and computes the real
+// blocktemplate_blob bytes at that offset, computes the real
 // Monero difficulty of proof.ResultHex (the miner's claimed RandomX
 // hash — trusted here exactly as RXT's own BuildCandidateBlock trusts
 // it; session.go's handleSubmit only calls this after
 // validator.RandomXValidator has already confirmed that claimed hash is
 // what the real daemon/RandomX computation actually produced for this
-// job's blob+seed).
+// job's blob+seed), and ALSO computes the real, canonical Monero block
+// ID for that SAME candidate, entirely locally (MoneroCandidate.
+// BlockHash) — see this repo's git history for the real production
+// incident this closes: a post-submit get_block_header_by_height RPC
+// call used to be the ONLY source of this hash, and it raced the local
+// daemon's own tip advancement (monerod rpc error -2, "Requested block
+// height: X greater than current top block height: X-1"), losing 150
+// of 152 real block finds in one live 2-hour test.
+//
+// REAL DERIVATION, independently confirmed against monero-project/
+// monero's own source (fetched and read directly this session) AND
+// empirically verified against two REAL, live mainnet blocks (heights
+// 3761100 and 3761005, fetched via a real public monerod JSON-RPC
+// endpoint this session — see this method's own test,
+// TestMoneroLocalBlockHash_MatchesRealMainnetBlocks):
+//
+//   - src/cryptonote_basic/cryptonote_format_utils.cpp,
+//     get_block_hashing_blob(b): serializes the block header (major/
+//     minor/timestamp varints + prev_id[32] + nonce[4] — exactly
+//     job.TemplateData.(*moneroTemplateData).HashingBlob, before this
+//     nonce-patch), appends the tx tree root hash (crypto::
+//     tree_hash of [miner_tx_hash, ...regular tx hashes]), then a
+//     varint of (number of REGULAR, non-coinbase txs + 1). This exact
+//     byte sequence is what monerod's OWN get_block_template RPC
+//     hands back as "blockhashing_blob" — i.e. exactly
+//     data.HashingBlob, unpatched (nonce still zero).
+//   - Same file, calculate_block_hash(b): computes the real block ID
+//     as get_object_hash(get_block_hashing_blob(b), res).
+//   - src/cryptonote_basic/cryptonote_format_utils.h,
+//     get_object_hash<T>(o, res): NOT a bare hash of o's bytes — it
+//     first re-serializes o via t_serializable_object_to_blob(o) (a
+//     generic templated serializer), THEN hashes THAT. For T=blobdata
+//     (a std::string, exactly what get_block_hashing_blob returns),
+//     src/serialization/string.h's do_serialize(Archive<true>&,
+//     std::string&) serializes a string as
+//     `serialize_varint(size) + serialize_blob(data, size)` — i.e. a
+//     REAL-Monero-varint-encoded BYTE-LENGTH PREFIX ahead of the raw
+//     bytes.
+//
+// Put together: real Monero block ID =
+// Keccak-256( varint(len(hashing_blob)) ++ hashing_blob ), NOT a bare
+// Keccak-256(hashing_blob) as a naive reading of "cn_fast_hash(
+// get_block_hashing_blob(block))" (the commonly-cited shorthand for
+// this formula) would suggest — the length-prefix is easy to miss
+// because get_object_hash's own generic serialization step is not
+// mentioned by that shorthand at all. This distinction was NOT merely
+// assumed: it was independently, empirically confirmed against two
+// real, live mainnet blocks fetched via a public monerod RPC endpoint
+// this session (heights 3761100, a 2-leaf-merkle single-regular-tx
+// block, and 3761005, a 9-leaf-merkle 8-regular-tx block) — the
+// length-prefixed formula reproduced BOTH real block_header.hash
+// values exactly; the bare (non-length-prefixed) formula matched
+// NEITHER. See TestMoneroLocalBlockHash_MatchesRealMainnetBlocks for
+// the full, reproducible fixture data and computation.
 func (c *MoneroNodeClient) BuildCandidateBlock(job *Job, nonce uint64, proof SubmitProof) (uint64, any, error) {
 	data, ok := job.TemplateData.(*moneroTemplateData)
 	if !ok || data == nil {
@@ -467,12 +574,33 @@ func (c *MoneroNodeClient) BuildCandidateBlock(job *Job, nonce uint64, proof Sub
 	if nonceOffset+4 > len(data.TemplateBlob) {
 		return 0, nil, fmt.Errorf("solo: monero: nonce offset %d + 4 exceeds template blob length %d", nonceOffset, len(data.TemplateBlob))
 	}
+	// GetBlockTemplate already confirmed hashingBlob[:nonceOffset] ==
+	// templateBlob[:nonceOffset] and that nonceOffset+4 fits within
+	// BOTH blobs (see that method's own bounds check) -- this check is
+	// kept here too, defensively, on every call, rather than assumed,
+	// matching this file's own "never assume stability" convention;
+	// it can only fail here on a genuinely corrupted in-memory Job,
+	// not any real daemon response shape this package hasn't already
+	// validated.
+	if nonceOffset+4 > len(data.HashingBlob) {
+		return 0, nil, fmt.Errorf("solo: monero: nonce offset %d + 4 exceeds hashing blob length %d -- refusing to compute a local block hash from a malformed blob", nonceOffset, len(data.HashingBlob))
+	}
+
+	var nonceBuf [4]byte
+	binary.LittleEndian.PutUint32(nonceBuf[:], uint32(nonce))
 
 	candidate := make([]byte, len(data.TemplateBlob))
 	copy(candidate, data.TemplateBlob)
-	var nonceBuf [4]byte
-	binary.LittleEndian.PutUint32(nonceBuf[:], uint32(nonce))
 	copy(candidate[nonceOffset:nonceOffset+4], nonceBuf[:])
+
+	// Real, LOCAL block-ID computation (see this method's own doc
+	// comment for the full derivation/citations) -- the actual fix:
+	// no RPC round-trip to the daemon, so nothing to race against its
+	// own tip advancement.
+	patchedHashingBlob := make([]byte, len(data.HashingBlob))
+	copy(patchedHashingBlob, data.HashingBlob)
+	copy(patchedHashingBlob[nonceOffset:nonceOffset+4], nonceBuf[:])
+	blockHash := moneroLocalBlockHash(patchedHashingBlob)
 
 	hashBytes, err := hex.DecodeString(proof.ResultHex)
 	if err != nil {
@@ -482,19 +610,32 @@ func (c *MoneroNodeClient) BuildCandidateBlock(job *Job, nonce uint64, proof Sub
 	if err != nil {
 		return 0, nil, err
 	}
-	return diff, candidate, nil
+	return diff, &MoneroCandidate{TemplateBlob: candidate, BlockHash: blockHash[:]}, nil
+}
+
+// moneroLocalBlockHash computes the REAL, canonical Monero block ID
+// for an already nonce-patched blockhashing_blob, entirely locally --
+// see BuildCandidateBlock's own doc comment for the full derivation,
+// citations, and real empirical verification against two live
+// mainnet blocks.
+func moneroLocalBlockHash(patchedHashingBlob []byte) [32]byte {
+	var lenPrefix [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(lenPrefix[:], uint64(len(patchedHashingBlob)))
+	preimage := make([]byte, 0, n+len(patchedHashingBlob))
+	preimage = append(preimage, lenPrefix[:n]...)
+	preimage = append(preimage, patchedHashingBlob...)
+	return xmrcrypto.KeccakOneShot(preimage)
 }
 
 // SubmitBlock implements NodeClient via a real monerod submit_block
-// call. candidate must be the []byte produced by this SAME
-// implementation's own BuildCandidateBlock (a nonce-patched
-// blocktemplate_blob).
+// call. candidate must be the *MoneroCandidate produced by this SAME
+// implementation's own BuildCandidateBlock.
 func (c *MoneroNodeClient) SubmitBlock(ctx context.Context, candidate any) error {
-	blob, ok := candidate.([]byte)
-	if !ok {
-		return fmt.Errorf("solo: monero: SubmitBlock: candidate is not a []byte (got %T)", candidate)
+	mc, ok := candidate.(*MoneroCandidate)
+	if !ok || mc == nil {
+		return fmt.Errorf("solo: monero: SubmitBlock: candidate is not a real *MoneroCandidate (got %T)", candidate)
 	}
-	return c.call(ctx, "submit_block", []string{hex.EncodeToString(blob)}, nil)
+	return c.call(ctx, "submit_block", []string{hex.EncodeToString(mc.TemplateBlob)}, nil)
 }
 
 // AuxChainResult is one merge-mined chain's own real acceptance
@@ -508,19 +649,21 @@ func (c *MoneroNodeClient) SubmitBlock(ctx context.Context, candidate any) error
 //
 // Confirmed against the real tari-project/tari source
 // (applications/minotari_merge_mining_proxy/src/proxy/inner.rs,
-// handle_submit_block/append_aux_chain_data) and live against
-// CT132's tari-mmproxy.service this session: on a submit_block call
-// whose embedded Tari merge-mining header clears Tari's OWN real
-// difficulty target AND the Tari base node accepts the resulting
-// block, the proxy's JSON-RPC result gains an aux_chain_data array
-// with entries shaped {"id": "xtr", "block_hash": "<hex>"} --
-// "xtr" is Tari's own real aux-chain identifier in this response.
-// When Tari's target isn't cleared, or IS cleared but the Tari base
-// node then rejects the submission, aux_chain_data is simply absent
-// (no entry for that chain) — this is NOT an error condition for the
-// Monero leg, which this same submit_block response resolves
-// entirely independently (see moneroSubmitBlockAuxResult's own doc
-// comment for the exact decode).
+// handle_submit_block, and src/proxy/utils.rs,
+// append_aux_chain_data/MMPROXY_AUX_KEY_NAME): on a successful
+// Tari-side submission, minotari_merge_mining_proxy calls
+// append_aux_chain_data(json_resp, json!({"id": TARI_CHAIN_ID,
+// "block_hash": resp.block_hash.to_hex()})), and append_aux_chain_data
+// appends into result["_aux"]["chains"] (an array) --
+// MMPROXY_AUX_KEY_NAME is "_aux", NOT a top-level "aux_chain_data" key
+// (the shape this file used before this fix, which never actually
+// matched the real proxy's wire format -- see
+// moneroSubmitBlockAuxResult's own doc comment). "xtr" is Tari's own
+// real aux-chain identifier in this response. When Tari's target isn't
+// cleared, or IS cleared but the Tari base node then rejects the
+// submission, no entry is appended for that chain -- this is NOT an
+// error condition for the Monero leg, which this same submit_block
+// response resolves entirely independently.
 type AuxChainResult struct {
 	// ChainID is the aux-chain identifier as reported by the proxy's
 	// own response (e.g. "xtr" for Tari) -- callers match this
@@ -536,26 +679,40 @@ type AuxChainResult struct {
 // moneroSubmitBlockAuxResult decodes submit_block's real JSON-RPC
 // result payload when the underlying endpoint is a merge-mining
 // proxy: a normal monerod-style {"status":"OK","untrusted":bool}
-// PLUS an optional "aux_chain_data" array carrying each OTHER
-// configured chain's own real acceptance outcome for this SAME
-// submission (see AuxChainResult's doc comment). Raw monerod itself
-// never populates aux_chain_data at all (unknown field, silently
-// ignored by json.Unmarshal) — decoding this same struct against a
-// raw-monerod submit_block response is safe and simply yields zero
-// AuxChainData entries.
+// PLUS an optional "_aux":{"chains":[...]} object carrying each
+// configured chain's own template-request-time info (difficulty/
+// height/mining_hash/miner_reward) AND, on genuine acceptance, an
+// "id"/"block_hash" pair for that chain (see AuxChainResult's own doc
+// comment for the real, tari-project/tari-source-confirmed wire
+// shape: "_aux" is minotari_merge_mining_proxy's own
+// MMPROXY_AUX_KEY_NAME, NOT "aux_chain_data" -- that top-level key
+// never actually existed on the real wire; using it was this file's
+// own pre-fix bug). Only entries carrying BOTH a non-empty "id" AND a
+// non-empty "block_hash" represent a genuine chain acceptance -- the
+// "_aux.chains" array also carries template-request-time entries
+// (difficulty/height/mining_hash/miner_reward, no block_hash at all)
+// that must NOT be misinterpreted as an acceptance signal.
+//
+// Raw monerod itself never populates "_aux" at all (unknown field,
+// silently ignored by json.Unmarshal) -- decoding this same struct
+// against a raw-monerod submit_block response is safe and simply
+// yields a nil Aux (zero AuxChainResult entries).
 type moneroSubmitBlockAuxResult struct {
-	Status       string `json:"status"`
-	Untrusted    bool   `json:"untrusted"`
-	AuxChainData []struct {
-		ID        string `json:"id"`
-		BlockHash string `json:"block_hash"`
-	} `json:"aux_chain_data"`
+	Status    string `json:"status"`
+	Untrusted bool   `json:"untrusted"`
+	Aux       *struct {
+		Chains []struct {
+			ID        string `json:"id"`
+			BlockHash string `json:"block_hash"`
+		} `json:"chains"`
+	} `json:"_aux"`
 }
 
 // SubmitBlockAuxChains performs the exact SAME real submit_block call
-// SubmitBlock does, additionally decoding the response for any
-// aux_chain_data entries (see AuxChainResult's doc comment). A
-// non-nil error here means submit_block itself failed (the SAME
+// SubmitBlock does, additionally decoding the response for any real
+// aux-chain acceptance entries under "_aux.chains" (see
+// AuxChainResult's and moneroSubmitBlockAuxResult's own doc comments).
+// A non-nil error here means submit_block itself failed (the SAME
 // outcome SubmitBlock's own error return would represent) -- when
 // that happens, auxChains is always nil: this deployment's mmproxy
 // (submit_to_origin=false) reports the WHOLE call's outcome, so an
@@ -567,18 +724,60 @@ type moneroSubmitBlockAuxResult struct {
 // forwarded to the backend on error, exactly mirroring this
 // package's existing skipBackendForward-style "never fabricate,
 // when in doubt leave it out" convention). On success (nil error),
-// auxChains reflects exactly whatever aux_chain_data entries (zero or
-// more) the response carried.
+// auxChains reflects exactly whatever genuine acceptance entries
+// (zero or more) the response carried.
+//
+// WIRE-SHAPE TOLERANCE: real, live-observed raw monerod submit_block
+// success can shape the JSON-RPC "result" field as a bare STRING
+// ("{}") rather than an object (confirmed live against this exact
+// testnet daemon this session: {"id":-1,"jsonrpc":"2.0","result":"{}",
+// "status":"OK","untrusted":false} -- note status/untrusted sitting
+// at the TOP level, siblings of "result", and "result" itself being
+// the literal string "{}", not an object). This mirrors this same
+// file's own documented monerod-is-wire-inconsistent precedent (see
+// moneroRPCResponse.ID's doc comment for the "id" field's own
+// number-vs-string inconsistency on this SAME RPC method). This
+// function decodes the real object shape first; if that fails AND
+// the raw result is instead a JSON string that parses to an
+// effectively-empty value ("" or "{}"), it is treated as a plain,
+// non-aux success rather than a hard decode failure (logged
+// distinctly so the degraded shape stays visible without breaking
+// submission). A genuine daemon-reported RPC error
+// (rpcResp.Error != nil) still fails loudly exactly as before -- this
+// tolerance is specifically for the success-path response-shape
+// ambiguity described above, never for a real error.
 func (c *MoneroNodeClient) SubmitBlockAuxChains(ctx context.Context, candidate any) (auxChains []AuxChainResult, err error) {
-	blob, ok := candidate.([]byte)
-	if !ok {
-		return nil, fmt.Errorf("solo: monero: SubmitBlockAuxChains: candidate is not a []byte (got %T)", candidate)
+	mc, ok := candidate.(*MoneroCandidate)
+	if !ok || mc == nil {
+		return nil, fmt.Errorf("solo: monero: SubmitBlockAuxChains: candidate is not a real *MoneroCandidate (got %T)", candidate)
 	}
-	var result moneroSubmitBlockAuxResult
-	if err := c.call(ctx, "submit_block", []string{hex.EncodeToString(blob)}, &result); err != nil {
+	rawResult, err := c.callRaw(ctx, "submit_block", []string{hex.EncodeToString(mc.TemplateBlob)})
+	if err != nil {
 		return nil, err
 	}
-	for _, entry := range result.AuxChainData {
+
+	var result moneroSubmitBlockAuxResult
+	if decodeErr := json.Unmarshal(rawResult, &result); decodeErr != nil {
+		// Degraded-shape tolerance -- see this method's own doc
+		// comment. Only the specific "result is a bare string that
+		// parses to an effectively-empty value" shape is tolerated;
+		// anything else is still a hard error.
+		var bareString string
+		if strErr := json.Unmarshal(rawResult, &bareString); strErr != nil {
+			return nil, fmt.Errorf("solo: monero: decoding submit_block result payload: %w", decodeErr)
+		}
+		trimmed := strings.TrimSpace(bareString)
+		if trimmed != "" && trimmed != "{}" {
+			return nil, fmt.Errorf("solo: monero: submit_block result was a non-empty bare string %q (not decodable as an object, and not the known degraded \"{}\" success shape): %w", bareString, decodeErr)
+		}
+		log.Printf("solo: monero: submit_block returned a bare-string result %q (a known monerod wire-shape quirk on this RPC -- see moneroSubmitBlockAuxResult's doc comment) -- treating as a plain, non-aux success", bareString)
+		return nil, nil
+	}
+
+	if result.Aux == nil {
+		return nil, nil
+	}
+	for _, entry := range result.Aux.Chains {
 		if entry.ID == "" || entry.BlockHash == "" {
 			continue
 		}
