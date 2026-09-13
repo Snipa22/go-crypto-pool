@@ -96,18 +96,37 @@ func TestGRPCNodeClientBuildCoinbaseExtraDiffersPerCall(t *testing.T) {
 	}
 }
 
+// coinbaseExtraSuffixLen is the fixed "1 NUL byte + 4 random bytes"
+// overhead NormalizeCoinbaseExtraTag now always appends after the
+// (possibly-truncated) base tag string.
+const coinbaseExtraSuffixLen = 1 + 4
+
 func TestNormalizeCoinbaseExtraTagUsesExplicitValueVerbatim(t *testing.T) {
 	got := NormalizeCoinbaseExtraTag("my-custom-tag", "supportxtm-sha3x")
-	if string(got) != "my-custom-tag" {
-		t.Errorf("NormalizeCoinbaseExtraTag = %q, want %q", got, "my-custom-tag")
+	wantBase := "my-custom-tag"
+	if len(got) != len(wantBase)+coinbaseExtraSuffixLen {
+		t.Fatalf("len(NormalizeCoinbaseExtraTag(...)) = %d, want %d (base tag + NUL + 4 random bytes)", len(got), len(wantBase)+coinbaseExtraSuffixLen)
+	}
+	if string(got[:len(wantBase)]) != wantBase {
+		t.Errorf("NormalizeCoinbaseExtraTag base tag = %q, want %q", got[:len(wantBase)], wantBase)
+	}
+	if got[len(wantBase)] != 0x00 {
+		t.Errorf("byte immediately after base tag = %#x, want 0x00", got[len(wantBase)])
 	}
 }
 
 func TestNormalizeCoinbaseExtraTagFallsBackWhenEmpty(t *testing.T) {
 	for _, tag := range []string{"", "   "} {
 		got := NormalizeCoinbaseExtraTag(tag, "supportxtm-rxt")
-		if string(got) != "supportxtm-rxt" {
-			t.Errorf("NormalizeCoinbaseExtraTag(%q, ...) = %q, want fallback %q", tag, got, "supportxtm-rxt")
+		wantBase := "supportxtm-rxt"
+		if len(got) != len(wantBase)+coinbaseExtraSuffixLen {
+			t.Fatalf("NormalizeCoinbaseExtraTag(%q, ...): len = %d, want %d", tag, len(got), len(wantBase)+coinbaseExtraSuffixLen)
+		}
+		if string(got[:len(wantBase)]) != wantBase {
+			t.Errorf("NormalizeCoinbaseExtraTag(%q, ...) base = %q, want fallback %q", tag, got[:len(wantBase)], wantBase)
+		}
+		if got[len(wantBase)] != 0x00 {
+			t.Errorf("NormalizeCoinbaseExtraTag(%q, ...): byte after base tag = %#x, want 0x00", tag, got[len(wantBase)])
 		}
 	}
 }
@@ -115,19 +134,162 @@ func TestNormalizeCoinbaseExtraTagFallsBackWhenEmpty(t *testing.T) {
 func TestNormalizeCoinbaseExtraTagTruncatesOverlongInput(t *testing.T) {
 	overlong := strings.Repeat("A", MaxCoinbaseExtraTagLen+50)
 	got := NormalizeCoinbaseExtraTag(overlong, "supportxtm-sha3x")
+	const maxBaseTagLen = MaxCoinbaseExtraTagLen - coinbaseExtraSuffixLen
 	if len(got) != MaxCoinbaseExtraTagLen {
 		t.Fatalf("len(NormalizeCoinbaseExtraTag(overlong, ...)) = %d, want %d", len(got), MaxCoinbaseExtraTagLen)
 	}
-	if string(got) != overlong[:MaxCoinbaseExtraTagLen] {
-		t.Errorf("truncated tag does not match the expected prefix")
+	if string(got[:maxBaseTagLen]) != overlong[:maxBaseTagLen] {
+		t.Errorf("truncated base tag does not match the expected prefix")
+	}
+	if got[maxBaseTagLen] != 0x00 {
+		t.Errorf("byte immediately after truncated base tag = %#x, want 0x00", got[maxBaseTagLen])
 	}
 }
 
 func TestNormalizeCoinbaseExtraTagAcceptsExactMaxLength(t *testing.T) {
-	exact := strings.Repeat("B", MaxCoinbaseExtraTagLen)
+	// "Exact max length" now means the base tag alone consumes the
+	// full maxBaseTagLen budget (MaxCoinbaseExtraTagLen - 5); the
+	// total returned length is still capped at MaxCoinbaseExtraTagLen
+	// once the NUL+4-random-byte suffix is appended.
+	const maxBaseTagLen = MaxCoinbaseExtraTagLen - coinbaseExtraSuffixLen
+	exact := strings.Repeat("B", maxBaseTagLen)
 	got := NormalizeCoinbaseExtraTag(exact, "supportxtm-sha3x")
 	if len(got) != MaxCoinbaseExtraTagLen {
-		t.Errorf("len(got) = %d, want %d (exact-length input must not be truncated further)", len(got), MaxCoinbaseExtraTagLen)
+		t.Errorf("len(got) = %d, want %d (exact-max-budget base tag must not be truncated further, and the suffix must still fit)", len(got), MaxCoinbaseExtraTagLen)
+	}
+}
+
+// --- NUL-delimited random-suffix coinbase-extra-tag scheme tests
+// (required tests (a)-(f) from this feature's brief) ---
+
+// TestNormalizeCoinbaseExtraTagSuffixIsExactlyFourBytes is required
+// test (a): the random suffix appended after the NUL delimiter is
+// exactly 4 bytes.
+func TestNormalizeCoinbaseExtraTagSuffixIsExactlyFourBytes(t *testing.T) {
+	resetCoinbaseExtraRandomSuffixForTest()
+	t.Cleanup(resetCoinbaseExtraRandomSuffixForTest)
+
+	base := "supportxtm-sha3x"
+	got := NormalizeCoinbaseExtraTag(base, "fallback")
+	// len(got) = len(base) + 1 (NUL) + 4 (random suffix).
+	suffix := got[len(base)+1:]
+	if len(suffix) != 4 {
+		t.Fatalf("len(random suffix) = %d, want 4", len(suffix))
+	}
+}
+
+// TestNormalizeCoinbaseExtraTagByteAfterBaseTagIsNUL is required test
+// (b): the byte immediately following the base tag string in the
+// returned slice is exactly 0x00 (a genuine NUL byte, not a printable
+// placeholder), since a separate repo (go-tari-explorer) splits on
+// this exact byte value to recover the original prefix.
+func TestNormalizeCoinbaseExtraTagByteAfterBaseTagIsNUL(t *testing.T) {
+	resetCoinbaseExtraRandomSuffixForTest()
+	t.Cleanup(resetCoinbaseExtraRandomSuffixForTest)
+
+	base := "supportxtm-rxt"
+	got := NormalizeCoinbaseExtraTag(base, "fallback")
+	if got[len(base)] != 0x00 {
+		t.Fatalf("byte immediately after base tag = %#x, want a genuine 0x00 NUL byte", got[len(base)])
+	}
+}
+
+// TestNormalizeCoinbaseExtraTagSuffixCachedAcrossCallsSameProcess is
+// required test (c): two calls within the same test (same process, no
+// reset in between) must return byte-identical suffixes, proving the
+// suffix is generated once and cached, not freshly generated per
+// call.
+func TestNormalizeCoinbaseExtraTagSuffixCachedAcrossCallsSameProcess(t *testing.T) {
+	resetCoinbaseExtraRandomSuffixForTest()
+	t.Cleanup(resetCoinbaseExtraRandomSuffixForTest)
+
+	base1 := "supportxtm-sha3x"
+	got1 := NormalizeCoinbaseExtraTag(base1, "fallback")
+	suffix1 := append([]byte(nil), got1[len(base1)+1:]...)
+
+	// A different base tag string (and different fallback) on the
+	// second call -- only the suffix itself is asserted identical,
+	// confirming the cache is keyed on the process, not the input.
+	base2 := "a-completely-different-tag"
+	got2 := NormalizeCoinbaseExtraTag(base2, "another-fallback")
+	suffix2 := got2[len(base2)+1:]
+
+	if !bytes.Equal(suffix1, suffix2) {
+		t.Fatalf("suffix1 = %x, suffix2 = %x -- two NormalizeCoinbaseExtraTag calls in the same process must return byte-identical random suffixes (generated once, cached)", suffix1, suffix2)
+	}
+}
+
+// TestNormalizeCoinbaseExtraTagSuffixDiffersAfterProcessReset is
+// required test (d): after resetCoinbaseExtraRandomSuffixForTest
+// (simulating a fresh OS process), a subsequent call must produce a
+// suffix that differs from the previous "process"'s suffix.
+//
+// Four random bytes only guarantee this with overwhelming (not
+// absolute) probability: 4 bytes = 2^32 possible values. Across N
+// independent 4-byte draws, the collision probability (birthday
+// bound) is bounded by ~N^2 / 2^33. This test performs 300
+// reset+generate+compare cycles against every prior draw
+// (N=300 => N^2/2^33 ~= 90000 / 8.6e9 ~= 1.05e-5, i.e. about a
+// 0.001% chance of ANY collision across the whole run) and requires
+// zero collisions across all of them -- well below any realistic
+// flakiness threshold, and re-run on every `go test` invocation
+// rather than relying on a single bare comparison.
+func TestNormalizeCoinbaseExtraTagSuffixDiffersAfterProcessReset(t *testing.T) {
+	t.Cleanup(resetCoinbaseExtraRandomSuffixForTest)
+
+	const iterations = 300
+	seen := make(map[[4]byte]int, iterations)
+	base := "supportxtm-sha3x"
+	for i := 0; i < iterations; i++ {
+		resetCoinbaseExtraRandomSuffixForTest()
+		got := NormalizeCoinbaseExtraTag(base, "fallback")
+		var suffix [4]byte
+		copy(suffix[:], got[len(base)+1:])
+		if prev, ok := seen[suffix]; ok {
+			t.Fatalf("iteration %d: suffix %x collided with iteration %d's suffix -- astronomically unlikely for 4-byte crypto/rand draws (see this test's doc comment for the birthday-bound math)", i, suffix, prev)
+		}
+		seen[suffix] = i
+	}
+}
+
+// TestNormalizeCoinbaseExtraTagTotalLengthNeverExceedsMax is required
+// test (e): total returned length never exceeds MaxCoinbaseExtraTagLen
+// even when the input tag string is deliberately much longer than
+// MaxCoinbaseExtraTagLen.
+func TestNormalizeCoinbaseExtraTagTotalLengthNeverExceedsMax(t *testing.T) {
+	resetCoinbaseExtraRandomSuffixForTest()
+	t.Cleanup(resetCoinbaseExtraRandomSuffixForTest)
+
+	overlong := strings.Repeat("Z", 3*MaxCoinbaseExtraTagLen)
+	got := NormalizeCoinbaseExtraTag(overlong, "fallback")
+	if len(got) > MaxCoinbaseExtraTagLen {
+		t.Fatalf("len(NormalizeCoinbaseExtraTag(overlong, ...)) = %d, exceeds MaxCoinbaseExtraTagLen = %d", len(got), MaxCoinbaseExtraTagLen)
+	}
+	if len(got) != MaxCoinbaseExtraTagLen {
+		t.Errorf("len(got) = %d, want exactly %d for a deliberately overlong input", len(got), MaxCoinbaseExtraTagLen)
+	}
+}
+
+// TestNormalizeCoinbaseExtraTagOperatorOverrideGetsSameSuffixTreatment
+// is required test (f): an operator-supplied non-empty tag argument
+// (simulating the -coinbase-extra-tag override path) gets the
+// identical NUL+4-random-byte treatment as the fallback-default path.
+func TestNormalizeCoinbaseExtraTagOperatorOverrideGetsSameSuffixTreatment(t *testing.T) {
+	resetCoinbaseExtraRandomSuffixForTest()
+	t.Cleanup(resetCoinbaseExtraRandomSuffixForTest)
+
+	override := "operator-custom-override-tag"
+	got := NormalizeCoinbaseExtraTag(override, "this-fallback-must-not-be-used")
+
+	if !bytes.HasPrefix(got, []byte(override)) {
+		t.Fatalf("NormalizeCoinbaseExtraTag(override, ...) = %q, want prefix %q", got, override)
+	}
+	if got[len(override)] != 0x00 {
+		t.Fatalf("byte immediately after operator-supplied override tag = %#x, want 0x00", got[len(override)])
+	}
+	suffix := got[len(override)+1:]
+	if len(suffix) != 4 {
+		t.Fatalf("len(random suffix after operator override) = %d, want 4", len(suffix))
 	}
 }
 
