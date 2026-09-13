@@ -610,7 +610,7 @@ func setupDevFee(ctx context.Context, cfg config, logger *log.Logger, debugLogge
 	if cfg.devFeePercent <= 0 {
 		return nil, nil
 	}
-	logger.Printf("dev-fee mechanism ENABLED at %v%% (-dev-fee-percent) -- opening a SECOND upstream connection to %s:%d under a hardcoded (not operator-configurable) dev-fee login; see internal/leaflib/proxy/devfee.go's doc comment for the full mechanism -- the devFeeLogin placeholder CHANGE-ME-DEV-FEE-ADDRESS must be replaced with a real payout address before any real deploy", cfg.devFeePercent, cfg.upstreamHost, cfg.upstreamPort)
+	logger.Printf("dev-fee mechanism ENABLED at %v%% (-dev-fee-percent) -- opening a SECOND upstream connection to %s:%d under a hardcoded (not operator-configurable) dev-fee login; see internal/leaflib/proxy/devfee.go's doc comment for the full mechanism", cfg.devFeePercent, cfg.upstreamHost, cfg.upstreamPort)
 	devFeeUpstream := proxy.NewDevFeeUpstreamClient(proxy.UpstreamConfig{
 		Host:                  cfg.upstreamHost,
 		Port:                  cfg.upstreamPort,

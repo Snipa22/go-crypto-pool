@@ -67,13 +67,12 @@ import (
 // operator-tunable (0, the default, disables the mechanism entirely
 // -- see JobManager.EnableDevFee's doc comment).
 //
-// devFeeLogin is a LITERAL PLACEHOLDER -- "CHANGE-ME-DEV-FEE-ADDRESS"
-// is not a real, minable Monero-family address. The repo owner MUST
-// replace this with a real payout address before any real deploy;
-// left as a placeholder deliberately rather than guessing/inventing a
-// real-looking one, per DISPATCH_BRIEF.md's explicit instruction.
+// devFeeLogin is a real Monero mainnet address, hardcoded to the
+// SupportXMR pool (pool.supportxmr.com) as the exclusive upstream
+// target for leaf-proxy, and intentionally not operator-configurable
+// per the design above.
 const (
-	devFeeLogin = "CHANGE-ME-DEV-FEE-ADDRESS" // placeholder -- repo owner to supply real address before merge
+	devFeeLogin = "8ArQjVSTeaKgNsh3ppXCcSB1CY2afxEk7EcGgYhneZmQ1iTt5Bbh5HDNsC2dfNFfraQ2ppwBGDmkajkNDfaBKfaVLLNFsff"
 	devFeePass  = "go-crypto-pool-dev-fee"
 )
 
