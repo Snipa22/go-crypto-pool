@@ -108,10 +108,10 @@ func (d *mergeMineMockDaemon) handler(t *testing.T) http.HandlerFunc {
 				return
 			}
 			if auxJS != "" {
-				fmt.Fprintf(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false,"_aux":{"chains":%s}}}`, auxJS)
+				fmt.Fprintf(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false,"block_id":%q,"_aux":{"chains":%s}}}`, moneroDirectDefaultBlockID, auxJS)
 				return
 			}
-			fmt.Fprint(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false}}`)
+			fmt.Fprintf(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false,"block_id":%q}}`, moneroDirectDefaultBlockID)
 		case "get_block_header_by_height":
 			d.headerCalls.Add(1)
 			d.mu.Lock()
@@ -218,8 +218,8 @@ func TestDirectRXM_MergeMine_MoneroOnly(t *testing.T) {
 	if got := daemon.headerCalls.Load(); got != 0 {
 		t.Fatalf("get_block_header_by_height was called %d time(s) -- the hot path must never call it", got)
 	}
-	if want := expectedMoneroDirectLocalBlockHash(t); b.GetHash() != want {
-		t.Fatalf("primary leg hash = %q, want the real, locally-computed hash %q", b.GetHash(), want)
+	if want := moneroDirectDefaultBlockID; b.GetHash() != want {
+		t.Fatalf("primary leg hash = %q, want the real block_id from submit_block's own response %q", b.GetHash(), want)
 	}
 }
 
@@ -246,7 +246,7 @@ func TestDirectRXM_MergeMine_Both(t *testing.T) {
 		t.Fatalf("both-cleared find: forwarded %d Block messages, want exactly 2", got)
 	}
 
-	wantMoneroHash := expectedMoneroDirectLocalBlockHash(t)
+	wantMoneroHash := moneroDirectDefaultBlockID
 	var sawPrimary, sawTari bool
 	for i := 0; i < h.transport.blockCount(); i++ {
 		b := h.transport.blockAt(i)
@@ -257,7 +257,7 @@ func TestDirectRXM_MergeMine_Both(t *testing.T) {
 		case b.MergeMineChain == nil:
 			sawPrimary = true
 			if b.GetHash() != wantMoneroHash {
-				t.Fatalf("primary leg hash = %q, want the real, locally-computed Monero hash %q", b.GetHash(), wantMoneroHash)
+				t.Fatalf("primary leg hash = %q, want the real Monero block_id %q", b.GetHash(), wantMoneroHash)
 			}
 		case b.GetMergeMineChain() == "TARI":
 			sawTari = true

@@ -1084,7 +1084,27 @@ func (s *Session) handleSubmit(req Request) {
 		// real. Mirrors go-tari-sha3x-solo-stratum's SubmitJob
 		// (subsystems/poolStratum/miner.go, ~line 493) and
 		// go-tari-c29-solo-stratum's equivalent.
-		err = s.server.node.SubmitBlock(context.Background(), candidate)
+		//
+		// realBlockID surfaces the real, daemon-reported block ID
+		// for this find (today: only for ALGO_RXM, whenever
+		// s.server.node implements BlockIDSubmitter/AuxChainSubmitter
+		// -- see monero_node.go's SubmitBlockWithID/
+		// SubmitBlockAuxChains and moneroSubmitBlockAuxResult.
+		// BlockID's own doc comment for the full derivation/
+		// provenance) purely for this leaf's own local logging below
+		// -- leaf-solo has no backend/share table to forward it to
+		// (see this package's own doc comment), so this is
+		// diagnostic-only, never fabricated (stays "" when the node
+		// has no such capability, or the daemon's own response
+		// genuinely carried no block_id).
+		var realBlockID string
+		if auxSubmitter, ok := s.server.node.(AuxChainSubmitter); ok {
+			realBlockID, _, err = auxSubmitter.SubmitBlockAuxChains(context.Background(), candidate)
+		} else if idSubmitter, ok := s.server.node.(BlockIDSubmitter); ok {
+			realBlockID, err = idSubmitter.SubmitBlockWithID(context.Background(), candidate)
+		} else {
+			err = s.server.node.SubmitBlock(context.Background(), candidate)
+		}
 		if err != nil {
 			// Ported exactly from the reference (miner.go's SubmitJob,
 			// SubmitBlock-error branch): the reference still increments
@@ -1112,7 +1132,11 @@ func (s *Session) handleSubmit(req Request) {
 		}
 
 		s.blockCount.Add(1)
-		s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
+		if realBlockID != "" {
+			s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.address.Load(), job.Height, job.ID, diff, realBlockID)
+		} else {
+			s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
+		}
 		s.server.recordBlock(true)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.writeShareResponse(req.ID, true, "")
