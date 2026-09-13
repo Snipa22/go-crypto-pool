@@ -65,6 +65,23 @@ type Job struct {
 	// share upstream (UpstreamClient.SubmitShare's job_id param).
 	UpstreamJobID string
 
+	// Route records which upstream connection (devfee.go's
+	// UpstreamRoute) this Job's UpstreamJobID/TemplateGeneration/
+	// SeedHash/Height/UpstreamShareDiff fields above were actually
+	// drawn from — RoutePrimary unless the dev-fee mechanism is
+	// enabled AND was genuinely selected for this specific issuance
+	// (see JobManager.NextJob's own doc comment for the exact rule,
+	// including its fail-open-to-primary fault-isolation guarantee).
+	// session.go's handleSubmit uses this to resolve which
+	// UpstreamSubmitter/UpstreamGenerationSource to re-check/forward
+	// this Job's eventual submit against (Server.upstreamForRoute) —
+	// this is what makes the dev-fee mechanism's core correctness
+	// requirement hold: a submit routed to the dev-fee connection is
+	// ALWAYS validated/submitted against that SAME connection's own
+	// template, never the primary's (see the DISPATCH_BRIEF.md
+	// requirement this field exists to satisfy).
+	Route UpstreamRoute
+
 	// TemplateGeneration captures which upstream-CONNECTION
 	// generation (WorkerTemplate.Generation, at the moment this Job
 	// was minted — see that field's doc comment for the full
@@ -221,6 +238,19 @@ type TemplateSource interface {
 type JobManager struct {
 	source TemplateSource
 	logger *log.Logger
+
+	// devFeeSource/devFeeSelect back the optional developer-fee
+	// mechanism (devfee.go, DISPATCH_BRIEF.md "leaf-proxy dev-fee
+	// second-connection") — both are nil unless EnableDevFee has been
+	// called (cmd/leaf-proxy/main.go only calls it when
+	// -dev-fee-percent > 0), which is the exact same "nil is a
+	// complete no-op" convention this codebase already uses
+	// throughout (debugLogger, addressFlags, etc.): NextJob below
+	// never even evaluates devFeeSelect when devFeeSource is nil, so
+	// leaving this unset costs this hot path nothing beyond one
+	// extra nil-check.
+	devFeeSource TemplateSource
+	devFeeSelect func(time.Time) bool
 }
 
 // NewJobManager constructs a JobManager over source (a real
@@ -232,17 +262,52 @@ func NewJobManager(source TemplateSource, logger *log.Logger) *JobManager {
 	return &JobManager{source: source, logger: logger}
 }
 
-// currentTemplateJobID reports the current upstream template's OWN
-// job_id (WorkerTemplate.JobID) WITHOUT allocating a new Job or
-// burning any worker-/pool-nonce — a pure, side-effect-free read,
-// mirroring XNP's own getJob() check of `activeBlockTemplate.id`
-// (lib/xmr.js) before deciding whether miner.cachedJob can be reused.
-// Returns ("", false) if no upstream template has been published yet
-// (jm.source.CurrentTemplate() == nil) — Session.currentJob treats
-// that identically to "cannot cache" and falls through to NextJob,
-// which will itself return ErrNoUpstreamTemplate in that case.
-func (jm *JobManager) currentTemplateJobID() (id string, ok bool) {
-	t := jm.source.CurrentTemplate()
+// EnableDevFee opts this JobManager into the optional developer-fee
+// mechanism: from this call onward, NextJob will consult selector on
+// every issuance and, when it returns true AND devFeeSource currently
+// has a live template, mint that Job from devFeeSource (tagged
+// Job.Route = RouteDevFee) instead of the primary source. Intended
+// caller: cmd/leaf-proxy/main.go, only when -dev-fee-percent > 0 (see
+// devfee.go's NewDevFeeSelector for the production selector
+// construction) — never called at all when the mechanism is disabled,
+// which is what makes "-dev-fee-percent=0 is a complete no-op" hold
+// structurally (this method, and therefore any dev-fee code path in
+// NextJob below, is simply never reached).
+func (jm *JobManager) EnableDevFee(devFeeSource TemplateSource, selector func(time.Time) bool) {
+	jm.devFeeSource = devFeeSource
+	jm.devFeeSelect = selector
+}
+
+// currentTemplateJobIDForRoute reports the current job_id of whichever
+// connection route identifies (RoutePrimary -> jm.source, RouteDevFee
+// -> jm.devFeeSource) WITHOUT allocating a new Job or burning any
+// worker-/pool-nonce — a pure, side-effect-free read, mirroring XNP's
+// own getJob() check of `activeBlockTemplate.id` (lib/xmr.js) before
+// deciding whether miner.cachedJob can be reused. Returns ("", false)
+// if that connection has no template yet (some pool dialects never
+// publish job_id at all either — confirmed possible, see
+// UpstreamJobPayload.JobID's own omitempty tag) — Session.currentJob
+// treats that identically to "cannot cache" and falls through to
+// NextJob, which will itself return ErrNoUpstreamTemplate if there is
+// truly no template anywhere yet.
+//
+// This is Session.currentJob's per-session job cache's (session.go)
+// dev-fee-aware validation primitive: it lets that cache check a
+// cached Job against the SAME connection it was actually minted from
+// — never the other one, which matters because the primary and
+// dev-fee connections' own upstream templates change completely
+// independently of each other. A route of RouteDevFee when
+// jm.devFeeSource is nil (should not happen in practice: NextJob
+// never tags a Job RouteDevFee unless devFeeSource was non-nil at
+// mint time) falls back to the primary source, the same fail-safe
+// direction every other dev-fee fault-isolation fallback in this file
+// takes.
+func (jm *JobManager) currentTemplateJobIDForRoute(route UpstreamRoute) (id string, ok bool) {
+	source := jm.source
+	if route == RouteDevFee && jm.devFeeSource != nil {
+		source = jm.devFeeSource
+	}
+	t := source.CurrentTemplate()
 	if t == nil {
 		return "", false
 	}
@@ -315,8 +380,44 @@ func (jm *JobManager) currentTemplateJobID() (id string, ok bool) {
 // independent counters (see WorkerTemplate.nextPoolNonce's doc
 // comment for why), even though they both advance once per issuance
 // here and are now patched together in a single pass.
+//
+// DEV-FEE ROUTING (DISPATCH_BRIEF.md "leaf-proxy dev-fee
+// second-connection"): when EnableDevFee has been called, every call
+// here first consults jm.devFeeSelect(time.Now()) -- see devfee.go's
+// NewDevFeeSelector for the rolling-window mechanism this
+// production-wires. If it reports true AND jm.devFeeSource currently
+// has a live template (CurrentTemplate() != nil), THIS Job is minted
+// from the dev-fee source instead of the primary one, and tagged
+// Job.Route = RouteDevFee accordingly -- every field below
+// (UpstreamJobID/TemplateGeneration/SeedHash/Height/UpstreamShareDiff)
+// is then genuinely the DEV-FEE connection's own current values, never
+// a mix of the two. If the selector says true but the dev-fee
+// connection has NO template yet (e.g. still dialing/logging in, or
+// lost its connection and hasn't reconnected) this FALLS BACK to the
+// primary source and RoutePrimary instead of failing this job
+// issuance outright -- the explicit fault-isolation requirement: a
+// dev-fee connection outage must never degrade the primary path or
+// any downstream miner session. When EnableDevFee was never called at
+// all (jm.devFeeSource == nil, the default -- see that field's doc
+// comment), none of this logic runs at all: this is byte-identical to
+// the pre-dev-fee behavior, RoutePrimary, jm.source only.
 func (jm *JobManager) NextJob(difficulty uint64) (*Job, error) {
-	t := jm.source.CurrentTemplate()
+	source := jm.source
+	route := RoutePrimary
+	if jm.devFeeSource != nil && jm.devFeeSelect != nil && jm.devFeeSelect(time.Now()) {
+		if jm.devFeeSource.CurrentTemplate() != nil {
+			source = jm.devFeeSource
+			route = RouteDevFee
+		}
+		// else: dev-fee connection has no live template right now --
+		// fall through to the primary source/RoutePrimary above
+		// rather than returning ErrNoUpstreamTemplate for a job the
+		// primary connection could perfectly well have served. This
+		// is the fault-isolation guarantee: a dev-fee outage never
+		// blocks a real downstream job issuance.
+	}
+
+	t := source.CurrentTemplate()
 	if t == nil {
 		return nil, ErrNoUpstreamTemplate
 	}
@@ -334,6 +435,7 @@ func (jm *JobManager) NextJob(difficulty uint64) (*Job, error) {
 		WorkerNonce:        workerNonce,
 		PoolNonce:          poolNonce,
 		UpstreamJobID:      t.JobID,
+		Route:              route,
 		TemplateGeneration: t.Generation,
 		SeedHash:           t.SeedHash,
 		Height:             t.Height,

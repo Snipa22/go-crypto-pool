@@ -31,12 +31,25 @@ import (
 // counterpart handlePoolMessage/handleNewBlockTemplate, ~line
 // 675-727).
 //
-// Deliberately NOT ported (per explicit instruction): the legacy's 1%
-// developer-donation-pool skim (devPool, lib/xmr.js ~line 240-251) —
-// no dev/donation pool logic exists anywhere in this type or its
-// callers. Also not ported: the legacy's cluster/worker multi-process
-// fan-out (this Go process handles every downstream connection in one
-// process via goroutines, same model as leaf-solo).
+// DEVELOPER-FEE MECHANISM (re-added this pass, DISPATCH_BRIEF.md
+// "leaf-proxy dev-fee second-connection" -- superseding an earlier
+// pass's doc comment here that said this was deliberately NOT
+// ported): this UpstreamClient type is reused, unmodified, to
+// construct the SECOND, dev-fee connection too (see devfee.go's
+// NewDevFeeUpstreamClient) -- same dial/login/heartbeat/reconnect
+// lifecycle code, just a second instance logged in under a hardcoded
+// dev-fee login instead of the operator's own -upstream-login. See
+// devfee.go's package-level doc comment for the full mechanism,
+// including a confirmed citation of the real legacy xmr-node-proxy
+// reference's own, materially different devPool mechanism (lib/
+// xmr.js ~line 240-251's devPool config object plus proxy.js's
+// balanceWorkers 90-second whole-miner hashrate-balancing
+// reassignment) and why this leaf's own simplified, per-job
+// rolling-window mechanism is a deliberate approximation of that,
+// not a literal port. Still not ported: the legacy's cluster/worker
+// multi-process fan-out (this Go process handles every downstream
+// connection in one process via goroutines, same model as
+// leaf-solo).
 //
 // PORTED (this pass): the reference's 30-second `keepalived`
 // heartbeat (proxy.js ~line 672: `setInterval(pool.heartbeat,
