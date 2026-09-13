@@ -51,7 +51,7 @@
 //     hands the whole run to Repository.ApplyBlockPayout, which
 //     claims a per-block idempotency ledger row and applies every
 //     credit in ONE database transaction. See
-//     migrations/0011_block_payouts.up.sql and
+//     migrations/0013_block_payouts.up.sql and
 //     internal/backend/db/blockpayout.go for the full writeup of why
 //     — the short version is that the legacy shape's partial failures
 //     left an unknown subset of miners credited, and the only
@@ -112,7 +112,7 @@ type Repository interface {
 	// address" call in this interface any more, because a per-payee
 	// credit that is not part of a claimed, all-or-nothing block run
 	// is exactly the money-critical bug
-	// migrations/0011_block_payouts.up.sql exists to close. See
+	// migrations/0013_block_payouts.up.sql exists to close. See
 	// db.Repository.ApplyBlockPayout's doc comment for the full
 	// contract (claim semantics, the APPLIED no-op, the PENDING hard
 	// refusal, and the row-level idempotency backstop underneath).
@@ -514,7 +514,7 @@ type ApplyResult struct {
 // an UNKNOWN subset of miners credited with no record of which, and
 // the only retry available (a manual `backend block relock`) then
 // credited every already-paid miner a second time. See
-// migrations/0011_block_payouts.up.sql for the full writeup.
+// migrations/0013_block_payouts.up.sql for the full writeup.
 //
 // What happens instead: the payments are flattened into a
 // deterministically ordered credit list and handed, whole, to
@@ -600,7 +600,7 @@ func derefPaymentID(s *string) string {
 //
 // blockID is the `blocks.id` of the matured row and is REQUIRED: it
 // is the idempotency key the `block_payouts` ledger hangs off (see
-// Apply and migrations/0011_block_payouts.up.sql). A run for a block
+// Apply and migrations/0013_block_payouts.up.sql). A run for a block
 // whose payout already committed returns
 // ApplyResult.AlreadyApplied = true with a nil error — a safe,
 // expected no-op, counted separately on payout_cycles_total (see

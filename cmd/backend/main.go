@@ -1277,7 +1277,7 @@ func (a payoutRepositoryAdapter) SoloShare(ctx context.Context, algo string, hei
 // deliberately no CreditBalance passthrough on this adapter any more:
 // payout.Repository no longer exposes a per-payee credit call at all,
 // because a credit outside a claimed, all-or-nothing block run is the
-// money bug migrations/0011_block_payouts.up.sql exists to close.
+// money bug migrations/0013_block_payouts.up.sql exists to close.
 func (a payoutRepositoryAdapter) ApplyBlockPayout(ctx context.Context, run payout.BlockPayoutRun) (payout.BlockPayoutOutcome, error) {
 	credits := make([]db.BlockCredit, 0, len(run.Credits))
 	for _, c := range run.Credits {
@@ -1437,7 +1437,7 @@ func (a retentionRepositoryAdapter) DropOldPartitions(ctx context.Context, algo,
 //
 // b.ID (the real `blocks.id`) is passed straight through as the
 // payout run's idempotency key — see payout.MaturedBlock and
-// migrations/0011_block_payouts.up.sql. An AlreadyApplied result is
+// migrations/0013_block_payouts.up.sql. An AlreadyApplied result is
 // NOT an error: it is the expected outcome when the unlocker retries
 // a block whose payout committed but whose status write did not, and
 // returning nil here is what lets that retry finally mark the block
@@ -2008,7 +2008,7 @@ func startDisburseLoop(ctx context.Context, engine *disburse.Engine, label strin
 // its miners may already hold its credit. db.Repository.ApplyBlockPayout
 // refuses to run for such a block, so the unlocker will retry and
 // fail it on every poll tick until a human resolves it (see
-// migrations/0011_block_payouts.up.sql).
+// migrations/0013_block_payouts.up.sql).
 //
 // Unlike the disbursement check, this deliberately does NOT stop
 // anything from starting: a stuck block payout is scoped to that ONE

@@ -7,7 +7,7 @@
 //	backend block-payout resolve-not-credited -block-id=<id> -reason=<text> [-by=<operator>] [-dsn=...] -yes
 //
 // THIS IS THE HUMAN HALF OF A MONEY-CRITICAL SAFETY MECHANISM. Read
-// migrations/0011_block_payouts.up.sql and
+// migrations/0013_block_payouts.up.sql and
 // internal/backend/db/blockpayout.go's own doc comments before using
 // it.
 //

@@ -1,4 +1,4 @@
--- 0011_block_payouts.up.sql
+-- 0013_block_payouts.up.sql
 --
 -- Adds the matured-block payout IDEMPOTENCY LEDGER: `block_payouts`
 -- (one row per block whose payout run has been claimed) and
