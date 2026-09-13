@@ -775,7 +775,8 @@ func (s *Session) handleSubmit(req solo.Request) {
 		)
 		switch job.Algo {
 		case poolpb.Algo_ALGO_RXM:
-			if _, ok := candidate.([]byte); !ok {
+			moneroCandidate, ok := candidate.(*solo.MoneroCandidate)
+			if !ok || moneroCandidate == nil {
 				s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
 				return
 			}
@@ -790,7 +791,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			// Tari) ALSO cleared its own real target on this SAME
 			// PoW submission -- see solo.AuxChainResult's doc
 			// comment for the real, live-confirmed wire shape
-			// (aux_chain_data array, "xtr" for Tari). Falls back to
+			// ("_aux.chains" array, "xtr" for Tari). Falls back to
 			// the plain SubmitBlock call (identical to pre-existing
 			// behavior) when the configured node has no such
 			// capability (e.g. a bare monerod with no merge-mining
@@ -809,27 +810,28 @@ func (s *Session) handleSubmit(req solo.Request) {
 				s.server.logger.Printf("direct: monero BLOCK SUBMIT FAILED (single-node; multi-node Monero submit is a known, deferred gap) for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, submitErr)
 			} else {
 				submitOK = true
-				// The real monerod submit_block RPC returns NO block
-				// hash at all -- sha256(candidate blob) is NOT a
-				// real Monero block ID (a real Monero block ID is a
-				// Keccak-based hash of the serialized block header/
-				// hashing blob; see FIX_BRIEF.md). Resolve the REAL,
-				// canonical hash the exact same way the backend's
-				// own MoneroVerifier.Verify ultimately checks a
-				// stored hash against
-				// (internal/backend/chain/monero.go's Verify --
-				// get_block_header_by_height at this job's height),
-				// so what gets forwarded here can actually
-				// mature/unlock downstream instead of being
-				// permanently orphaned like every prior leaf-direct
-				// RXM block find.
-				hashHex, hashErr := s.server.resolveMoneroBlockHash(context.Background(), job.Height)
-				if hashErr != nil {
+				// THE FIX (real production incident, 2026-09-12 live
+				// test against leaf-direct-monero-pplns.service/
+				// CT132: 150 of 152 real block finds lost):
+				// moneroCandidate.BlockHash is a pure, LOCAL function
+				// of the exact same nonce-patched blob this leaf
+				// already submitted above (BuildCandidateBlock, see
+				// solo/monero_node.go's own doc comment for the full
+				// derivation/citations) -- no RPC round-trip to the
+				// daemon needed, and therefore nothing left to race
+				// against the local monerod's own (possibly slow) tip
+				// advancement (the old code's
+				// get_block_header_by_height post-submit call, which
+				// this fix removes from this hot path entirely, used
+				// to fail with rpc error -2 "Requested block height:
+				// X greater than current top block height: X-1"
+				// almost every time in that live test).
+				if len(moneroCandidate.BlockHash) == 0 {
 					s.server.recordMoneroBlockHashUnresolved()
-					s.server.logger.Printf("direct: MONERO BLOCK HASH UNRESOLVED for session %s (job %s, height %d): the block was accepted by submit_block but its real canonical hash could not be confirmed via get_block_header_by_height: %v -- refusing to forward a placeholder/empty hash to the backend (that would silently, permanently orphan a genuinely found block); this find needs manual reconciliation against the real monerod chain at this height", s.sessionID, job.ID, job.Height, hashErr)
+					s.server.logger.Printf("direct: MONERO BLOCK HASH UNRESOLVED for session %s (job %s, height %d): BuildCandidateBlock's own local hash computation produced an empty hash -- refusing to forward a placeholder/empty hash to the backend (that would silently, permanently orphan a genuinely found block); this find needs manual reconciliation against the real monerod chain at this height", s.sessionID, job.ID, job.Height)
 					skipBackendForward = true
 				} else {
-					blockHashHex = hashHex
+					blockHashHex = hex.EncodeToString(moneroCandidate.BlockHash)
 				}
 
 				// For EACH configured merge-mined chain
@@ -1079,10 +1081,11 @@ func (s *Session) forwardShare(share *poolpb.Share) {
 // blockHashHex is a coin-agnostic, already-hex-encoded identifying
 // hash for the found block (Tari: the REAL base-node-confirmed hash
 // from realBlockHashHex/submitBlockDirect — see that function's doc
-// comment; Monero: the REAL canonical hash resolved via
-// s.server.resolveMoneroBlockHash/get_block_header_by_height — see
-// handleSubmit's coin-aware dispatch; this method is never called at
-// all for a Monero find whose real hash could not be resolved, see
+// comment; Monero: the REAL canonical hash computed entirely locally
+// by solo.MoneroNodeClient.BuildCandidateBlock — see that method's
+// own doc comment for the full derivation, and handleSubmit's
+// coin-aware dispatch above; this method is never called at all for
+// a Monero find whose local hash computation genuinely failed, see
 // handleSubmit's skipBackendForward), computed by the caller since
 // this method no longer assumes a *tari_generated.Block shape.
 //

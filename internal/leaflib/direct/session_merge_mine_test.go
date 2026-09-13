@@ -108,7 +108,7 @@ func (d *mergeMineMockDaemon) handler(t *testing.T) http.HandlerFunc {
 				return
 			}
 			if auxJS != "" {
-				fmt.Fprintf(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false,"aux_chain_data":%s}}`, auxJS)
+				fmt.Fprintf(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false,"_aux":{"chains":%s}}}`, auxJS)
 				return
 			}
 			fmt.Fprint(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false}}`)
@@ -191,13 +191,12 @@ func submitRXMBlockFind(t *testing.T, h *directTestHarness, reqID int) {
 }
 
 // TestDirectRXM_MergeMine_MoneroOnly is the "one submission clears
-// Monero only" scenario: submit_block succeeds with no aux_chain_data
-// at all (the merge-mined chain's own target was not cleared) --
+// Monero only" scenario: submit_block succeeds with no "_aux" data at
+// all (the merge-mined chain's own target was not cleared) --
 // exactly ONE Block message should be forwarded, with
 // MergeMineChain unset (nil).
 func TestDirectRXM_MergeMine_MoneroOnly(t *testing.T) {
 	daemon := &mergeMineMockDaemon{height: 500, difficulty: 1000}
-	daemon.setHeaderHash("monerohash11111111111111111111111111111111111111111111111111")
 	srv := httptest.NewServer(daemon.handler(t))
 	defer srv.Close()
 
@@ -216,20 +215,25 @@ func TestDirectRXM_MergeMine_MoneroOnly(t *testing.T) {
 	if b.GetAlgo() != poolpb.Algo_ALGO_RXM {
 		t.Fatalf("forwarded block algo = %v, want ALGO_RXM", b.GetAlgo())
 	}
+	if got := daemon.headerCalls.Load(); got != 0 {
+		t.Fatalf("get_block_header_by_height was called %d time(s) -- the hot path must never call it", got)
+	}
+	if want := expectedMoneroDirectLocalBlockHash(t); b.GetHash() != want {
+		t.Fatalf("primary leg hash = %q, want the real, locally-computed hash %q", b.GetHash(), want)
+	}
 }
 
 // TestDirectRXM_MergeMine_Both is the "one submission clears both"
-// scenario: submit_block succeeds AND its response carries
-// aux_chain_data for the configured "xtr" (TARI) chain -- exactly
-// TWO Block messages must be forwarded: one primary leg
-// (MergeMineChain nil, Monero's own resolved hash) and one secondary
-// leg (MergeMineChain="TARI", the aux_chain_data hash).
+// scenario: submit_block succeeds AND its response carries a real
+// "_aux.chains" acceptance entry for the configured "xtr" (TARI)
+// chain -- exactly TWO Block messages must be forwarded: one primary
+// leg (MergeMineChain nil, Monero's own real, locally-computed hash)
+// and one secondary leg (MergeMineChain="TARI", the _aux.chains
+// hash).
 func TestDirectRXM_MergeMine_Both(t *testing.T) {
-	const moneroHash = "monerohash22222222222222222222222222222222222222222222222222"
 	const tariHash = "tarihashaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbcc"
 
 	daemon := &mergeMineMockDaemon{height: 500, difficulty: 1000}
-	daemon.setHeaderHash(moneroHash)
 	daemon.setAuxChainData(fmt.Sprintf(`[{"id":"xtr","block_hash":"%s"}]`, tariHash))
 	srv := httptest.NewServer(daemon.handler(t))
 	defer srv.Close()
@@ -242,6 +246,7 @@ func TestDirectRXM_MergeMine_Both(t *testing.T) {
 		t.Fatalf("both-cleared find: forwarded %d Block messages, want exactly 2", got)
 	}
 
+	wantMoneroHash := expectedMoneroDirectLocalBlockHash(t)
 	var sawPrimary, sawTari bool
 	for i := 0; i < h.transport.blockCount(); i++ {
 		b := h.transport.blockAt(i)
@@ -251,13 +256,13 @@ func TestDirectRXM_MergeMine_Both(t *testing.T) {
 		switch {
 		case b.MergeMineChain == nil:
 			sawPrimary = true
-			if b.GetHash() != moneroHash {
-				t.Fatalf("primary leg hash = %q, want the real resolved Monero hash %q", b.GetHash(), moneroHash)
+			if b.GetHash() != wantMoneroHash {
+				t.Fatalf("primary leg hash = %q, want the real, locally-computed Monero hash %q", b.GetHash(), wantMoneroHash)
 			}
 		case b.GetMergeMineChain() == "TARI":
 			sawTari = true
 			if b.GetHash() != tariHash {
-				t.Fatalf("TARI leg hash = %q, want the real aux_chain_data hash %q", b.GetHash(), tariHash)
+				t.Fatalf("TARI leg hash = %q, want the real _aux.chains hash %q", b.GetHash(), tariHash)
 			}
 		default:
 			t.Fatalf("forwarded block %d has unexpected merge_mine_chain %q", i, b.GetMergeMineChain())

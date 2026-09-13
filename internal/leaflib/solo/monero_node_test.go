@@ -4,6 +4,7 @@ package solo
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -267,10 +268,11 @@ func TestMoneroNodeClient_RealDaemonRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildCandidateBlock: %v", err)
 	}
-	candidate, ok := candidateAny.([]byte)
-	if !ok {
-		t.Fatalf("BuildCandidateBlock candidate is not []byte (got %T)", candidateAny)
+	moneroCandidate, ok := candidateAny.(*MoneroCandidate)
+	if !ok || moneroCandidate == nil {
+		t.Fatalf("BuildCandidateBlock candidate is not a real *MoneroCandidate (got %T)", candidateAny)
 	}
+	candidate := moneroCandidate.TemplateBlob
 	beforeNonce := data.TemplateBlob[independentOffset : independentOffset+4]
 	afterNonce := candidate[independentOffset : independentOffset+4]
 	t.Logf("real nonce patch at offset %d: before=%x after=%x (diff-from-claimed-hash=%d)", independentOffset, beforeNonce, afterNonce, diff)
@@ -289,6 +291,24 @@ func TestMoneroNodeClient_RealDaemonRoundTrip(t *testing.T) {
 		t.Fatalf("bytes after the nonce field were altered by patching")
 	}
 
+	// Real, LOCAL block-ID computation -- confirm it's populated,
+	// 32 bytes, and matches an independent re-derivation from the
+	// SAME real live-daemon blob (see BuildCandidateBlock's own doc
+	// comment for the full derivation).
+	if len(moneroCandidate.BlockHash) != 32 {
+		t.Fatalf("BuildCandidateBlock's locally-computed BlockHash has length %d, want 32", len(moneroCandidate.BlockHash))
+	}
+	independentPatchedHashingBlob := make([]byte, len(data.HashingBlob))
+	copy(independentPatchedHashingBlob, data.HashingBlob)
+	var independentNonceBuf [4]byte
+	binary.LittleEndian.PutUint32(independentNonceBuf[:], 0x11223344)
+	copy(independentPatchedHashingBlob[independentOffset:independentOffset+4], independentNonceBuf[:])
+	independentBlockHash := moneroLocalBlockHash(independentPatchedHashingBlob)
+	if !bytes.Equal(moneroCandidate.BlockHash, independentBlockHash[:]) {
+		t.Fatalf("BuildCandidateBlock's BlockHash = %x, want independently-recomputed %x", moneroCandidate.BlockHash, independentBlockHash)
+	}
+	t.Logf("real, locally-computed block ID for this candidate: %x", moneroCandidate.BlockHash)
+
 	// Real submit_block call for the nonce-patched candidate:
 	// well-formed at the byte-structure level (this is exactly what
 	// BuildCandidateBlock's nonce-patching is supposed to produce —
@@ -305,7 +325,7 @@ func TestMoneroNodeClient_RealDaemonRoundTrip(t *testing.T) {
 	// and either is an acceptable outcome for THIS deliberately-wrong
 	// nonce; what matters is that the daemon reports a genuine error,
 	// not a fabricated/hardcoded one.
-	err = client.SubmitBlock(ctx, candidate)
+	err = client.SubmitBlock(ctx, moneroCandidate)
 	if err == nil {
 		t.Fatalf("SubmitBlock unexpectedly succeeded for a deliberately-wrong candidate block")
 	}
@@ -323,7 +343,7 @@ func TestMoneroNodeClient_RealDaemonRoundTrip(t *testing.T) {
 	// structurally-malformed blob (independently confirmed via a raw
 	// curl call against this SAME real daemon this session to produce
 	// exactly this shape).
-	garbageErr := client.SubmitBlock(ctx, []byte{0xde, 0xad, 0xbe, 0xef})
+	garbageErr := client.SubmitBlock(ctx, &MoneroCandidate{TemplateBlob: []byte{0xde, 0xad, 0xbe, 0xef}})
 	if garbageErr == nil {
 		t.Fatalf("SubmitBlock unexpectedly succeeded for a garbage 4-byte candidate")
 	}
@@ -437,12 +457,12 @@ func TestMoneroNodeClient_BuildCandidateBlock_RejectsWrongTemplateType(t *testin
 }
 
 // TestMoneroNodeClient_SubmitBlock_RejectsWrongCandidateType confirms
-// SubmitBlock refuses a candidate that isn't a []byte.
+// SubmitBlock refuses a candidate that isn't a *MoneroCandidate.
 func TestMoneroNodeClient_SubmitBlock_RejectsWrongCandidateType(t *testing.T) {
 	client := NewMoneroNodeClient("http://127.0.0.1:1")
 	err := client.SubmitBlock(context.Background(), 12345)
 	if err == nil {
-		t.Fatalf("expected an error for a non-[]byte candidate")
+		t.Fatalf("expected an error for a non-*MoneroCandidate candidate")
 	}
 }
 

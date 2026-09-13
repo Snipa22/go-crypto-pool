@@ -353,10 +353,10 @@ type MergeMineChainConfig struct {
 	Name string
 
 	// AuxChainID is the aux-chain identifier a merge-mining proxy's
-	// own submit_block response tags THIS chain's aux_chain_data
-	// entry with (see solo.AuxChainResult.ChainID's doc comment --
-	// Tari's own real minotari_merge_mining_proxy convention,
-	// confirmed live against CT132's tari-mmproxy.service, is "xtr").
+	// own submit_block response tags THIS chain's "_aux.chains" entry
+	// with (see solo.AuxChainResult.ChainID's doc comment -- Tari's
+	// own real minotari_merge_mining_proxy convention, confirmed
+	// against tari-project/tari's own source, is "xtr").
 	// Required non-empty.
 	AuxChainID string
 }
@@ -610,21 +610,32 @@ func (s *Server) recordTransportSuccess(kind string) {
 // hash at height via this Server's configured moneroHeaderResolver --
 // a real get_block_header_by_height call against the same monerod
 // this leaf's own solo.MoneroNodeClient already talks to (see
-// ServerConfig.MonerodURL and monero_hash.go). This is
-// session.go's handleSubmit's ONLY source of the real hash for a
-// genuine ALGO_RXM block find; sha256(candidate blob) is NOT a real
-// Monero block ID (see FIX_BRIEF.md).
+// ServerConfig.MonerodURL and monero_hash.go).
+//
+// NO LONGER CALLED FROM session.go's handleSubmit HOT PATH (real
+// production incident, 2026-09-12 live test against
+// leaf-direct-monero-pplns.service/CT132: this exact post-submit RPC
+// call raced the local testnet daemon's own tip advancement --
+// monerod rpc error -2, "Requested block height: X greater than
+// current top block height: X-1" -- and lost 150 of 152 real block
+// finds in one 2-hour test). handleSubmit's ALGO_RXM case now sources
+// the real block hash entirely locally instead, from
+// solo.MoneroCandidate.BlockHash (solo.MoneroNodeClient.
+// BuildCandidateBlock's own doc comment has the full derivation) --
+// no RPC round-trip, so nothing left to race. This method (and the
+// moneroHeaderResolver/MonerodURL wiring behind it) is kept only as
+// an independent, RPC-based capability for tests/tooling (see
+// monero_hash_test.go and TestDirectResolveMoneroBlockHash_
+// NoResolverConfigured) and as a potential future manual-
+// reconciliation/startup-capability-check helper -- it is
+// deliberately NOT deleted, per this fix's own explicit "keep as a
+// startup-only capability check / test" allowance, but it no longer
+// gates any real block-find forward.
 //
 // Returns an error -- NEVER a placeholder/empty string -- if no
 // resolver is configured (ServerConfig.MonerodURL was left empty for
 // a -coin=monero process, a genuine startup misconfiguration), the
 // RPC call itself fails, or the daemon reports an empty hash.
-// Callers (handleSubmit) must treat any error here as "the real hash
-// is not known right now" and must not silently forward a
-// placeholder-shaped hash downstream -- see this fix's explicit
-// fallback-hardening requirement (FIX_BRIEF.md item 3, mirroring the
-// same requirement already applied to the Tari side's own
-// realBlockHashHex/submitBlockDirect path).
 func (s *Server) resolveMoneroBlockHash(ctx context.Context, height uint64) (string, error) {
 	if s.moneroHeaderResolver == nil {
 		return "", fmt.Errorf("direct: no Monero block-header resolver configured (ServerConfig.MonerodURL empty -- see -monerod-url/LEAF_DIRECT_MONEROD_URL)")
@@ -640,11 +651,18 @@ func (s *Server) resolveMoneroBlockHash(ctx context.Context, height uint64) (str
 }
 
 // recordMoneroBlockHashUnresolved bumps the real
-// leaf_direct_block_hash_unresolved_total counter (FIX_BRIEF.md item
-// 3's explicit "fail loudly" requirement) whenever
-// resolveMoneroBlockHash could not confirm the real hash for an
-// otherwise-accepted ALGO_RXM block find. nil-safe like every other
-// record* helper on this type (metrics may not be enabled).
+// leaf_direct_block_hash_unresolved_total counter -- the "fail
+// loudly" signal for a genuine ALGO_RXM block find whose real hash
+// could not be established. Since the local-hash-computation fix
+// (see resolveMoneroBlockHash's own updated doc comment), this now
+// fires ONLY when solo.MoneroCandidate.BlockHash (computed entirely
+// locally by BuildCandidateBlock) comes back empty on an otherwise-
+// accepted block find -- a defensive-only path that should be
+// unreachable in practice (BuildCandidateBlock itself already
+// validates the blob/offset before ever computing a hash), kept per
+// this fix's explicit "keep defensive error handling for a genuinely
+// malformed blob" requirement. nil-safe like every other record*
+// helper on this type (metrics may not be enabled).
 func (s *Server) recordMoneroBlockHashUnresolved() {
 	if s.metrics == nil {
 		return
