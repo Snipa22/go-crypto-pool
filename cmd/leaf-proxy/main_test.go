@@ -176,6 +176,56 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			},
 		},
 
+		// -- bool field: pool-diff-cap-enabled -----------------------------
+		{
+			name: "pool-diff-cap-enabled/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.poolDiffCapEnabled != true {
+					t.Errorf("poolDiffCapEnabled = %v, want hardcoded default %v", cfg.poolDiffCapEnabled, true)
+				}
+			},
+		},
+		{
+			name: "pool-diff-cap-enabled/file-only",
+			toml: `pool_diff_cap_enabled = false`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.poolDiffCapEnabled != false {
+					t.Errorf("poolDiffCapEnabled = %v, want file value %v", cfg.poolDiffCapEnabled, false)
+				}
+			},
+		},
+		{
+			name: "pool-diff-cap-enabled/env-only",
+			env:  map[string]string{"LEAF_PROXY_POOL_DIFF_CAP_ENABLED": "false"},
+			toml: `pool_diff_cap_enabled = true`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.poolDiffCapEnabled != false {
+					t.Errorf("poolDiffCapEnabled = %v, want env value %v (env must beat file)", cfg.poolDiffCapEnabled, false)
+				}
+			},
+		},
+		{
+			name: "pool-diff-cap-enabled/flag-only",
+			args: []string{"-pool-diff-cap-enabled=false"},
+			toml: `pool_diff_cap_enabled = true`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.poolDiffCapEnabled != false {
+					t.Errorf("poolDiffCapEnabled = %v, want flag value %v (flag must beat env absence and file)", cfg.poolDiffCapEnabled, false)
+				}
+			},
+		},
+		{
+			name: "pool-diff-cap-enabled/flag-env-file-all-set",
+			args: []string{"-pool-diff-cap-enabled=false"},
+			env:  map[string]string{"LEAF_PROXY_POOL_DIFF_CAP_ENABLED": "true"},
+			toml: `pool_diff_cap_enabled = false`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.poolDiffCapEnabled != false {
+					t.Errorf("poolDiffCapEnabled = %v, want flag value %v (flag must win full precedence over env=true)", cfg.poolDiffCapEnabled, false)
+				}
+			},
+		},
+
 		// -- int field: vardiff-target-time -------------------------------
 		{
 			name: "vardiff-target-time/default",
@@ -272,6 +322,37 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			check: func(t *testing.T, cfg config) {
 				if cfg.jobMaxAge != 300*time.Second {
 					t.Errorf("jobMaxAge = %v, want flag value %v (flag must win full precedence)", cfg.jobMaxAge, 300*time.Second)
+				}
+			},
+		},
+
+		// -- uint64 fields: starting-difficulty/min-difficulty base
+		// defaults (DISPATCH_BRIEF.md 2026-09-13, Alex: "lets set
+		// reasonable defaults. 20-30k diff floors in the base
+		// config" -- confirmed exact bump from 10000->20000 and
+		// 100->10000 respectively; -max-difficulty's default is
+		// explicitly out of scope and unchanged).
+		{
+			name: "starting-difficulty/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.startingDifficulty != 20000 {
+					t.Errorf("startingDifficulty = %d, want the new hardcoded default %d", cfg.startingDifficulty, 20000)
+				}
+			},
+		},
+		{
+			name: "min-difficulty/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.minDifficulty != 10000 {
+					t.Errorf("minDifficulty = %d, want the new hardcoded default %d", cfg.minDifficulty, 10000)
+				}
+			},
+		},
+		{
+			name: "max-difficulty/default-unchanged",
+			check: func(t *testing.T, cfg config) {
+				if cfg.maxDifficulty != 1_000_000_000 {
+					t.Errorf("maxDifficulty = %d, want the unchanged hardcoded default %d (out of scope for this pass)", cfg.maxDifficulty, 1_000_000_000)
 				}
 			},
 		},

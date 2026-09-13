@@ -506,8 +506,16 @@ func (s *Session) handleLogin(req Request) {
 	// target_diff, there is no pool diff to cap against -- skip the
 	// cap entirely rather than inventing one, mirroring
 	// currentTargetDiffForRoute's own doc comment.
-	if poolTargetDiff, ok := s.server.jobs.currentTargetDiffForRoute(RoutePrimary); ok && poolTargetDiff > 0 && startDiff > poolTargetDiff {
-		startDiff = poolTargetDiff
+	//
+	// DISPATCH_BRIEF.md 2026-09-13 (Alex, toggle): this entire cap
+	// block is now gated behind s.server.poolDiffCapEnabled (default
+	// true -- see Server.poolDiffCapEnabled's own doc comment).
+	// Disabled, this falls through to exactly the pre-flag
+	// (pre-46a6e2c) max()-of-floors behavior, byte-identical.
+	if s.server.poolDiffCapEnabled {
+		if poolTargetDiff, ok := s.server.jobs.currentTargetDiffForRoute(RoutePrimary); ok && poolTargetDiff > 0 && startDiff > poolTargetDiff {
+			startDiff = poolTargetDiff
+		}
 	}
 
 	s.currentDifficulty.Store(startDiff)
