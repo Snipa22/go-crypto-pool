@@ -84,11 +84,11 @@ tls_cert_persist_path = ""
 
 # Starting downstream share difficulty; vardiff adjusts it from here.
 # Ignored when ports (above) is set -- each port tier carries its own
-# starting difficulty instead. (default: 10000)
-starting_difficulty = 10000
+# starting difficulty instead. (default: 20000)
+starting_difficulty = 20000
 
-# Absolute floor vardiff will never retarget below. (default: 100)
-min_difficulty = 100
+# Absolute floor vardiff will never retarget below. (default: 10000)
+min_difficulty = 10000
 
 # Absolute ceiling vardiff will never retarget above. (default: 1000000000)
 max_difficulty = 1000000000
@@ -132,6 +132,16 @@ invalid_share_disconnect_enabled = true
 # disconnected (see invalid_share_disconnect_enabled above). 0/unset uses
 # the documented default (20). (default: 0)
 invalid_share_disconnect_threshold = 0
+
+# Cap all three login-time difficulty floors (port starting_difficulty
+# above, min_difficulty above, and any per-address operator-forced
+# ForcedMinDifficulty floor) so none may leave a downstream session
+# starting ABOVE the upstream pool's own current target_diff -- a
+# mis-configuration guardrail. Most proxy operators with reasonable
+# starting points won't hit this; an operator who genuinely wants the
+# pre-existing uncapped max()-of-floors behavior can set this to false.
+# (default: true)
+pool_diff_cap_enabled = true
 
 # HTTP listen address for /metrics (Prometheus) and the stats page. Separate
 # from listen_address (the downstream-facing stratum port). Defaults to

@@ -168,6 +168,20 @@ type Server struct {
 	// in NewServer; overridable via SetInvalidShareGuardConfig.
 	invalidShareGuardConfig leaflib.InvalidShareGuardConfig
 
+	// poolDiffCapEnabled gates the login-time pool-target-diff cap
+	// added by commit 46a6e2c (see session.go's handleLogin doc
+	// comment on that cap block for the full mechanism this toggles).
+	// DISPATCH_BRIEF.md 2026-09-13 (Alex): "lets put this feature
+	// behind a default-on flag to help protect against
+	// mis-configuration, most proxy ops likely won't have this issue
+	// because they'll have reasonable starting points." Defaults to
+	// true (enabled) in NewServer, mirroring
+	// invalidShareGuardConfig's own default-enabled convention above;
+	// overridable via SetPoolDiffCapEnabled. When false, handleLogin
+	// skips the entire cap block and falls through to exactly the
+	// pre-flag (pre-46a6e2c) max()-of-floors behavior.
+	poolDiffCapEnabled bool
+
 	// debugLogger is nil unless SetDebugLogger has been called (see
 	// cmd/leaf-proxy/main.go's -debug/LEAF_PROXY_DEBUG wiring) --
 	// the real, opt-in verbose logging sink (internal/leaflib/
@@ -224,6 +238,7 @@ func NewServer(cm *leaflib.ConnectionManager, jobs *JobManager, validator ShareV
 		sessions:                make(map[uint64]*Session),
 		maxAddressLabels:        metrics.DefaultMaxAddressLabels,
 		invalidShareGuardConfig: leaflib.DefaultInvalidShareGuardConfig(),
+		poolDiffCapEnabled:      true,
 		// workers=0 lets NewAsyncValidationPool apply its own default
 		// (DefaultAsyncValidationWorkers() == runtime.NumCPU(), NOT a
 		// hardcoded literal -- see solo/asyncvalidation.go's doc
@@ -315,6 +330,16 @@ func (s *Server) SetRandomXWorkerPoolSize(workers, queueSize int) {
 func (s *Server) SetInvalidShareGuardConfig(cfg leaflib.InvalidShareGuardConfig) {
 	s.invalidShareGuardConfig = cfg.Normalized()
 	s.invalidShareGuardConfig.Enabled = cfg.Enabled
+}
+
+// SetPoolDiffCapEnabled toggles the login-time pool-target-diff cap
+// (see poolDiffCapEnabled's own doc comment above and session.go's
+// handleLogin for the full mechanism). Defaults to true (enabled) via
+// NewServer; cmd/leaf-proxy wires this from
+// -pool-diff-cap-enabled/LEAF_PROXY_POOL_DIFF_CAP_ENABLED/
+// pool_diff_cap_enabled before Serve begins.
+func (s *Server) SetPoolDiffCapEnabled(enabled bool) {
+	s.poolDiffCapEnabled = enabled
 }
 
 // EnableAddressFlags mirrors solo.Server's/direct.Server's own

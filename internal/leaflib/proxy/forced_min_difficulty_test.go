@@ -266,6 +266,75 @@ func TestSessionLogin_PoolTargetDiffCapsForcedMinDifficultyFloor(t *testing.T) {
 	}
 }
 
+// --- DISPATCH_BRIEF.md 2026-09-13 (Alex): make the pool-diff cap
+// toggleable (default ON) -------------------------------------------
+//
+// The tests below cover Server.poolDiffCapEnabled/
+// SetPoolDiffCapEnabled -- the new toggle gating the entire cap block
+// tested above. newHarness's NewServer defaults poolDiffCapEnabled to
+// true (the implicit/default case, flag never set), which is already
+// exercised by TestSessionLogin_PoolTargetDiffCapsPortStartingDifficulty
+// above; the tests below cover the explicit-true and explicit-false
+// cases.
+
+// TestSessionLogin_PoolDiffCapDisabled_PortStartingDifficultyNotCapped
+// is the required "flag disabled" test: Alex's exact reported example
+// (300k port floor, 50k pool target_diff) must now start at 300k, NOT
+// capped to 50k, proving the flag genuinely gates the cap block --
+// this is the exact byte-identical pre-46a6e2c max()-of-floors
+// behavior.
+func TestSessionLogin_PoolDiffCapDisabled_PortStartingDifficultyNotCapped(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	h.server.SetPoolDiffCapEnabled(false)
+
+	const (
+		addr           = "pool-cap-toggle-disabled-address"
+		portStartDiff  = uint64(300_000)
+		poolTargetDiff = uint64(50_000)
+	)
+	h.source.setTemplate(poolTemplateWithTargetDiff(poolTargetDiff))
+
+	c, _ := h.connectAtDifficulty(portStartDiff)
+	loginResp := c.login(t, addr)
+	if loginResp.Result.Status != "OK" {
+		t.Fatalf("expected login to succeed, got status=%q", loginResp.Result.Status)
+	}
+
+	sess := h.onlySession()
+	if got := sess.currentDifficulty.Load(); got != portStartDiff {
+		t.Fatalf("expected starting difficulty to remain at the port's own %d (cap disabled), got %d", portStartDiff, got)
+	}
+}
+
+// TestSessionLogin_PoolDiffCapEnabledExplicit_StillCapsPortStartingDifficulty
+// is the required "flag enabled, explicit true" test: re-runs Alex's
+// exact scenario with SetPoolDiffCapEnabled(true) wired explicitly
+// (rather than relying on NewServer's own default), proving the
+// existing capped behavior from commit 46a6e2c still holds when the
+// toggle is explicitly turned on.
+func TestSessionLogin_PoolDiffCapEnabledExplicit_StillCapsPortStartingDifficulty(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	h.server.SetPoolDiffCapEnabled(true)
+
+	const (
+		addr           = "pool-cap-toggle-enabled-address"
+		portStartDiff  = uint64(300_000)
+		poolTargetDiff = uint64(50_000)
+	)
+	h.source.setTemplate(poolTemplateWithTargetDiff(poolTargetDiff))
+
+	c, _ := h.connectAtDifficulty(portStartDiff)
+	loginResp := c.login(t, addr)
+	if loginResp.Result.Status != "OK" {
+		t.Fatalf("expected login to succeed, got status=%q", loginResp.Result.Status)
+	}
+
+	sess := h.onlySession()
+	if got := sess.currentDifficulty.Load(); got != poolTargetDiff {
+		t.Fatalf("expected starting difficulty to be capped down to the pool's target_diff %d (cap explicitly enabled), got %d", poolTargetDiff, got)
+	}
+}
+
 // TestSessionLogin_PoolTargetDiffHigherThanFloors_NoRegression is the
 // required non-regression check: when the pool's own target_diff is
 // HIGHER than every configured/forced floor, the existing

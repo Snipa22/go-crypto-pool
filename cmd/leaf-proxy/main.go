@@ -151,6 +151,25 @@ type config struct {
 	invalidShareDisconnectEnabled   bool
 	invalidShareDisconnectThreshold int
 
+	// poolDiffCapEnabled is -pool-diff-cap-enabled/
+	// LEAF_PROXY_POOL_DIFF_CAP_ENABLED: toggles the login-time
+	// pool-target-diff cap added by commit 46a6e2c (none of the
+	// three difficulty floors -- port starting_difficulty, global
+	// min_difficulty, per-address ForcedMinDifficulty -- may leave a
+	// downstream session starting ABOVE the upstream pool's own
+	// current target_diff). See proxy.Server.poolDiffCapEnabled's
+	// own doc comment and internal/leaflib/proxy/session.go's
+	// handleLogin for the full mechanism.
+	//
+	// DISPATCH_BRIEF.md 2026-09-13 (Alex): "lets put this feature
+	// behind a default-on flag to help protect against
+	// mis-configuration, most proxy ops likely won't have this
+	// issue because they'll have reasonable starting points."
+	// Defaults to true (enabled) -- an operator who genuinely wants
+	// the pre-46a6e2c uncapped behavior must explicitly set this to
+	// false.
+	poolDiffCapEnabled bool
+
 	// metricsListenAddress/maxAddressLabels follow cmd/leaf-solo's
 	// exact established convention for this flag pair (see
 	// leaf-solo's identical -metrics-listen-address/
@@ -262,9 +281,9 @@ func loadConfig() (config, error) {
 
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_PROXY_LISTEN_ADDRESS", ":5555"), "downstream miner-facing TCP listen address. Ignored as a listener source when -ports/LEAF_PROXY_PORTS is set (still used as -ports' own fallback default when -ports is unset -- see -ports' doc comment). Env: LEAF_PROXY_LISTEN_ADDRESS")
 	flag.StringVar(&cfg.tlsListenAddress, "tls-listen-address", envOr("LEAF_PROXY_TLS_LISTEN_ADDRESS", ""), "optional SECOND downstream miner-facing TCP listen address, served over TLS using the shared self-signed-or-operator-supplied cert (see -tls-cert-file/-tls-key-file/-tls-cert-persist-path), alongside (never instead of) -listen-address. Empty (default) disables it entirely -- zero behavior change. Only consulted when -ports/LEAF_PROXY_PORTS is UNSET -- setting both is a fatal startup misconfiguration (see -ports' doc comment). Env: LEAF_PROXY_TLS_LISTEN_ADDRESS")
-	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_PROXY_STARTING_DIFFICULTY", 10000), "starting downstream share difficulty; vardiff adjusts it from here. Ignored when -ports/LEAF_PROXY_PORTS is set (each port tier carries its own starting difficulty instead -- see -ports' doc comment). Env: LEAF_PROXY_STARTING_DIFFICULTY")
+	flag.Uint64Var(&cfg.startingDifficulty, "starting-difficulty", envOrUint64("LEAF_PROXY_STARTING_DIFFICULTY", 20000), "starting downstream share difficulty; vardiff adjusts it from here. Ignored when -ports/LEAF_PROXY_PORTS is set (each port tier carries its own starting difficulty instead -- see -ports' doc comment). Env: LEAF_PROXY_STARTING_DIFFICULTY")
 	flag.StringVar(&cfg.portsRaw, "ports", envOr("LEAF_PROXY_PORTS", ""), "comma-separated list of address:difficulty[:desc][:tls] port tiers, e.g. '0.0.0.0:5555:1000:medium-plain,0.0.0.0:5556:1000:medium-tls:tls' (first entry plain, second entry the same difficulty on a different port with TLS enabled). The optional trailing ':tls' marker (case-insensitive) enables the shared self-signed TLS listener for that ONE port tier only -- see -tls-cert-file/-tls-key-file/-tls-cert-persist-path. When unset (the default), -listen-address/-starting-difficulty are used as a single implicit tier (plain, no TLS), and -tls-listen-address (if also set) is added as a second, TLS-enabled tier exactly as before this flag existed -- fully backward-compatible, zero behavior change for any deployment that doesn't set this. Setting BOTH -ports and -tls-listen-address is a fatal startup misconfiguration -- move any TLS tier into a -ports entry instead. Env: LEAF_PROXY_PORTS")
-	flag.Uint64Var(&cfg.minDifficulty, "min-difficulty", envOrUint64("LEAF_PROXY_MIN_DIFFICULTY", 100), "absolute floor vardiff will never retarget below. Env: LEAF_PROXY_MIN_DIFFICULTY")
+	flag.Uint64Var(&cfg.minDifficulty, "min-difficulty", envOrUint64("LEAF_PROXY_MIN_DIFFICULTY", 10000), "absolute floor vardiff will never retarget below. Env: LEAF_PROXY_MIN_DIFFICULTY")
 	flag.Uint64Var(&cfg.maxDifficulty, "max-difficulty", envOrUint64("LEAF_PROXY_MAX_DIFFICULTY", 1_000_000_000), "absolute ceiling vardiff will never retarget above. Env: LEAF_PROXY_MAX_DIFFICULTY")
 	flag.IntVar(&cfg.vardiffTargetTime, "vardiff-target-time", envOrInt("LEAF_PROXY_VARDIFF_TARGET_TIME", 30), "seconds between shares vardiff aims for. Env: LEAF_PROXY_VARDIFF_TARGET_TIME")
 	flag.DurationVar(&cfg.vardiffInterval, "vardiff-retarget-interval", envOrDuration("LEAF_PROXY_VARDIFF_RETARGET_INTERVAL", 60*time.Second), "how often each downstream session's own vardiff retarget timer fires. Env: LEAF_PROXY_VARDIFF_RETARGET_INTERVAL")
@@ -283,6 +302,8 @@ func loadConfig() (config, error) {
 	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_PROXY_RANDOMX_WORKERS", 0), "RandomX async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_PROXY_RANDOMX_WORKERS")
 	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a downstream session after too many CONSECUTIVE real RandomX validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
 	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a downstream session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD")
+
+	flag.BoolVar(&cfg.poolDiffCapEnabled, "pool-diff-cap-enabled", envOr("LEAF_PROXY_POOL_DIFF_CAP_ENABLED", "true") == "true", "cap all three login-time difficulty floors (port starting_difficulty, global min_difficulty, per-address ForcedMinDifficulty) so none may leave a downstream session starting ABOVE the upstream pool's own current target_diff -- a mis-configuration guardrail, enabled unless explicitly turned off. Env: LEAF_PROXY_POOL_DIFF_CAP_ENABLED (\"false\" to disable)")
 
 	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_PROXY_METRICS_LISTEN_ADDRESS", "127.0.0.1:9601"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the downstream-facing stratum port). Defaults to loopback-only (127.0.0.1) -- an operator must explicitly set this to a wildcard/public address to expose stats/metrics publicly. Set to empty string to disable. Env: LEAF_PROXY_METRICS_LISTEN_ADDRESS")
 	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOrBool("LEAF_PROXY_HIDE_REMOTE_ADDRESS", false), "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_PROXY_HIDE_REMOTE_ADDRESS")
@@ -363,6 +384,8 @@ type fileConfig struct {
 	InvalidShareDisconnectEnabled   *bool `toml:"invalid_share_disconnect_enabled"`
 	InvalidShareDisconnectThreshold *int  `toml:"invalid_share_disconnect_threshold"`
 
+	PoolDiffCapEnabled *bool `toml:"pool_diff_cap_enabled"`
+
 	MetricsListenAddress *string `toml:"metrics_listen_address"`
 	MaxAddressLabels     *int    `toml:"max_address_labels"`
 	HideRemoteAddress    *bool   `toml:"hide_remote_address"`
@@ -437,6 +460,8 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyInt(&cfg.randomxWorkers, fc.RandomXWorkers, visited, "randomx-workers", "LEAF_PROXY_RANDOMX_WORKERS")
 	cfgfile.ApplyBool(&cfg.invalidShareDisconnectEnabled, fc.InvalidShareDisconnectEnabled, visited, "invalid-share-disconnect-enabled", "LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED")
 	cfgfile.ApplyInt(&cfg.invalidShareDisconnectThreshold, fc.InvalidShareDisconnectThreshold, visited, "invalid-share-disconnect-threshold", "LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD")
+
+	cfgfile.ApplyBool(&cfg.poolDiffCapEnabled, fc.PoolDiffCapEnabled, visited, "pool-diff-cap-enabled", "LEAF_PROXY_POOL_DIFF_CAP_ENABLED")
 
 	cfgfile.ApplyString(&cfg.metricsListenAddress, fc.MetricsListenAddress, visited, "metrics-listen-address", "LEAF_PROXY_METRICS_LISTEN_ADDRESS")
 	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_PROXY_MAX_ADDRESS_LABELS")
@@ -753,6 +778,18 @@ func main() {
 		logger.Printf("consecutive-invalid-share disconnect guard ENABLED (threshold=%d -- 0 means the documented default is in effect)", cfg.invalidShareDisconnectThreshold)
 	} else {
 		logger.Printf("consecutive-invalid-share disconnect guard DISABLED by operator config")
+	}
+
+	// DISPATCH_BRIEF.md 2026-09-13 (Alex): toggle for the login-time
+	// pool-target-diff cap (commit 46a6e2c). Enabled by default; an
+	// operator with reasonable starting points who genuinely wants
+	// the pre-46a6e2c uncapped max()-of-floors behavior can opt out
+	// via -pool-diff-cap-enabled=false.
+	server.SetPoolDiffCapEnabled(cfg.poolDiffCapEnabled)
+	if cfg.poolDiffCapEnabled {
+		logger.Printf("pool-target-diff login cap ENABLED (-pool-diff-cap-enabled) -- none of the three difficulty floors may start a session above the upstream pool's own current target_diff")
+	} else {
+		logger.Printf("pool-target-diff login cap DISABLED by operator config (-pool-diff-cap-enabled=false) -- falling back to the pre-46a6e2c uncapped max()-of-floors behavior")
 	}
 
 	// Real, manual ban enforcement (see internal/leaflib/addressflags's
