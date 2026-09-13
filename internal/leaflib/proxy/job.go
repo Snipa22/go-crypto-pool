@@ -314,6 +314,36 @@ func (jm *JobManager) currentTemplateJobIDForRoute(route UpstreamRoute) (id stri
 	return t.JobID, true
 }
 
+// currentTargetDiffForRoute reports the current upstream pool's own
+// published target_diff for whichever connection route identifies
+// (RoutePrimary -> jm.source, RouteDevFee -> jm.devFeeSource) --
+// mirrors currentTemplateJobIDForRoute exactly (same pure,
+// side-effect-free read, same route-resolution/fail-safe-to-primary
+// rule -- see that method's doc comment), just surfacing
+// WorkerTemplate.TargetDiff instead of JobID.
+//
+// DISPATCH_BRIEF.md 2026-09-13 (Alex, "cap starting/min difficulty to
+// the pool's own target_diff"): this is session.go's handleLogin's
+// choke point for finding out what the upstream pool is CURRENTLY
+// asking for, at the moment a downstream session's starting
+// difficulty is computed, so that value can never be capped-down
+// against a stale/wrong number. Returns (0, false) if that connection
+// has no template yet -- handleLogin treats that identically to "no
+// pool diff known yet, don't invent one" and skips the cap entirely,
+// exactly like currentTemplateJobIDForRoute's own ok==false/
+// templateJobID=="" callers already do for the job-caching decision.
+func (jm *JobManager) currentTargetDiffForRoute(route UpstreamRoute) (diff uint64, ok bool) {
+	source := jm.source
+	if route == RouteDevFee && jm.devFeeSource != nil {
+		source = jm.devFeeSource
+	}
+	t := source.CurrentTemplate()
+	if t == nil {
+		return 0, false
+	}
+	return t.TargetDiff, true
+}
+
 // NextJob allocates a brand new Job at the given (session-owned)
 // difficulty from the current upstream template, UNCONDITIONALLY --
 // every single call burns a fresh worker-/pool-nonce pair and mints a

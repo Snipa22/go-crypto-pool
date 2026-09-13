@@ -478,13 +478,39 @@ func (s *Session) handleLogin(req Request) {
 	// identical handleLogin logic exactly (see that function's doc
 	// comment for the full rationale).
 	startDiff := s.currentDifficulty.Load()
+	if global := s.server.vardiff.MinDifficulty; global > startDiff {
+		startDiff = global
+	}
 	if forcedFloor > 0 {
 		s.forcedMinDifficulty.Store(forcedFloor)
 		if forcedFloor > startDiff {
 			startDiff = forcedFloor
-			s.currentDifficulty.Store(startDiff)
 		}
 	}
+
+	// DISPATCH_BRIEF.md 2026-09-13 (Alex, "cap starting/min difficulty
+	// to the pool's own target_diff"): none of the three floors folded
+	// into startDiff above may exceed what the upstream pool is
+	// CURRENTLY actually asking for on the template that's live right
+	// now (WorkerTemplate.TargetDiff, the same target_diff field an
+	// ordinary miner receives -- see Job.UpstreamShareDiff's doc
+	// comment for the exact provenance). This is a ONE-TIME cap, at
+	// login only: it deliberately does NOT change forcedMinDifficulty
+	// itself (still stores the operator's raw, uncapped floor above,
+	// for maybeRetarget's own ongoing floor-enforcement job, which is
+	// explicitly out of scope for this change -- see vardiff.go's
+	// maybeRetarget) and does NOT touch cfg.minDifficulty's own
+	// configured value either -- only this session's own STARTING
+	// currentDifficulty is capped down. If there's genuinely no
+	// template yet (ok==false) or this pool dialect published a zero
+	// target_diff, there is no pool diff to cap against -- skip the
+	// cap entirely rather than inventing one, mirroring
+	// currentTargetDiffForRoute's own doc comment.
+	if poolTargetDiff, ok := s.server.jobs.currentTargetDiffForRoute(RoutePrimary); ok && poolTargetDiff > 0 && startDiff > poolTargetDiff {
+		startDiff = poolTargetDiff
+	}
+
+	s.currentDifficulty.Store(startDiff)
 
 	job, err := s.currentJob(s.currentDifficulty.Load())
 	if err != nil {
