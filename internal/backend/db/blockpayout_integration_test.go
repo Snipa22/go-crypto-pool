@@ -1,7 +1,7 @@
 package db_test
 
 // Integration tests for the matured-block payout idempotency ledger
-// (migrations/0011_block_payouts.up.sql,
+// (migrations/0013_block_payouts.up.sql,
 // internal/backend/db/blockpayout.go) against a REAL Postgres
 // instance. Set GCPOOL_TEST_DSN to run them — see integration_test.go's
 // package doc comment for the exact setup.

@@ -3,7 +3,7 @@ package db
 // blockpayout.go holds the matured-block payout IDEMPOTENCY LEDGER --
 // the `block_payouts` claim table and its per-miner
 // `block_payout_credits` itemisation, added by
-// migrations/0011_block_payouts.up.sql.
+// migrations/0013_block_payouts.up.sql.
 //
 // Read that migration's doc comment before touching anything here: it
 // is the full writeup of the two real bugs this file exists to fix (a
@@ -29,7 +29,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// block_payouts statuses. See migrations/0011_block_payouts.up.sql's
+// block_payouts statuses. See migrations/0013_block_payouts.up.sql's
 // doc comment for the full meaning of each; the short version:
 //
 //   - PENDING is UNRESOLVED and blocks all further automatic payout
@@ -656,7 +656,7 @@ func (r *Repository) ResolveBlockPayoutCredited(ctx context.Context, blockID int
 // credit is a judgement call about live miner balances and is
 // deliberately NOT automated here.
 //
-// FAILED is re-claimable (see migrations/0011_block_payouts.up.sql),
+// FAILED is re-claimable (see migrations/0013_block_payouts.up.sql),
 // so this is what hands the block back to the automatic payout path:
 // the next unlocker poll pass re-runs the full payout calculation for
 // it from scratch.

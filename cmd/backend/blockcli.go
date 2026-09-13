@@ -43,7 +43,7 @@
 //     longer re-credits anybody. The matured-block payout path is now
 //     idempotent per block (a `block_payouts` claim ledger written in
 //     the same transaction as the credits -- see
-//     migrations/0011_block_payouts.up.sql), so the re-triggered
+//     migrations/0013_block_payouts.up.sql), so the re-triggered
 //     payout for an APPLIED block is a recorded no-op and the block
 //     is simply marked unlocked again. That was NOT true before: this
 //     subcommand used to be the documented recovery path for a

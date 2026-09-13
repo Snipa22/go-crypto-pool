@@ -101,7 +101,7 @@ type Block struct {
 // already have committed (e.g. the payout succeeded and only the status
 // write failed). internal/backend/payout.Calculator is, via the
 // `block_payouts` claim ledger — see
-// migrations/0011_block_payouts.up.sql.
+// migrations/0013_block_payouts.up.sql.
 type PayoutTrigger interface {
 	TriggerPayout(ctx context.Context, b Block) error
 }

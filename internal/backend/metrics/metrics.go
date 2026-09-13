@@ -71,7 +71,7 @@ const (
 	// unlocked=FALSE) for the next poll pass to retry rather than
 	// marked unlocked with its payout dropped. See
 	// unlocker.checkBlock's doc comment; the payout itself is
-	// idempotent (migrations/0011_block_payouts.up.sql), which is
+	// idempotent (migrations/0013_block_payouts.up.sql), which is
 	// what makes that automatic retry safe.
 	//
 	// This is distinct from "error" on purpose: an "error" block's
