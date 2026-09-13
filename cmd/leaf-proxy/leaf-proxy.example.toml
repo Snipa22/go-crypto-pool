@@ -38,21 +38,38 @@ upstream_pass = "go-crypto-pool-leaf-proxy"
 upstream_agent = "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0"
 
 
-# Downstream miner-facing TCP listen address. (default: ":5555")
+# Downstream miner-facing TCP listen address. Used as -ports' own fallback
+# default (see ports below) when ports is unset. (default: ":5555")
 listen_address = ":5555"
 
 # Optional SECOND downstream miner-facing TCP listen address, served over
 # TLS using the shared self-signed-or-operator-supplied cert (see
 # tls_cert_file/tls_key_file/tls_cert_persist_path below), alongside (never
 # instead of) listen_address. Empty (default) disables it entirely -- zero
-# behavior change. (default: "")
+# behavior change. Only consulted when ports (below) is UNSET -- setting
+# both is a fatal startup misconfiguration; move any TLS tier into a ports
+# entry instead. (default: "")
 tls_listen_address = ""
 
+# Comma-separated list of address:difficulty[:desc][:tls] port tiers, e.g.
+# "0.0.0.0:5555:1000:medium-plain,0.0.0.0:5556:1000:medium-tls:tls" (first
+# entry plain, second entry the same difficulty on a different port with
+# TLS enabled). The optional trailing ":tls" marker (case-insensitive)
+# enables the shared self-signed TLS listener for that ONE port tier only
+# -- see tls_cert_file/tls_key_file/tls_cert_persist_path below. When unset
+# (the default), listen_address/starting_difficulty are used as a single
+# implicit tier (plain, no TLS), and tls_listen_address (if also set) is
+# added as a second, TLS-enabled tier exactly as before this key existed --
+# fully backward-compatible, zero behavior change for any deployment that
+# doesn't set this. Setting BOTH ports and tls_listen_address is a fatal
+# startup misconfiguration. (default: "")
+ports = ""
+
 # Optional PEM-encoded TLS certificate file for the shared, process-wide
-# self-signed-or-operator-supplied cert used by tls_listen_address. Empty
-# (default) auto-generates a self-signed cert instead -- see
-# tls_cert_persist_path. Ignored entirely if tls_listen_address is unset.
-# (default: "")
+# self-signed-or-operator-supplied cert used by any ":tls"-suffixed ports
+# entry (or tls_listen_address, in the fallback case). Empty (default)
+# auto-generates a self-signed cert instead -- see tls_cert_persist_path.
+# Ignored entirely if no port has TLS enabled. (default: "")
 tls_cert_file = ""
 
 # Optional PEM-encoded TLS private key file paired with tls_cert_file.
@@ -66,7 +83,8 @@ tls_key_file = ""
 tls_cert_persist_path = ""
 
 # Starting downstream share difficulty; vardiff adjusts it from here.
-# (default: 10000)
+# Ignored when ports (above) is set -- each port tier carries its own
+# starting difficulty instead. (default: 10000)
 starting_difficulty = 10000
 
 # Absolute floor vardiff will never retarget below. (default: 100)
