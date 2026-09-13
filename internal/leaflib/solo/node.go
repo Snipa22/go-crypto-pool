@@ -14,11 +14,13 @@ package solo
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/nodeGRPC"
@@ -406,25 +408,97 @@ func NewGRPCNodeClient(address string, coinbaseExtraTag []byte) *GRPCNodeClient 
 // appends an 8-byte per-xn random nonce INTO THE SAME coinbase_extra
 // field alongside the tag (see nonceBuf below), so the tag itself must
 // leave headroom for that: 256 - 8 = 248.
+//
+// Within that same 248-byte budget, NormalizeCoinbaseExtraTag (below)
+// ALSO reserves 5 bytes for its own NUL-delimited random-suffix scheme
+// (1 literal 0x00 delimiter + 4 crypto/rand bytes) — the base-tag
+// string portion is truncated to MaxCoinbaseExtraTagLen-5 bytes before
+// that suffix is appended. This 5-byte reservation and the 8-byte
+// per-xn-nonce reservation above do NOT stack against each other: both
+// exist within the same 248-byte (256-8) base-tag budget; 248 itself
+// is unchanged by the new suffix.
 const MaxCoinbaseExtraTagLen = 256 - 8
+
+// coinbaseExtraRandomSuffixOnce/coinbaseExtraRandomSuffixValue cache
+// the process-lifetime-scoped 4-byte random suffix NormalizeCoinbaseExtraTag
+// appends after its NUL delimiter — see coinbaseExtraRandomSuffix's doc
+// comment for the full rationale.
+var (
+	coinbaseExtraRandomSuffixOnce  sync.Once
+	coinbaseExtraRandomSuffixValue [4]byte
+)
+
+// coinbaseExtraRandomSuffix returns this process's cached 4-byte
+// cryptographically-random coinbase-extra-tag suffix, generating it
+// via crypto/rand (NOT math/rand — math/rand is used elsewhere in this
+// file for the per-xn nonce, which has different randomness
+// requirements) exactly once per process, the first time it's needed,
+// and reusing that same value for every subsequent call for the rest
+// of the process's lifetime. This is deliberately NOT persisted
+// anywhere (no disk/env/config) — a fresh process restart must get a
+// fresh random suffix. Guarded by sync.Once (rather than a call-count
+// assumption) so the caching is correct even if callers other than
+// today's single-call-per-process pattern ever emerge.
+//
+// A companion go-tari-explorer repo (out of scope for this codebase)
+// splits NormalizeCoinbaseExtraTag's returned bytes on the NUL
+// delimiter this suffix follows to recover the original tag prefix
+// for its own pool-attribution table.
+func coinbaseExtraRandomSuffix() [4]byte {
+	coinbaseExtraRandomSuffixOnce.Do(func() {
+		if _, err := cryptorand.Read(coinbaseExtraRandomSuffixValue[:]); err != nil {
+			// crypto/rand.Read failing is effectively unrecoverable
+			// (the OS's CSPRNG is unavailable) — panic rather than
+			// silently falling back to a predictable/zero suffix,
+			// which would defeat this scheme's purpose.
+			panic(fmt.Sprintf("solo: crypto/rand.Read failed while generating the coinbase-extra-tag random suffix: %v", err))
+		}
+	})
+	return coinbaseExtraRandomSuffixValue
+}
+
+// resetCoinbaseExtraRandomSuffixForTest resets the sync.Once guard and
+// cached suffix so a test can simulate a fresh OS process (which would
+// otherwise generate its own fresh suffix) within a single test
+// binary. Test-only — never called from production code.
+func resetCoinbaseExtraRandomSuffixForTest() {
+	coinbaseExtraRandomSuffixOnce = sync.Once{}
+	coinbaseExtraRandomSuffixValue = [4]byte{}
+}
 
 // NormalizeCoinbaseExtraTag validates/sanitizes a user-supplied
 // coinbase-extra tag string: an empty/whitespace-only tag falls back to
 // fallback (the caller's computed per-algo default), and anything over
-// MaxCoinbaseExtraTagLen bytes is truncated — this leaf never silently
-// submits a block template whose coinbase_extra would exceed the real
-// base node's consensus-enforced max length (which would get the whole
-// template/block rejected).
+// MaxCoinbaseExtraTagLen-5 bytes is truncated — this leaf never
+// silently submits a block template whose coinbase_extra would exceed
+// the real base node's consensus-enforced max length (which would get
+// the whole template/block rejected).
+//
+// The returned []byte is always <base-tag-string bytes> + one literal
+// 0x00 NUL delimiter byte + 4 cryptographically-random bytes (see
+// coinbaseExtraRandomSuffix): this lets a separate repo
+// (go-tari-explorer, out of scope here) split on the NUL byte to
+// recover the original tag prefix for its own pool-attribution table,
+// while the trailing random bytes keep every process's on-chain tag
+// genuinely distinct even when two processes share the identical
+// configured/default tag string. The random suffix is generated once
+// per process and reused for every call — see coinbaseExtraRandomSuffix.
 func NormalizeCoinbaseExtraTag(tag, fallback string) []byte {
 	t := tag
 	if strings.TrimSpace(t) == "" {
 		t = fallback
 	}
 	b := []byte(t)
-	if len(b) > MaxCoinbaseExtraTagLen {
-		b = b[:MaxCoinbaseExtraTagLen]
+	const maxBaseTagLen = MaxCoinbaseExtraTagLen - 5 // reserve 1 NUL + 4 random bytes
+	if len(b) > maxBaseTagLen {
+		b = b[:maxBaseTagLen]
 	}
-	return b
+	suffix := coinbaseExtraRandomSuffix()
+	out := make([]byte, 0, len(b)+1+len(suffix))
+	out = append(out, b...)
+	out = append(out, 0x00)
+	out = append(out, suffix[:]...)
+	return out
 }
 
 // tariPowAlgo maps this codebase's poolpb.Algo onto the real
