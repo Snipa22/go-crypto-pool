@@ -203,3 +203,76 @@ func scrapeMetrics(t *testing.T, s *Server) string {
 	}
 	return string(body)
 }
+
+// TestServer_SessionSnapshots_DevFeeUpstreamHealthTypeAssertion_GracefulWhenDisabled
+// confirms the optional dev-fee health gauge/counter pair (DISPATCH_BRIEF.md
+// "leaf-proxy dev-fee second-connection") stay at their zero value --
+// no panic, no spurious activity -- when EnableDevFeeUpstream was
+// never called at all (the default, -dev-fee-percent=0 case).
+func TestServer_SessionSnapshots_DevFeeUpstreamHealthTypeAssertion_GracefulWhenDisabled(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	h.server.EnableMetrics("test", 0)
+
+	body := scrapeMetrics(t, h.server)
+	if !strings.Contains(body, "leaf_proxy_dev_fee_upstream_connected 0") {
+		t.Errorf("expected leaf_proxy_dev_fee_upstream_connected 0 (dev-fee mechanism disabled), got:\n%s", body)
+	}
+}
+
+// TestServer_SessionSnapshots_DevFeeUpstreamHealthReportedWhenEnabled
+// confirms that once EnableDevFeeUpstream has been called with a
+// concrete UpstreamSubmitter that also implements UpstreamHealth, its
+// real Connected()/ReconnectCount() values flow into the dedicated
+// leaf_proxy_dev_fee_upstream_connected/
+// leaf_proxy_dev_fee_upstream_reconnects_total collectors --
+// completely independently of the PRIMARY connection's own
+// leaf_proxy_upstream_connected/leaf_proxy_upstream_reconnects_total
+// pair (asserted here too, to prove the two are not accidentally
+// aliased onto the same collector).
+func TestServer_SessionSnapshots_DevFeeUpstreamHealthReportedWhenEnabled(t *testing.T) {
+	tmpl := &WorkerTemplate{
+		Blob:              fakeBlob(76, 50),
+		ReservedOffset:    50,
+		ClientNonceOffset: -1,
+		PoolOffset:        -1,
+		SeedHash:          []byte("test-seed-hash-32-bytes-exactly!"),
+		Height:            123,
+		JobID:             "upstream-job-1",
+		TargetDiff:        1_000_000,
+		Difficulty:        1000,
+	}
+	source := newFakeTemplateSource(tmpl)
+	jm := NewJobManager(source, nil)
+	validator := &fakeValidator{accept: true}
+	primary := &fakeUpstreamWithHealth{connected: true, reconnects: 1}
+	devFee := &fakeUpstreamWithHealth{connected: true, reconnects: 7}
+
+	cm := leaflib.NewConnectionManager(t.Context(), leaflib.ManagerConfig{IdleTimeout: 30 * time.Second})
+	server := NewServer(cm, jm, validator, primary, nil, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	server.EnableDevFeeUpstream(devFee)
+	server.EnableMetrics("test", 0)
+
+	body := scrapeMetrics(t, server)
+	if !strings.Contains(body, "leaf_proxy_upstream_connected 1") {
+		t.Errorf("expected primary leaf_proxy_upstream_connected 1, got:\n%s", body)
+	}
+	if !strings.Contains(body, "leaf_proxy_upstream_reconnects_total 1") {
+		t.Errorf("expected primary leaf_proxy_upstream_reconnects_total 1, got:\n%s", body)
+	}
+	if !strings.Contains(body, "leaf_proxy_dev_fee_upstream_connected 1") {
+		t.Errorf("expected leaf_proxy_dev_fee_upstream_connected 1, got:\n%s", body)
+	}
+	if !strings.Contains(body, "leaf_proxy_dev_fee_upstream_reconnects_total 7") {
+		t.Errorf("expected leaf_proxy_dev_fee_upstream_reconnects_total 7, got:\n%s", body)
+	}
+
+	// A dev-fee disconnect must not affect the primary's own gauge.
+	devFee.connected = false
+	body = scrapeMetrics(t, server)
+	if !strings.Contains(body, "leaf_proxy_dev_fee_upstream_connected 0") {
+		t.Errorf("expected leaf_proxy_dev_fee_upstream_connected 0 after a dev-fee-only disconnect, got:\n%s", body)
+	}
+	if !strings.Contains(body, "leaf_proxy_upstream_connected 1") {
+		t.Errorf("primary leaf_proxy_upstream_connected must remain 1 -- a dev-fee outage must never affect the primary's own health reporting, got:\n%s", body)
+	}
+}

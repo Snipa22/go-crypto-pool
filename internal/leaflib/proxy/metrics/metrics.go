@@ -193,6 +193,24 @@ type Metrics struct {
 	// connection loss is).
 	UpstreamReconnectsTotal prometheus.Counter
 
+	// DevFeeUpstreamConnected/DevFeeUpstreamReconnectsTotal mirror
+	// UpstreamConnected/UpstreamReconnectsTotal above exactly, but for
+	// the OPTIONAL second, dev-fee upstream pool connection
+	// (DISPATCH_BRIEF.md "leaf-proxy dev-fee second-connection") --
+	// always present (registered unconditionally, like every other
+	// collector here), but only ever driven away from their zero
+	// value when Server.EnableDevFeeUpstream has actually been called
+	// (-dev-fee-percent > 0) AND the concrete dev-fee upstream
+	// implements the optional UpstreamHealth capability -- see
+	// server.go's sessionSnapshots for the wiring. Always 0/absent
+	// activity when the dev-fee mechanism is disabled -- a byte-
+	// identical, always-zero metric is a safe default for a disabled
+	// optional feature, exactly like every other opt-in metric this
+	// package already exposes (e.g. BanRejectionsTotal before
+	// EnableAddressFlags is ever called).
+	DevFeeUpstreamConnected       prometheus.Gauge
+	DevFeeUpstreamReconnectsTotal prometheus.Counter
+
 	ConnectionErrorsTotal *prometheus.CounterVec
 
 	BuildInfo *prometheus.GaugeVec
@@ -244,6 +262,16 @@ func New(version string, maxAddressLabels int) *Metrics {
 	m.UpstreamReconnectsTotal = shared.RegisterCounter(reg, prometheus.CounterOpts{
 		Name: "leaf_proxy_upstream_reconnects_total",
 		Help: "Total number of times leaf-proxy has successfully re-established its upstream pool connection after a real connection loss (does not count the initial startup connect).",
+	})
+
+	m.DevFeeUpstreamConnected = shared.RegisterGauge(reg, prometheus.GaugeOpts{
+		Name: "leaf_proxy_dev_fee_upstream_connected",
+		Help: "1 if leaf-proxy's optional second, dev-fee upstream pool connection is currently established, 0 otherwise -- including when the dev-fee mechanism is disabled (-dev-fee-percent=0), which is this metric's permanent value in that case.",
+	})
+
+	m.DevFeeUpstreamReconnectsTotal = shared.RegisterCounter(reg, prometheus.CounterOpts{
+		Name: "leaf_proxy_dev_fee_upstream_reconnects_total",
+		Help: "Total number of times leaf-proxy has successfully re-established its optional dev-fee upstream pool connection after a real connection loss (does not count the initial startup connect). Always 0 when the dev-fee mechanism is disabled.",
 	})
 
 	m.ConnectionErrorsTotal = shared.RegisterCounterVec(reg, prometheus.CounterOpts{

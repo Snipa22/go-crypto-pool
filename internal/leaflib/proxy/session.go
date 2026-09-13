@@ -225,9 +225,12 @@ func (s *Session) alreadyDelivered(job *Job) bool {
 //
 // The rule, in order:
 //
-//  1. Read the CURRENT upstream template's own job_id via
-//     s.server.jobs.currentTemplateJobID() -- a pure, side-effect-free
-//     read, no nonce/ID allocated.
+//  1. Read the CURRENT upstream template's own job_id, for whichever
+//     connection route the CACHED job (if any) belongs to, via
+//     s.server.jobs.currentTemplateJobIDForRoute(route) -- a pure,
+//     side-effect-free read, no nonce/ID allocated (see this
+//     function's own "DEV-FEE ROUTING NOTE" below for why this must
+//     be route-aware, not always the primary connection's template).
 //  2. If that job_id is EMPTY (some pool dialects never publish
 //     job_id at all -- confirmed possible, see UpstreamJobPayload.
 //     JobID's own omitempty tag), caching is UNSAFE: an empty id can
@@ -255,18 +258,41 @@ func (s *Session) alreadyDelivered(job *Job) bool {
 // retarget always forces a new job) -- doing so keeps a single,
 // consistent code path for every production caller and costs nothing
 // extra.
+//
+// DEV-FEE ROUTING NOTE (DISPATCH_BRIEF.md "leaf-proxy dev-fee
+// second-connection"): the cache-validity check above is deliberately
+// keyed against whichever connection the CACHED job itself belongs to
+// (s.cachedJob.Route), via JobManager.currentTemplateJobIDForRoute --
+// NOT always the primary connection's template. The primary and
+// dev-fee connections' own upstream templates change completely
+// independently of one another (different pools' own job cadence),
+// so validating a possibly-dev-fee-routed cached job against the
+// PRIMARY's template job_id would be simply wrong: it could either
+// falsely invalidate a still-good dev-fee job (primary's job_id
+// happened to change, dev-fee's didn't) or, worse, falsely keep
+// serving a now-stale dev-fee job (primary's job_id happened to stay
+// the same while dev-fee's own template moved on). When s.cachedJob
+// is nil (nothing cached yet), route defaults to RoutePrimary purely
+// so the very first currentTemplateJobIDForRoute call has a
+// well-defined route to ask about -- this has no effect on which
+// connection NextJob ultimately mints from below, since NextJob makes
+// that decision itself via its own selector call, independent of
+// this cache-validity check.
 func (s *Session) currentJob(difficulty uint64) (*Job, error) {
-	templateJobID, ok := s.server.jobs.currentTemplateJobID()
-	if !ok || templateJobID == "" {
-		// No template yet, or this pool dialect never publishes
-		// job_id: caching is unsafe/impossible -- always mint fresh.
-		return s.server.jobs.NextJob(difficulty)
-	}
-
 	s.jobCacheMu.Lock()
 	defer s.jobCacheMu.Unlock()
 
-	if s.cachedJob != nil && s.cachedJob.UpstreamJobID == templateJobID && s.cachedJob.StaticDifficulty == difficulty {
+	route := RoutePrimary
+	if s.cachedJob != nil {
+		route = s.cachedJob.Route
+	}
+	templateJobID, ok := s.server.jobs.currentTemplateJobIDForRoute(route)
+	if ok && templateJobID != "" && s.cachedJob != nil && s.cachedJob.UpstreamJobID == templateJobID && s.cachedJob.StaticDifficulty == difficulty {
+		// No template yet, or this pool dialect never publishes
+		// job_id (ok==false or templateJobID==""): caching is
+		// unsafe/impossible for a job on this route -- falls through
+		// to minting fresh below, exactly like the pre-dev-fee
+		// behavior did.
 		return s.cachedJob, nil
 	}
 
@@ -704,7 +730,15 @@ func (s *Session) handleSubmit(req Request) {
 	// dispatch further down: a stale-generation submit is rejected
 	// SYNCHRONOUSLY on this read loop, never handed to the async
 	// pool needlessly.
-	if gs, ok := s.server.upstream.(UpstreamGenerationSource); ok {
+	//
+	// DEV-FEE ROUTING: resolved via s.server.upstreamForRoute(job.Route)
+	// -- job.Route (job.go) already records which connection (the
+	// primary, or the optional dev-fee one) this Job was actually
+	// minted from, so this generation check (and the eventual
+	// SubmitShare forward below) is always checked against that SAME
+	// connection's own live generation counter, never the other
+	// connection's.
+	if gs, ok := s.server.upstreamForRoute(job.Route).(UpstreamGenerationSource); ok {
 		if current := gs.CurrentGeneration(); job.TemplateGeneration < current {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("job's upstream template generation is stale (this leaf's upstream connection has reconnected since this job was issued) -- job_id %s", submit.JobID))
 			return
@@ -895,15 +929,17 @@ func (s *Session) handleSubmit(req Request) {
 		// wasting a real round-trip against a dead/superseded
 		// upstream session (see UpstreamGenerationSource's own doc
 		// comment for why that costs this leaf's invalid-share/ban
-		// ratio upstream).
-		if gs, ok := s.server.upstream.(UpstreamGenerationSource); ok {
+		// ratio upstream). Route-resolved via upstreamForRoute
+		// (job.Route), exactly like the pre-dispatch check above.
+		submitter := s.server.upstreamForRoute(job.Route)
+		if gs, ok := submitter.(UpstreamGenerationSource); ok {
 			if current := gs.CurrentGeneration(); job.TemplateGeneration < current {
 				s.writeShareResponse(req.ID, false, fmt.Sprintf("job's upstream template generation went stale while queued for validation (this leaf's upstream connection reconnected) -- job_id %s", submit.JobID))
 				return
 			}
 		}
 
-		accepted, err := s.server.upstream.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce)
+		accepted, err := submitter.SubmitShare(context.Background(), job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce)
 		s.server.debugLogger.Debugf("proxy: upstream forward: session=%s upstream_job_id=%s nonce=%s result=%s worker_nonce=%v pool_nonce=%v -> accepted=%v err=%v", s.sessionID, job.UpstreamJobID, nonceHex, submit.Result, job.WorkerNonce, job.PoolNonce, accepted, err)
 		if err != nil {
 			s.server.logger.Printf("proxy: upstream submit failed for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, err)

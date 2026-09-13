@@ -175,6 +175,26 @@ type Server struct {
 	// through its own server back-reference. nil is a complete
 	// no-op.
 	debugLogger *leaflib.DebugLogger
+
+	// devFeeUpstream is nil unless EnableDevFeeUpstream has been
+	// called (cmd/leaf-proxy/main.go only calls it when
+	// -dev-fee-percent > 0 -- DISPATCH_BRIEF.md "leaf-proxy dev-fee
+	// second-connection") -- the optional SECOND, independent
+	// upstream connection a Job tagged Route == RouteDevFee (job.go)
+	// must actually be forwarded/re-checked against instead of the
+	// primary s.upstream. See upstreamForRoute below, the single
+	// resolution choke point session.go's handleSubmit uses for
+	// every route-dependent decision. nil is a complete no-op: every
+	// route-dependent decision falls back to the primary s.upstream,
+	// which is exactly the pre-dev-fee behavior.
+	devFeeUpstream UpstreamSubmitter
+
+	// lastDevFeeReconnectCount mirrors lastReconnectCount above but
+	// for the optional dev-fee connection's own UpstreamHealth.
+	// ReconnectCount() delta tracking at scrape time (sessionSnapshots)
+	// -- see that field's doc comment for the exact rationale, which
+	// applies identically here.
+	lastDevFeeReconnectCount atomic.Uint64
 }
 
 // NewServer constructs a Server. cm must already be configured with
@@ -306,6 +326,45 @@ func (s *Server) EnableAddressFlags(cache *addressflags.Cache) {
 	s.addressFlags = cache
 }
 
+// EnableDevFeeUpstream opts this Server into the optional
+// developer-fee mechanism's forwarding side (DISPATCH_BRIEF.md
+// "leaf-proxy dev-fee second-connection"): from this call onward,
+// upstreamForRoute resolves RouteDevFee (job.go's Job.Route) to
+// upstream instead of falling back to the primary s.upstream. Intended
+// caller: cmd/leaf-proxy/main.go, only when -dev-fee-percent > 0, in
+// lockstep with the SAME UpstreamClient instance also passed to
+// JobManager.EnableDevFee -- both must agree on which concrete
+// connection RouteDevFee means, or a submit would be validated against
+// one connection's template but forwarded to the other's socket.
+// Never called at all when the mechanism is disabled, which is what
+// makes "-dev-fee-percent=0 is a complete no-op" hold structurally at
+// this layer too.
+func (s *Server) EnableDevFeeUpstream(upstream UpstreamSubmitter) {
+	s.devFeeUpstream = upstream
+}
+
+// upstreamForRoute is the single resolution choke point every
+// route-dependent decision in session.go's handleSubmit goes through:
+// given the UpstreamRoute a specific Job (job.go) was minted under, it
+// returns the concrete UpstreamSubmitter that Job's eventual submit
+// must be validated/forwarded against. RouteDevFee resolves to
+// s.devFeeUpstream ONLY when EnableDevFeeUpstream has actually been
+// called (s.devFeeUpstream != nil) -- falling back to the primary
+// s.upstream otherwise, which should never actually happen in
+// practice (JobManager.NextJob never tags a Job RouteDevFee unless its
+// own devFeeSource was non-nil at mint time, and cmd/leaf-proxy always
+// calls EnableDevFee/EnableDevFeeUpstream together -- see
+// EnableDevFeeUpstream's own doc comment) but is the same
+// fail-safe-toward-primary direction every other dev-fee fault-
+// isolation fallback in this package takes, rather than a nil-pointer
+// panic. RoutePrimary always resolves to s.upstream, unconditionally.
+func (s *Server) upstreamForRoute(route UpstreamRoute) UpstreamSubmitter {
+	if route == RouteDevFee && s.devFeeUpstream != nil {
+		return s.devFeeUpstream
+	}
+	return s.upstream
+}
+
 // MetricsHandler returns the Prometheus /metrics HTTP handler if
 // EnableMetrics has been called, or a handler that responds 404
 // otherwise (rather than panicking a caller that wires it
@@ -342,6 +401,25 @@ func (s *Server) sessionSnapshots() []metrics.SessionSnapshot {
 			delta := current - s.lastReconnectCount.Swap(current)
 			if delta > 0 && current >= delta {
 				s.metrics.UpstreamReconnectsTotal.Add(float64(delta))
+			}
+		}
+		// Dev-fee connection health mirrors the primary's exact same
+		// pattern above, on its own gauge/counter pair -- see
+		// EnableDevFeeUpstream's doc comment. s.devFeeUpstream is nil
+		// (this whole block a no-op) unless the dev-fee mechanism was
+		// actually enabled.
+		if s.devFeeUpstream != nil {
+			if health, ok := s.devFeeUpstream.(UpstreamHealth); ok {
+				if health.Connected() {
+					s.metrics.DevFeeUpstreamConnected.Set(1)
+				} else {
+					s.metrics.DevFeeUpstreamConnected.Set(0)
+				}
+				current := health.ReconnectCount()
+				delta := current - s.lastDevFeeReconnectCount.Swap(current)
+				if delta > 0 && current >= delta {
+					s.metrics.DevFeeUpstreamReconnectsTotal.Add(float64(delta))
+				}
 			}
 		}
 	}

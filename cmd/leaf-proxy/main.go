@@ -26,12 +26,29 @@
 // ports do drift over time — do not assume this default stays
 // correct indefinitely.
 //
-// NOT ported from the legacy xmr-node-proxy reference (per explicit
-// instruction): the 1% developer-donation-pool skim (devPool), and
-// the Node.js cluster/worker multi-process architecture — this is a
-// single Go process using goroutines + internal/leaflib's
-// ConnectionManager, which comfortably out-scales the legacy's
-// per-worker sharding model without needing to replicate it.
+// DEVELOPER-FEE MECHANISM (re-added this pass, DISPATCH_BRIEF.md
+// "leaf-proxy dev-fee second-connection" -- a PRIOR pass of this same
+// file's doc comment said the legacy reference's 1% devPool skim was
+// "deliberately NOT ported"; that statement is now WRONG and has been
+// corrected here): -dev-fee-percent/LEAF_PROXY_DEV_FEE_PERCENT
+// (default 1.0, matching the legacy reference's own pre-configured
+// 1% donation; 0 fully disables the mechanism, a complete no-op with
+// zero second connection ever dialed) opens a SECOND, independent
+// upstream connection under a hardcoded (not operator-configurable)
+// dev-fee login and routes approximately that percentage of job
+// issuances/upstream-forwarded share traffic to it instead of the
+// primary connection -- see internal/leaflib/proxy/devfee.go's
+// package-level doc comment for the full mechanism, INCLUDING an
+// explicit, confirmed citation of what the real legacy xmr-node-proxy
+// reference source actually does differently (a 90-second,
+// whole-miner hashrate-balancing reassignment, not a per-job rolling
+// window) and why this leaf's own simplified mechanism is a
+// deliberate, documented approximation of that rather than a literal
+// port. Still NOT ported from the legacy reference: its Node.js
+// cluster/worker multi-process architecture — this is a single Go
+// process using goroutines + internal/leaflib's ConnectionManager,
+// which comfortably out-scales the legacy's per-worker sharding model
+// without needing to replicate it.
 package main
 
 import (
@@ -173,6 +190,30 @@ type config struct {
 	// process. OFF (false) by default -- purely additive, byte-
 	// identical existing log output when left off.
 	debug bool
+
+	// devFeePercent is -dev-fee-percent/LEAF_PROXY_DEV_FEE_PERCENT:
+	// the ONLY operator-tunable knob for leaf-proxy's optional
+	// developer-fee mechanism (see internal/leaflib/proxy/devfee.go's
+	// package-level doc comment for the full design, including the
+	// real legacy xmr-node-proxy reference this is a deliberate,
+	// documented simplification of). Valid range is [0, 100]
+	// inclusive -- validated by validateDevFeePercent below, which
+	// fails fast at startup with a clear error rather than silently
+	// clamping a nonsensical value. 0 (NOT the default -- see below)
+	// is a COMPLETE no-op: setupDevFee never even constructs a
+	// second UpstreamClient, let alone dials one, in that case.
+	//
+	// Defaults to 1.0 (a real, non-zero opt-OUT-only default,
+	// mirroring the real legacy xmr-node-proxy reference's own
+	// pre-configured 1% donation -- see this repo's own
+	// DISPATCH_BRIEF.md for the explicit instruction this default
+	// value comes from) -- an operator who wants the mechanism fully
+	// disabled must explicitly set this to 0.
+	//
+	// Dev-fee login/pass are DELIBERATELY NOT configurable here (no
+	// corresponding flag/env/TOML key exists for them at all) -- see
+	// devfee.go's devFeeLogin/devFeePass doc comment.
+	devFeePercent float64
 }
 
 func loadConfig() (config, error) {
@@ -254,13 +295,33 @@ func loadConfig() (config, error) {
 
 	flag.BoolVar(&cfg.debug, "debug", envOrBool("LEAF_PROXY_DEBUG", false), "enable verbose [DEBUG]-tagged logging (downstream submit params, validation attempt/result, upstream forward attempts/responses, template lifecycle, connection lifecycle, vardiff retargets). OFF by default -- purely additive, never changes any existing log line. Env: LEAF_PROXY_DEBUG")
 
+	flag.Float64Var(&cfg.devFeePercent, "dev-fee-percent", envOrFloat64("LEAF_PROXY_DEV_FEE_PERCENT", 1.0), "percentage (0-100) of job issuances/upstream-forwarded share traffic routed to a SECOND, independent upstream connection logged in under a hardcoded (not operator-configurable) dev-fee login -- see internal/leaflib/proxy/devfee.go's doc comment for the full mechanism. 0 disables the mechanism entirely: no second connection is ever dialed. Env: LEAF_PROXY_DEV_FEE_PERCENT")
+
 	flag.Parse()
 
 	if err := applyConfigFile(&cfg); err != nil {
 		return cfg, err
 	}
 
+	if err := validateDevFeePercent(cfg.devFeePercent); err != nil {
+		return cfg, err
+	}
+
 	return cfg, nil
+}
+
+// validateDevFeePercent enforces -dev-fee-percent/
+// LEAF_PROXY_DEV_FEE_PERCENT's documented valid range (0-100
+// inclusive) -- fails fast at startup with a clear error rather than
+// silently clamping or accepting a nonsensical value: a negative
+// percentage or one above 100 has no sane interpretation for
+// internal/leaflib/proxy's devFeeSelector (a rolling-window fraction
+// outside [0, 100] is meaningless).
+func validateDevFeePercent(percent float64) error {
+	if percent < 0 || percent > 100 {
+		return fmt.Errorf("leaf-proxy: -dev-fee-percent/LEAF_PROXY_DEV_FEE_PERCENT must be between 0 and 100 (inclusive), got %v", percent)
+	}
+	return nil
 }
 
 // fileConfig mirrors config field-for-field (excluding configFile
@@ -310,6 +371,8 @@ type fileConfig struct {
 	AddressFlagsPollIntervalSeconds *int    `toml:"address_flags_poll_interval_seconds"`
 
 	Debug *bool `toml:"debug"`
+
+	DevFeePercent *float64 `toml:"dev_fee_percent"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -387,6 +450,8 @@ func applyConfigFile(cfg *config) error {
 
 	cfgfile.ApplyBool(&cfg.debug, fc.Debug, visited, "debug", "LEAF_PROXY_DEBUG")
 
+	cfgfile.ApplyFloat64(&cfg.devFeePercent, fc.DevFeePercent, visited, "dev-fee-percent", "LEAF_PROXY_DEV_FEE_PERCENT")
+
 	return nil
 }
 
@@ -428,6 +493,15 @@ func envOrDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func envOrFloat64(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def
@@ -513,6 +587,50 @@ func parsePortEntry(raw string) (solo.PortConfig, error) {
 	return solo.PortConfig{Address: address, Difficulty: difficulty, PortDesc: desc, TLS: tlsEnabled}, nil
 }
 
+// setupDevFee wires cmd/leaf-proxy's optional dev-fee mechanism
+// (-dev-fee-percent/LEAF_PROXY_DEV_FEE_PERCENT) into jobManager --
+// see internal/leaflib/proxy/devfee.go's package-level doc comment
+// for the full design, including the real legacy xmr-node-proxy
+// reference this is a deliberate, documented simplification of.
+//
+// Returns the constructed, already-Connect()-ed dev-fee
+// *proxy.UpstreamClient so main() can wire it into
+// Server.EnableDevFeeUpstream and defer its Close, or (nil, nil) when
+// cfg.devFeePercent <= 0 -- a COMPLETE no-op: this function does not
+// even construct a proxy.UpstreamClient, let alone dial one, in that
+// case (see TestSetupDevFee_ZeroPercentIsANoOp in main_test.go). A
+// genuine dial/login failure for the dev-fee connection is returned
+// as an error (main() treats it as fatal, matching how a failed
+// PRIMARY upstream connect is already handled) rather than silently
+// degrading to "dev-fee disabled" -- an operator who explicitly
+// configured a non-zero -dev-fee-percent should be told loudly if
+// the second connection this promises could not actually be
+// established, not have it silently vanish.
+func setupDevFee(ctx context.Context, cfg config, logger *log.Logger, debugLogger *leaflib.DebugLogger, jobManager *proxy.JobManager) (*proxy.UpstreamClient, error) {
+	if cfg.devFeePercent <= 0 {
+		return nil, nil
+	}
+	logger.Printf("dev-fee mechanism ENABLED at %v%% (-dev-fee-percent) -- opening a SECOND upstream connection to %s:%d under a hardcoded (not operator-configurable) dev-fee login; see internal/leaflib/proxy/devfee.go's doc comment for the full mechanism -- the devFeeLogin placeholder CHANGE-ME-DEV-FEE-ADDRESS must be replaced with a real payout address before any real deploy", cfg.devFeePercent, cfg.upstreamHost, cfg.upstreamPort)
+	devFeeUpstream := proxy.NewDevFeeUpstreamClient(proxy.UpstreamConfig{
+		Host:                  cfg.upstreamHost,
+		Port:                  cfg.upstreamPort,
+		TLS:                   cfg.upstreamTLS,
+		InsecureSkipVerifyTLS: cfg.upstreamInsecure,
+		Agent:                 cfg.upstreamAgent,
+		DialTimeout:           cfg.dialTimeout,
+		IdleTimeout:           cfg.idleTimeout,
+		RequestTimeout:        cfg.requestTimeout,
+	}, logger)
+	devFeeUpstream.SetDebugLogger(debugLogger)
+	if err := devFeeUpstream.Connect(ctx); err != nil {
+		return nil, fmt.Errorf("connecting dev-fee upstream connection: %w", err)
+	}
+	jobManager.EnableDevFee(devFeeUpstream, proxy.NewDevFeeSelector(cfg.devFeePercent))
+	tmpl := devFeeUpstream.CurrentTemplate()
+	logger.Printf("dev-fee upstream connection established: session_id=%s height=%d", devFeeUpstream.SessionID(), tmpl.Height)
+	return devFeeUpstream, nil
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -563,6 +681,20 @@ func main() {
 
 	jobManager := proxy.NewJobManager(upstream, logger)
 
+	// Optional developer-fee mechanism (-dev-fee-percent/
+	// LEAF_PROXY_DEV_FEE_PERCENT, default 1.0) -- see setupDevFee's
+	// own doc comment and internal/leaflib/proxy/devfee.go's
+	// package-level doc comment for the full design. A COMPLETE
+	// no-op (devFeeUpstream stays nil, nothing else below changes
+	// behavior at all) when cfg.devFeePercent <= 0.
+	devFeeUpstream, err := setupDevFee(ctx, cfg, logger, debugLogger, jobManager)
+	if err != nil {
+		logger.Fatalf("failed to set up dev-fee mechanism: %v", err)
+	}
+	if devFeeUpstream != nil {
+		defer devFeeUpstream.Close()
+	}
+
 	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{
 		MaxConnections: cfg.maxConnections,
 		IdleTimeout:    cfg.idleTimeout,
@@ -593,6 +725,10 @@ func main() {
 
 	server := proxy.NewServer(cm, jobManager, rxValidator, upstream, logger, vardiffCfg, cfg.jobMaxAge)
 	defer server.Shutdown()
+
+	if devFeeUpstream != nil {
+		server.EnableDevFeeUpstream(devFeeUpstream)
+	}
 
 	server.SetDebugLogger(debugLogger)
 

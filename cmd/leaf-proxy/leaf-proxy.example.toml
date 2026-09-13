@@ -164,3 +164,13 @@ address_flags_poll_interval_seconds = 30
 # (default: false)
 debug = false
 
+# Percentage (0-100) of job issuances/upstream-forwarded share traffic
+# routed to a SECOND, independent upstream connection logged in under a
+# hardcoded (NOT operator-configurable -- there is no dev_fee_login/
+# dev_fee_pass key) dev-fee login, against the same upstream_host/
+# upstream_port/upstream_tls as above. See
+# internal/leaflib/proxy/devfee.go's doc comment for the full mechanism.
+# 0 disables the mechanism entirely: no second connection is ever dialed.
+# (default: 1.0)
+dev_fee_percent = 1.0
+
