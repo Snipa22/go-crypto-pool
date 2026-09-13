@@ -4,7 +4,6 @@ package solo
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -291,24 +290,6 @@ func TestMoneroNodeClient_RealDaemonRoundTrip(t *testing.T) {
 		t.Fatalf("bytes after the nonce field were altered by patching")
 	}
 
-	// Real, LOCAL block-ID computation -- confirm it's populated,
-	// 32 bytes, and matches an independent re-derivation from the
-	// SAME real live-daemon blob (see BuildCandidateBlock's own doc
-	// comment for the full derivation).
-	if len(moneroCandidate.BlockHash) != 32 {
-		t.Fatalf("BuildCandidateBlock's locally-computed BlockHash has length %d, want 32", len(moneroCandidate.BlockHash))
-	}
-	independentPatchedHashingBlob := make([]byte, len(data.HashingBlob))
-	copy(independentPatchedHashingBlob, data.HashingBlob)
-	var independentNonceBuf [4]byte
-	binary.LittleEndian.PutUint32(independentNonceBuf[:], 0x11223344)
-	copy(independentPatchedHashingBlob[independentOffset:independentOffset+4], independentNonceBuf[:])
-	independentBlockHash := moneroLocalBlockHash(independentPatchedHashingBlob)
-	if !bytes.Equal(moneroCandidate.BlockHash, independentBlockHash[:]) {
-		t.Fatalf("BuildCandidateBlock's BlockHash = %x, want independently-recomputed %x", moneroCandidate.BlockHash, independentBlockHash)
-	}
-	t.Logf("real, locally-computed block ID for this candidate: %x", moneroCandidate.BlockHash)
-
 	// Real submit_block call for the nonce-patched candidate:
 	// well-formed at the byte-structure level (this is exactly what
 	// BuildCandidateBlock's nonce-patching is supposed to produce —
@@ -324,14 +305,20 @@ func TestMoneroNodeClient_RealDaemonRoundTrip(t *testing.T) {
 	// here) — both are real, confirmed rejection codes for this RPC,
 	// and either is an acceptable outcome for THIS deliberately-wrong
 	// nonce; what matters is that the daemon reports a genuine error,
-	// not a fabricated/hardcoded one.
-	err = client.SubmitBlock(ctx, moneroCandidate)
+	// not a fabricated/hardcoded one. Uses SubmitBlockWithID (rather
+	// than the bare SubmitBlock) so this same real round-trip also
+	// exercises the real block_id decode path -- on a rejection,
+	// blockID must come back empty, never fabricated.
+	blockID, err := client.SubmitBlockWithID(ctx, moneroCandidate)
 	if err == nil {
-		t.Fatalf("SubmitBlock unexpectedly succeeded for a deliberately-wrong candidate block")
+		t.Fatalf("SubmitBlockWithID unexpectedly succeeded for a deliberately-wrong candidate block")
+	}
+	if blockID != "" {
+		t.Fatalf("SubmitBlockWithID returned a non-empty blockID (%q) alongside a real submit_block error -- must never fabricate a hash", blockID)
 	}
 	var rpcErr *moneroRPCError
 	if !asMoneroRPCError(err, &rpcErr) {
-		t.Fatalf("SubmitBlock error is not a *moneroRPCError (got %T: %v)", err, err)
+		t.Fatalf("SubmitBlockWithID error is not a *moneroRPCError (got %T: %v)", err, err)
 	}
 	t.Logf("real live submit_block rejection for well-formed-but-wrong-nonce candidate: code=%d message=%q", rpcErr.Code, rpcErr.Message)
 	if rpcErr.Code != -6 && rpcErr.Code != -7 {

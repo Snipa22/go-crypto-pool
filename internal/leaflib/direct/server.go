@@ -313,17 +313,15 @@ type ServerConfig struct {
 	// configured against, see cmd/leaf-direct/main.go's -monerod-url/
 	// LEAF_DIRECT_MONEROD_URL) -- used ONLY to construct this
 	// Server's own, independent moneroHeaderResolver
-	// (MoneroBlockHeaderClient, monero_hash.go), which
-	// session.go's handleSubmit queries via
-	// get_block_header_by_height to capture the REAL Monero block
-	// hash on a genuine ALGO_RXM block find (see FIX_BRIEF.md --
-	// sha256(candidate blob) is NOT a real Monero block ID and was
-	// silently orphaning every real RXM block found via this leaf).
-	// Empty for -coin=tari (ignored entirely); REQUIRED for
-	// -coin=monero -- leaving it empty for -coin=monero means
-	// resolveMoneroBlockHash always fails loudly rather than
-	// forwarding a placeholder hash, per this fix's explicit
-	// fallback-hardening requirement.
+	// (MoneroBlockHeaderClient, monero_hash.go). session.go's
+	// handleSubmit no longer queries that resolver from its hot path
+	// at all (see resolveMoneroBlockHash's own doc comment for the
+	// full history: the real Monero block hash for a genuine ALGO_RXM
+	// block find is sourced directly from submit_block's own
+	// response's real "block_id" field instead) -- this field is kept
+	// only for the independent, RPC-based capability resolveMoneroBlockHash
+	// still exposes (tests/tooling/potential future manual
+	// reconciliation). Empty for -coin=tari (ignored entirely).
 	MonerodURL string
 
 	// MergeMineChains lists every merge-mined chain (beyond the
@@ -612,25 +610,41 @@ func (s *Server) recordTransportSuccess(kind string) {
 // this leaf's own solo.MoneroNodeClient already talks to (see
 // ServerConfig.MonerodURL and monero_hash.go).
 //
-// NO LONGER CALLED FROM session.go's handleSubmit HOT PATH (real
-// production incident, 2026-09-12 live test against
-// leaf-direct-monero-pplns.service/CT132: this exact post-submit RPC
-// call raced the local testnet daemon's own tip advancement --
-// monerod rpc error -2, "Requested block height: X greater than
-// current top block height: X-1" -- and lost 150 of 152 real block
-// finds in one 2-hour test). handleSubmit's ALGO_RXM case now sources
-// the real block hash entirely locally instead, from
-// solo.MoneroCandidate.BlockHash (solo.MoneroNodeClient.
-// BuildCandidateBlock's own doc comment has the full derivation) --
-// no RPC round-trip, so nothing left to race. This method (and the
-// moneroHeaderResolver/MonerodURL wiring behind it) is kept only as
-// an independent, RPC-based capability for tests/tooling (see
-// monero_hash_test.go and TestDirectResolveMoneroBlockHash_
-// NoResolverConfigured) and as a potential future manual-
-// reconciliation/startup-capability-check helper -- it is
-// deliberately NOT deleted, per this fix's own explicit "keep as a
-// startup-only capability check / test" allowance, but it no longer
-// gates any real block-find forward.
+// NO LONGER CALLED FROM session.go's handleSubmit HOT PATH. This was
+// true for two DIFFERENT reasons across this repo's git history, in
+// order:
+//
+//  1. (real production incident, 2026-09-12 live test against
+//     leaf-direct-monero-pplns.service/CT132): this exact post-submit
+//     RPC call raced the local testnet daemon's own tip advancement --
+//     monerod rpc error -2, "Requested block height: X greater than
+//     current top block height: X-1" -- and lost 150 of 152 real block
+//     finds in one 2-hour test. The first fix for this replaced this
+//     call with a LOCAL hash computation (solo.MoneroCandidate.
+//     BlockHash) -- but that local computation was itself CONFIRMED
+//     WRONG by further live testing (the computed hash did not match
+//     the real chain's own reported hash at the same height) and has
+//     since been removed entirely.
+//  2. (the correction): the real, correct fix needs no RPC round-trip
+//     of ANY kind here, local or otherwise -- monerod's own real
+//     submit_block response already carries the real, canonical
+//     block ID directly (a top-level "block_id" field, confirmed
+//     present since monero-project/monero commit
+//     e8cac61f4b9a662cbc1b00e46d1f9a3dd991c5f0). handleSubmit's
+//     ALGO_RXM case now sources the real block hash from THAT SAME
+//     submit_block response instead (see solo.MoneroNodeClient.
+//     SubmitBlockWithID/SubmitBlockAuxChains and
+//     solo.moneroSubmitBlockAuxResult.BlockID's own doc comment for
+//     the full derivation/citations).
+//
+// This method (and the moneroHeaderResolver/MonerodURL wiring behind
+// it) is kept only as an independent, RPC-based capability for
+// tests/tooling (see monero_hash_test.go and
+// TestDirectResolveMoneroBlockHash_NoResolverConfigured) and as a
+// potential future manual-reconciliation/startup-capability-check
+// helper -- it is deliberately NOT deleted, per this fix's own
+// explicit "keep as a startup-only capability check / test"
+// allowance, but it no longer gates any real block-find forward.
 //
 // Returns an error -- NEVER a placeholder/empty string -- if no
 // resolver is configured (ServerConfig.MonerodURL was left empty for
@@ -653,15 +667,17 @@ func (s *Server) resolveMoneroBlockHash(ctx context.Context, height uint64) (str
 // recordMoneroBlockHashUnresolved bumps the real
 // leaf_direct_block_hash_unresolved_total counter -- the "fail
 // loudly" signal for a genuine ALGO_RXM block find whose real hash
-// could not be established. Since the local-hash-computation fix
-// (see resolveMoneroBlockHash's own updated doc comment), this now
-// fires ONLY when solo.MoneroCandidate.BlockHash (computed entirely
-// locally by BuildCandidateBlock) comes back empty on an otherwise-
-// accepted block find -- a defensive-only path that should be
-// unreachable in practice (BuildCandidateBlock itself already
-// validates the blob/offset before ever computing a hash), kept per
-// this fix's explicit "keep defensive error handling for a genuinely
-// malformed blob" requirement. nil-safe like every other record*
+// could not be established. This now fires when the real
+// submit_block RPC response carried an empty/missing top-level
+// "block_id" field on an otherwise-accepted block find (see
+// handleSubmit's ALGO_RXM case and solo.moneroSubmitBlockAuxResult.
+// BlockID's own doc comment for the legitimate reasons that field can
+// still be empty: an older, pre-e8cac61f monerod, or a merge-mining
+// proxy that doesn't pass block_id through untouched) -- a real,
+// reachable defensive case (unlike the prior local-hash-computation
+// fix's equivalent, which was defensive-only/should-be-unreachable),
+// kept per this fix's explicit "handle the empty/missing block_id
+// case defensively" requirement. nil-safe like every other record*
 // helper on this type (metrics may not be enabled).
 func (s *Server) recordMoneroBlockHashUnresolved() {
 	if s.metrics == nil {

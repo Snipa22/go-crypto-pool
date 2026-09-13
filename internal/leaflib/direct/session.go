@@ -780,58 +780,75 @@ func (s *Session) handleSubmit(req solo.Request) {
 				s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
 				return
 			}
-			// AUX-CHAIN FIX (multi-chain RXM merge-mine recording):
-			// when s.server.node ALSO implements
-			// solo.AuxChainSubmitter (true today whenever this
-			// leaf's configured Monero endpoint is a
+			// THE REAL FIX (see this repo's git history for the full
+			// correction): an earlier version of this fix computed
+			// the Monero block hash entirely LOCALLY
+			// (moneroLocalBlockHash) to avoid a real, live-confirmed
+			// race between a post-submit get_block_header_by_height
+			// call and the daemon's own tip advancement. That local
+			// computation was CONFIRMED WRONG by live testing (the
+			// computed hash did not match the real chain's own
+			// reported hash at the same height) and has been removed
+			// entirely. The correct fix needs neither a local
+			// computation NOR a second RPC call: monerod's own real
+			// submit_block JSON-RPC response has included a top-level
+			// "block_id" field directly since monero-project/monero
+			// commit e8cac61f4b9a662cbc1b00e46d1f9a3dd991c5f0 ("core_
+			// rpc_server: return ID of submitted block", first
+			// released in v0.18.0.0+246, June 2023) -- see
+			// solo.moneroSubmitBlockAuxResult.BlockID's own doc
+			// comment. This leaf reads that same field straight off
+			// the SAME submit_block call that already accepted the
+			// block, via whichever of solo.AuxChainSubmitter (also
+			// surfaces merge-mine-chain acceptance in this SAME call)
+			// or solo.BlockIDSubmitter (block_id only) the configured
+			// node implements -- falling back to the plain SubmitBlock
+			// call (identical to this leaf's pre-existing behavior,
+			// with no real block_id available at all) when the node
+			// implements neither.
+			//
+			// AUX-CHAIN NOTE (multi-chain RXM merge-mine recording):
+			// solo.AuxChainSubmitter is implemented today whenever
+			// this leaf's configured Monero endpoint is a
 			// minotari_merge_mining_proxy listener rather than raw
-			// monerod -- see cmd/leaf-direct's -monerod-url doc
-			// comment), this SAME submit_block call additionally
-			// reports whether any OTHER configured chain (today:
-			// Tari) ALSO cleared its own real target on this SAME
-			// PoW submission -- see solo.AuxChainResult's doc
-			// comment for the real, live-confirmed wire shape
-			// ("_aux.chains" array, "xtr" for Tari). Falls back to
-			// the plain SubmitBlock call (identical to pre-existing
-			// behavior) when the configured node has no such
-			// capability (e.g. a bare monerod with no merge-mining
-			// proxy in front of it).
+			// monerod (see cmd/leaf-direct's -monerod-url doc
+			// comment) -- see solo.AuxChainResult's doc comment for
+			// the real, live-confirmed wire shape ("_aux.chains"
+			// array, "xtr" for Tari).
 			var (
-				auxChains []solo.AuxChainResult
-				submitErr error
+				realBlockID string
+				auxChains   []solo.AuxChainResult
+				submitErr   error
 			)
-			if auxSubmitter, ok := s.server.node.(solo.AuxChainSubmitter); ok {
-				auxChains, submitErr = auxSubmitter.SubmitBlockAuxChains(context.Background(), candidate)
-			} else {
-				submitErr = s.server.node.SubmitBlock(context.Background(), candidate)
+			switch submitter := s.server.node.(type) {
+			case solo.AuxChainSubmitter:
+				realBlockID, auxChains, submitErr = submitter.SubmitBlockAuxChains(context.Background(), moneroCandidate)
+			case solo.BlockIDSubmitter:
+				realBlockID, submitErr = submitter.SubmitBlockWithID(context.Background(), moneroCandidate)
+			default:
+				submitErr = s.server.node.SubmitBlock(context.Background(), moneroCandidate)
 			}
 			if submitErr != nil {
 				submitOK = false
 				s.server.logger.Printf("direct: monero BLOCK SUBMIT FAILED (single-node; multi-node Monero submit is a known, deferred gap) for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, submitErr)
 			} else {
 				submitOK = true
-				// THE FIX (real production incident, 2026-09-12 live
-				// test against leaf-direct-monero-pplns.service/
-				// CT132: 150 of 152 real block finds lost):
-				// moneroCandidate.BlockHash is a pure, LOCAL function
-				// of the exact same nonce-patched blob this leaf
-				// already submitted above (BuildCandidateBlock, see
-				// solo/monero_node.go's own doc comment for the full
-				// derivation/citations) -- no RPC round-trip to the
-				// daemon needed, and therefore nothing left to race
-				// against the local monerod's own (possibly slow) tip
-				// advancement (the old code's
-				// get_block_header_by_height post-submit call, which
-				// this fix removes from this hot path entirely, used
-				// to fail with rpc error -2 "Requested block height:
-				// X greater than current top block height: X-1"
-				// almost every time in that live test).
-				if len(moneroCandidate.BlockHash) == 0 {
+				// DEFENSIVE, NEVER-FABRICATE handling for an
+				// empty/missing block_id (item 7 of the correction
+				// this comment documents): a genuinely older monerod
+				// (pre-e8cac61f) or a merge-mining proxy that doesn't
+				// pass block_id through untouched can legitimately
+				// return "" here -- treat that EXACTLY like this
+				// leaf's former "hash unresolved" handling: skip
+				// backend-forwarding, log loudly, never forward a
+				// placeholder/empty hash (that would silently,
+				// permanently orphan a genuinely found block).
+				if strings.TrimSpace(realBlockID) == "" {
 					s.server.recordMoneroBlockHashUnresolved()
-					s.server.logger.Printf("direct: MONERO BLOCK HASH UNRESOLVED for session %s (job %s, height %d): BuildCandidateBlock's own local hash computation produced an empty hash -- refusing to forward a placeholder/empty hash to the backend (that would silently, permanently orphan a genuinely found block); this find needs manual reconciliation against the real monerod chain at this height", s.sessionID, job.ID, job.Height)
+					s.server.logger.Printf("direct: MONERO BLOCK HASH UNRESOLVED for session %s (job %s, height %d): submit_block's own response carried an empty/missing block_id (older monerod pre-e8cac61f4b9a662cbc1b00e46d1f9a3dd991c5f0, or a merge-mining proxy that doesn't pass block_id through) -- refusing to forward a placeholder/empty hash to the backend (that would silently, permanently orphan a genuinely found block); this find needs manual reconciliation against the real monerod chain at this height", s.sessionID, job.ID, job.Height)
 					skipBackendForward = true
 				} else {
-					blockHashHex = hex.EncodeToString(moneroCandidate.BlockHash)
+					blockHashHex = realBlockID
 				}
 
 				// For EACH configured merge-mined chain

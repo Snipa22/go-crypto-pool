@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -20,8 +19,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
-
-	xmrcrypto "github.com/Snipa22/go-xmr-lib/support/crypto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
@@ -40,10 +37,15 @@ import (
 // unexported in the solo package.
 const moneroDirectFixtureBlobHex = "1010c3f4a4d4062d5456c2d3d54707336bc352fc9910c8adbd586603439b548fca04de64c1973d00000000936c23078acfd28dc0b307b8a2e63eb4eef27681ebb63f9ec67f09b8e3b59cef01"
 
-// moneroDirectFixtureNonceOffset is the real, independently-confirmed
-// nonce offset for moneroDirectFixtureBlobHex (see
-// solo.TestParseMoneroBlockHeaderNonceOffset_RealFixture).
-const moneroDirectFixtureNonceOffset = 39
+// moneroDirectDefaultBlockID is the real, top-level "block_id" this
+// file's mock daemon's submit_block response carries by default (see
+// moneroDirectMockDaemon.setBlockID) -- a realistic-looking 32-byte
+// hex string, standing in for the REAL block ID a real monerod
+// v0.18.0.0+246+ returns directly in its submit_block response (see
+// solo.moneroSubmitBlockAuxResult.BlockID's own doc comment). This
+// package's own tests assert THIS value is what gets forwarded to
+// the backend, never a locally-computed or RPC-looked-up hash.
+const moneroDirectDefaultBlockID = "a69b402d9c1122334455667788990011223344556677889900112233445566"
 
 // moneroDirectMockDaemon is a minimal, real monerod JSON-RPC 2.0 mock
 // (httptest-backed) implementing exactly the methods this leaf's
@@ -53,8 +55,8 @@ const moneroDirectFixtureNonceOffset = 39
 // monero_hash.go -- retained ONLY for
 // TestDirectResolveMoneroBlockHash_NoResolverConfigured-style direct
 // tests and to prove, via headerCalls staying at 0, that
-// session.go's handleSubmit hot path genuinely never calls it
-// anymore -- see this file's own tests below).
+// session.go's handleSubmit hot path genuinely never calls it -- see
+// this file's own tests below).
 type moneroDirectMockDaemon struct {
 	height     uint64
 	difficulty uint64
@@ -65,6 +67,14 @@ type moneroDirectMockDaemon struct {
 	mu                 sync.Mutex
 	headerHash         string // "" (default) makes the header lookup fail with an empty hash
 	headerErrorMessage string // if set, get_block_header_by_height fails with a real JSON-RPC error instead
+	// blockID is the real top-level "block_id" submit_block's mocked
+	// response carries (see moneroDirectDefaultBlockID's own doc
+	// comment) -- defaults to moneroDirectDefaultBlockID until
+	// setBlockID is called explicitly (including with "", to
+	// simulate an older pre-e8cac61f monerod or a merge-mining proxy
+	// that doesn't pass block_id through).
+	blockID    string
+	blockIDSet bool
 }
 
 func (d *moneroDirectMockDaemon) setHeaderHash(hash string) {
@@ -79,6 +89,18 @@ func (d *moneroDirectMockDaemon) setHeaderError(msg string) {
 	defer d.mu.Unlock()
 	d.headerHash = ""
 	d.headerErrorMessage = msg
+}
+
+// setBlockID overrides the real top-level "block_id" submit_block's
+// mocked response carries -- pass "" to simulate an older,
+// pre-e8cac61f monerod (or a merge-mining proxy that doesn't pass
+// block_id through), which must be handled defensively (see
+// TestDirectSessionRXMBlockFindMissingBlockIDSkipsBackendForward).
+func (d *moneroDirectMockDaemon) setBlockID(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.blockID = id
+	d.blockIDSet = true
 }
 
 func (d *moneroDirectMockDaemon) handler(t *testing.T) http.HandlerFunc {
@@ -114,7 +136,24 @@ func (d *moneroDirectMockDaemon) handler(t *testing.T) http.HandlerFunc {
 				hex.EncodeToString(bytes.Repeat([]byte{0xAB}, 32)), hex.EncodeToString(bytes.Repeat([]byte{0xCD}, 32)))
 		case "submit_block":
 			d.submitCalls.Add(1)
-			fmt.Fprint(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK"}}`)
+			d.mu.Lock()
+			blockID, blockIDSet := d.blockID, d.blockIDSet
+			d.mu.Unlock()
+			if !blockIDSet {
+				blockID = moneroDirectDefaultBlockID
+			}
+			// Real monero-project/monero wire shape: "block_id" is a
+			// top-level field, sibling of status/untrusted -- see
+			// solo.moneroSubmitBlockAuxResult.BlockID's own doc
+			// comment. Omitted entirely (not merely empty-stringed)
+			// when blockID=="" to also cover the real
+			// pre-e8cac61f monerod shape, which never emits this
+			// field at all.
+			if blockID == "" {
+				fmt.Fprint(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false}}`)
+			} else {
+				fmt.Fprintf(w, `{"id":"0","jsonrpc":"2.0","result":{"status":"OK","untrusted":false,"block_id":%q}}`, blockID)
+			}
 		case "get_block_header_by_height":
 			d.headerCalls.Add(1)
 			d.mu.Lock()
@@ -136,8 +175,8 @@ func (d *moneroDirectMockDaemon) handler(t *testing.T) http.HandlerFunc {
 // alwaysValidRXMValidator is a validator.AlgoValidator test double
 // that always reports a share as cryptographically valid without any
 // real RandomX hashing. This file's own tests are about the REAL
-// Monero block-hash COMPUTATION path (session.go's handleSubmit +
-// solo.MoneroNodeClient.BuildCandidateBlock's local hash) --
+// Monero block-hash SOURCING path (session.go's handleSubmit reading
+// the real block_id off submit_block's own response) --
 // RandomXValidator's own hash-equality logic is already covered
 // elsewhere (validator/randomx_test.go,
 // validator/randomx_real_daemon_test.go), so standing up a real
@@ -220,60 +259,24 @@ func newDirectRXMBlockFindHarness(t *testing.T, srv *httptest.Server, staticDiff
 // alwaysValidRXMValidator instead of a real randomx-service.
 var moneroDirectClaimedTinyResult = "01" + strings.Repeat("00", 31)
 
-// moneroDirectFixtureNonceLE is the little-endian 4-byte wire nonce
-// this file's tests submit ("01000000" hex on the wire -> uint32
-// 0x00000001) -- kept as a named constant since
-// expectedMoneroDirectLocalBlockHash (below) needs the SAME uint32
-// value to independently reproduce the real local hash computation.
+// moneroDirectFixtureNonceUint32 is the little-endian uint32 value the
+// wire nonce "01000000" this file's tests submit decodes to.
 const moneroDirectFixtureNonceUint32 = 0x00000001
 
-// expectedMoneroDirectLocalBlockHash independently reproduces
-// solo.MoneroNodeClient.BuildCandidateBlock's own real local
-// block-hash derivation (see that method's own doc comment) for
-// moneroDirectFixtureBlobHex nonce-patched with
-// moneroDirectFixtureNonceUint32 -- duplicated here (rather than
-// imported) since the underlying computation is unexported in the
-// solo package, per this repo's own established
-// duplicate-small-fixtures/computations-across-packages convention
-// (see moneroDirectFixtureBlobHex's own doc comment). This is
-// int­entionally an INDEPENDENT re-derivation (real varint-length-
-// prefix + Keccak, not a call into solo's own unexported
-// moneroLocalBlockHash), so this test file's own assertions are not
-// merely "the implementation agrees with itself".
-func expectedMoneroDirectLocalBlockHash(t *testing.T) string {
-	t.Helper()
-	blob, err := hex.DecodeString(moneroDirectFixtureBlobHex)
-	if err != nil {
-		t.Fatalf("decoding fixture blob: %v", err)
-	}
-	patched := make([]byte, len(blob))
-	copy(patched, blob)
-	var nonceBuf [4]byte
-	binary.LittleEndian.PutUint32(nonceBuf[:], moneroDirectFixtureNonceUint32)
-	copy(patched[moneroDirectFixtureNonceOffset:moneroDirectFixtureNonceOffset+4], nonceBuf[:])
-
-	var lenPrefix [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(lenPrefix[:], uint64(len(patched)))
-	preimage := append(append([]byte{}, lenPrefix[:n]...), patched...)
-	sum := xmrcrypto.KeccakOneShot(preimage)
-	return hex.EncodeToString(sum[:])
-}
-
-// TestDirectSessionRXMBlockFindUsesLocallyComputedHashNotRPCLookup is
-// this fix's own required regression test: a fabricated RXM
+// TestDirectSessionRXMBlockFindUsesRealSubmitBlockID is this fix's own
+// required regression test (as corrected): a fabricated RXM
 // block-find through leaf-direct's REAL session code must forward
-// the REAL, LOCALLY-COMPUTED Monero block hash (solo.MoneroNodeClient.
-// BuildCandidateBlock's own derivation -- see that method's doc
-// comment) to the backend, and must NEVER call
-// get_block_header_by_height to obtain it -- the real, live-confirmed
-// production bug this fix closes (2026-09-12 live test: that
-// post-submit RPC call raced the local testnet daemon's own tip
-// advancement and lost 150 of 152 real block finds).
-func TestDirectSessionRXMBlockFindUsesLocallyComputedHashNotRPCLookup(t *testing.T) {
+// the REAL block_id straight off submit_block's own JSON-RPC
+// response, and must NEVER call get_block_header_by_height to obtain
+// it -- see solo.moneroSubmitBlockAuxResult.BlockID's own doc comment
+// for why no RPC round-trip (local computation OR a second RPC call)
+// is needed at all.
+func TestDirectSessionRXMBlockFindUsesRealSubmitBlockID(t *testing.T) {
 	daemon := &moneroDirectMockDaemon{height: 500, difficulty: 1000}
-	// Deliberately set to a hash that does NOT match the real local
-	// computation -- if this ever got forwarded, it would prove the
-	// old (buggy, race-prone) RPC-lookup path is still in use.
+	// Deliberately set to a hash that does NOT match the real
+	// submit_block block_id -- if this ever got forwarded, it would
+	// prove the old (buggy, race-prone) RPC-lookup path is still in
+	// use.
 	const staleUnusedHeaderHash = "d34d34d34d34d34d34d34d34d34d34d34d34d34d34d34d34d34d34d34d34d3"
 	daemon.setHeaderHash(staleUnusedHeaderHash)
 	srv := httptest.NewServer(daemon.handler(t))
@@ -311,9 +314,8 @@ func TestDirectSessionRXMBlockFindUsesLocallyComputedHashNotRPCLookup(t *testing
 	waitForBlockCount(t, h.transport, 1)
 	forwardedHash := h.transport.blockAt(0).GetHash()
 
-	wantHash := expectedMoneroDirectLocalBlockHash(t)
-	if forwardedHash != wantHash {
-		t.Fatalf("forwarded block hash = %q, want the REAL, locally-computed hash %q", forwardedHash, wantHash)
+	if forwardedHash != moneroDirectDefaultBlockID {
+		t.Fatalf("forwarded block hash = %q, want the REAL block_id from submit_block's own response %q", forwardedHash, moneroDirectDefaultBlockID)
 	}
 	if forwardedHash == staleUnusedHeaderHash {
 		t.Fatalf("BUG REGRESSION: forwarded hash equals the mock daemon's get_block_header_by_height response -- the old RPC-lookup path is still being used")
@@ -322,24 +324,23 @@ func TestDirectSessionRXMBlockFindUsesLocallyComputedHashNotRPCLookup(t *testing
 		t.Fatalf("forwarded block hash %q looks like a nonce-height placeholder (contains '-'), not a real hex Monero block hash", forwardedHash)
 	}
 	if got := testutil.ToFloat64(m.DirectBlockHashUnresolvedTotal); got != 0 {
-		t.Fatalf("DirectBlockHashUnresolvedTotal = %v on the successful-computation path, want 0", got)
+		t.Fatalf("DirectBlockHashUnresolvedTotal = %v on the successful path, want 0", got)
 	}
 }
 
 // TestDirectSessionRXMBlockFindSucceedsEvenWhenHeaderLookupWouldFail
 // is this fix's own direct reproduction of the real production
-// incident (2026-09-12 live test against
-// leaf-direct-monero-pplns.service/CT132: 302 "MONERO BLOCK HASH
-// UNRESOLVED" log lines from a get_block_header_by_height call
-// racing the local daemon's own tip advancement, rpc error -2
+// incident that originally motivated this whole fix (2026-09-12 live
+// test against leaf-direct-monero-pplns.service/CT132: 302 "MONERO
+// BLOCK HASH UNRESOLVED" log lines from a get_block_header_by_height
+// call racing the local daemon's own tip advancement, rpc error -2
 // "Requested block height: X greater than current top block height:
 // X-1"): even when the mock daemon's get_block_header_by_height
 // would fail exactly like that, the block find must STILL be
-// forwarded with its real, locally-computed hash -- because the hot
-// path no longer calls that RPC method at all (headerCalls stays 0).
-// Before this fix, this exact scenario incremented
-// leaf_direct_block_hash_unresolved_total and skipped the backend
-// forward entirely; after this fix, it succeeds normally.
+// forwarded with its real block_id -- because the hot path no longer
+// calls that RPC method at all (headerCalls stays 0), and the real
+// hash is already available directly from submit_block's own
+// response regardless.
 func TestDirectSessionRXMBlockFindSucceedsEvenWhenHeaderLookupWouldFail(t *testing.T) {
 	daemon := &moneroDirectMockDaemon{height: 500, difficulty: 1000}
 	daemon.setHeaderError("Requested block height: 501 greater than current top block height: 500")
@@ -373,17 +374,72 @@ func TestDirectSessionRXMBlockFindSucceedsEvenWhenHeaderLookupWouldFail(t *testi
 		t.Fatalf("BUG REGRESSION: get_block_header_by_height was called %d time(s) -- the hot path must never call it, so a failing/racing daemon response for THIS method can no longer affect a block find at all", got)
 	}
 
-	// THE FIX: unlike the pre-fix behavior, this block find must be
-	// forwarded normally -- there is no RPC lookup left to fail.
+	// THE FIX: this block find must be forwarded normally -- there is
+	// no RPC lookup left to fail, and the real hash comes straight off
+	// submit_block's own response.
 	waitForBlockCount(t, h.transport, 1)
 	forwardedHash := h.transport.blockAt(0).GetHash()
-	wantHash := expectedMoneroDirectLocalBlockHash(t)
-	if forwardedHash != wantHash {
-		t.Fatalf("forwarded block hash = %q, want the REAL, locally-computed hash %q", forwardedHash, wantHash)
+	if forwardedHash != moneroDirectDefaultBlockID {
+		t.Fatalf("forwarded block hash = %q, want the REAL block_id from submit_block's own response %q", forwardedHash, moneroDirectDefaultBlockID)
 	}
 
 	if got := testutil.ToFloat64(m.DirectBlockHashUnresolvedTotal); got != 0 {
 		t.Fatalf("DirectBlockHashUnresolvedTotal = %v, want 0 -- a get_block_header_by_height failure must have ZERO effect now that the hot path never calls it", got)
+	}
+}
+
+// TestDirectSessionRXMBlockFindMissingBlockIDSkipsBackendForward is
+// the REQUIRED defensive-handling regression test (item 7 of this
+// fix): when submit_block's own response carries no "block_id" at
+// all (an older, pre-e8cac61f monerod, or a merge-mining proxy that
+// doesn't pass it through), this leaf must NEVER fabricate a hash --
+// the block find is accepted (the node itself already confirmed it),
+// but the backend forward is skipped and
+// leaf_direct_block_hash_unresolved_total is bumped, exactly
+// mirroring this leaf's former "hash unresolved" handling.
+func TestDirectSessionRXMBlockFindMissingBlockIDSkipsBackendForward(t *testing.T) {
+	daemon := &moneroDirectMockDaemon{height: 500, difficulty: 1000}
+	daemon.setBlockID("") // simulate an older/incompatible daemon
+	srv := httptest.NewServer(daemon.handler(t))
+	defer srv.Close()
+
+	h := newDirectRXMBlockFindHarness(t, srv, 1)
+	m := h.server.EnableMetrics("test", 0)
+
+	sessionID, xn := directLoginRXM(t, h)
+	jobID := directCurrentJobIDForXN(t, h, xn)
+
+	h.send(solo.Request{ID: 52, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
+		ID:     sessionID,
+		JobID:  jobID,
+		Nonce:  "01000000",
+		Result: moneroDirectClaimedTinyResult,
+	})})
+	resp := h.recvShareResponse()
+	if resp.Error != nil {
+		t.Fatalf("unexpected share rejection: %+v", resp.Error)
+	}
+	if resp.Result == nil || resp.Result.Status != "OK" {
+		t.Fatalf("expected an accepted block-finding share (the NODE still accepted it) even though block_id was missing, got %#v", resp)
+	}
+
+	if daemon.submitCalls.Load() != 1 {
+		t.Errorf("expected exactly 1 real submit_block call, got %d", daemon.submitCalls.Load())
+	}
+	if got := daemon.headerCalls.Load(); got != 0 {
+		t.Fatalf("get_block_header_by_height was called %d time(s) -- a missing block_id must never trigger a fallback RPC lookup", got)
+	}
+
+	// THE DEFENSIVE FIX: never forward a placeholder/empty hash.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := h.transport.blockCount(); got != 0 {
+		t.Fatalf("blockCount = %d, want 0 -- a missing block_id must never be forwarded as a placeholder/empty hash", got)
+	}
+	if got := testutil.ToFloat64(m.DirectBlockHashUnresolvedTotal); got != 1 {
+		t.Fatalf("DirectBlockHashUnresolvedTotal = %v, want 1 for a genuinely missing block_id", got)
 	}
 }
 
