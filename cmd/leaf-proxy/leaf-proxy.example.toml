@@ -93,12 +93,12 @@ min_difficulty = 10000
 # Absolute ceiling vardiff will never retarget above. (default: 1000000000)
 max_difficulty = 1000000000
 
-# Seconds between shares vardiff aims for. (default: 30)
-vardiff_target_time_seconds = 30
+# Seconds between shares vardiff aims for. (default: 15)
+vardiff_target_time_seconds = 15
 
 # How often each downstream session's own vardiff retarget timer fires, in
-# seconds. (default: 60)
-vardiff_retarget_interval_seconds = 60
+# seconds. (default: 30)
+vardiff_retarget_interval_seconds = 30
 
 # Real per-job expiry threshold, in seconds; a submit against an older job is
 # rejected. (default: 360)
