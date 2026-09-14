@@ -230,8 +230,8 @@ func TestLoadConfigPrecedence(t *testing.T) {
 		{
 			name: "vardiff-target-time/default",
 			check: func(t *testing.T, cfg config) {
-				if cfg.vardiffTargetTime != 30 {
-					t.Errorf("vardiffTargetTime = %d, want hardcoded default %d", cfg.vardiffTargetTime, 30)
+				if cfg.vardiffTargetTime != 15 {
+					t.Errorf("vardiffTargetTime = %d, want hardcoded default %d", cfg.vardiffTargetTime, 15)
 				}
 			},
 		},
