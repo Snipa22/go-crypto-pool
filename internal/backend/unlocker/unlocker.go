@@ -205,6 +205,41 @@ type Config struct {
 	// default for every pre-existing caller/test) is a complete
 	// no-op.
 	Debug *leaflib.DebugLogger
+
+	// StuckTimeout is how long a chain-unresolved pending block (Verify
+	// error, not-found, or below-maturity-depth) may sit before checkBlock
+	// auto-marks it invalid+unlocked instead of retrying it forever. Zero
+	// (the default) disables this entirely — existing forever-retry
+	// behavior for chain-unresolved blocks. Does NOT apply to
+	// outcomePayoutRetry (a confirmed-mature block whose payout failed) —
+	// that case always retries forever regardless of this setting; money
+	// already confirmed owed must never time out.
+	//
+	// When non-zero, checkBlock compares it against time.Since(b.
+	// InsertedAt) -- this backend's own receipt time for the block row,
+	// the same field RunOnce's pending-blocks-age gauge already uses (see
+	// Block.InsertedAt's doc comment) -- NOT against how long the block
+	// has specifically been in any one of the three chain-unresolved
+	// states individually. A block that, say, spent 20 minutes erroring
+	// and then 15 more minutes below maturity depth still trips at 30
+	// minutes total, not 30 minutes in either state alone; this package
+	// does not track a per-state clock, only "how long has this row been
+	// sitting unresolved since we first saw it".
+	//
+	// The resulting write is byte-for-byte identical to the genuine
+	// on-chain orphan path's SetBlockStatus(ctx, b.ID, false, true) call
+	// -- from the DB's point of view a stuck-disabled block and a real
+	// orphan look the same (invalid, unlocked, dead, never retried
+	// again). They are DELIBERATELY kept distinguishable everywhere else
+	// that matters: a distinct blockOutcome (outcomeStuckDisabled, never
+	// outcomeOrphaned), a distinct metrics.UnlockerBlocksTotal outcome
+	// label (metrics.UnlockerOutcomeStuckDisabled, never
+	// UnlockerOutcomeOrphaned), and a distinct, differently-worded log
+	// line -- so an operator investigating a dead block later can always
+	// tell "the chain told us this was reorged off" apart from "we gave
+	// up waiting after StuckTimeout and nothing had happened yet", even
+	// though the row itself can no longer say which happened.
+	StuckTimeout time.Duration
 }
 
 // Unlocker runs Config's poll loop against a Repository.
@@ -244,6 +279,21 @@ type PassResult struct {
 	// retry. A steadily non-zero count here means the same block(s)
 	// are failing every tick and need a human.
 	PayoutRetries int
+	// StuckDisabled counts blocks this pass auto-marked invalid+
+	// unlocked purely because they sat in one of the three
+	// chain-unresolved states (Verify error, not-found, or
+	// below-maturity-depth) longer than Config.StuckTimeout — see
+	// checkBlock's outcomeStuckDisabled branch. Zero for every pass
+	// while Config.StuckTimeout is 0 (the disabled default).
+	// Deliberately NOT folded into Orphaned: an Orphaned block was
+	// affirmatively told by the real chain that it was reorged off; a
+	// StuckDisabled block's chain status was NEVER resolved at
+	// all — this pass simply gave up waiting on it. A non-zero count
+	// here is worth an operator's attention (it means at least one
+	// block never got a definitive chain answer within StuckTimeout),
+	// but it is not the same incident as a genuine orphan and must
+	// not be read as one.
+	StuckDisabled int
 }
 
 // RunOnce performs exactly one poll pass: for every algo configured in
@@ -343,6 +393,10 @@ func (u *Unlocker) RunOnce(ctx context.Context) PassResult {
 				total.Orphaned++
 				u.logf("unlocker: %s: block id=%d height=%d hash=%s: orphaned, marking invalid+unlocked", algo, b.ID, b.Height, b.Hash)
 				u.observeOutcome(algo, metrics.UnlockerOutcomeOrphaned)
+			case outcome == outcomeStuckDisabled:
+				total.StuckDisabled++
+				u.logf("unlocker: %s: block id=%d height=%d hash=%s: auto-disabled after %s pending without resolving on chain, marking invalid+unlocked", algo, b.ID, b.Height, b.Hash, u.cfg.StuckTimeout)
+				u.observeOutcome(algo, metrics.UnlockerOutcomeStuckDisabled)
 			default:
 				total.Pending++
 				u.cfg.Debug.Debugf("unlocker: %s: block id=%d height=%d hash=%s: still pending, no change", algo, b.ID, b.Height, b.Hash)
@@ -446,6 +500,20 @@ const (
 	// deliberately left in the pending queue for the next pass. See
 	// checkBlock's decision table.
 	outcomePayoutRetry
+	// outcomeStuckDisabled — the block is still in one of the three
+	// chain-unresolved states (Verify error, not-found, or
+	// below-maturity-depth) after every other check above ran and
+	// found no resolution, AND it has now been sitting pending longer
+	// than Config.StuckTimeout. checkBlock writes the exact same
+	// SetBlockStatus(ctx, b.ID, false, true) an orphan gets, but this
+	// is a distinct outcome value on purpose -- see Config.
+	// StuckTimeout's doc comment for why a timeout give-up must stay
+	// distinguishable from a real, chain-confirmed orphan everywhere
+	// outside the raw DB row itself (metrics, logs). Never reached for
+	// a block that resolved this same tick to outcomeMatured/
+	// outcomeOrphaned/outcomePayoutRetry -- see checkBlock's decision
+	// table for exactly where this is checked.
+	outcomeStuckDisabled
 )
 
 // checkBlock verifies one pending block and, for the outcomes that
@@ -476,6 +544,32 @@ const (
 //     if it succeeds is SetBlockStatus(valid=true, unlocked=true)
 //     written (outcomeMatured). If the payout fails, nothing is
 //     written at all and the block stays pending (outcomePayoutRetry).
+//
+// # The StuckTimeout override on the three chain-unresolved branches
+//
+// Each of the first three bullets above (Verify error / not-found /
+// below-maturity-depth) is a "chain-unresolved" outcome: checkBlock
+// genuinely does not yet know this block's real fate. Immediately
+// before any of those three bullets returns its plain outcomePending,
+// checkBlock additionally checks whether Config.StuckTimeout is
+// non-zero AND time.Since(b.InsertedAt) >= Config.StuckTimeout. If so,
+// the block is NOT left pending: it is instead auto-marked
+// SetBlockStatus(ctx, b.ID, false, true) -- identical to the orphan
+// write above -- and outcomeStuckDisabled is returned instead of
+// outcomePending. Config.StuckTimeout == 0 (the default) disables this
+// entirely, restoring the plain forever-retry behavior every one of
+// those three bullets had before this check existed.
+//
+// This override is deliberately NOT reachable from the Orphaned
+// bullet (already a terminal, definitively-resolved outcome) or from
+// either MATURED/outcomePayoutRetry bullet below (the block's chain
+// status there is already settled -- it is mature; only whether the
+// payout committed is still open, and that must retry forever with no
+// timeout regardless of Config.StuckTimeout, by design -- see
+// PayoutTrigger's and Config.StuckTimeout's own doc comments). A block
+// that resolves to any of those on a given tick can never also come
+// back as outcomeStuckDisabled that same tick, no matter how old
+// b.InsertedAt is.
 //
 // coinCfg here is the CALLER-RESOLVED CoinConfig for b: RunOnce picks
 // it from Config.MergeMineChainVerifiers[b.MergeMineChain] when
@@ -558,9 +652,15 @@ func (u *Unlocker) checkBlock(ctx context.Context, b Block, coinCfg CoinConfig) 
 
 	result, err := coinCfg.Verifier.Verify(ctx, b.Hash, b.Height)
 	if err != nil {
+		if outcome, serr, fired := u.checkStuckTimeout(ctx, b); fired {
+			return outcome, serr
+		}
 		return outcomePending, fmt.Errorf("verify: %w", err)
 	}
 	if !result.Found {
+		if outcome, serr, fired := u.checkStuckTimeout(ctx, b); fired {
+			return outcome, serr
+		}
 		return outcomePending, nil
 	}
 	if result.Orphaned {
@@ -570,6 +670,9 @@ func (u *Unlocker) checkBlock(ctx context.Context, b Block, coinCfg CoinConfig) 
 		return outcomeOrphaned, nil
 	}
 	if result.Confirmations < coinCfg.MaturityDepth {
+		if outcome, serr, fired := u.checkStuckTimeout(ctx, b); fired {
+			return outcome, serr
+		}
 		return outcomePending, nil
 	}
 
@@ -604,4 +707,45 @@ func (u *Unlocker) checkBlock(ctx context.Context, b Block, coinCfg CoinConfig) 
 		return outcomePending, fmt.Errorf("marking matured block unlocked (its payout already applied; the next poll pass will re-attempt this write and re-running the payout is a no-op): %w", err)
 	}
 	return outcomeMatured, nil
+}
+
+// checkStuckTimeout is checkBlock's shared gate for the StuckTimeout
+// override -- called from each of the three chain-unresolved branches
+// (Verify error, not-found, below-maturity-depth) immediately before
+// they would otherwise return a plain outcomePending. See Config.
+// StuckTimeout's and checkBlock's own doc comments for the full
+// rationale; this method only implements the mechanics.
+//
+// fired reports whether this call actually decided the block's fate:
+// false means "Config.StuckTimeout is 0, or b hasn't been pending long
+// enough yet -- proceed with whatever plain outcomePending/err the
+// caller was already about to return", and the returned (outcome,
+// err) pair MUST be ignored by the caller in that case. true means
+// this call's own (outcome, err) return is what the caller should
+// return instead, REPLACING (not wrapping/combining with) whatever
+// error the caller's own branch was about to report -- in particular,
+// a Verify error that also trips this timeout is reported purely as
+// outcomeStuckDisabled, never as outcomeStuckDisabled-with-the-
+// original-verify-error-attached, since RunOnce's outcome switch
+// checks err != nil first and would otherwise miscount a successful
+// auto-disable as a plain error.
+//
+// A zero b.InsertedAt (e.g. a legacy row from before this field
+// existed, or a test fixture that never set it) is deliberately
+// treated as "not yet eligible" rather than as "infinitely old" --
+// time.Since(zero value) would otherwise be a huge duration and
+// auto-disable such a row on the very first poll pass it's seen on,
+// which is never the intent (mirrors trackPending's identical zero-
+// value guard for the same reason).
+func (u *Unlocker) checkStuckTimeout(ctx context.Context, b Block) (outcome blockOutcome, err error, fired bool) {
+	if u.cfg.StuckTimeout <= 0 {
+		return outcomePending, nil, false
+	}
+	if b.InsertedAt.IsZero() || time.Since(b.InsertedAt) < u.cfg.StuckTimeout {
+		return outcomePending, nil, false
+	}
+	if err := u.repo.SetBlockStatus(ctx, b.ID, false, true); err != nil {
+		return outcomePending, fmt.Errorf("marking stuck (chain-unresolved for longer than StuckTimeout=%s) block invalid+unlocked: %w", u.cfg.StuckTimeout, err), true
+	}
+	return outcomeStuckDisabled, nil, true
 }

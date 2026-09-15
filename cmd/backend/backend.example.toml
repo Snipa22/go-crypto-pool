@@ -83,6 +83,15 @@ unlocker_tari_maturity = 60
 # mirroring Monero's own CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW. (default: 60)
 unlocker_monero_maturity = 60
 
+# How long a chain-unresolved pending block (Verify error, not-found, or
+# below-maturity-depth) may sit before the unlocker gives up and auto-marks it
+# invalid+unlocked instead of retrying it forever, in seconds. Does NOT apply
+# to a confirmed-mature block whose payout failed -- that always retries
+# forever, since money already confirmed owed must never time out.
+# Deliberately ON by default; set to 0 to restore forever-retry for
+# chain-unresolved blocks too. (default: 1800, i.e. 30 minutes)
+unlocker_stuck_timeout_seconds = 1800
+
 # How often the network-state poller re-checks the real upstream chain(s)
 # configured via tari_grpc_addr/monero_rpc_addr, in seconds. (default: 60)
 network_poller_poll_interval_seconds = 60
