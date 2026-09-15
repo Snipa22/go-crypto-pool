@@ -99,6 +99,26 @@
 //	                         (coinbase spend maturity) — a sensible
 //	                         starting default, but still operator-
 //	                         tunable via this variable, not hardcoded.
+//	GCPOOL_UNLOCKER_STUCK_TIMEOUT (optional) how long a CHAIN-
+//	                         UNRESOLVED pending block (Verify error,
+//	                         not-found, or below-maturity-depth — see
+//	                         unlocker.Config.StuckTimeout's doc
+//	                         comment for the exact three cases) may
+//	                         sit before the unlocker gives up waiting
+//	                         and auto-marks it invalid+unlocked
+//	                         instead of retrying it forever, as a
+//	                         time.ParseDuration string (e.g. "30m").
+//	                         Default "30m" -- deliberately ON by
+//	                         default, unlike most other optional knobs
+//	                         in this file. Does NOT affect a block
+//	                         that is confirmed mature on-chain but
+//	                         whose payout failed (outcomePayoutRetry):
+//	                         that case always retries forever
+//	                         regardless of this setting, since money
+//	                         already confirmed owed must never time
+//	                         out. Set to "0" to restore the pre-this-
+//	                         feature forever-retry behavior for
+//	                         chain-unresolved blocks too.
 //	GCPOOL_PAYOUT_TARI_FEE_ADDRESS (optional) pool operator
 //	                         fee-collection payment address for
 //	                         Tari-family algos (RXT/C29/SHA3X).
@@ -227,6 +247,17 @@ const (
 	defaultTariMaturity         = int64(60)
 	defaultMoneroMaturity       = int64(60)
 
+	// defaultUnlockerStuckTimeout is this command's default for
+	// GCPOOL_UNLOCKER_STUCK_TIMEOUT/unlocker.Config.StuckTimeout.
+	// Unlike defaultUnlockerPollInterval/defaultTariMaturity/
+	// defaultMoneroMaturity above, this is NOT a placeholder an
+	// operator is expected to have to tune -- 30 minutes is the
+	// confirmed, deliberate ON-by-default value (see
+	// unlocker.Config.StuckTimeout's doc comment and the
+	// GCPOOL_UNLOCKER_STUCK_TIMEOUT env var doc above): "if it
+	// hasn't resolved in that time, it won't."
+	defaultUnlockerStuckTimeout = 30 * time.Minute
+
 	// defaultNetworkPollerInterval is internal/backend/networkpoller's
 	// own PLACEHOLDER default poll interval, mirroring
 	// defaultUnlockerPollInterval's role/rationale above for the
@@ -302,6 +333,7 @@ type config struct {
 	unlockerPollInterval   time.Duration
 	unlockerTariMaturity   int64
 	unlockerMoneroMaturity int64
+	unlockerStuckTimeout   time.Duration
 
 	networkPollerPollInterval time.Duration
 
@@ -426,6 +458,7 @@ func loadConfig() (config, error) {
 	flag.DurationVar(&cfg.unlockerPollInterval, "unlocker-poll-interval", checkedDuration("GCPOOL_UNLOCKER_POLL_INTERVAL", defaultUnlockerPollInterval), "how often the unlocker re-checks pending blocks. Only consulted if at least one of -tari-grpc-addr/-monero-rpc-addr is set. Env: GCPOOL_UNLOCKER_POLL_INTERVAL")
 	flag.Int64Var(&cfg.unlockerTariMaturity, "unlocker-tari-maturity", checkedInt64("GCPOOL_UNLOCKER_TARI_MATURITY", defaultTariMaturity), "confirmations required before a Tari-family block (RXT/C29/SHA3X) is marked unlocked/payable. A PLACEHOLDER, operationally-tunable value, not a Tari protocol constant. Env: GCPOOL_UNLOCKER_TARI_MATURITY")
 	flag.Int64Var(&cfg.unlockerMoneroMaturity, "unlocker-monero-maturity", checkedInt64("GCPOOL_UNLOCKER_MONERO_MATURITY", defaultMoneroMaturity), "confirmations required before an RXM block is marked unlocked/payable, mirroring Monero's own CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW. Env: GCPOOL_UNLOCKER_MONERO_MATURITY")
+	flag.DurationVar(&cfg.unlockerStuckTimeout, "unlocker-stuck-timeout", envOrDuration("GCPOOL_UNLOCKER_STUCK_TIMEOUT", defaultUnlockerStuckTimeout), "how long a chain-unresolved pending block (Verify error, not-found, or below-maturity-depth) may sit before the unlocker gives up and auto-marks it invalid+unlocked instead of retrying it forever. Does NOT apply to a confirmed-mature block whose payout failed -- that always retries forever. Default 30m, deliberately on by default; set to 0 to restore forever-retry for chain-unresolved blocks too. Env: GCPOOL_UNLOCKER_STUCK_TIMEOUT")
 
 	flag.DurationVar(&cfg.networkPollerPollInterval, "network-poller-poll-interval", envOrDuration("GCPOOL_NETWORK_POLLER_POLL_INTERVAL", defaultNetworkPollerInterval), "how often the network-state poller re-checks the real upstream chain(s) configured via -tari-grpc-addr/-monero-rpc-addr. Env: GCPOOL_NETWORK_POLLER_POLL_INTERVAL")
 
@@ -508,6 +541,7 @@ type fileConfig struct {
 	UnlockerPollIntervalSeconds *int   `toml:"unlocker_poll_interval_seconds"`
 	UnlockerTariMaturity        *int64 `toml:"unlocker_tari_maturity"`
 	UnlockerMoneroMaturity      *int64 `toml:"unlocker_monero_maturity"`
+	UnlockerStuckTimeoutSeconds *int   `toml:"unlocker_stuck_timeout_seconds"`
 
 	NetworkPollerPollIntervalSeconds *int `toml:"network_poller_poll_interval_seconds"`
 
@@ -579,6 +613,10 @@ func applyConfigFile(cfg *config) error {
 	}
 	cfgfile.ApplyInt64(&cfg.unlockerTariMaturity, fc.UnlockerTariMaturity, visited, "unlocker-tari-maturity", "GCPOOL_UNLOCKER_TARI_MATURITY")
 	cfgfile.ApplyInt64(&cfg.unlockerMoneroMaturity, fc.UnlockerMoneroMaturity, visited, "unlocker-monero-maturity", "GCPOOL_UNLOCKER_MONERO_MATURITY")
+	if fc.UnlockerStuckTimeoutSeconds != nil {
+		d := time.Duration(*fc.UnlockerStuckTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.unlockerStuckTimeout, &d, visited, "unlocker-stuck-timeout", "GCPOOL_UNLOCKER_STUCK_TIMEOUT")
+	}
 
 	if fc.NetworkPollerPollIntervalSeconds != nil {
 		d := time.Duration(*fc.NetworkPollerPollIntervalSeconds) * time.Second
@@ -1476,6 +1514,7 @@ func buildUnlockerConfig(cfg config, debug *leaflib.DebugLogger) (out unlocker.C
 	out.Coins = map[string]unlocker.CoinConfig{}
 	out.MergeMineChainVerifiers = map[string]unlocker.CoinConfig{}
 	out.PollInterval = cfg.unlockerPollInterval
+	out.StuckTimeout = cfg.unlockerStuckTimeout
 	out.Debug = debug
 
 	if cfg.tariGRPCAddr != "" {

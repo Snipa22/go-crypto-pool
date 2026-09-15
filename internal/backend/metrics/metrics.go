@@ -81,6 +81,29 @@ const (
 	// is being retried every poll tick and no miner has been
 	// credited for it.
 	UnlockerOutcomePayoutFailed = "payout_failed"
+	// UnlockerOutcomeStuckDisabled — the block sat in one of the
+	// three chain-unresolved states (Verify error, not-found, or
+	// below-maturity-depth) longer than
+	// unlocker.Config.StuckTimeout, so it was auto-marked
+	// invalid+unlocked (identical SetBlockStatus write to the
+	// orphaned path) purely because this backend gave up waiting on
+	// it, WITHOUT the real chain ever having told it the block was
+	// reorged off.
+	//
+	// This is DELIBERATELY a distinct label from "orphaned", not a
+	// reuse of it, even though both write the exact same
+	// (valid=false, unlocked=true) row shape: "orphaned" means the
+	// real chain affirmatively confirmed a reorg; "stuck_disabled"
+	// means the chain never gave a definitive answer at all within
+	// the configured timeout. An operator grepping logs or querying
+	// this metric later must be able to tell "the chain told us this
+	// was reorged off" apart from "we gave up waiting after N
+	// minutes and nothing had happened yet" — conflating the two
+	// here would erase exactly the distinction that matters for
+	// diagnosing which failure mode actually occurred. Zero for
+	// every algo while StuckTimeout is unconfigured (0, the
+	// default).
+	UnlockerOutcomeStuckDisabled = "stuck_disabled"
 )
 
 // Result label values for payout_cycles_total — whether one
@@ -482,7 +505,7 @@ func New(version string) *Metrics {
 
 	m.UnlockerBlocksTotal = registerCounterVec(reg, prometheus.CounterOpts{
 		Name: "unlocker_blocks_total",
-		Help: "Total number of pending blocks resolved to a terminal outcome by the block unlocker, by algo and outcome (matured/orphaned/error).",
+		Help: "Total number of pending blocks resolved to a terminal outcome by the block unlocker, by algo and outcome (matured/orphaned/error/payout_failed/stuck_disabled).",
 	}, []string{"algo", "outcome"})
 
 	m.UnlockerPollDuration = registerHistogramVec(reg, prometheus.HistogramOpts{

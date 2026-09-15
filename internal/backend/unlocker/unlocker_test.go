@@ -424,3 +424,183 @@ func TestRunOnce_PayoutTriggerReceivesFreshRewardNotStaleValue(t *testing.T) {
 		t.Fatalf("PayoutTrigger received PoolType=%q Difficulty=%d, want SOLO/12345 unchanged", got.PoolType, got.Difficulty)
 	}
 }
+
+// TestRunOnce_StuckTimeout_VerifyErrorOlderThanTimeoutAutoDisables is
+// the primary test for the new StuckTimeout feature: a block whose
+// Verify call keeps erroring, sitting well past Config.StuckTimeout,
+// must be auto-marked invalid+unlocked (outcomeStuckDisabled) exactly
+// once rather than left pending forever.
+func TestRunOnce_StuckTimeout_VerifyErrorOlderThanTimeoutAutoDisables(t *testing.T) {
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{ID: 20, Algo: "RXM", Hash: "broken", Height: 100, InsertedAt: time.Now().Add(-time.Hour)}},
+	}}
+	verifier := &fakeVerifier{errs: map[string]error{"broken": errors.New("rpc down")}}
+	u := New(repo, Config{
+		Coins:        map[string]CoinConfig{"RXM": {Verifier: verifier, MaturityDepth: 60}},
+		StuckTimeout: 30 * time.Minute,
+	})
+
+	result := u.RunOnce(context.Background())
+	if result.StuckDisabled != 1 || result.Errors != 0 || result.Pending != 0 {
+		t.Fatalf("RunOnce: got %+v, want 1 stuck-disabled / 0 errors / 0 pending", result)
+	}
+	if len(repo.statusCalls) != 1 || repo.statusCalls[0] != (statusCall{id: 20, valid: false, unlocked: true}) {
+		t.Fatalf("RunOnce: got statusCalls=%+v, want a single {id:20 valid:false unlocked:true} call", repo.statusCalls)
+	}
+}
+
+// TestRunOnce_StuckTimeout_RecentErrorStaysPending confirms the
+// timeout genuinely gates on elapsed time, not merely "any error while
+// StuckTimeout is configured": the same erroring block, but with a
+// fresh InsertedAt well within StuckTimeout, must still be plain
+// outcomePending with no SetBlockStatus call at all.
+func TestRunOnce_StuckTimeout_RecentErrorStaysPending(t *testing.T) {
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{ID: 21, Algo: "RXM", Hash: "broken", Height: 100, InsertedAt: time.Now().Add(-time.Minute)}},
+	}}
+	verifier := &fakeVerifier{errs: map[string]error{"broken": errors.New("rpc down")}}
+	u := New(repo, Config{
+		Coins:        map[string]CoinConfig{"RXM": {Verifier: verifier, MaturityDepth: 60}},
+		StuckTimeout: 30 * time.Minute,
+	})
+
+	result := u.RunOnce(context.Background())
+	if result.StuckDisabled != 0 || result.Errors != 1 || result.Pending != 0 {
+		t.Fatalf("RunOnce: got %+v, want 0 stuck-disabled / 1 error (still within StuckTimeout)", result)
+	}
+	if len(repo.statusCalls) != 0 {
+		t.Fatalf("RunOnce: got statusCalls=%+v, want none -- StuckTimeout not yet elapsed", repo.statusCalls)
+	}
+}
+
+// TestRunOnce_StuckTimeout_PayoutRetryNeverAutoDisabled is the
+// critical money-safety regression test: a block that resolves as
+// outcomePayoutRetry this same tick (mature on-chain, payout failed)
+// must NEVER be auto-disabled by StuckTimeout, no matter how old
+// InsertedAt is. outcomePayoutRetry always wins and always retries
+// forever -- see Config.StuckTimeout's and PayoutTrigger's doc
+// comments: money already confirmed owed must never time out.
+func TestRunOnce_StuckTimeout_PayoutRetryNeverAutoDisabled(t *testing.T) {
+	reward := int64(600000000000)
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{
+			ID: 22, Algo: "RXM", Hash: "deadbeef", Height: 100,
+			PoolType: "SOLO", Difficulty: 1, Value: &reward,
+			// Deliberately far older than StuckTimeout below --
+			// must make no difference at all to a payout-retry.
+			InsertedAt: time.Now().Add(-24 * time.Hour),
+		}},
+	}}
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{
+		"deadbeef": {Found: true, Confirmations: 60, Reward: reward},
+	}}
+	trigger := &fakePayoutTrigger{err: errors.New("payout exploded")}
+	u := New(repo, Config{
+		Coins:         map[string]CoinConfig{"RXM": {Verifier: verifier, MaturityDepth: 60}},
+		PayoutTrigger: trigger,
+		StuckTimeout:  30 * time.Minute,
+	})
+
+	result := u.RunOnce(context.Background())
+	if result.PayoutRetries != 1 || result.StuckDisabled != 0 || result.Matured != 0 {
+		t.Fatalf("RunOnce: got %+v, want 1 payout retry / 0 stuck-disabled / 0 matured -- payout-retry must win over StuckTimeout regardless of age", result)
+	}
+	if len(repo.statusCalls) != 0 {
+		t.Fatalf("RunOnce: got statusCalls=%+v, want NONE -- a payout-retry block must never be auto-disabled even when far older than StuckTimeout", repo.statusCalls)
+	}
+}
+
+// TestRunOnce_StuckTimeout_ZeroDisablesFeature confirms the documented
+// escape hatch: Config.StuckTimeout == 0 (the default) means a
+// chain-unresolved block retries forever with no auto-disable, no
+// matter how old it is -- restoring the exact pre-feature behavior.
+func TestRunOnce_StuckTimeout_ZeroDisablesFeature(t *testing.T) {
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{ID: 23, Algo: "RXM", Hash: "broken", Height: 100, InsertedAt: time.Now().Add(-365 * 24 * time.Hour)}},
+	}}
+	verifier := &fakeVerifier{errs: map[string]error{"broken": errors.New("rpc down")}}
+	u := New(repo, Config{
+		Coins: map[string]CoinConfig{"RXM": {Verifier: verifier, MaturityDepth: 60}},
+		// StuckTimeout deliberately left at its zero value.
+	})
+
+	result := u.RunOnce(context.Background())
+	if result.StuckDisabled != 0 || result.Errors != 1 {
+		t.Fatalf("RunOnce: got %+v, want 0 stuck-disabled / 1 error -- StuckTimeout==0 must never auto-disable", result)
+	}
+	if len(repo.statusCalls) != 0 {
+		t.Fatalf("RunOnce: got statusCalls=%+v, want none when StuckTimeout is disabled", repo.statusCalls)
+	}
+}
+
+// TestRunOnce_StuckTimeout_NotFoundOlderThanTimeoutAutoDisables and
+// TestRunOnce_StuckTimeout_BelowMaturityOlderThanTimeoutAutoDisables
+// cover the other two chain-unresolved branches (not the Verify-error
+// branch already covered above), confirming the override fires
+// identically from all three, not just the error path.
+func TestRunOnce_StuckTimeout_NotFoundOlderThanTimeoutAutoDisables(t *testing.T) {
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{ID: 24, Algo: "RXM", Hash: "notseen", Height: 999, InsertedAt: time.Now().Add(-time.Hour)}},
+	}}
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{}} // Found=false
+	u := New(repo, Config{
+		Coins:        map[string]CoinConfig{"RXM": {Verifier: verifier, MaturityDepth: 60}},
+		StuckTimeout: 30 * time.Minute,
+	})
+
+	result := u.RunOnce(context.Background())
+	if result.StuckDisabled != 1 || result.Pending != 0 {
+		t.Fatalf("RunOnce: got %+v, want 1 stuck-disabled / 0 pending", result)
+	}
+	if len(repo.statusCalls) != 1 || repo.statusCalls[0] != (statusCall{id: 24, valid: false, unlocked: true}) {
+		t.Fatalf("RunOnce: got statusCalls=%+v, want a single {id:24 valid:false unlocked:true} call", repo.statusCalls)
+	}
+}
+
+func TestRunOnce_StuckTimeout_BelowMaturityOlderThanTimeoutAutoDisables(t *testing.T) {
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXM": {{ID: 25, Algo: "RXM", Hash: "confirming", Height: 100, InsertedAt: time.Now().Add(-time.Hour)}},
+	}}
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{
+		"confirming": {Found: true, Confirmations: 5},
+	}}
+	u := New(repo, Config{
+		Coins:        map[string]CoinConfig{"RXM": {Verifier: verifier, MaturityDepth: 60}},
+		StuckTimeout: 30 * time.Minute,
+	})
+
+	result := u.RunOnce(context.Background())
+	if result.StuckDisabled != 1 || result.Pending != 0 {
+		t.Fatalf("RunOnce: got %+v, want 1 stuck-disabled / 0 pending", result)
+	}
+	if len(repo.statusCalls) != 1 || repo.statusCalls[0] != (statusCall{id: 25, valid: false, unlocked: true}) {
+		t.Fatalf("RunOnce: got statusCalls=%+v, want a single {id:25 valid:false unlocked:true} call", repo.statusCalls)
+	}
+}
+
+// TestRunOnce_StuckTimeout_OrphanedBlockUnaffected confirms the
+// override never reaches the genuine orphan branch: an orphaned block
+// old enough to trip StuckTimeout must still be reported as
+// outcomeOrphaned (never outcomeStuckDisabled), preserving the "real
+// chain-confirmed orphan" vs "timeout give-up" distinction the whole
+// feature exists to preserve.
+func TestRunOnce_StuckTimeout_OrphanedBlockUnaffected(t *testing.T) {
+	repo := &fakeRepo{pending: map[string][]Block{
+		"RXT": {{ID: 26, Algo: "RXT", Hash: "aabbcc", Height: 50, InsertedAt: time.Now().Add(-time.Hour)}},
+	}}
+	verifier := &fakeVerifier{results: map[string]chain.VerifyResult{
+		"aabbcc": {Found: true, Orphaned: true},
+	}}
+	u := New(repo, Config{
+		Coins:        map[string]CoinConfig{"RXT": {Verifier: verifier, MaturityDepth: 6}},
+		StuckTimeout: 30 * time.Minute,
+	})
+
+	result := u.RunOnce(context.Background())
+	if result.Orphaned != 1 || result.StuckDisabled != 0 {
+		t.Fatalf("RunOnce: got %+v, want 1 orphaned / 0 stuck-disabled", result)
+	}
+	if len(repo.statusCalls) != 1 || repo.statusCalls[0] != (statusCall{id: 26, valid: false, unlocked: true}) {
+		t.Fatalf("RunOnce: got statusCalls=%+v, want a single {id:26 valid:false unlocked:true} call", repo.statusCalls)
+	}
+}

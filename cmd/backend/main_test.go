@@ -362,6 +362,65 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			},
 		},
 
+		// -- duration field: unlocker-stuck-timeout ------------------------
+		{
+			name: "unlocker-stuck-timeout/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.unlockerStuckTimeout != 30*time.Minute {
+					t.Errorf("unlockerStuckTimeout = %v, want hardcoded default %v (deliberately on by default)", cfg.unlockerStuckTimeout, 30*time.Minute)
+				}
+			},
+		},
+		{
+			name: "unlocker-stuck-timeout/file-only",
+			toml: `unlocker_stuck_timeout_seconds = 900`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.unlockerStuckTimeout != 15*time.Minute {
+					t.Errorf("unlockerStuckTimeout = %v, want file value %v", cfg.unlockerStuckTimeout, 15*time.Minute)
+				}
+			},
+		},
+		{
+			name: "unlocker-stuck-timeout/env-only",
+			env:  map[string]string{"GCPOOL_UNLOCKER_STUCK_TIMEOUT": "45m"},
+			toml: `unlocker_stuck_timeout_seconds = 900`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.unlockerStuckTimeout != 45*time.Minute {
+					t.Errorf("unlockerStuckTimeout = %v, want env value %v (env must beat file)", cfg.unlockerStuckTimeout, 45*time.Minute)
+				}
+			},
+		},
+		{
+			name: "unlocker-stuck-timeout/flag-only",
+			args: []string{"-unlocker-stuck-timeout=1h"},
+			toml: `unlocker_stuck_timeout_seconds = 900`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.unlockerStuckTimeout != time.Hour {
+					t.Errorf("unlockerStuckTimeout = %v, want flag value %v (flag must beat env absence and file)", cfg.unlockerStuckTimeout, time.Hour)
+				}
+			},
+		},
+		{
+			name: "unlocker-stuck-timeout/flag-env-file-all-set",
+			args: []string{"-unlocker-stuck-timeout=1h"},
+			env:  map[string]string{"GCPOOL_UNLOCKER_STUCK_TIMEOUT": "45m"},
+			toml: `unlocker_stuck_timeout_seconds = 900`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.unlockerStuckTimeout != time.Hour {
+					t.Errorf("unlockerStuckTimeout = %v, want flag value %v (flag must win full precedence)", cfg.unlockerStuckTimeout, time.Hour)
+				}
+			},
+		},
+		{
+			name: "unlocker-stuck-timeout/env-zero-disables",
+			env:  map[string]string{"GCPOOL_UNLOCKER_STUCK_TIMEOUT": "0"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.unlockerStuckTimeout != 0 {
+					t.Errorf("unlockerStuckTimeout = %v, want 0 (explicit escape hatch back to forever-retry)", cfg.unlockerStuckTimeout)
+				}
+			},
+		},
+
 		// -- float64 field: payout-pps-fee-percent -------------------------
 		// (substituted for a bool field per the brief's instruction: backend
 		// genuinely has no bool-typed setting among its current env vars.)
