@@ -9,11 +9,13 @@ import (
 // This file implements leaf-proxy's optional developer-fee mechanism
 // (DISPATCH_BRIEF.md "leaf-proxy dev-fee second-connection"):
 // cmd/leaf-proxy's -dev-fee-percent/LEAF_PROXY_DEV_FEE_PERCENT
-// (default 0, a complete no-op) opens a SECOND, independent
-// UpstreamClient logged in under a hardcoded dev-fee login/pass
-// against the SAME upstream host/port/TLS settings as the primary
-// connection, and routes approximately -dev-fee-percent% of job
-// issuances (and, transitively, the eventually-upstream-forwarded
+// (default 1.0, matching the legacy xmr-node-proxy reference's own
+// pre-configured 1% donation; 0 fully disables the mechanism, a
+// complete no-op with zero second connection ever dialed) opens a
+// SECOND, independent UpstreamClient logged in under a hardcoded
+// dev-fee login/pass against the SAME upstream host/port/TLS settings
+// as the primary connection, and routes approximately -dev-fee-percent%
+// of job issuances (and, transitively, the eventually-upstream-forwarded
 // share traffic those jobs produce -- see JobManager.NextJob and
 // job.go's Job.Route doc comments) to it instead of the primary
 // connection.
