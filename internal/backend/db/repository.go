@@ -345,13 +345,13 @@ func (r *Repository) SetBlockStatus(ctx context.Context, id int64, valid, unlock
 func (r *Repository) GetBlockByID(ctx context.Context, id int64) (Block, error) {
 	const stmt = `
 		SELECT algo, network, pool_type, hash, height, difficulty, shares,
-		       block_timestamp, unlocked, valid, value, pool_id
+		       block_timestamp, unlocked, valid, value, pool_id, merge_mine_chain
 		FROM blocks
 		WHERE id = $1`
 	var b Block
 	err := r.pool.QueryRow(ctx, stmt, id).Scan(
 		&b.Algo, &b.Network, &b.PoolType, &b.Hash, &b.Height, &b.Difficulty, &b.Shares,
-		&b.Timestamp, &b.Unlocked, &b.Valid, &b.Value, &b.PoolID,
+		&b.Timestamp, &b.Unlocked, &b.Valid, &b.Value, &b.PoolID, &b.MergeMineChain,
 	)
 	if err != nil {
 		return Block{}, fmt.Errorf("db: getting block %d: %w", id, err)
