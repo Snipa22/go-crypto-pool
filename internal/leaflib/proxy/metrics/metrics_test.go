@@ -112,10 +112,10 @@ func TestSnapshotDerivedMetrics_ActiveConnectionsAndUniqueIPs(t *testing.T) {
 	if !strings.Contains(body, "leaf_proxy_unique_remote_ips_gauge 2") {
 		t.Errorf("expected leaf_proxy_unique_remote_ips_gauge 2 in output, got:\n%s", body)
 	}
-	if !strings.Contains(body, `leaf_proxy_miners_by_address{address="addr-1"} 2`) {
+	if !strings.Contains(body, `leaf_proxy_miners_by_address{address="addr-1",port=""} 2`) {
 		t.Errorf("expected addr-1 count 2 in output, got:\n%s", body)
 	}
-	if !strings.Contains(body, `leaf_proxy_miners_by_address{address="addr-2"} 1`) {
+	if !strings.Contains(body, `leaf_proxy_miners_by_address{address="addr-2",port=""} 1`) {
 		t.Errorf("expected addr-2 count 1 in output, got:\n%s", body)
 	}
 	if !strings.Contains(body, "leaf_proxy_vardiff_current_difficulty_count 3") {
@@ -161,7 +161,7 @@ func TestAddressCardinalityCap_OverflowGoesToOtherBucket(t *testing.T) {
 	if !strings.Contains(body, `address="other"`) {
 		t.Errorf("expected overflow addresses aggregated into address=\"other\", got:\n%s", body)
 	}
-	if !strings.Contains(body, `leaf_proxy_miners_by_address{address="other"} 46`) {
+	if !strings.Contains(body, `leaf_proxy_miners_by_address{address="other",port=""} 46`) {
 		t.Errorf("expected other bucket count 46, got:\n%s", body)
 	}
 }

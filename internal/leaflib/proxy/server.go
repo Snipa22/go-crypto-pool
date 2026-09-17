@@ -458,6 +458,7 @@ func (s *Server) sessionSnapshots() []metrics.SessionSnapshot {
 			Address:    addr,
 			RemoteIP:   metrics.RemoteIPOf(sess.mc.RemoteAddr()),
 			Difficulty: sess.currentDifficulty.Load(),
+			Port:       sess.Port,
 		})
 	}
 	return out
@@ -606,6 +607,7 @@ func (s *Server) recordBlock(accepted bool) {
 // itself stays a bare uint64 -- only Serve takes the full PortConfig.
 // Blocks; callers typically run it in its own goroutine.
 func (s *Server) Serve(ctx context.Context, ln net.Listener, port solo.PortConfig) error {
+	label := portLabel(port)
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -618,11 +620,30 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener, port solo.PortConfi
 			}
 			return err
 		}
-		go s.handleConn(ctx, conn, port.Difficulty)
+		go s.handleConn(ctx, conn, port.Difficulty, label)
 	}
 }
 
-func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficulty uint64) {
+// portLabel is the SINGLE source of truth for the canonical port-
+// identity string every consumer of a session's port (Session.Port,
+// SessionStat.Port, the stats HTML "Port" column in statsui.go, and
+// the Prometheus "port" label in internal/leaflib/proxy/metrics)
+// derives from -- Finding #1 (per-port stats): prefers port.PortDesc
+// (the operator-facing tier label, e.g. "low-diff") when non-empty,
+// falling back to port.Address (the raw net.Listen address, e.g.
+// ":4444") otherwise, so every session always has SOME non-empty
+// port identity to report as long as this port tier's own Address is
+// non-empty. This precedence is defined exactly ONCE here; every
+// other call site (Serve below) must go through this helper rather
+// than re-deriving the same precedence independently.
+func portLabel(port solo.PortConfig) string {
+	if port.PortDesc != "" {
+		return port.PortDesc
+	}
+	return port.Address
+}
+
+func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficulty uint64, portLabel string) {
 	// HARDENING FIX (FIX_BRIEF.md, finding #20): mirrors
 	// solo.Server's own identical handleConn recovery exactly -- see
 	// that method's doc comment for the full rationale.
@@ -643,12 +664,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficul
 		return
 	}
 
-	session := newSession(mc, s, startingDifficulty)
+	session := newSession(mc, s, startingDifficulty, portLabel)
 	s.mu.Lock()
 	s.sessions[mc.ID()] = session
 	s.mu.Unlock()
 
-	s.debugLogger.Debugf("proxy: connection accepted: session=%s remote=%s starting_difficulty=%d", session.sessionID, conn.RemoteAddr(), startingDifficulty)
+	s.debugLogger.Debugf("proxy: connection accepted: session=%s remote=%s starting_difficulty=%d port=%s", session.sessionID, conn.RemoteAddr(), startingDifficulty, portLabel)
 
 	defer func() {
 		s.mu.Lock()
@@ -695,10 +716,15 @@ func (s *Server) SessionCount() int {
 // internal/leaflib/proxy/metrics's doc comment), NOT a real found
 // block the way leaf-solo's BlockCount is.
 type SessionStat struct {
-	SessionID         string
-	Address           string
-	Worker            string
-	RemoteAddr        string
+	SessionID  string
+	Address    string
+	Worker     string
+	RemoteAddr string
+	// Port is this session's canonical port-tier label (see
+	// Session.Port's doc comment and server.go's portLabel helper --
+	// Finding #1, per-port stats) -- copied verbatim from
+	// Session.Port by both Stats() and sessionSnapshots below.
+	Port              string
 	ConnectedAt       time.Time
 	CurrentDifficulty uint64
 	ShareCount        uint64
@@ -818,6 +844,7 @@ func (s *Server) Stats() Stats {
 			Address:           addr,
 			Worker:            worker,
 			RemoteAddr:        remoteAddr,
+			Port:              sess.Port,
 			ConnectedAt:       sess.connectedAt,
 			CurrentDifficulty: diff,
 			ShareCount:        sess.shareCount.Load(),

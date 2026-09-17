@@ -210,10 +210,20 @@ func (h *harness) connect() (*testClient, *Session) {
 // computation, not a hand-picked hashForDifficulty value) to clear the
 // per-share difficulty gate before the block-target check even runs.
 func (h *harness) connectAtDifficulty(startingDifficulty uint64) (*testClient, *Session) {
+	return h.connectAtDifficultyWithPort(startingDifficulty, "")
+}
+
+// connectAtDifficultyWithPort is connectAtDifficulty but additionally
+// lets the caller assert a specific port-tier label (Finding #1,
+// per-port stats) -- used by TestSessionPort_SurfacesInStatsAndMetrics
+// (server_test.go) to prove Session.Port/SessionStat.Port/the
+// Prometheus "port" label all end up carrying the SAME value passed
+// to handleConn here.
+func (h *harness) connectAtDifficultyWithPort(startingDifficulty uint64, port string) (*testClient, *Session) {
 	h.t.Helper()
 	serverConn, clientConn := net.Pipe()
 	ctx := context.Background()
-	go h.server.handleConn(ctx, serverConn, startingDifficulty)
+	go h.server.handleConn(ctx, serverConn, startingDifficulty, port)
 
 	c := &testClient{t: h.t, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
 	h.t.Cleanup(func() { _ = clientConn.Close() })
@@ -837,7 +847,7 @@ func TestSession_StaleTemplateGenerationRejectedLocally_NotForwardedUpstream(t *
 	server := NewServer(cm, jm, validator, upstream, log.New(nil2Writer{}, "", 0), leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
 
 	serverConn, clientConn := net.Pipe()
-	go server.handleConn(ctx, serverConn, 1000)
+	go server.handleConn(ctx, serverConn, 1000, "")
 	t.Cleanup(func() { _ = clientConn.Close() })
 	c := &testClient{t: t, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
 
@@ -996,7 +1006,7 @@ func TestHandleSubmit_BannedAddressAndStaleGeneration_BothReject(t *testing.T) {
 	server.EnableAddressFlags(cache)
 
 	serverConn, clientConn := net.Pipe()
-	go server.handleConn(ctx, serverConn, 1000)
+	go server.handleConn(ctx, serverConn, 1000, "")
 	t.Cleanup(func() { _ = clientConn.Close() })
 	c := &testClient{t: t, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
 

@@ -110,6 +110,16 @@ type SessionSnapshot struct {
 	Address    string
 	RemoteIP   string
 	Difficulty uint64
+	// Port is this session's canonical port-tier label (see
+	// proxy.Session.Port's doc comment and proxy/server.go's
+	// portLabel helper -- Finding #1, per-port stats). Empty when the
+	// session's port identity is unknown/unset (e.g. a test harness
+	// that bypasses Server.Serve's real port-derivation). Fed into
+	// minersByAddressDesc's "port" label alongside "address" below --
+	// unlike address, this label carries NO cardinality cap (ports
+	// are a small, fixed, operator-configured set, not
+	// attacker-controllable input).
+	Port string
 }
 
 // SnapshotFunc returns the current set of connected downstream
@@ -350,10 +360,22 @@ var (
 	// for the full cardinality-bounding rationale (a payment address
 	// is attacker-controllable, so this cap is enforced regardless
 	// of how small real-world cardinality usually is).
+	// minersByAddressDesc carries a SECOND label, "port" (Finding #1,
+	// per-port stats), alongside "address" -- see SessionSnapshot.
+	// Port's doc comment. Unlike "address" (capped, overflow
+	// aggregated into address="other" -- see CapAddressCounts), the
+	// "port" label carries NO cardinality cap of its own: ports are
+	// a small, fixed, operator-configured set, not
+	// attacker-controllable input, so there's no analogous overflow
+	// risk to guard against. The overflow "address=\"other\"" row
+	// (see Collect below) always reports port="" -- once an address
+	// has overflowed into that aggregated bucket, it may represent
+	// sessions across multiple different ports, so no single port
+	// value would be meaningful for that row.
 	minersByAddressDesc = prometheus.NewDesc(
 		"leaf_proxy_miners_by_address",
-		"Current number of connected downstream sessions per mining/payout address (live snapshot, capped cardinality -- overflow addresses are aggregated into address=\"other\").",
-		[]string{"address"}, nil,
+		"Current number of connected downstream sessions per mining/payout address and port tier (live snapshot, address cardinality capped -- overflow addresses are aggregated into address=\"other\", port=\"\").",
+		[]string{"address", "port"}, nil,
 	)
 
 	// asyncPool*Desc mirrors solo/metrics's own identical Desc vars
@@ -428,6 +450,15 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 
 	ipSet := make(map[string]struct{}, len(snaps))
 	addrCounts := make(map[string]int)
+	// addrPortCounts backs the "port" label added to
+	// minersByAddressDesc (Finding #1, per-port stats) -- keyed by
+	// address, then by that address's own port label, so a single
+	// address connected across multiple port tiers reports one row
+	// per (address, port) pair. addrCounts above (address only) is
+	// still what CapAddressCounts' cardinality cap is computed
+	// against, unchanged -- this map is purely the finer-grained
+	// breakdown emitted for whichever addresses survive that cap.
+	addrPortCounts := make(map[string]map[string]int)
 	hist := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "leaf_proxy_vardiff_current_difficulty",
 		Help:    "Distribution of currently-connected downstream sessions' current (post-vardiff) share difficulty, recomputed on every scrape.",
@@ -439,6 +470,12 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 		}
 		if s.Address != "" {
 			addrCounts[s.Address]++
+			byPort, ok := addrPortCounts[s.Address]
+			if !ok {
+				byPort = make(map[string]int)
+				addrPortCounts[s.Address] = byPort
+			}
+			byPort[s.Port]++
 		}
 		hist.Observe(float64(s.Difficulty))
 	}
@@ -454,10 +491,20 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	}
 	sort.Strings(addrs)
 	for _, addr := range addrs {
-		ch <- prometheus.MustNewConstMetric(minersByAddressDesc, prometheus.GaugeValue, float64(kept[addr]), addr)
+		ports := make([]string, 0, len(addrPortCounts[addr]))
+		for port := range addrPortCounts[addr] {
+			ports = append(ports, port)
+		}
+		sort.Strings(ports)
+		for _, port := range ports {
+			ch <- prometheus.MustNewConstMetric(minersByAddressDesc, prometheus.GaugeValue, float64(addrPortCounts[addr][port]), addr, port)
+		}
 	}
 	if other > 0 {
-		ch <- prometheus.MustNewConstMetric(minersByAddressDesc, prometheus.GaugeValue, float64(other), OtherAddressLabel)
+		// See minersByAddressDesc's doc comment for why the overflow
+		// bucket always reports port="" -- an aggregated "other"
+		// address may span multiple real port tiers.
+		ch <- prometheus.MustNewConstMetric(minersByAddressDesc, prometheus.GaugeValue, float64(other), OtherAddressLabel, "")
 	}
 
 	if m.asyncPoolStats != nil {
