@@ -85,12 +85,13 @@ const statsPageHTML = `<!DOCTYPE html>
   <h2>Connected sessions</h2>
   {{if .Stats.Sessions}}
   <table>
-    <tr><th>Session ID</th><th>Address</th><th>Worker</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Upstream-forwarded</th></tr>
+    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Port</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Upstream-forwarded</th></tr>
     {{range .Stats.Sessions}}
     <tr>
       <td>{{.SessionID}}</td>
       <td>{{if .Address}}{{.Address}}{{else}}<span class="empty">(not logged in)</span>{{end}}</td>
       <td>{{.Worker}}</td>
+      <td>{{.Port}}</td>
       {{if not $.HideRemoteAddress}}<td>{{.RemoteAddr}}</td>{{end}}
       <td>{{formatTime .ConnectedAt}}</td>
       <td>{{connDuration .ConnectedAt}}</td>

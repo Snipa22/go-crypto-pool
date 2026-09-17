@@ -95,6 +95,18 @@ type Session struct {
 	address   atomic.Value // string
 	worker    atomic.Value // string
 
+	// Port is the canonical port-tier label this session was
+	// accepted on (see server.go's portLabel helper, the single
+	// source of truth both this field and the Prometheus "port"
+	// label/stats-HTML "Port" column are derived from) -- set once
+	// in newSession below and never mutated afterward for the
+	// lifetime of the connection. Finding #1 (per-port stats): before
+	// this field existed, Session dropped port/tier identity
+	// entirely, so neither the stats HTML sessions table nor
+	// per-session Prometheus metrics could distinguish which
+	// configured listener/port tier a given session connected on.
+	Port string
+
 	// --- per-session job ownership (SAME security pattern as
 	// leaf-solo's fix/job-ownership-and-expiry, applied here from the
 	// start rather than reintroduced as a later fix): a submit must
@@ -317,7 +329,7 @@ const defaultProxySessionJobHistorySize = 8
 // value, or stats-HTML content.
 const maxProxyLoginLen = 512
 
-func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64) *Session {
+func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64, port string) *Session {
 	id, err := newRandomHexID()
 	if err != nil {
 		id = "0000000000000000"
@@ -326,6 +338,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		mc:          mc,
 		server:      server,
 		sessionID:   id,
+		Port:        port,
 		connectedAt: time.Now(),
 		jobs:        leaflib.NewJobHistory[*Job](defaultProxySessionJobHistorySize),
 	}

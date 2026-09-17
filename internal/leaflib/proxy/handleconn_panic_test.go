@@ -26,7 +26,7 @@ func TestHandleConn_RecoversFromPanicAndClosesOnlyThisConnection(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.handleConn(context.Background(), serverConn, 1)
+		s.handleConn(context.Background(), serverConn, 1, "")
 	}()
 
 	select {

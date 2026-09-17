@@ -11,7 +11,75 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 )
+
+// TestPortLabel_PrefersPortDescFallsBackToAddress is the required
+// Finding #1 (per-port stats) unit test for portLabel's own
+// documented precedence: non-empty PortDesc wins; an empty PortDesc
+// falls back to Address; both empty yields an empty label (no
+// synthesized placeholder).
+func TestPortLabel_PrefersPortDescFallsBackToAddress(t *testing.T) {
+	cases := []struct {
+		name string
+		port solo.PortConfig
+		want string
+	}{
+		{"PortDesc wins when set", solo.PortConfig{Address: ":4444", PortDesc: "low-diff"}, "low-diff"},
+		{"falls back to Address when PortDesc empty", solo.PortConfig{Address: ":4444"}, ":4444"},
+		{"both empty yields empty", solo.PortConfig{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := portLabel(tc.port); got != tc.want {
+				t.Errorf("portLabel(%+v) = %q, want %q", tc.port, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSessionPort_SurfacesInStatsAndMetrics is the required Finding
+// #1 (per-port stats) end-to-end test: the SAME port label a session
+// was accepted under (via handleConn) surfaces identically in
+// Stats().Sessions[i].Port (and therefore the stats HTML "Port"
+// column, which renders that field directly -- see statsui.go) AND
+// in the Prometheus leaf_proxy_miners_by_address{address=...,
+// port=...} series (via sessionSnapshots -> metrics.SessionSnapshot.
+// Port -- see metrics.go's Collect), proving both consumers derive
+// from the one canonical value rather than diverging.
+func TestSessionPort_SurfacesInStatsAndMetrics(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+	h.server.EnableMetrics("test", 0)
+
+	const wantPort = "high-diff"
+	c, _ := h.connectAtDifficultyWithPort(1000, wantPort)
+	loginResp := c.login(t, "addr-port-label-test")
+	if loginResp.Result.Status != "OK" {
+		t.Fatalf("login failed: %+v", loginResp)
+	}
+
+	st := h.server.Stats()
+	if len(st.Sessions) != 1 {
+		t.Fatalf("expected exactly 1 session in Stats(), got %d", len(st.Sessions))
+	}
+	if got := st.Sessions[0].Port; got != wantPort {
+		t.Errorf("Stats().Sessions[0].Port = %q, want %q", got, wantPort)
+	}
+
+	sess := h.onlySession()
+	if sess == nil {
+		t.Fatal("expected exactly 1 live session")
+	}
+	if sess.Port != wantPort {
+		t.Errorf("Session.Port = %q, want %q", sess.Port, wantPort)
+	}
+
+	body := scrapeMetrics(t, h.server)
+	want := `leaf_proxy_miners_by_address{address="addr-port-label-test",port="high-diff"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", want, body)
+	}
+}
 
 // TestServer_EnableMetrics_ShareDecisionsIncrementOnBothRealCodePaths
 // confirms the real local-credit-vs-upstream-forward counter tracks
@@ -95,7 +163,7 @@ func TestServer_EnableMetrics_ActiveConnectionsReflectsRealSessions(t *testing.T
 	if !strings.Contains(body, "leaf_proxy_active_connections 1") {
 		t.Errorf("expected leaf_proxy_active_connections 1 with one logged-in session, got:\n%s", body)
 	}
-	if !strings.Contains(body, `leaf_proxy_miners_by_address{address="addr-active-conn"} 1`) {
+	if !strings.Contains(body, `leaf_proxy_miners_by_address{address="addr-active-conn",port=""} 1`) {
 		t.Errorf("expected addr-active-conn count 1, got:\n%s", body)
 	}
 }

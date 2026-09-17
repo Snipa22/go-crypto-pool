@@ -79,7 +79,7 @@ func TestHandleSubmit_GenerationAdvancesWhileQueued_ForwardSkipped(t *testing.T)
 	server := NewServer(cm, jm, validator, upstream, log.New(nil2Writer{}, "", 0), leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
 
 	serverConn, clientConn := net.Pipe()
-	go server.handleConn(ctx, serverConn, 1000)
+	go server.handleConn(ctx, serverConn, 1000, "")
 	t.Cleanup(func() { _ = clientConn.Close() })
 	c := &testClient{t: t, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
 
@@ -147,7 +147,7 @@ func TestHandleSubmit_GenerationUnchangedWhileQueued_ForwardStillHappens(t *test
 	server := NewServer(cm, jm, validator, upstream, log.New(nil2Writer{}, "", 0), leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
 
 	serverConn, clientConn := net.Pipe()
-	go server.handleConn(ctx, serverConn, 1000)
+	go server.handleConn(ctx, serverConn, 1000, "")
 	t.Cleanup(func() { _ = clientConn.Close() })
 	c := &testClient{t: t, client: clientConn, reader: bufio.NewReader(clientConn), writer: bufio.NewWriter(clientConn)}
 
