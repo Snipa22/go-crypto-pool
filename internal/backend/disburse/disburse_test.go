@@ -3,6 +3,7 @@ package disburse
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
@@ -23,6 +24,13 @@ type fakeRepo struct {
 	failErr        error
 	ambiguousErr   error
 	unresolvedErr  error
+
+	// payableBalancesCalls counts every PayableBalances call,
+	// atomically -- overlap_test.go relies on this being race-safe,
+	// since its whole point is to prove a REJECTED (overlapped)
+	// RunOnce call never reaches this method at all, observed from
+	// a goroutine other than the one that's actually running.
+	payableBalancesCalls atomic.Int64
 }
 
 type pendingCall struct {
@@ -64,6 +72,7 @@ type ambiguousCall struct {
 func key(algo, network string) string { return algo + "/" + network }
 
 func (f *fakeRepo) PayableBalances(_ context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
+	f.payableBalancesCalls.Add(1)
 	var out []PayableBalance
 	for _, b := range f.balances[key(algo, network)] {
 		// Mirrors db.Repository.PayableBalances' real SQL: a row is
@@ -222,6 +231,23 @@ type fakeWallet struct {
 	transferFee  int64
 	transferCall []wallet.TransferRequest
 	txHashSeq    int
+
+	// transferCallCount counts every Transfer call, atomically --
+	// overlap_test.go relies on this being race-safe, since its
+	// whole point is proving how many goroutines actually reach the
+	// real wallet call, observed from a goroutine other than the
+	// one(s) calling Transfer.
+	transferCallCount atomic.Int64
+
+	// blockTransfer, if non-nil, makes Transfer block (after
+	// incrementing transferCallCount, so the count is observable
+	// while blocked) by receiving from this channel, until the test
+	// closes it. Used by overlap_test.go to prove only ONE goroutine
+	// ever reaches the wallet, not just that a second one "happened
+	// to be slow" -- every other existing test leaves this nil,
+	// which is a complete no-op (a nil channel receive would block
+	// forever, so this is explicitly guarded).
+	blockTransfer chan struct{}
 }
 
 func (f *fakeWallet) GetBalance(_ context.Context) (wallet.Balance, error) {
@@ -229,6 +255,10 @@ func (f *fakeWallet) GetBalance(_ context.Context) (wallet.Balance, error) {
 }
 
 func (f *fakeWallet) Transfer(_ context.Context, req wallet.TransferRequest) (wallet.TransferResult, error) {
+	f.transferCallCount.Add(1)
+	if f.blockTransfer != nil {
+		<-f.blockTransfer
+	}
 	f.transferCall = append(f.transferCall, req)
 	if f.transferErr != nil {
 		return wallet.TransferResult{}, f.transferErr
