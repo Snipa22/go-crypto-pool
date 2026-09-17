@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -443,11 +444,12 @@ func claimBlockPayout(ctx context.Context, tx pgx.Tx, run BlockPayoutRun) (claim
 	}
 }
 
-// blockPayoutCurrency determines the currency ("XMR" or "XTM", see
-// migrations/0014_balance_payouts_currency.up.sql) that block
-// blockID's payout credits belong on, derived directly from a fresh
-// read of the REAL `blocks` row's own algo/merge_mine_chain columns —
-// never from anything the caller supplies. This is deliberate: the
+// blockPayoutCurrency determines the currency (see
+// migrations/0014_balance_payouts_currency.up.sql and
+// migrations/0017_multicoin_currencies.up.sql) that block blockID's
+// payout credits belong on, derived directly from a fresh read of
+// the REAL `blocks` row's own algo/merge_mine_chain columns — never
+// from anything the caller supplies. This is deliberate: the
 // migration's own doc comment on `block_payout_credits.currency`
 // requires this value be derived from the parent block, not accepted
 // as an independently-settable parameter, precisely so a caller bug
@@ -457,12 +459,26 @@ func claimBlockPayout(ctx context.Context, tx pgx.Tx, run BlockPayoutRun) (claim
 // same blockID and is therefore guaranteed the same currency, so this
 // is called exactly once per run rather than once per credit.
 //
-// Only ALGO_RXM's primary (Monero) leg — merge_mine_chain IS NULL —
-// is "XMR"; every other case (RXT/C29/SHA3X, whose merge_mine_chain
-// is always NULL too, and ALGO_RXM's secondary/Tari leg, whose
-// merge_mine_chain is "TARI") is "XTM". See
-// migrations/0012_blocks_merge_mine_chain.up.sql for the full
-// merge-mine mechanism this reads.
+// Three cases, checked in this order:
+//
+//   - ALGO_RXM's primary (Monero) leg — merge_mine_chain IS NULL —
+//     is "XMR". Unchanged, do not touch (see this file's own doc
+//     comment / migration 0014).
+//   - Any algo that resolves to a internal/coinprofile.Registry
+//     entry (i.e. one of the 7 standalone monerod-family coins added
+//     by internal/coinprofile — XMR, ARQ, XEQ, GRFT, SFX, ZEPH, SAL)
+//     is that coin's own Ticker, e.g. an ALGO_ARQ block's currency is
+//     "ARQ", never "XTM". These coins have no merge-mine leg at all
+//     (merge_mine_chain is always NULL for them), so this check does
+//     not need to consult that column. See
+//     migrations/0017_multicoin_currencies.up.sql, which is the
+//     migration that widened the currency CHECK constraints this
+//     depends on.
+//   - Everything else (RXT/C29/SHA3X, whose merge_mine_chain is
+//     always NULL too, and ALGO_RXM's secondary/Tari leg, whose
+//     merge_mine_chain is "TARI") is "XTM". See
+//     migrations/0012_blocks_merge_mine_chain.up.sql for the full
+//     merge-mine mechanism this reads.
 func blockPayoutCurrency(ctx context.Context, tx pgx.Tx, blockID int64) (string, error) {
 	var algo string
 	var mergeMineChain *string
@@ -472,6 +488,9 @@ func blockPayoutCurrency(ctx context.Context, tx pgx.Tx, blockID int64) (string,
 	}
 	if algo == "RXM" && mergeMineChain == nil {
 		return "XMR", nil
+	}
+	if profile, ok := coinprofile.Lookup(algo); ok {
+		return profile.Ticker, nil
 	}
 	return "XTM", nil
 }
