@@ -87,6 +87,14 @@ type fakeAddrMapRepo struct {
 	err error
 
 	gotXMR, gotTari string
+
+	// mapped, if non-nil, mirrors the real repo's same-value-ok /
+	// different-value-rejected semantics (see
+	// FIX_BRIEF_IDEMPOTENT.md): tests that want to exercise the
+	// idempotent-resubmit or reject-different-value paths through
+	// Set set this to the xmr_address's already-mapped tari_address
+	// instead of setting err directly.
+	mapped *string
 }
 
 func (f *fakeAddrMapRepo) Set(_ context.Context, xmrAddress, tariAddress string) error {
@@ -94,6 +102,12 @@ func (f *fakeAddrMapRepo) Set(_ context.Context, xmrAddress, tariAddress string)
 		return f.err
 	}
 	f.gotXMR, f.gotTari = xmrAddress, tariAddress
+	if f.mapped != nil {
+		if *f.mapped == tariAddress {
+			return nil
+		}
+		return addressmap.ErrAlreadyMapped
+	}
 	return nil
 }
 
@@ -745,14 +759,16 @@ func TestHandleUpdateTariAddress_UpsertFailure(t *testing.T) {
 }
 
 func TestHandleUpdateTariAddress_AlreadyMapped(t *testing.T) {
-	// Second call for an already-mapped xmr_address must render the
-	// exact SAME legacy 400 shape as any other Set failure -- see
-	// handleUpdateTariAddress's doc comment / FIX_BRIEF.md: legacy
-	// callers must see identical behavior to a plain duplicate-INSERT
-	// failure, not a new response shape.
+	// Second call for an already-mapped xmr_address WITH A DIFFERENT
+	// tari_address must render the exact SAME legacy 400 shape as any
+	// other Set failure -- see handleUpdateTariAddress's doc comment
+	// / FIX_BRIEF.md: legacy callers must see identical behavior to a
+	// plain duplicate-INSERT failure, not a new response shape.
 	h, d := newTestHandler(Config{})
-	d.addrMap.err = addressmap.ErrAlreadyMapped
-	body := `{"xmrAddress":"` + testXMRAddress + `","tariAddress":"` + testTariAddress + `"}`
+	mapped := testTariAddress
+	d.addrMap.mapped = &mapped
+	differentTari := "13rvPKhft3guQqmZ5kxW14DAzb2d8k8Gaw6scp5zDP8xkfE"
+	body := `{"xmrAddress":"` + testXMRAddress + `","tariAddress":"` + differentTari + `"}`
 	rr := doPost(t, h.Mux(), "/user/updateTariAddress", body)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rr.Code)
@@ -761,6 +777,29 @@ func TestHandleUpdateTariAddress_AlreadyMapped(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
 	if resp["msg"] != "Unable to insert address" || resp["success"] != false {
 		t.Errorf("unexpected body: %+v", resp)
+	}
+}
+
+// TestHandleUpdateTariAddress_IdempotentSameValue is the sibling of
+// TestHandleUpdateTariAddress_AlreadyMapped covering the gap
+// FIX_BRIEF_IDEMPOTENT.md closes: a resubmit of the SAME xmr_address
+// with the IDENTICAL tari_address it is already mapped to must
+// succeed through this legacy wrapper too (its own normal 200
+// success shape), not fall into the "Unable to insert address" 400
+// path.
+func TestHandleUpdateTariAddress_IdempotentSameValue(t *testing.T) {
+	h, d := newTestHandler(Config{})
+	mapped := testTariAddress
+	d.addrMap.mapped = &mapped
+	body := `{"xmrAddress":"` + testXMRAddress + `","tariAddress":"` + testTariAddress + `"}`
+	rr := doPost(t, h.Mux(), "/user/updateTariAddress", body)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (idempotent no-op), body = %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]string
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp["msg"] != testTariAddress {
+		t.Errorf("msg = %q, want tari address echoed back", resp["msg"])
 	}
 }
 
