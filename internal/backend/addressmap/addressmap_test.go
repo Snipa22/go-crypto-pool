@@ -61,14 +61,22 @@ func newFakeRepo() *fakeRepo {
 	return &fakeRepo{rows: map[string]Record{}}
 }
 
+// Set mirrors db.Repository.SetAddressMap's real same-value-is-ok
+// semantics (see FIX_BRIEF_IDEMPOTENT.md): an identical resubmit of
+// an existing xmr_address/tari_address pair is a no-op success, not
+// an error; only a DIFFERENT tari_address for an already-mapped
+// xmr_address is rejected with ErrAlreadyMapped.
 func (f *fakeRepo) Set(_ context.Context, xmrAddress, tariAddress string) error {
 	if f.err != nil {
 		return f.err
 	}
-	if _, existed := f.rows[xmrAddress]; existed {
+	f.gotXMR, f.gotTari = xmrAddress, tariAddress
+	if existing, existed := f.rows[xmrAddress]; existed {
+		if existing.TariAddress == tariAddress {
+			return nil
+		}
 		return ErrAlreadyMapped
 	}
-	f.gotXMR, f.gotTari = xmrAddress, tariAddress
 	now := time.Unix(1000, 0)
 	f.rows[xmrAddress] = Record{
 		XMRAddress:  xmrAddress,
@@ -147,6 +155,45 @@ func TestUpsert_SecondCallForSameXMRAddressIsRejected(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
 	if resp.TariAddress != realTariEsmeraldaAddr {
 		t.Fatalf("expected original tari_address to be preserved, got %q", resp.TariAddress)
+	}
+}
+
+// TestUpsert_SameXMRAddressSameTariAddressIsIdempotent is the sibling
+// of TestUpsert_SecondCallForSameXMRAddressIsRejected covering the
+// gap FIX_BRIEF_IDEMPOTENT.md closes: re-POSTing the SAME xmr_address
+// with the IDENTICAL tari_address it is already mapped to must
+// succeed as a no-op (still 201, not 409) -- an idempotent retry/
+// resubmit is not an attack. Only a DIFFERENT tari_address for an
+// already-mapped xmr_address (covered above) is rejected.
+func TestUpsert_SameXMRAddressSameTariAddressIsIdempotent(t *testing.T) {
+	repo := newFakeRepo()
+	mux := NewHandler(repo, Config{}).Mux()
+
+	body := `{"xmr_address":"` + realXMRMainnetAddr + `","tari_address":"` + realTariEsmeraldaAddr + `"}`
+	rr := doPost(t, mux, "/api/v1/address-map", body)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("first set status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	// Identical resubmit -- same xmr_address, same tari_address.
+	rr = doPost(t, mux, "/api/v1/address-map", body)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("identical resubmit status = %d, want 201 (idempotent no-op), body = %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["tari_address"] != realTariEsmeraldaAddr {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+
+	// The mapping must still be exactly what it was.
+	rr = doGet(t, mux, "/api/v1/address-map?xmr_address="+realXMRMainnetAddr)
+	var getResp getResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &getResp)
+	if getResp.TariAddress != realTariEsmeraldaAddr {
+		t.Fatalf("expected tari_address to remain %q, got %q", realTariEsmeraldaAddr, getResp.TariAddress)
 	}
 }
 
