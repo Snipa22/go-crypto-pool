@@ -87,8 +87,8 @@ tls_cert_persist_path = ""
 # starting difficulty instead. (default: 20000)
 starting_difficulty = 20000
 
-# Absolute floor vardiff will never retarget below. (default: 10000)
-min_difficulty = 10000
+# Absolute floor vardiff will never retarget below. (default: 20000)
+min_difficulty = 20000
 
 # Absolute ceiling vardiff will never retarget above. (default: 1000000000)
 max_difficulty = 1000000000

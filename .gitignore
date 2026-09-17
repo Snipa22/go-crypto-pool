@@ -34,3 +34,11 @@ go.work.sum
 # build output
 /bin/
 /dist/
+
+# stray repo-root binaries from `go build ./...`/`go build ./cmd/...`
+# (built binaries belong in /bin or /dist, never checked in at the
+# repo root -- these match this repo's cmd/ package names exactly).
+/backend
+/leaf-direct
+/leaf-proxy
+/leaf-solo
