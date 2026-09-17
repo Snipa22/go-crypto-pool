@@ -26,23 +26,36 @@ func TestIntegrationUsersCRUD(t *testing.T) {
 
 	repo := db.NewRepository(pool)
 
-	// UpsertUserThreshold creates a fresh row with the legacy
-	// placeholder email when none exists yet.
-	if err := repo.UpsertUserThreshold(ctx, "addr-1", 1000); err != nil {
-		t.Fatalf("UpsertUserThreshold (create): %v", err)
+	// UpdateUserThreshold is UPDATE-only: it must NOT create a row
+	// for a username that doesn't exist yet (see db/users.go's doc
+	// comment -- this is the fix for the unauthenticated
+	// POST /user/updateThreshold row-fabrication vulnerability).
+	if err := repo.UpdateUserThreshold(ctx, "addr-1", 1000); !errors.Is(err, db.ErrUserNotFound) {
+		t.Fatalf("UpdateUserThreshold(missing user): expected ErrUserNotFound, got %v", err)
+	}
+	if _, err := repo.GetUserByUsername(ctx, "addr-1"); !errors.Is(err, db.ErrUserNotFound) {
+		t.Fatalf("GetUserByUsername(addr-1): expected ErrUserNotFound (no row should have been created), got %v", err)
+	}
+
+	// Seed a `users` row directly -- there is no public create-user
+	// API; some other admin/auth path would provision this row in a
+	// real deployment.
+	if _, err := pool.Exec(ctx, `INSERT INTO users (username, email, payout_threshold) VALUES ('addr-1', 'null@null.null', 1000)`); err != nil {
+		t.Fatalf("seeding users row: %v", err)
 	}
 	u, err := repo.GetUserByUsername(ctx, "addr-1")
 	if err != nil {
 		t.Fatalf("GetUserByUsername: %v", err)
 	}
 	if u.Email != "null@null.null" || u.PayoutThreshold != 1000 || u.Pass != nil || u.Admin || u.EnableEmail {
-		t.Fatalf("unexpected freshly-created user: %+v", u)
+		t.Fatalf("unexpected seeded user: %+v", u)
 	}
 
-	// Re-upserting the same username updates the threshold in place,
-	// not a second row (uq_users_username).
-	if err := repo.UpsertUserThreshold(ctx, "addr-1", 2000); err != nil {
-		t.Fatalf("UpsertUserThreshold (update): %v", err)
+	// UpdateUserThreshold against that EXISTING row succeeds and
+	// updates the threshold in place, not a second row
+	// (uq_users_username).
+	if err := repo.UpdateUserThreshold(ctx, "addr-1", 2000); err != nil {
+		t.Fatalf("UpdateUserThreshold (update): %v", err)
 	}
 	u2, err := repo.GetUserByUsername(ctx, "addr-1")
 	if err != nil {
@@ -118,6 +131,9 @@ func TestIntegrationUsersCRUD(t *testing.T) {
 	}
 	if err := repo.UpdateUserPayoutThreshold(ctx, 999999, 1); !errors.Is(err, db.ErrUserNotFound) {
 		t.Fatalf("UpdateUserPayoutThreshold(999999): expected ErrUserNotFound, got %v", err)
+	}
+	if err := repo.UpdateUserThreshold(ctx, "ghost", 1); !errors.Is(err, db.ErrUserNotFound) {
+		t.Fatalf("UpdateUserThreshold(ghost): expected ErrUserNotFound, got %v", err)
 	}
 }
 
