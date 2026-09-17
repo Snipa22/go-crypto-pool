@@ -59,6 +59,21 @@ insecure_allow_unauthenticated_ingestion = false
 # missing or does not parse to a valid network.
 network = ""
 
+# Sustained requests/second, per source IP, allowed against the public,
+# unauthenticated GET routes registered by internal/backend/statsapi,
+# internal/backend/networkapi, and internal/backend/legacyconfig. These are
+# public stats-page endpoints, expected to be polled more frequently and by
+# more distinct legitimate clients (browsers, dashboards, monitoring) than the
+# leaf-to-backend ingestion endpoints -- hence a materially higher default
+# than an ingestion-appropriate rate. <= 0 disables rate limiting entirely.
+# (default: 30)
+stats_api_rate_limit_per_second = 30
+
+# Token-bucket burst size (per source IP) for
+# stats_api_rate_limit_per_second above. Only consulted when the rate limit
+# is enabled. (default: 90)
+stats_api_rate_limit_burst = 90
+
 # host:port of a real Tari base node's GRPC endpoint. When set, the block
 # unlocker polls every pending ALGO_RXT/ALGO_C29/ALGO_SHA3X block against it
 # to detect maturity/orphaning. When unset, those algos' blocks are simply

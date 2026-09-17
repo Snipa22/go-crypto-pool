@@ -186,8 +186,8 @@ func (h *Handler) handleMinerStatsAllWorkers(w http.ResponseWriter, r *http.Requ
 		sharesSum  int64
 		shareCount int64
 	}
-	byWorker := make(map[string]workerAgg, len(workerStats))
-	for _, ws := range workerStats {
+	byWorker := make(map[string]workerAgg, len(workerStats.Rows))
+	for _, ws := range workerStats.Rows {
 		byWorker[ws.Identifier] = workerAgg{sharesSum: ws.SharesSum, shareCount: ws.ShareCount}
 	}
 
@@ -229,7 +229,7 @@ func (h *Handler) handleMinerStatsWorker(w http.ResponseWriter, r *http.Request)
 	}
 
 	var sharesSum, shareCount int64
-	for _, ws := range workerStats {
+	for _, ws := range workerStats.Rows {
 		if ws.Identifier == identifier {
 			sharesSum, shareCount = ws.SharesSum, ws.ShareCount
 			break
