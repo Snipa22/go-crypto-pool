@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -379,6 +380,25 @@ func TestHandleShare_DBErrorReturns500WithoutLeakingDetail(t *testing.T) {
 	}
 	if bytes.Contains(rr.Body.Bytes(), []byte("10.0.0.5")) {
 		t.Errorf("response body leaked internal error detail: %s", rr.Body.String())
+	}
+}
+
+// TestHandleShare_AddressBannedReturns403 is the regression test for
+// the address-flags ban-enforcement fix: when the repository's
+// InsertShare returns (a wrapped) ErrAddressBanned, handleShare must
+// map it to a 403 -- a clean, semantically-correct rejection -- NOT
+// the generic 500 every other InsertShare error still maps to (see
+// TestHandleShare_DBErrorReturns500WithoutLeakingDetail above).
+func TestHandleShare_AddressBannedReturns403(t *testing.T) {
+	repo := &fakeRepo{shareErr: fmt.Errorf("db: inserting share: %w: addr-1", ErrAddressBanned)}
+	h := NewHandler(repo, Config{})
+	rr := postProto(t, h.Mux(), "/api/v1/share", validShare(), nil)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rr.Code, rr.Body.String())
+	}
+	if len(repo.shares) != 0 {
+		t.Errorf("expected no share inserted for a banned address, got %d", len(repo.shares))
 	}
 }
 
