@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -55,13 +56,22 @@ var ErrWrongProofType = fmt.Errorf("validator: share's raw_proof does not match 
 //     from go-tari-c29-solo-stratum)
 //   - ALGO_SHA3X -> *SHA3XValidator (real triple-sha3-256 header hash
 //     verification, ported from go-tari-sha3x-solo-stratum)
-//   - ALGO_RXT / ALGO_RXM -> *RandomXValidator (real go-xmr-lib
+//   - ALGO_RXT / ALGO_RXM / any internal/coinprofile.Registry algo
+//     (ALGO_XMR and the other confirmed standalone monerod-family
+//     coins) -> *RandomXValidator (real go-xmr-lib
 //     hashValidation.RXVerifier HTTP-service-backed verification — see
-//     randomx.go for the full honest status writeup)
+//     randomx.go for the full honest status writeup). NOTE: this
+//     assumes each coin's PoW is genuinely vanilla RandomX exactly
+//     like Monero's own -- true for the coins this pass confirmed
+//     (they are direct monero-project/monero source forks that have
+//     not changed the mining PoW itself), but a coin whose fork
+//     tweaks RandomX's parameters (a "RandomX variant") would need
+//     its own validator, not this shared one; see the PR description
+//     for which coins this was and wasn't verified for.
 //
-// randomXServiceURL is only consulted for ALGO_RXT/ALGO_RXM; pass "" to
-// use go-xmr-lib's built-in default (http://127.0.0.1:39093), or a
-// configured service address.
+// randomXServiceURL is only consulted for the RandomX-family algos
+// above; pass "" to use go-xmr-lib's built-in default
+// (http://127.0.0.1:39093), or a configured service address.
 func NewValidator(algo poolpb.Algo, randomXServiceURL string) (AlgoValidator, error) {
 	switch algo {
 	case poolpb.Algo_ALGO_C29:
@@ -71,6 +81,9 @@ func NewValidator(algo poolpb.Algo, randomXServiceURL string) (AlgoValidator, er
 	case poolpb.Algo_ALGO_RXT, poolpb.Algo_ALGO_RXM:
 		return NewRandomXValidator(randomXServiceURL), nil
 	default:
+		if _, ok := coinprofile.ByAlgo(algo); ok {
+			return NewRandomXValidator(randomXServiceURL), nil
+		}
 		return nil, fmt.Errorf("%w: %v", ErrUnsupportedAlgo, algo)
 	}
 }
@@ -81,19 +94,25 @@ func NewValidator(algo poolpb.Algo, randomXServiceURL string) (AlgoValidator, er
 // than constructing one validator per call.
 type Registry map[poolpb.Algo]AlgoValidator
 
-// NewRegistry builds a Registry covering all four algos. randomXServiceURL
-// is passed through to the RandomX validators shared by RXT and RXM (see
-// NewValidator).
+// NewRegistry builds a Registry covering RXT/C29/SHA3X/RXM plus every
+// confirmed internal/coinprofile.Registry algo (all sharing the same
+// RandomX-family validator instance as RXT/RXM — see NewValidator's
+// doc comment for the caveat on coins with a tweaked RandomX variant).
+// randomXServiceURL is passed through to the shared RandomX validator.
 func NewRegistry(randomXServiceURL string) Registry {
 	c29 := NewC29Validator()
 	sha3x := NewSHA3XValidator()
 	rx := NewRandomXValidator(randomXServiceURL)
-	return Registry{
+	reg := Registry{
 		poolpb.Algo_ALGO_C29:   c29,
 		poolpb.Algo_ALGO_SHA3X: sha3x,
 		poolpb.Algo_ALGO_RXT:   rx,
 		poolpb.Algo_ALGO_RXM:   rx,
 	}
+	for _, profile := range coinprofile.Registry {
+		reg[profile.Algo] = rx
+	}
+	return reg
 }
 
 // Get returns the validator for algo, or ErrUnsupportedAlgo if none is

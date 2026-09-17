@@ -198,6 +198,22 @@ type Config struct {
 	TariDonationAddress   string
 	MoneroDonationAddress string
 
+	// ExtraFeeAddresses/ExtraDonationAddresses generalize
+	// TariFeeAddress/MoneroFeeAddress (and their donation
+	// counterparts) to the new standalone monerod-family coins added
+	// via internal/coinprofile.Registry (ALGO_XMR and below): each
+	// one is its own independent coin with its own wallet, so it
+	// cannot share RXM's MoneroFeeAddress/MoneroDonationAddress the
+	// way Tari's three native algos share Tari*Address. Keyed by the
+	// exact uppercase algo string (db.ValidAlgos' form, e.g. "ARQ",
+	// "XEQ") -- see addressesForAlgo. An algo with no entry in either
+	// map (and not RXT/C29/SHA3X/RXM) makes RunForMaturedBlock refuse
+	// to pay out that block rather than guess a coin family, exactly
+	// like the pre-existing RXT/C29/SHA3X/RXM-only behavior did for
+	// any OTHER unrecognized algo string.
+	ExtraFeeAddresses      map[string]string
+	ExtraDonationAddresses map[string]string
+
 	// PPSFeePercent/PPLNSFeePercent/SoloFeePercent are each pool
 	// type's operator fee cut — global.config.payout.{pps,pplns,solo}Fee.
 	PPSFeePercent   float64
@@ -255,11 +271,14 @@ func paymentKey(address string, paymentID *string) string {
 // fee/donation addresses. RXT/C29/SHA3X (see
 // internal/backend/db.ValidAlgos) are Tari-family and resolve to
 // cfg.Tari*Address; RXM is Monero and resolves to cfg.Monero*Address.
-// Any other algo string is refused with an error rather than
-// silently falling back to either family's addresses — a single
-// backend process pays out both families simultaneously, so a wrong
-// or unmapped algo here would misroute real funds, not just misfile
-// a log line.
+// Every OTHER internal/coinprofile.Registry algo (ALGO_XMR and below,
+// e.g. "ARQ", "XEQ") is its own independent coin family and resolves
+// to cfg.ExtraFeeAddresses[algo]/cfg.ExtraDonationAddresses[algo].
+// Any algo string with no mapping in ANY of the above is refused with
+// an error rather than silently falling back to any family's
+// addresses — a single backend process may pay out several coin
+// families simultaneously, so a wrong or unmapped algo here would
+// misroute real funds, not just misfile a log line.
 func addressesForAlgo(cfg Config, algo string) (feeAddr, donationAddr string, err error) {
 	switch algo {
 	case "RXT", "C29", "SHA3X":
@@ -267,7 +286,12 @@ func addressesForAlgo(cfg Config, algo string) (feeAddr, donationAddr string, er
 	case "RXM":
 		return cfg.MoneroFeeAddress, cfg.MoneroDonationAddress, nil
 	default:
-		return "", "", fmt.Errorf("payout: addressesForAlgo: unrecognized algo %q -- refusing to guess a coin family (expected one of RXT, C29, SHA3X, RXM)", algo)
+		fee, feeOK := cfg.ExtraFeeAddresses[algo]
+		donation, donationOK := cfg.ExtraDonationAddresses[algo]
+		if feeOK || donationOK {
+			return fee, donation, nil
+		}
+		return "", "", fmt.Errorf("payout: addressesForAlgo: unrecognized algo %q -- refusing to guess a coin family (no Tari/Monero mapping and no Config.ExtraFeeAddresses/ExtraDonationAddresses entry)", algo)
 	}
 }
 

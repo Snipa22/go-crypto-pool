@@ -53,6 +53,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
@@ -77,18 +78,43 @@ type config struct {
 
 	// coin selects which coin/PoW family this leaf-solo process talks
 	// to for its block source: "tari" (default, unchanged behavior --
-	// GRPCNodeClient against a real Tari base node) or "monero" (a
-	// real MoneroNodeClient against a real monerod JSON-RPC daemon --
-	// see monerodURL below). This governs NodeClient construction and
-	// forces algo to ALGO_RXM below; it does NOT touch the wire
-	// protocol layer at all (protocol.go's JSON-RPC 2.0 dialect is
-	// already Monero-compatible).
+	// GRPCNodeClient against a real Tari base node) or a coin ticker
+	// resolved (case-insensitively) against
+	// internal/coinprofile.Registry (e.g. "xmr", "arq", "xeq", "grft",
+	// "sfx", "zeph", "sal") -- a real MoneroNodeClient against a real
+	// monerod-JSON-RPC-compatible daemon at monerodURL, tracked under
+	// that coin's own dedicated poolpb.Algo value (see resolveAlgo).
+	// "monero" remains a backward-compatible alias for "xmr" in
+	// EXACTLY its pre-existing ALGO_RXM/Tari-merge-mine behavior --
+	// see standalone below for the new, genuinely-standalone-XMR
+	// capability. An unregistered ticker fails fast at startup (see
+	// main's own validation) rather than silently falling through to
+	// any default. This does NOT touch the wire protocol layer at all
+	// (protocol.go's JSON-RPC 2.0 dialect is already Monero-compatible
+	// and shared by every monerod-family coin here).
 	coin string
 
-	// monerodURL is the real monerod JSON-RPC base URL (e.g.
-	// "http://148.163.90.157:28081") this leaf talks to when
-	// -coin/LEAF_SOLO_COIN is "monero". Ignored/unused for coin=tari.
-	// REQUIRED when coin=monero -- see main's own validation.
+	// standalone, when true AND -coin/LEAF_SOLO_COIN resolves to "xmr"
+	// (or its "monero" alias), runs genuinely standalone (non-merge-
+	// mined) Monero against monerodURL, tracked under the new
+	// poolpb.Algo_ALGO_XMR value instead of the legacy
+	// poolpb.Algo_ALGO_RXM (Tari-merge-mined) behavior -- see
+	// resolveAlgo. Has NO effect for -coin=tari (no monerod-family
+	// coin involved) or any OTHER registered coin ticker (arq, xeq,
+	// grft, sfx, zeph, sal), which are always standalone already and
+	// have no merge-mine concept to disambiguate from. Defaults to
+	// false so an existing "-coin=monero"/"-coin=xmr" deployment's
+	// behavior is completely unchanged unless this is explicitly set.
+	standalone bool
+
+	// monerodURL is the real monerod-JSON-RPC-compatible base URL
+	// (e.g. "http://148.163.90.157:28081") this leaf talks to when
+	// -coin/LEAF_SOLO_COIN resolves to any monerod-family coin (see
+	// coin above). Ignored/unused for coin=tari. REQUIRED for every
+	// monerod-family coin -- see main's own validation. For
+	// -coin=monero (or -coin=xmr without -standalone), point this at
+	// your local minotari_merge_mining_proxy, NOT raw monerod -- see
+	// the startup log NOTE this produces.
 	monerodURL string
 
 	// randomxWorkers overrides the RandomX-family (RXT/RXM) async
@@ -143,8 +169,9 @@ type config struct {
 	// internal/leaflib/solo/node.go's GRPCNodeClient.coinbaseExtraTag).
 	// Left empty (the default), resolveCoinbaseExtraTag computes a
 	// per-algo default instead ("supportxtm-sha3x"/"supportxtm-c29"/
-	// "supportxtm-rxt"/"supportxtm-rxm") from whichever algo/coin this
-	// process is actually configured for (see resolveAlgo/isMoneroCoin)
+	// "supportxtm-rxt"/"supportxtm-rxm"/"supportxtm-<ticker>") from
+	// whichever algo/coin this process is actually configured for
+	// (see resolveAlgo/isMoneroFamilyCoin)
 	// — a single blended tag across every algo/process defeats
 	// per-algo on-chain attribution, which is the whole point of this
 	// flag existing. When set, this value is used VERBATIM, overriding
@@ -270,8 +297,9 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.listenAddress, "listen-address", envOr("LEAF_SOLO_LISTEN_ADDRESS", ":4444"), "miner-facing TCP listen address. Env: LEAF_SOLO_LISTEN_ADDRESS")
 	flag.StringVar(&cfg.payoutAddress, "payout-address", envOr("LEAF_SOLO_PAYOUT_ADDRESS", ""), "solo payout address; found-block coinbase rewards go here. Env: LEAF_SOLO_PAYOUT_ADDRESS")
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_SOLO_NETWORK", "testnet"), "network tag for share/diagnostic records: mainnet|testnet. Env: LEAF_SOLO_NETWORK")
-	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_SOLO_COIN", "tari"), "which coin/PoW family this leaf-solo process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_SOLO_COIN")
-	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_SOLO_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081), no trailing slash or /json_rpc suffix required. REQUIRED when -coin=monero; ignored for -coin=tari. For RXM/merge-mining, point this at your local minotari_merge_mining_proxy listener, NOT raw monerod directly -- pointing at raw monerod will mine Monero-only with no Tari merge-mine revenue. Env: LEAF_SOLO_MONEROD_URL")
+	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_SOLO_COIN", "tari"), "which coin/PoW family this leaf-solo process serves: tari (default, unchanged behavior) or a coin ticker from internal/coinprofile.Registry (xmr, arq, xeq, grft, sfx, zeph, sal -- case-insensitive). \"monero\" is a backward-compatible alias for \"xmr\" in its exact existing merge-mine (ALGO_RXM) behavior; see -standalone to run non-merge-mined XMR instead. An unregistered ticker fails fast at startup. Env: LEAF_SOLO_COIN")
+	flag.BoolVar(&cfg.standalone, "standalone", envOr("LEAF_SOLO_STANDALONE", "false") == "true", "only meaningful for -coin=xmr/monero: when true, runs standalone (non-merge-mined) XMR (poolpb.Algo_ALGO_XMR) against -monerod-url instead of the default Tari-merge-mined ALGO_RXM behavior. No effect for -coin=tari or any other registered coin ticker (already always standalone). Env: LEAF_SOLO_STANDALONE (\"true\" to enable)")
+	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_SOLO_MONEROD_URL", ""), "real monerod-JSON-RPC-compatible base URL (e.g. http://148.163.90.157:28081), no trailing slash or /json_rpc suffix required. REQUIRED when -coin resolves to any monerod-family coin; ignored for -coin=tari. For -coin=monero (or -coin=xmr without -standalone), point this at your local minotari_merge_mining_proxy listener, NOT raw monerod -- pointing at raw monerod will mine Monero-only with no Tari merge-mine revenue. Env: LEAF_SOLO_MONEROD_URL")
 	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_SOLO_RANDOMX_WORKERS", 0), "RandomX-family (RXT/RXM) async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_SOLO_RANDOMX_WORKERS")
 	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a session after too many CONSECUTIVE real RandomX-family (RXT/RXM) block-find-level validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
 	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD")
@@ -351,6 +379,7 @@ type fileConfig struct {
 	PayoutAddress   *string `toml:"payout_address"`
 	Network         *string `toml:"network"`
 	Coin            *string `toml:"coin"`
+	Standalone      *bool   `toml:"standalone"`
 	MonerodURL      *string `toml:"monerod_url"`
 
 	RandomXWorkers                  *int  `toml:"randomx_workers"`
@@ -420,6 +449,7 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.payoutAddress, fc.PayoutAddress, visited, "payout-address", "LEAF_SOLO_PAYOUT_ADDRESS")
 	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "LEAF_SOLO_NETWORK")
 	cfgfile.ApplyString(&cfg.coin, fc.Coin, visited, "coin", "LEAF_SOLO_COIN")
+	cfgfile.ApplyBool(&cfg.standalone, fc.Standalone, visited, "standalone", "LEAF_SOLO_STANDALONE")
 	cfgfile.ApplyString(&cfg.monerodURL, fc.MonerodURL, visited, "monerod-url", "LEAF_SOLO_MONEROD_URL")
 
 	cfgfile.ApplyInt(&cfg.randomxWorkers, fc.RandomXWorkers, visited, "randomx-workers", "LEAF_SOLO_RANDOMX_WORKERS")
@@ -678,27 +708,95 @@ func algoFromString(s string) poolpb.Algo {
 	}
 }
 
-// isMoneroCoin reports whether cfg.coin/-coin selects the real Monero
-// path (case-insensitive, tolerant of surrounding whitespace) -- the
-// single normalization point every coin-conditional branch in main
-// below consults, so "Monero"/"MONERO"/" monero " all behave
-// identically.
-func isMoneroCoin(coin string) bool {
-	return strings.EqualFold(strings.TrimSpace(coin), "monero")
+// normalizeCoinTicker is the single normalization point every
+// coin-conditional branch in this file consults: lowercases/trims
+// -coin/LEAF_SOLO_COIN, then applies the ONE backward-compatible
+// alias this codebase has ever had -- "monero" means "xmr" -- so
+// "Monero"/"MONERO"/" monero "/"xmr"/"XMR" all resolve identically.
+// Does NOT validate that the result is actually a registered ticker
+// (or "tari") -- see resolveCoinProfile/validateCoinFlag for that.
+func normalizeCoinTicker(coin string) string {
+	t := coinprofile.NormalizeTicker(coin)
+	if t == "monero" {
+		return "xmr"
+	}
+	return t
 }
 
-// resolveAlgo is what main actually calls to get the real
-// poolpb.Algo this leaf-solo process serves: for -coin=monero, this is
-// ALWAYS poolpb.Algo_ALGO_RXM (Monero genuinely has only one algo --
-// plain RandomX/rx -- so there is no meaningful per-process -algo
-// choice to make for it, unlike Tari's SHA3X/C29/RXT), regardless of
-// whatever -algo/LEAF_SOLO_ALGO happens to be set to; for -coin=tari
-// (the default), this is algoFromString(cfg.algo) exactly as before
-// Monero support existed.
+// validateCoinFlag fails fast (a real, greppable error) on an
+// unrecognized -coin/LEAF_SOLO_COIN ticker -- called once, early in
+// main(), before anything else consults cfg.coin. "tari" (and the
+// empty string, matching the flag's own default) is always accepted;
+// every other value must resolve against
+// internal/coinprofile.Registry (after the "monero"->"xmr" alias
+// normalization) or this returns a non-nil error. Extracted into its
+// own pure function (rather than inlined in main()) so it is directly
+// unit-testable without spawning a subprocess to observe a
+// logger.Fatalf call.
+func validateCoinFlag(coin string) error {
+	ticker := normalizeCoinTicker(coin)
+	if ticker == "" || ticker == "tari" {
+		return nil
+	}
+	if _, ok := coinprofile.Lookup(ticker); !ok {
+		return fmt.Errorf("unknown/unregistered -coin/LEAF_SOLO_COIN value %q -- see internal/coinprofile.Registry for supported tickers (or use \"tari\")", coin)
+	}
+	return nil
+}
+
+// monerod-JSON-RPC-compatible daemon connection (a real
+// solo.MoneroNodeClient) rather than the Tari GRPC path --
+// generalizes the old isMoneroCoin (which only ever recognized the
+// literal string "monero") to every ticker registered in
+// internal/coinprofile.Registry, since every one of them is served by
+// the exact same coin-agnostic MoneroNodeClient wire implementation
+// (see that package's own doc comment: "This really should be mostly
+// configuration data, not a new daemon").
+func isMoneroFamilyCoin(coin string) bool {
+	ticker := normalizeCoinTicker(coin)
+	if ticker == "" || ticker == "tari" {
+		return false
+	}
+	_, ok := coinprofile.Lookup(ticker)
+	return ok
+}
+
+// resolveAlgo is what main actually calls to get the real poolpb.Algo
+// this leaf-solo process serves:
+//
+//   - -coin=tari (the default, empty, or unrecognized -- see
+//     validateCoinFlag for why "unrecognized" cannot actually reach
+//     here in real operation): algoFromString(cfg.algo), exactly as
+//     before any Monero/multi-coin support existed.
+//   - -coin=monero, or -coin=xmr WITHOUT -standalone: ALWAYS
+//     poolpb.Algo_ALGO_RXM -- Monero's pre-existing, EXACTLY-unchanged
+//     Tari-merge-mine behavior, regardless of -algo.
+//   - -coin=xmr WITH -standalone, or any OTHER registered
+//     internal/coinprofile.Registry ticker (arq/xeq/grft/sfx/zeph/sal,
+//     which have no merge-mine concept at all and are therefore
+//     always standalone): that coin's own dedicated CoinProfile.Algo
+//     value (e.g. poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, ...) --
+//     the genuinely NEW capability this dispatch adds. Reuses this
+//     function's own pre-existing conditional structure; the new
+//     standalone-coin branch is added explicitly below rather than
+//     silently folded into the ALGO_RXM case above.
 func resolveAlgo(cfg config) poolpb.Algo {
-	if isMoneroCoin(cfg.coin) {
+	ticker := normalizeCoinTicker(cfg.coin)
+	if ticker == "" || ticker == "tari" {
+		return algoFromString(cfg.algo)
+	}
+	if ticker == "xmr" && !cfg.standalone {
 		return poolpb.Algo_ALGO_RXM
 	}
+	if profile, ok := coinprofile.Lookup(ticker); ok {
+		return profile.Algo
+	}
+	// Unregistered ticker: validateCoinFlag already made main() fatal
+	// before this point is ever reached in real operation. This
+	// defensive fallback only matters for direct unit-test callers
+	// that construct a config{} literal bypassing loadConfig/main's
+	// validation -- mirrors algoFromString's own "unrecognized value"
+	// default rather than returning ALGO_UNSPECIFIED.
 	return algoFromString(cfg.algo)
 }
 
@@ -706,11 +804,14 @@ func resolveAlgo(cfg config) poolpb.Algo {
 // suffix from resolveAlgo's real, already-normalized poolpb.Algo for
 // this process (reusing that exact resolution logic rather than a
 // second, separate/hardcoded mapping) -- "rxm" is handled specially
-// since resolveAlgo maps EVERY -coin=monero configuration to
-// ALGO_RXM regardless of -algo, and that mapping is exactly what
-// distinguishes it from Tari's own native RXT.
+// since resolveAlgo maps -coin=monero (and -coin=xmr without
+// -standalone) to ALGO_RXM regardless of -algo; every OTHER
+// registered coin ticker's suffix is that coin's own lowercase
+// ticker, read back out of internal/coinprofile.Registry via ByAlgo
+// rather than a second hardcoded switch arm per coin.
 func algoTagSuffix(cfg config) string {
-	switch resolveAlgo(cfg) {
+	algo := resolveAlgo(cfg)
+	switch algo {
 	case poolpb.Algo_ALGO_C29:
 		return "c29"
 	case poolpb.Algo_ALGO_RXT:
@@ -718,6 +819,9 @@ func algoTagSuffix(cfg config) string {
 	case poolpb.Algo_ALGO_RXM:
 		return "rxm"
 	default:
+		if profile, ok := coinprofile.ByAlgo(algo); ok {
+			return coinprofile.NormalizeTicker(profile.Ticker)
+		}
 		return "sha3x"
 	}
 }
@@ -767,12 +871,23 @@ func main() {
 		logger.Print("debug logging ENABLED (-debug/LEAF_SOLO_DEBUG) -- verbose [DEBUG]-tagged output follows for share submits, validation, job lifecycle, connection lifecycle, and vardiff retargets")
 	}
 
-	if isMoneroCoin(cfg.coin) {
+	// Fail fast on an unrecognized -coin/LEAF_SOLO_COIN ticker --
+	// never silently fall through to Tari or Monero defaults. See
+	// validateCoinFlag's own doc comment.
+	if err := validateCoinFlag(cfg.coin); err != nil {
+		logger.Fatalf("%v", err)
+	}
+	coinTicker := normalizeCoinTicker(cfg.coin)
+	if cfg.standalone && coinTicker != "xmr" {
+		logger.Printf("note: -standalone/LEAF_SOLO_STANDALONE is set but -coin=%s has no merge-mine concept to disambiguate from -- it is already always standalone, this flag has no effect for it", cfg.coin)
+	}
+
+	if isMoneroFamilyCoin(cfg.coin) {
 		if strings.TrimSpace(cfg.monerodURL) == "" {
-			logger.Fatal("LEAF_SOLO_MONEROD_URL (or -monerod-url) is required when -coin=monero")
+			logger.Fatalf("LEAF_SOLO_MONEROD_URL (or -monerod-url) is required when -coin=%s", cfg.coin)
 		}
 		if cfg.nodeGRPCAddress != "" {
-			logger.Printf("note: -coin=monero -- ignoring -node-grpc-address/LEAF_NODE_GRPC_ADDRESS (%s); no Tari GRPC daemon is involved", cfg.nodeGRPCAddress)
+			logger.Printf("note: -coin=%s -- ignoring -node-grpc-address/LEAF_NODE_GRPC_ADDRESS (%s); no Tari GRPC daemon is involved", cfg.coin, cfg.nodeGRPCAddress)
 		}
 	} else if cfg.nodeGRPCAddress == "" {
 		logger.Fatal("LEAF_NODE_GRPC_ADDRESS (or -node-grpc-address) is required")
@@ -812,9 +927,11 @@ func main() {
 	// (JobManager, Server, session.go's handleSubmit) is unaffected by
 	// which one gets constructed here.
 	var node solo.NodeClient
-	if isMoneroCoin(cfg.coin) {
-		logger.Printf("connecting to Monero daemon (monerod JSON-RPC) at %s", cfg.monerodURL)
-		logger.Printf("NOTE: for RXM/merge-mining revenue, -monerod-url must point at a local minotari_merge_mining_proxy listener, NOT raw monerod -- pointing at raw monerod mines Monero-only with zero Tari merge-mine revenue")
+	if isMoneroFamilyCoin(cfg.coin) {
+		if coinTicker == "xmr" && !cfg.standalone {
+			logger.Printf("NOTE: for RXM/merge-mining revenue, -monerod-url must point at a local minotari_merge_mining_proxy listener, NOT raw monerod -- pointing at raw monerod mines Monero-only with zero Tari merge-mine revenue")
+		}
+		logger.Printf("connecting to monerod-compatible daemon (-coin=%s) at %s", cfg.coin, cfg.monerodURL)
 		node = solo.NewMoneroNodeClient(cfg.monerodURL)
 	} else {
 		logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
@@ -873,17 +990,18 @@ func main() {
 	jobManager.Start(ctx)
 
 	// Real, ADDITIONAL fast-invalidation trigger for the real monerod
-	// ZMQ pub/sub stream -- -coin=monero ONLY, and only when
-	// -monero-zmq-url is explicitly set (a complete no-op otherwise --
-	// see internal/leaflib/monero/zmq's own doc comment). This never
-	// REPLACES jobManager's own tip-poll loop (already started above),
-	// it is purely an additional, faster trigger running alongside it.
-	if isMoneroCoin(cfg.coin) && cfg.moneroZMQURL != "" {
+	// ZMQ pub/sub stream -- any monerod-family -coin ONLY, and only
+	// when -monero-zmq-url is explicitly set (a complete no-op
+	// otherwise -- see internal/leaflib/monero/zmq's own doc comment).
+	// This never REPLACES jobManager's own tip-poll loop (already
+	// started above), it is purely an additional, faster trigger
+	// running alongside it.
+	if isMoneroFamilyCoin(cfg.coin) && cfg.moneroZMQURL != "" {
 		zmqClient := monerozmq.NewClient(cfg.moneroZMQURL, jobManager.InvalidateAll, logger)
 		go zmqClient.Start(ctx)
 		logger.Printf("real monerod ZMQ fast-invalidation trigger enabled at %s (topic %q)", cfg.moneroZMQURL, monerozmq.TopicNewBlock)
 	} else if cfg.moneroZMQURL != "" {
-		logger.Printf("note: -monero-zmq-url is set but -coin != monero -- ignoring it (%s); no ZMQ subscription started", cfg.moneroZMQURL)
+		logger.Printf("note: -monero-zmq-url is set but -coin=%s is not a monerod-family coin -- ignoring it (%s); no ZMQ subscription started", cfg.coin, cfg.moneroZMQURL)
 	}
 
 	cm := leaflib.NewConnectionManager(ctx, leaflib.ManagerConfig{

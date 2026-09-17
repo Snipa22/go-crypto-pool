@@ -337,14 +337,22 @@ func (t *MinerTrust) Snapshot() TrustSnapshot {
 	return TrustSnapshot{Threshold: t.threshold, Probability: t.probability, Penalty: t.penalty}
 }
 
-// IsRandomXFamily reports whether algo is one of the two algos this
-// trust mechanism applies to (RXT/RXM — the two RandomX-family algos
-// where full validation is a real, service-backed RandomX hash that
-// is genuinely expensive/latency-sensitive to skip probabilistically;
+// IsRandomXFamily reports whether algo is genuinely RandomX-family:
+// RXT/RXM (the two original algos this trust mechanism applies to --
+// full validation is a real, service-backed RandomX hash that is
+// genuinely expensive/latency-sensitive to skip probabilistically;
 // SHA3X/C29 validation is cheap local computation with no analogous
 // legacy trust mechanism in the reference, and are deliberately left
-// untouched). Exported so internal/leaflib/direct's own handleSubmit
-// can gate the identical real check without duplicating this list.
+// untouched) PLUS every confirmed standalone monerod-family coin
+// algo added via internal/coinprofile.Registry (ALGO_XMR and below)
+// -- they are all genuine, unmodified RandomX PoW too, and this same
+// function also gates solo/session.go's async-RandomX-validation-
+// worker-pool dispatch (asyncvalidation.go) and
+// ClaimedRandomXFamilyDifficulty's own block-level-target check, NOT
+// just the trust mechanism -- missing a new coin here would silently
+// skip that whole dispatch path for it, not just the (opt-in) trust
+// skip. Exported so internal/leaflib/direct's own handleSubmit can
+// gate the identical real check without duplicating this list.
 func IsRandomXFamily(algo poolpb.Algo) bool {
-	return algo == poolpb.Algo_ALGO_RXT || algo == poolpb.Algo_ALGO_RXM
+	return algo == poolpb.Algo_ALGO_RXT || IsMoneroFamilyAlgo(algo)
 }

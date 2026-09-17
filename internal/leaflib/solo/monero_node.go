@@ -252,12 +252,16 @@ type moneroGetInfoResult struct {
 }
 
 // GetBlockTemplate implements NodeClient. algo is expected to be
-// poolpb.Algo_ALGO_RXM (Monero's own RandomX PoW family) — any other
-// value is rejected, since this NodeClient only ever produces Monero
-// block templates.
+// poolpb.Algo_ALGO_RXM (Monero's own RandomX PoW family, merge-mined)
+// OR any of the standalone monerod-family algos this MoneroNodeClient
+// now also serves (ALGO_XMR and the other confirmed
+// internal/coinprofile.Registry entries -- see IsMoneroFamilyAlgo) —
+// any other value is rejected, since this NodeClient only ever
+// produces monerod-shaped (get_block_template/submit_block) block
+// templates.
 func (c *MoneroNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress string, algo poolpb.Algo) (*Job, error) {
-	if algo != poolpb.Algo_ALGO_RXM {
-		return nil, fmt.Errorf("solo: MoneroNodeClient does not support fetching block templates for algo %v (only ALGO_RXM is supported)", algo)
+	if !IsMoneroFamilyAlgo(algo) {
+		return nil, fmt.Errorf("solo: MoneroNodeClient does not support fetching block templates for algo %v (only ALGO_RXM or a registered monerod-compatible coin algo is supported)", algo)
 	}
 	if payoutAddress == "" {
 		return nil, fmt.Errorf("solo: monero: GetBlockTemplate requires a non-empty payoutAddress")

@@ -841,7 +841,7 @@ func TestValidateDonationConfig(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateDonationConfig(tc.cfg)
+			err := validateDonationConfig(tc.cfg, nil, nil)
 			if tc.wantErr && err == nil {
 				t.Fatalf("validateDonationConfig(%+v) = nil, want error", tc.cfg)
 			}
@@ -849,5 +849,88 @@ func TestValidateDonationConfig(t *testing.T) {
 				t.Fatalf("validateDonationConfig(%+v) = %v, want nil", tc.cfg, err)
 			}
 		})
+	}
+}
+
+// realARQAddressForBackendTest is a real, primary-source-cited ArQmA
+// address (see internal/coinprofile/address_test.go for the exact
+// provenance) -- used so parseExtraCoinAddresses's real
+// coinprofile.ValidateAddress call has a genuinely valid address to
+// accept in these tests.
+const realARQAddressForBackendTest = "ar2dJ21SCuNiJndoQBf5ojhbdA7K8B3sREpnWSg4pHedXcwMbvUkYREAapZJMn3cVRj6VqDqDkj9bFoXLJViCmFs2qWkdufHt"
+
+// TestParseExtraCoinAddresses covers the real TICKER=address parsing
+// this dispatch adds for per-new-coin fee/donation addresses:
+// case-insensitive ticker lookup, real address validation against
+// that coin's own CoinProfile, multiple comma-separated entries, and
+// fail-fast behavior on a malformed entry / unregistered ticker /
+// invalid address.
+func TestParseExtraCoinAddresses(t *testing.T) {
+	t.Run("empty raw returns nil map, no error", func(t *testing.T) {
+		m, err := parseExtraCoinAddresses("", "-test-flag")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if m != nil {
+			t.Fatalf("expected nil map, got %v", m)
+		}
+	})
+
+	t.Run("single valid entry", func(t *testing.T) {
+		m, err := parseExtraCoinAddresses("arq="+realARQAddressForBackendTest, "-test-flag")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if m["ARQ"] != realARQAddressForBackendTest {
+			t.Fatalf("m[ARQ] = %q, want %q", m["ARQ"], realARQAddressForBackendTest)
+		}
+	})
+
+	t.Run("malformed entry (no '=') is refused", func(t *testing.T) {
+		if _, err := parseExtraCoinAddresses("ARQ-no-equals-sign", "-test-flag"); err == nil {
+			t.Fatal("expected an error for a malformed entry, got nil")
+		}
+	})
+
+	t.Run("unregistered ticker is refused", func(t *testing.T) {
+		if _, err := parseExtraCoinAddresses("NOTACOIN="+realARQAddressForBackendTest, "-test-flag"); err == nil {
+			t.Fatal("expected an error for an unregistered ticker, got nil")
+		}
+	})
+
+	t.Run("invalid address for the given coin is refused", func(t *testing.T) {
+		// A real ARQ address is NOT a valid XEQ address (different
+		// network bytes) -- this must fail real ValidateAddress, not
+		// just a length/format heuristic.
+		if _, err := parseExtraCoinAddresses("XEQ="+realARQAddressForBackendTest, "-test-flag"); err == nil {
+			t.Fatal("expected an error for a cross-coin invalid address, got nil")
+		}
+	})
+
+	t.Run("empty ticker or address in an entry is refused", func(t *testing.T) {
+		if _, err := parseExtraCoinAddresses("=someaddress", "-test-flag"); err == nil {
+			t.Fatal("expected an error for an empty ticker, got nil")
+		}
+		if _, err := parseExtraCoinAddresses("ARQ=", "-test-flag"); err == nil {
+			t.Fatal("expected an error for an empty address, got nil")
+		}
+	})
+}
+
+// TestValidateDonationConfig_ExtraCoins covers the new per-extra-coin
+// donation-address-required check: a coin configured in extraFee with
+// no matching extraDonation entry is refused when the donation
+// percent is > 0, mirroring the pre-existing Tari/Monero check.
+func TestValidateDonationConfig_ExtraCoins(t *testing.T) {
+	cfg := config{payoutDonationPercent: 10}
+
+	extraFee := map[string]string{"ARQ": "arq-fee-addr"}
+	if err := validateDonationConfig(cfg, extraFee, nil); err == nil {
+		t.Fatal("validateDonationConfig: expected an error for ARQ fee address with no donation address, got nil")
+	}
+
+	extraDonation := map[string]string{"ARQ": "arq-donation-addr"}
+	if err := validateDonationConfig(cfg, extraFee, extraDonation); err != nil {
+		t.Fatalf("validateDonationConfig: unexpected error once ARQ donation address is set: %v", err)
 	}
 }

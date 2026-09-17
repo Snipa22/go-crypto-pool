@@ -49,6 +49,19 @@
 // process using goroutines + internal/leaflib's ConnectionManager,
 // which comfortably out-scales the legacy's per-worker sharding model
 // without needing to replicate it.
+//
+// COIN SCOPE (internal/coinprofile.Registry): this binary has no
+// -coin/-algo flag at all -- it is a wire-protocol-level, coin-generic
+// proxy: it emulates the upstream's own claimed protocol dialect
+// (-upstream-agent) and forwards whatever monerod-shaped
+// get_block_template/submit_block-derived blob traffic the upstream
+// hands it, without itself needing to know WHICH monerod-family coin
+// (Monero itself, or any other coin in internal/coinprofile.Registry)
+// that upstream pool actually mines. Generalizing leaf-solo/
+// leaf-direct's -coin flag therefore had no equivalent flag to change
+// here; this doc comment note plus the example TOML's own comment are
+// this dispatch's documentation of that fact, per the brief's ask to
+// "generalize -coin on leaf-solo, leaf-direct, leaf-proxy."
 package main
 
 import (

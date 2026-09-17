@@ -9,7 +9,7 @@
 
 # Tari base node GRPC address (host:port); also the primary template-source
 # AND is always included in the multi-node submit set. REQUIRED when
-# -coin=tari (the default); ignored for -coin=monero. (default: "")
+# -coin=tari (the default); ignored for any monerod-family coin. (default: "")
 node_grpc_address = ""
 
 # Miner-facing TCP listen address. (default: ":4444")
@@ -21,21 +21,36 @@ payout_address = ""
 # Network tag for share/block records: mainnet|testnet. (default: "testnet")
 network = "testnet"
 
-# Which coin/PoW family this leaf-direct process serves: tari (default,
-# unchanged behavior) or monero (real MoneroNodeClient against a real monerod
-# JSON-RPC daemon -- see monerod_url). (default: "tari")
+# Which coin/PoW family this leaf-direct process serves: "tari" (default,
+# unchanged behavior) or a coin ticker from internal/coinprofile.Registry --
+# see that package for the current, authoritative list of supported tickers
+# (as of this writing: xmr, arq, xeq, grft, sfx, zeph, sal; case-insensitive).
+# "monero" remains a backward-compatible alias for "xmr" in its EXACT
+# existing merge-mine (ALGO_RXM) behavior -- see `standalone` below to run
+# non-merge-mined XMR instead. An unregistered ticker fails fast at startup.
+# (default: "tari")
 coin = "tari"
 
-# Real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081). REQUIRED
-# when -coin=monero; ignored for -coin=tari. (default: "")
+# Only meaningful for coin="xmr" (or its "monero" alias): when true, runs
+# standalone (non-merge-mined) XMR against monerod_url, tracked under its own
+# new ALGO_XMR value, instead of the default Tari-merge-mined ALGO_RXM
+# behavior. Has no effect for coin="tari" or any OTHER registered coin ticker
+# (already always standalone). (default: false)
+standalone = false
+
+# Real monerod-JSON-RPC-compatible base URL (e.g. http://148.163.90.157:28081).
+# REQUIRED when `coin` resolves to any monerod-family coin; ignored for
+# coin="tari". (default: "")
 monerod_url = ""
 
 # Comma-separated NAME:auxid pairs naming every merge-mined chain this leaf should ALSO
 # check the same PoW submission against, on top of the primary chain -- only meaningful
-# for coin=monero, ignored for coin=tari. auxid is the aux-chain identifier a merge-mining
-# proxy's own submit_block response tags that chain's aux_chain_data entry with (Tari's own
-# real minotari_merge_mining_proxy convention, confirmed live, is "xtr"). Empty (default)
-# disables merge-mine-chain checking entirely. Example: 'TARI:xtr'. (default: "")
+# for coin="monero"/"xmr" (RXM merge-mining), ignored for coin="tari" or any OTHER
+# monerod-family coin (no merge-mine concept). auxid is the aux-chain identifier a
+# merge-mining proxy's own submit_block response tags that chain's aux_chain_data entry
+# with (Tari's own real minotari_merge_mining_proxy convention, confirmed live, is "xtr").
+# Empty (default) disables merge-mine-chain checking entirely. Example: 'TARI:xtr'.
+# (default: "")
 merge_mine_chains = ""
 
 # Enable the real, legacy-ported probabilistic RandomX-validation-skip
@@ -83,8 +98,9 @@ invalid_share_disconnect_enabled = true
 invalid_share_disconnect_threshold = 0
 
 # Which single mining algorithm this leaf-direct process serves: sha3x
-# (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/
-# plain RandomX) when -coin=monero. (default: "sha3x")
+# (default), c29, or rxt -- for coin="tari" only. Ignored (always resolves
+# to that coin's own dedicated algo instead) for any monerod-family coin.
+# (default: "sha3x")
 algo = "sha3x"
 
 # Real pool payout model stamped onto every share/block forwarded to the
@@ -104,8 +120,10 @@ randomx_service_url = "http://127.0.0.1:39093"
 # Coinbase-extra ownership tag appended to every fetched Tari block template
 # (identifies this leaf's found blocks on-chain). Left unset (the default), a
 # per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 /
-# supportxtm-rxt / supportxtm-rxm, based on algo/coin. When set, this value is
-# used verbatim, overriding the per-algo default. (default: "")
+# supportxtm-rxt / supportxtm-rxm / supportxtm-<ticker> (e.g. supportxtm-arq),
+# based on algo/coin -- see internal/coinprofile.Registry for the per-coin
+# default. When set, this value is used verbatim, overriding the per-algo
+# default. (default: "")
 coinbase_extra_tag = ""
 
 # Starting share difficulty for a newly-connected session. (default: 10000)

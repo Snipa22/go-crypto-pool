@@ -59,7 +59,23 @@ enum Algo {
   ALGO_RXT = 1;   // RandomX-Tari
   ALGO_C29 = 2;   // Cuckaroo/Cuckatoo29
   ALGO_SHA3X = 3; // SHA3-256 (Tari merge-mining / SHA3X)
-  ALGO_RXM = 4;   // RandomX-Monero-family
+  ALGO_RXM = 4;   // RandomX-Monero-family (Tari-merge-mined Monero via mmproxy -- unchanged, do not repurpose)
+
+  // ALGO_XMR and below (5+) are standalone (non-merge-mined)
+  // RandomX/Monero-codebase-family coins, each pointed directly at that
+  // coin's own real monerod-compatible daemon rather than a merge-mining
+  // proxy. See internal/coinprofile.Registry for the CoinProfile entry
+  // (ticker, decimals, address network bytes, default RPC port) backing
+  // each one, and the PR description for the primary-source citation
+  // proving each coin is a genuine monerod-JSON-RPC-compatible fork
+  // (get_block_template/submit_block shape) -- NOT merely "uses RandomX".
+  ALGO_XMR = 5;  // Monero, standalone. https://github.com/monero-project/monero
+  ALGO_ARQ = 6;  // ArQmA. https://github.com/arqma/arqma
+  ALGO_XEQ = 7;  // Equilibria. https://github.com/EquilibriaCC/Equilibria
+  ALGO_GRFT = 8; // Graft Network. https://github.com/graft-project/GraftNetwork
+  ALGO_SFX = 9;  // Safex Cash. https://github.com/safex/safexcore
+  ALGO_ZEPH = 10; // Zephyr Protocol. https://github.com/ZephyrProtocol/zephyr
+  ALGO_SAL = 11;  // Salvium. https://github.com/salvium/salvium
 }
 
 // Network distinguishes mainnet from testnet deployments. Required on

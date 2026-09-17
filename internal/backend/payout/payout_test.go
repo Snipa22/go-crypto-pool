@@ -639,6 +639,49 @@ func TestCalculatePPLNS_ZeroShareMultiIsRejected(t *testing.T) {
 	}
 }
 
+// TestAddressesForAlgo_ExtraCoinAddressesResolve confirms the new
+// standalone monerod-family coin algos (ALGO_XMR and below) resolve
+// via cfg.ExtraFeeAddresses/ExtraDonationAddresses -- each one is its
+// own independent coin family, distinct from RXM's Monero address.
+func TestAddressesForAlgo_ExtraCoinAddressesResolve(t *testing.T) {
+	cfg := testConfig()
+	cfg.ExtraFeeAddresses = map[string]string{"ARQ": "arq-fee-addr", "XEQ": "xeq-fee-addr"}
+	cfg.ExtraDonationAddresses = map[string]string{"ARQ": "arq-donation-addr", "XEQ": "xeq-donation-addr"}
+
+	fee, donation, err := addressesForAlgo(cfg, "ARQ")
+	if err != nil {
+		t.Fatalf("addressesForAlgo(ARQ): unexpected error: %v", err)
+	}
+	if fee != "arq-fee-addr" || donation != "arq-donation-addr" {
+		t.Errorf("addressesForAlgo(ARQ) = (%q, %q), want (arq-fee-addr, arq-donation-addr)", fee, donation)
+	}
+
+	fee, donation, err = addressesForAlgo(cfg, "XEQ")
+	if err != nil {
+		t.Fatalf("addressesForAlgo(XEQ): unexpected error: %v", err)
+	}
+	if fee != "xeq-fee-addr" || donation != "xeq-donation-addr" {
+		t.Errorf("addressesForAlgo(XEQ) = (%q, %q), want (xeq-fee-addr, xeq-donation-addr)", fee, donation)
+	}
+
+	// A registered-coin algo with NO entry in either map is still
+	// refused -- ExtraFeeAddresses/ExtraDonationAddresses must be
+	// explicitly configured per coin, never silently defaulted.
+	if _, _, err := addressesForAlgo(cfg, "GRFT"); err == nil {
+		t.Fatal("addressesForAlgo(GRFT): expected an error (no ExtraFeeAddresses/ExtraDonationAddresses entry), got nil")
+	}
+
+	// RXM's own Monero address must NOT leak into any of the new
+	// coins, and vice versa.
+	rxmFee, _, err := addressesForAlgo(cfg, "RXM")
+	if err != nil {
+		t.Fatalf("addressesForAlgo(RXM): unexpected error: %v", err)
+	}
+	if rxmFee == "arq-fee-addr" || rxmFee == "xeq-fee-addr" {
+		t.Error("addressesForAlgo(RXM) leaked a new coin's fee address")
+	}
+}
+
 // TestAddressesForAlgo_UnknownAlgoIsAnError confirms an unmapped algo
 // string fails loudly rather than silently defaulting to either coin
 // family's addresses -- the whole point of addressesForAlgo existing
@@ -649,8 +692,22 @@ func TestAddressesForAlgo_UnknownAlgoIsAnError(t *testing.T) {
 		t.Fatal("addressesForAlgo: expected an error for an unmapped algo, got nil")
 	}
 	// Every real algo literal used elsewhere in this codebase
-	// (internal/backend/db.ValidAlgos) must resolve cleanly.
-	for _, algo := range []string{"RXT", "C29", "SHA3X", "RXM"} {
+	// (internal/backend/db.ValidAlgos) must resolve cleanly -- for
+	// RXT/C29/SHA3X/RXM via the Tari/Monero switch cases, and for
+	// every other registered coin via cfg.ExtraFeeAddresses (set
+	// below so this loop can cover them too).
+	cfg.ExtraFeeAddresses = map[string]string{
+		"XMR": "xmr-fee", "ARQ": "arq-fee", "XEQ": "xeq-fee",
+		"GRFT": "grft-fee", "SFX": "sfx-fee", "ZEPH": "zeph-fee", "SAL": "sal-fee",
+	}
+	cfg.ExtraDonationAddresses = map[string]string{
+		"XMR": "xmr-don", "ARQ": "arq-don", "XEQ": "xeq-don",
+		"GRFT": "grft-don", "SFX": "sfx-don", "ZEPH": "zeph-don", "SAL": "sal-don",
+	}
+	for _, algo := range []string{
+		"RXT", "C29", "SHA3X", "RXM",
+		"XMR", "ARQ", "XEQ", "GRFT", "SFX", "ZEPH", "SAL",
+	} {
 		if _, _, err := addressesForAlgo(cfg, algo); err != nil {
 			t.Fatalf("addressesForAlgo(%q): unexpected error: %v", algo, err)
 		}

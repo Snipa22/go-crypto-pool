@@ -17,6 +17,9 @@ func TestNewValidator(t *testing.T) {
 		{name: "SHA3X", algo: poolpb.Algo_ALGO_SHA3X, wantErr: false},
 		{name: "RXT", algo: poolpb.Algo_ALGO_RXT, wantErr: false},
 		{name: "RXM", algo: poolpb.Algo_ALGO_RXM, wantErr: false},
+		{name: "XMR (standalone, new)", algo: poolpb.Algo_ALGO_XMR, wantErr: false},
+		{name: "ARQ (new)", algo: poolpb.Algo_ALGO_ARQ, wantErr: false},
+		{name: "SAL (new)", algo: poolpb.Algo_ALGO_SAL, wantErr: false},
 		{name: "unspecified", algo: poolpb.Algo_ALGO_UNSPECIFIED, wantErr: true},
 		{name: "invalid/out-of-range", algo: poolpb.Algo(999), wantErr: true},
 	}
@@ -84,6 +87,13 @@ func TestRegistry(t *testing.T) {
 		poolpb.Algo_ALGO_SHA3X,
 		poolpb.Algo_ALGO_RXT,
 		poolpb.Algo_ALGO_RXM,
+		poolpb.Algo_ALGO_XMR,
+		poolpb.Algo_ALGO_ARQ,
+		poolpb.Algo_ALGO_XEQ,
+		poolpb.Algo_ALGO_GRFT,
+		poolpb.Algo_ALGO_SFX,
+		poolpb.Algo_ALGO_ZEPH,
+		poolpb.Algo_ALGO_SAL,
 	}
 	for _, algo := range wantAlgos {
 		v, err := reg.Get(algo)
@@ -118,6 +128,25 @@ func TestRegistry(t *testing.T) {
 		_, err := reg.Get(poolpb.Algo_ALGO_UNSPECIFIED)
 		if err == nil {
 			t.Errorf("expected an error for ALGO_UNSPECIFIED")
+		}
+	})
+
+	t.Run("every new coin algo shares the same RandomXValidator instance as RXT/RXM", func(t *testing.T) {
+		rxt, err := reg.Get(poolpb.Algo_ALGO_RXT)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, algo := range []poolpb.Algo{
+			poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, poolpb.Algo_ALGO_XEQ,
+			poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL,
+		} {
+			v, err := reg.Get(algo)
+			if err != nil {
+				t.Fatalf("Get(%v): unexpected error: %v", algo, err)
+			}
+			if v != rxt {
+				t.Errorf("Get(%v) did not resolve to the same *RandomXValidator instance as RXT", algo)
+			}
 		}
 	})
 }

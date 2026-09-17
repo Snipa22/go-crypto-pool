@@ -8,6 +8,7 @@ import (
 	tariaddress "github.com/Snipa22/go-tari-lib/address"
 	xmraddress "github.com/Snipa22/go-xmr-lib/support"
 
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -47,7 +48,18 @@ const maxLoginAddressLen = 512
 //     byte is one of Monero's real mainnet/testnet address tag bytes.
 //     Both mainnet and testnet are accepted (mirroring
 //     addressmap.validateXMRAddress) since this leaf is not itself
-//     scoped to a single network by this check.
+//     scoped to a single network by this check. UNCHANGED by the
+//     CoinProfile generalization below -- this exact code path stays
+//     exactly as it always has.
+//   - Any other registered internal/coinprofile.Registry algo (e.g.
+//     poolpb.Algo_ALGO_XMR for standalone Monero, or
+//     poolpb.Algo_ALGO_ARQ/_XEQ/_GRFT/_SFX/_ZEPH/_SAL) pays out to
+//     that coin's own wallet address, validated via
+//     coinprofile.ValidateAddress against that coin's own
+//     CoinProfile.AddressNetworkBytes -- the generalized,
+//     coin-agnostic replacement for the old hardcoded-Monero-only
+//     byte list, reading the CURRENT leaf's configured coin's own
+//     real per-coin byte table (see coinprofile.ByAlgo) instead.
 //   - poolpb.Algo_ALGO_UNSPECIFIED is treated as SHA3X (Tari), the
 //     same backward-compatibility normalization JobManagerConfig.Algo
 //     already applies (see job.go) — callers here always pass a
@@ -67,8 +79,27 @@ func ValidateAddressForAlgo(algo poolpb.Algo, address string) error {
 	case poolpb.Algo_ALGO_SHA3X, poolpb.Algo_ALGO_C29, poolpb.Algo_ALGO_RXT, poolpb.Algo_ALGO_UNSPECIFIED:
 		return validateTariLoginAddress(address)
 	default:
+		if profile, ok := coinprofile.ByAlgo(algo); ok {
+			return coinprofile.ValidateAddress(profile, address)
+		}
 		return errors.New("invalid address provided: no address validator configured for this leaf's algo")
 	}
+}
+
+// IsMoneroFamilyAlgo reports whether algo is served by a
+// monerod-JSON-RPC-compatible NodeClient (MoneroNodeClient,
+// monero_node.go) -- ALGO_RXM (the existing, untouched Tari-merge-
+// mined-Monero path) OR any confirmed standalone coin in
+// internal/coinprofile.Registry (ALGO_XMR and the other new algo
+// values). Used by MoneroNodeClient.GetBlockTemplate's own algo gate
+// and by leaf-solo/leaf-direct's coin-conditional NodeClient
+// construction.
+func IsMoneroFamilyAlgo(algo poolpb.Algo) bool {
+	if algo == poolpb.Algo_ALGO_RXM {
+		return true
+	}
+	_, ok := coinprofile.ByAlgo(algo)
+	return ok
 }
 
 // validateTariLoginAddress is validateAddressForAlgo's Tari-side real
