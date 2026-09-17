@@ -192,7 +192,7 @@ func TestIntegrationSetForcePayout(t *testing.T) {
 	// A balance row exists but pending_balance is zero -- still
 	// rejected (this backend's stated equivalent of legacy's
 	// too-low-balance check, see forcepayout.go's doc comment).
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "addr-zero", nil, 0); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "addr-zero", nil, 0); err != nil {
 		t.Fatalf("CreditBalance(0): %v", err)
 	}
 	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "addr-zero", nil); !errors.Is(err, db.ErrBalanceNotFound) {
@@ -200,7 +200,7 @@ func TestIntegrationSetForcePayout(t *testing.T) {
 	}
 
 	// A real, positive-balance row gets flagged.
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "addr-ok", nil, 500); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "addr-ok", nil, 500); err != nil {
 		t.Fatalf("CreditBalance: %v", err)
 	}
 	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "addr-ok", nil); err != nil {
@@ -216,10 +216,10 @@ func TestIntegrationSetForcePayout(t *testing.T) {
 
 	// payment_id-scoped rows are distinguished correctly.
 	pid := "pid-1"
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "addr-multi", nil, 100); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "addr-multi", nil, 100); err != nil {
 		t.Fatalf("CreditBalance(no pid): %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "addr-multi", &pid, 200); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "addr-multi", &pid, 200); err != nil {
 		t.Fatalf("CreditBalance(pid): %v", err)
 	}
 	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "addr-multi", &pid); err != nil {

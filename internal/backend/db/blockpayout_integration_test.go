@@ -252,7 +252,7 @@ func TestIntegrationApplyBlockPayoutRefusesPendingClaim(t *testing.T) {
 		VALUES ($1, 'RXM', 'TESTNET', 'PPS', 100, 'PENDING', 600000000000)`, blockID); err != nil {
 		t.Fatalf("fabricating the PENDING claim row: %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 58800); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 58800); err != nil {
 		t.Fatalf("fabricating alice's partial credit: %v", err)
 	}
 	var aliceBalanceID int64
@@ -260,8 +260,8 @@ func TestIntegrationApplyBlockPayoutRefusesPendingClaim(t *testing.T) {
 		t.Fatalf("looking up alice's balance id: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payout_bucket, amount)
-		VALUES ($1, $2, 'alice', 'pps', 58800)`, blockID, aliceBalanceID); err != nil {
+		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payout_bucket, amount, currency)
+		VALUES ($1, $2, 'alice', 'pps', 58800, 'XMR')`, blockID, aliceBalanceID); err != nil {
 		t.Fatalf("fabricating alice's credit ledger row: %v", err)
 	}
 
@@ -345,7 +345,7 @@ func TestIntegrationResolveBlockPayoutCredited(t *testing.T) {
 		VALUES ($1, 'RXM', 'TESTNET', 'PPS', 100, 'PENDING', 600000000000)`, blockID); err != nil {
 		t.Fatalf("fabricating the PENDING claim row: %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 58800); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 58800); err != nil {
 		t.Fatalf("crediting alice: %v", err)
 	}
 	var aliceBalanceID int64
@@ -353,8 +353,8 @@ func TestIntegrationResolveBlockPayoutCredited(t *testing.T) {
 		t.Fatalf("looking up alice's balance id: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payout_bucket, amount)
-		VALUES ($1, $2, 'alice', 'pps', 58800)`, blockID, aliceBalanceID); err != nil {
+		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payout_bucket, amount, currency)
+		VALUES ($1, $2, 'alice', 'pps', 58800, 'XMR')`, blockID, aliceBalanceID); err != nil {
 		t.Fatalf("fabricating alice's credit ledger row: %v", err)
 	}
 
@@ -496,7 +496,7 @@ func TestIntegrationResolveBlockPayoutNotCreditedDeletesVoidedLedger(t *testing.
 	}
 	// A ledger row whose credit the operator has reversed by hand:
 	// alice's balance is back to zero, but the ledger still names her.
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 0); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 0); err != nil {
 		t.Fatalf("creating alice's (reversed, zero) balance row: %v", err)
 	}
 	var aliceBalanceID int64
@@ -504,8 +504,8 @@ func TestIntegrationResolveBlockPayoutNotCreditedDeletesVoidedLedger(t *testing.
 		t.Fatalf("looking up alice's balance id: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payout_bucket, amount)
-		VALUES ($1, $2, 'alice', 'pps', 58800)`, blockID, aliceBalanceID); err != nil {
+		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payout_bucket, amount, currency)
+		VALUES ($1, $2, 'alice', 'pps', 58800, 'XMR')`, blockID, aliceBalanceID); err != nil {
 		t.Fatalf("fabricating alice's stale credit ledger row: %v", err)
 	}
 

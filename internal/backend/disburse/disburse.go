@@ -215,19 +215,27 @@ type PayoutEntry struct {
 // *db.Repository satisfies this interface via a small adapter in
 // cmd/backend, mirroring unlocker.Repository/payout.Repository's role.
 type Repository interface {
-	// PayableBalances returns every balance row for (algo, network)
-	// with pending_balance >= minPayout, EXCLUDING any row
+	// PayableBalances returns every balance row for (algo, network,
+	// currency) with pending_balance >= minPayout, EXCLUDING any row
 	// referenced by an unresolved (PENDING/AMBIGUOUS) payout — see
 	// db.Repository's identically-named method's doc comment.
-	PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]PayableBalance, error)
+	//
+	// currency is REQUIRED (see migrations/0014_balance_payouts_currency.up.sql)
+	// — a disbursement cycle for one currency's wallet must never be
+	// able to sweep up a balance row that only exists on a
+	// DIFFERENT currency for the same (algo, network), e.g.
+	// ALGO_RXM's independent XMR and XTM legs.
+	PayableBalances(ctx context.Context, algo, network, currency string, minPayout int64) ([]PayableBalance, error)
 
 	// UnresolvedPayouts returns every unresolved (PENDING or
-	// AMBIGUOUS) payout row for (algo, network). RunOnce calls this
-	// FIRST, before touching a wallet or a balance row, and refuses
-	// to run the cycle at all if the result is non-empty — see this
-	// package's doc comment on why disbursement halts rather than
-	// retrying.
-	UnresolvedPayouts(ctx context.Context, algo, network string) ([]UnresolvedPayout, error)
+	// AMBIGUOUS) payout row for (algo, network, currency). RunOnce
+	// calls this FIRST, before touching a wallet or a balance row,
+	// and refuses to run the cycle at all if the result is non-empty
+	// — see this package's doc comment on why disbursement halts
+	// rather than retrying. currency is REQUIRED for the same reason
+	// PayableBalances' is: an unresolved payout on one of ALGO_RXM's
+	// two independent currency legs must halt ONLY that leg.
+	UnresolvedPayouts(ctx context.Context, algo, network, currency string) ([]UnresolvedPayout, error)
 
 	// RecordPendingPayout durably records one about-to-be-attempted
 	// transfer batch BEFORE the real Transfer RPC call is made,
@@ -238,7 +246,9 @@ type Repository interface {
 	// ambiguous outcome can later be resolved to SENT by replaying
 	// precisely that debit (see db.Repository's identically-named
 	// method); amount is the real on-chain destination total.
-	RecordPendingPayout(ctx context.Context, algo, network string, entries []DebitEntry, amount int64) (int64, error)
+	// currency is REQUIRED and recorded on the new `payouts` row —
+	// see db.Repository.RecordPendingPayout's doc comment.
+	RecordPendingPayout(ctx context.Context, algo, network, currency string, entries []DebitEntry, amount int64) (int64, error)
 
 	// CompletePayoutSent atomically debits every entry's amount from
 	// pending_balance into paid_balance and marks payoutID SENT with
@@ -481,8 +491,8 @@ type Result struct {
 // set once more funds are available.
 //
 // HALT GATE: before any of the above, RunOnce asks the repository
-// whether this (algo, network) has any unresolved (PENDING or
-// AMBIGUOUS) payout row. If it does, the cycle pays out NOTHING —
+// whether this (algo, network, currency) has any unresolved (PENDING
+// or AMBIGUOUS) payout row. If it does, the cycle pays out NOTHING —
 // Result.Halted = 1, and an error wrapping ErrHalted is returned —
 // until an operator resolves those rows by hand. See this package's
 // doc comment for why halting is the correct response and
@@ -503,8 +513,21 @@ type Result struct {
 // OVERLAP GATE section of this package's doc comment for why that
 // broader problem is deliberately out of scope here. If the lock is
 // acquired, it is held for the ENTIRE rest of this cycle (via defer),
-// released on every exit path.
-func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, error) {
+// released on every exit path. Note the guard is scoped to the
+// *Engine INSTANCE only, not to (algo, network, currency): two
+// distinct *Engine instances (e.g. one per RXM currency leg, see
+// cmd/backend/main.go) never contend with each other here at all.
+//
+// currency is REQUIRED (see migrations/0014_balance_payouts_currency.up.sql
+// and db.ValidateCurrency) — for RXT/C29/SHA3X it is always "XTM";
+// for ALGO_RXM it is "XMR" or "XTM" depending on which of that algo's
+// two independent wallets/legs this call means. The halt gate, the
+// payable-balance query, and every payout row this cycle creates are
+// all scoped to this exact (algo, network, currency) triple, so an
+// unresolved XMR-side RXM payout can never halt (or be confused with)
+// XTM-side RXM disbursement, and vice versa — those are genuinely
+// independent wallets with independent failure domains.
+func (e *Engine) RunOnce(ctx context.Context, algo, network, currency string) (Result, error) {
 	// OVERLAP GATE. See this function's doc comment and this
 	// package's doc comment's "OVERLAP GATE" section. Deliberately
 	// the ABSOLUTE first thing RunOnce does: no balance query, no
@@ -513,10 +536,10 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 	if !e.runMu.TryLock() {
 		var result Result
 		result.Overlapped = 1
-		e.logf("disburse: %s/%s: OVERLAPPED: another RunOnce call is already running on this engine instance — this call is refusing to run at all (no balance query, no wallet call) rather than race it. This is an in-process guard only; see disburse.go's OVERLAP GATE doc.",
-			algo, network)
+		e.logf("disburse: %s/%s/%s: OVERLAPPED: another RunOnce call is already running on this engine instance — this call is refusing to run at all (no balance query, no wallet call) rather than race it. This is an in-process guard only; see disburse.go's OVERLAP GATE doc.",
+			algo, network, currency)
 		e.observeBatch(algo, network, metrics.DisbursementResultOverlapped)
-		return result, fmt.Errorf("disburse: RunOnce: %s/%s: %w", algo, network, ErrOverlapped)
+		return result, fmt.Errorf("disburse: RunOnce: %s/%s/%s: %w", algo, network, currency, ErrOverlapped)
 	}
 	defer e.runMu.Unlock()
 
@@ -539,7 +562,7 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 	// Halt gate. Deliberately the very first thing this cycle does:
 	// no wallet call, no balance query, no payout row is created
 	// while a previous attempt's outcome is still unknown.
-	unresolved, err := e.repo.UnresolvedPayouts(ctx, algo, network)
+	unresolved, err := e.repo.UnresolvedPayouts(ctx, algo, network, currency)
 	if err != nil {
 		return result, fmt.Errorf("disburse: RunOnce: checking for unresolved payouts: %w", err)
 	}
@@ -548,24 +571,24 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 		result.Halted = 1
 		result.Unresolved = len(unresolved)
 		for _, p := range unresolved {
-			e.logf("disburse: %s/%s: HALTED: payout %d is unresolved (status=%s amount=%d balance_ids=%v tx_hash=%q created=%s): %s",
-				algo, network, p.ID, p.Status, p.Amount, p.BalanceIDs, p.TxHash, p.Created.UTC().Format(time.RFC3339), p.Error)
+			e.logf("disburse: %s/%s/%s: HALTED: payout %d is unresolved (status=%s amount=%d balance_ids=%v tx_hash=%q created=%s): %s",
+				algo, network, currency, p.ID, p.Status, p.Amount, p.BalanceIDs, p.TxHash, p.Created.UTC().Format(time.RFC3339), p.Error)
 		}
-		e.logf("disburse: %s/%s: HALTED: %d unresolved payout(s) — NOTHING will be paid out for this algo/network until an operator resolves them. "+
-			"Inspect with `backend payout list-unresolved -algo=%s -network=%s`, confirm on-chain whether each transfer really happened, then run "+
+		e.logf("disburse: %s/%s/%s: HALTED: %d unresolved payout(s) — NOTHING will be paid out for this algo/network/currency until an operator resolves them. "+
+			"Inspect with `backend payout list-unresolved -algo=%s -network=%s -currency=%s`, confirm on-chain whether each transfer really happened, then run "+
 			"`backend payout resolve-sent` (it DID broadcast: records it, debits balances, no re-payment) or `backend payout resolve-not-sent` "+
 			"(it did NOT broadcast: makes those balances payable again).",
-			algo, network, len(unresolved), algo, network)
+			algo, network, currency, len(unresolved), algo, network, currency)
 		e.observeHalt(algo, network, metrics.HaltReasonUnresolvedPayouts)
-		return result, fmt.Errorf("disburse: RunOnce: %s/%s: %d unresolved payout(s): %w", algo, network, len(unresolved), ErrHalted)
+		return result, fmt.Errorf("disburse: RunOnce: %s/%s/%s: %d unresolved payout(s): %w", algo, network, currency, len(unresolved), ErrHalted)
 	}
 
-	rows, err := e.repo.PayableBalances(ctx, algo, network, e.cfg.MinPayoutAtomic)
+	rows, err := e.repo.PayableBalances(ctx, algo, network, currency, e.cfg.MinPayoutAtomic)
 	if err != nil {
 		return result, fmt.Errorf("disburse: RunOnce: listing payable balances: %w", err)
 	}
 	result.Payable = len(rows)
-	e.cfg.Debug.Debugf("disburse: %s/%s: poll cycle checking %d payable balance row(s) (min payout atomic=%d)", algo, network, len(rows), e.cfg.MinPayoutAtomic)
+	e.cfg.Debug.Debugf("disburse: %s/%s/%s: poll cycle checking %d payable balance row(s) (min payout atomic=%d)", algo, network, currency, len(rows), e.cfg.MinPayoutAtomic)
 	if len(rows) == 0 {
 		return result, nil
 	}
@@ -580,8 +603,8 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 		return result, fmt.Errorf("disburse: RunOnce: checking wallet balance: %w", err)
 	}
 	if bal.Unlocked < totalRequested {
-		e.logf("disburse: %s/%s: skipping cycle: wallet unlocked balance %d < required %d for %d payable balances",
-			algo, network, bal.Unlocked, totalRequested, len(rows))
+		e.logf("disburse: %s/%s/%s: skipping cycle: wallet unlocked balance %d < required %d for %d payable balances",
+			algo, network, currency, bal.Unlocked, totalRequested, len(rows))
 		result.Skipped = 1
 		e.observeBatch(algo, network, metrics.DisbursementResultSkipped)
 		return result, nil
@@ -590,16 +613,16 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 	batches := buildBatches(rows, e.cfg.MaxDestinationsPerBatch)
 	for i, batch := range batches {
 		result.Batches++
-		sent, fee, err := e.runBatch(ctx, algo, network, batch)
+		sent, fee, err := e.runBatch(ctx, algo, network, currency, batch)
 		if err != nil {
 			if errors.Is(err, errAmbiguous) {
 				result.BatchesAmbiguous++
 				e.observeBatch(algo, network, metrics.DisbursementResultAmbiguous)
 				e.observeHalt(algo, network, metrics.HaltReasonAmbiguousBatch)
-				e.logf("disburse: %s/%s: HALTING this cycle after an ambiguous batch outcome: %v", algo, network, err)
+				e.logf("disburse: %s/%s/%s: HALTING this cycle after an ambiguous batch outcome: %v", algo, network, currency, err)
 				if remaining := len(batches) - i - 1; remaining > 0 {
-					e.logf("disburse: %s/%s: abandoning the remaining %d batch(es) of this cycle — no further coin will be moved for this algo/network until the ambiguous payout above is manually resolved",
-						algo, network, remaining)
+					e.logf("disburse: %s/%s/%s: abandoning the remaining %d batch(es) of this cycle — no further coin will be moved for this algo/network/currency until the ambiguous payout above is manually resolved",
+						algo, network, currency, remaining)
 				}
 				// Return the error so RunLoop logs it loudly every
 				// cycle. The engine will refuse outright at the halt
@@ -607,7 +630,7 @@ func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, err
 				return result, err
 			}
 			result.BatchesFailed++
-			e.logf("disburse: %s/%s: batch of %d destinations failed (provably not broadcast, balances stay payable): %v", algo, network, len(batch), err)
+			e.logf("disburse: %s/%s/%s: batch of %d destinations failed (provably not broadcast, balances stay payable): %v", algo, network, currency, len(batch), err)
 			e.observeBatch(algo, network, metrics.DisbursementResultFailed)
 			continue
 		}
@@ -710,7 +733,7 @@ func buildBatches(rows []PayableBalance, maxPerBatch int) [][]PayableBalance {
 // Transfer error. In that case the payout row is marked AMBIGUOUS
 // (never FAILED) so the balances stay frozen, and RunOnce abandons
 // the remaining batches.
-func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []PayableBalance) (sent, fee int64, err error) {
+func (e *Engine) runBatch(ctx context.Context, algo, network, currency string, batch []PayableBalance) (sent, fee int64, err error) {
 	destinations := make([]wallet.Destination, 0, len(batch))
 	forceFees := make([]int64, len(batch))
 	var total int64
@@ -756,7 +779,7 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 		totalForceFee += forceFees[i]
 	}
 
-	payoutID, err := e.repo.RecordPendingPayout(ctx, algo, network, entries, total)
+	payoutID, err := e.repo.RecordPendingPayout(ctx, algo, network, currency, entries, total)
 	if err != nil {
 		// Nothing has been attempted yet and no payout row exists,
 		// so this is safely retriable: not ambiguous.
@@ -775,7 +798,7 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 			// no transaction was created, so FAILED is correct and
 			// the balances legitimately stay payable for next cycle.
 			if failErr := e.repo.FailPayout(ctx, payoutID, transferErr.Error()); failErr != nil {
-				e.logf("disburse: %s/%s: payout %d: also failed to mark payout as FAILED: %v", algo, network, payoutID, failErr)
+				e.logf("disburse: %s/%s/%s: payout %d: also failed to mark payout as FAILED: %v", algo, network, currency, payoutID, failErr)
 			}
 			return 0, 0, fmt.Errorf("transfer: %w", transferErr)
 		}
@@ -788,7 +811,7 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 		// leave the balance payable and re-send the same coin next
 		// cycle. Mark AMBIGUOUS instead, which freezes those
 		// balances out of PayableBalances and halts this (algo,
-		// network) until a human confirms on-chain.
+		// network, currency) until a human confirms on-chain.
 		msg := fmt.Sprintf("transfer outcome AMBIGUOUS (may or may not have broadcast, balances frozen pending manual resolution): %v", transferErr)
 		if markErr := e.repo.MarkPayoutAmbiguous(ctx, payoutID, "", msg); markErr != nil {
 			// Worst case: we cannot even record the ambiguity. The
@@ -796,12 +819,12 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 			// unresolved status and therefore still freezes these
 			// balances and still halts the next cycle — the safety
 			// property holds either way. Log both errors loudly.
-			e.logf("disburse: %s/%s: payout %d: CRITICAL: transfer outcome is ambiguous (%v) AND marking it AMBIGUOUS failed (%v) — the row stays PENDING, which still blocks disbursement for this algo/network; resolve it manually",
-				algo, network, payoutID, transferErr, markErr)
+			e.logf("disburse: %s/%s/%s: payout %d: CRITICAL: transfer outcome is ambiguous (%v) AND marking it AMBIGUOUS failed (%v) — the row stays PENDING, which still blocks disbursement for this algo/network/currency; resolve it manually",
+				algo, network, currency, payoutID, transferErr, markErr)
 		}
 		e.observeAmbiguous(algo, network, metrics.AmbiguousCauseTransfer)
-		e.logf("disburse: %s/%s: payout %d: AMBIGUOUS: %d destination(s), %d atomic units: %v — balances for this payout are frozen and disbursement for %s/%s is halted until `backend payout resolve-sent`/`resolve-not-sent` is run for payout %d",
-			algo, network, payoutID, len(batch), total, transferErr, algo, network, payoutID)
+		e.logf("disburse: %s/%s/%s: payout %d: AMBIGUOUS: %d destination(s), %d atomic units: %v — balances for this payout are frozen and disbursement for %s/%s/%s is halted until `backend payout resolve-sent`/`resolve-not-sent` is run for payout %d",
+			algo, network, currency, payoutID, len(batch), total, transferErr, algo, network, currency, payoutID)
 		return 0, 0, fmt.Errorf("transfer (payout %d): %w: %w", payoutID, errAmbiguous, transferErr)
 	}
 
@@ -816,22 +839,22 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 		msg := fmt.Sprintf("transfer SUCCEEDED (tx_hash=%s amount=%d fee=%d) but recording it failed, balances NOT yet debited: %v",
 			result.TxHash, result.Amount, result.Fee, err)
 		if markErr := e.repo.MarkPayoutAmbiguous(ctx, payoutID, result.TxHash, msg); markErr != nil {
-			e.logf("disburse: %s/%s: payout %d: CRITICAL: transfer succeeded (tx_hash=%s) but BOTH recording it (%v) and marking it AMBIGUOUS (%v) failed — the row stays PENDING, which still blocks disbursement for this algo/network; resolve it manually with tx_hash=%s",
-				algo, network, payoutID, result.TxHash, err, markErr, result.TxHash)
+			e.logf("disburse: %s/%s/%s: payout %d: CRITICAL: transfer succeeded (tx_hash=%s) but BOTH recording it (%v) and marking it AMBIGUOUS (%v) failed — the row stays PENDING, which still blocks disbursement for this algo/network/currency; resolve it manually with tx_hash=%s",
+				algo, network, currency, payoutID, result.TxHash, err, markErr, result.TxHash)
 		}
 		e.observeAmbiguous(algo, network, metrics.AmbiguousCauseBookkeeping)
-		e.logf("disburse: %s/%s: payout %d: AMBIGUOUS: real transfer tx_hash=%s SUCCEEDED but bookkeeping failed (%v) — coin has moved, balances are NOT debited and are frozen; resolve with `backend payout resolve-sent -id=%d -tx-hash=%s`",
-			algo, network, payoutID, result.TxHash, err, payoutID, result.TxHash)
+		e.logf("disburse: %s/%s/%s: payout %d: AMBIGUOUS: real transfer tx_hash=%s SUCCEEDED but bookkeeping failed (%v) — coin has moved, balances are NOT debited and are frozen; resolve with `backend payout resolve-sent -id=%d -tx-hash=%s`",
+			algo, network, currency, payoutID, result.TxHash, err, payoutID, result.TxHash)
 		return 0, 0, fmt.Errorf("transfer succeeded (payout %d tx_hash=%s amount=%d fee=%d) but recording it failed: %w: %w",
 			payoutID, result.TxHash, result.Amount, result.Fee, errAmbiguous, err)
 	}
 
 	if totalForceFee > 0 {
-		e.logf("disburse: %s/%s: payout %d: collected %d atomic units in force_payout fees across %d destinations",
-			algo, network, payoutID, totalForceFee, len(batch))
+		e.logf("disburse: %s/%s/%s: payout %d: collected %d atomic units in force_payout fees across %d destinations",
+			algo, network, currency, payoutID, totalForceFee, len(batch))
 	}
-	e.logf("disburse: %s/%s: payout %d: sent %d atomic units (fee %d) to %d destinations, tx_hash=%s",
-		algo, network, payoutID, total, result.Fee, len(batch), result.TxHash)
+	e.logf("disburse: %s/%s/%s: payout %d: sent %d atomic units (fee %d) to %d destinations, tx_hash=%s",
+		algo, network, currency, payoutID, total, result.Fee, len(batch), result.TxHash)
 	return total, result.Fee, nil
 }
 
@@ -855,9 +878,9 @@ func (e *Engine) runBatch(ctx context.Context, algo, network string, batch []Pay
 // starting disbursement on that basis is how money gets sent twice.
 func (e *Engine) CheckTargets(ctx context.Context, targets []Target) (safe []Target, blocked []BlockedTarget, err error) {
 	for _, t := range targets {
-		unresolved, uErr := e.repo.UnresolvedPayouts(ctx, t.Algo, t.Network)
+		unresolved, uErr := e.repo.UnresolvedPayouts(ctx, t.Algo, t.Network, t.Currency)
 		if uErr != nil {
-			return nil, nil, fmt.Errorf("disburse: CheckTargets: %s/%s: checking for unresolved payouts: %w", t.Algo, t.Network, uErr)
+			return nil, nil, fmt.Errorf("disburse: CheckTargets: %s/%s/%s: checking for unresolved payouts: %w", t.Algo, t.Network, t.Currency, uErr)
 		}
 		e.setUnresolvedGauge(t.Algo, t.Network, len(unresolved))
 		if len(unresolved) == 0 {
@@ -905,16 +928,24 @@ func (e *Engine) RunLoop(ctx context.Context, targets []Target, interval time.Du
 			return
 		case <-ticker.C:
 			for _, t := range targets {
-				if _, err := e.RunOnce(ctx, t.Algo, t.Network); err != nil {
-					e.logf("disburse: %s/%s: cycle failed: %v", t.Algo, t.Network, err)
+				if _, err := e.RunOnce(ctx, t.Algo, t.Network, t.Currency); err != nil {
+					e.logf("disburse: %s/%s/%s: cycle failed: %v", t.Algo, t.Network, t.Currency, err)
 				}
 			}
 		}
 	}
 }
 
-// Target is one (algo, network) pair RunLoop disburses for.
+// Target is one (algo, network, currency) triple RunLoop disburses
+// for. Currency is REQUIRED (see migrations/0014_balance_payouts_currency.up.sql
+// and db.ValidateCurrency) — "XTM" for every RXT/C29/SHA3X target,
+// and either "XMR" or "XTM" for an ALGO_RXM target depending on which
+// of that algo's two independent wallets/legs it means. There is
+// deliberately no default: cmd/backend's own Target literals must
+// each state their currency explicitly, so a future third
+// leg/algo/coin can never silently inherit the wrong one.
 type Target struct {
-	Algo    string
-	Network string
+	Algo     string
+	Network  string
+	Currency string
 }

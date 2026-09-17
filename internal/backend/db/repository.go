@@ -439,24 +439,37 @@ func (r *Repository) SoloShare(ctx context.Context, algo string, height int64) (
 }
 
 // CreditBalance adds amount to the pending balance for (algo, network,
-// paymentAddress, paymentID), inserting a new zero-balance row first
-// if none exists yet — the real-schema equivalent of nodejs-pool-sxmr's
-// createBalanceQueue (account-ensure) followed by balanceQueue
-// (increment), collapsed into a single upsert against this schema's
-// uq_balance_identity unique index (algo, network, payment_address,
-// COALESCE(payment_id, ”)).
-func (r *Repository) CreditBalance(ctx context.Context, algo, network, paymentAddress string, paymentID *string, amount int64) error {
+// currency, paymentAddress, paymentID), inserting a new zero-balance
+// row first if none exists yet — the real-schema equivalent of
+// nodejs-pool-sxmr's createBalanceQueue (account-ensure) followed by
+// balanceQueue (increment), collapsed into a single upsert against
+// this schema's uq_balance_identity unique index (algo, network,
+// currency, payment_address, COALESCE(payment_id, ”)).
+//
+// currency is a REQUIRED, explicitly-stated parameter (see
+// migrations/0014_balance_payouts_currency.up.sql) — not optional or
+// defaulted — specifically so every call site in this codebase is
+// forced, at compile time, to state which currency it means. For
+// RXT/C29/SHA3X this is always "XTM"; for ALGO_RXM it depends on
+// which merge-mine leg triggered the credit ("XMR" for the primary/
+// Monero leg, "XTM" for the secondary/Tari leg) — see
+// internal/backend/db/blockpayout.go's derivation of exactly this
+// value from a matured block's own `merge_mine_chain` column.
+func (r *Repository) CreditBalance(ctx context.Context, algo, network, currency, paymentAddress string, paymentID *string, amount int64) error {
 	if err := ValidateAlgo(algo); err != nil {
+		return err
+	}
+	if err := ValidateCurrency(currency); err != nil {
 		return err
 	}
 
 	const stmt = `
-		INSERT INTO balance (algo, network, payment_address, payment_id, pending_balance)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (algo, network, payment_address, (COALESCE(payment_id, '')))
+		INSERT INTO balance (algo, network, currency, payment_address, payment_id, pending_balance)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (algo, network, currency, payment_address, (COALESCE(payment_id, '')))
 		DO UPDATE SET pending_balance = balance.pending_balance + EXCLUDED.pending_balance,
 		              updated_at = now()`
-	_, err := r.pool.Exec(ctx, stmt, algo, network, paymentAddress, paymentID, amount)
+	_, err := r.pool.Exec(ctx, stmt, algo, network, currency, paymentAddress, paymentID, amount)
 	if err != nil {
 		return fmt.Errorf("db: crediting balance for %s: %w", paymentAddress, err)
 	}
@@ -487,10 +500,11 @@ type PayableBalance struct {
 	ForcePayout bool
 }
 
-// PayableBalances returns every `balance` row for (algo, network)
-// with a positive pending_balance that is EITHER >= minPayout OR
-// flagged force_payout = TRUE (see migrations/0008_balance_force_payout.up.sql
-// and internal/backend/authapi's POST /user/forcePayment) — oldest
+// PayableBalances returns every `balance` row for (algo, network,
+// currency) with a positive pending_balance that is EITHER >=
+// minPayout OR flagged force_payout = TRUE (see
+// migrations/0008_balance_force_payout.up.sql and
+// internal/backend/authapi's POST /user/forcePayment) — oldest
 // (lowest id) first, deterministic ordering so repeated disbursement
 // cycles process the same backlog in the same order rather than an
 // unspecified one. minPayout <= 0 returns every balance row with a
@@ -499,22 +513,35 @@ type PayableBalance struct {
 // error) — the force_payout override is purely additive on top of
 // the normal minPayout check, never a replacement for it.
 //
+// currency is a REQUIRED, explicitly-stated parameter (see
+// migrations/0014_balance_payouts_currency.up.sql and
+// ValidateCurrency) — not optional/defaulted — for the same
+// compile-time-visibility reason CreditBalance's currency parameter
+// is required: a disbursement cycle for ALGO_RXM's XMR leg must never
+// be able to accidentally sweep up (and pay out of the wrong wallet)
+// a balance row that only exists on the XTM leg, or vice versa.
+//
 // IN-FLIGHT EXCLUSION (money-critical, see
 // migrations/0010_payouts_ambiguous_status.up.sql): a balance row
 // referenced by an UNRESOLVED `payouts` row for the same (algo,
-// network) — status PENDING (attempted, outcome never recorded) or
-// AMBIGUOUS (attempted, and the failure cannot rule out that real
-// coin already moved) — is NEVER returned here, no matter how large
-// its pending_balance or whether it is force_payout-flagged. This is
-// the row-level half of the double-payment fix: before it existed,
-// an errored Transfer flipped the payout row to FAILED and this query
-// happily handed the exact same balance rows back to the very next
-// disbursement cycle, which sent the same coin a second time. The
-// engine additionally halts the whole (algo, network) cycle when any
-// unresolved row exists (see internal/backend/disburse's RunOnce and
+// network, currency) — status PENDING (attempted, outcome never
+// recorded) or AMBIGUOUS (attempted, and the failure cannot rule out
+// that real coin already moved) — is NEVER returned here, no matter
+// how large its pending_balance or whether it is force_payout-flagged.
+// This is the row-level half of the double-payment fix: before it
+// existed, an errored Transfer flipped the payout row to FAILED and
+// this query happily handed the exact same balance rows back to the
+// very next disbursement cycle, which sent the same coin a second
+// time. The engine additionally halts the whole (algo, network,
+// currency) cycle when any unresolved row exists (see
+// internal/backend/disburse's RunOnce and
 // Repository.UnresolvedPayouts) — this clause is the defense-in-depth
 // layer underneath that, so even a caller that skipped the halt check
-// cannot re-pay an in-flight balance.
+// cannot re-pay an in-flight balance. The anti-join is scoped to
+// currency too — an unresolved XMR-side RXM payout must never freeze
+// an XTM-side RXM balance row, since those are independent wallets
+// with independent failure domains (see disburse.go's package doc
+// comment).
 //
 // EMPTY-ADDRESS DEFENSE IN DEPTH (PROD_HARDENING_REVIEW.md finding
 // #10): a balance row with payment_address = ” (or all-whitespace)
@@ -530,8 +557,11 @@ type PayableBalance struct {
 // miner co-batched with it) — an operator still has to fix the
 // underlying row by hand (it is simply excluded, not deleted), but it
 // can no longer take other miners' payouts down with it.
-func (r *Repository) PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
+func (r *Repository) PayableBalances(ctx context.Context, algo, network, currency string, minPayout int64) ([]PayableBalance, error) {
 	if err := ValidateAlgo(algo); err != nil {
+		return nil, err
+	}
+	if err := ValidateCurrency(currency); err != nil {
 		return nil, err
 	}
 	if minPayout < 0 {
@@ -541,18 +571,18 @@ func (r *Repository) PayableBalances(ctx context.Context, algo, network string, 
 	const stmt = `
 		SELECT id, payment_address, payment_id, pending_balance, force_payout
 		FROM balance
-		WHERE algo = $1 AND network = $2 AND pending_balance > 0
+		WHERE algo = $1 AND network = $2 AND currency = $3 AND pending_balance > 0
 		  AND trim(payment_address) <> ''
-		  AND (pending_balance >= $3 OR force_payout = TRUE)
+		  AND (pending_balance >= $4 OR force_payout = TRUE)
 		  AND NOT EXISTS (
 		      SELECT 1
 		      FROM payouts p
-		      WHERE p.algo = $1 AND p.network = $2
+		      WHERE p.algo = $1 AND p.network = $2 AND p.currency = $3
 		        AND p.status IN ('PENDING', 'AMBIGUOUS')
 		        AND balance.id = ANY (p.balance_ids)
 		  )
 		ORDER BY id ASC`
-	rows, err := r.pool.Query(ctx, stmt, algo, network, minPayout)
+	rows, err := r.pool.Query(ctx, stmt, algo, network, currency, minPayout)
 	if err != nil {
 		return nil, fmt.Errorf("db: querying payable balances: %w", err)
 	}
@@ -675,8 +705,21 @@ type DisburseEntry struct {
 // any per-row force-payout fee deduction), which is NOT necessarily
 // the sum of entries' Amount fields (those are full pending_balance
 // debits) — the two are deliberately distinct, see DisburseEntry.
-func (r *Repository) RecordPendingPayout(ctx context.Context, algo, network string, entries []DisburseEntry, amount int64) (int64, error) {
+//
+// currency is a REQUIRED, explicitly-stated parameter (see
+// migrations/0014_balance_payouts_currency.up.sql) recorded verbatim
+// on the new `payouts` row — it identifies which wallet/ledger this
+// specific attempted transfer belongs to, which is what lets
+// internal/backend/disburse scope its halt-on-unresolved-payout gate
+// to (algo, network, currency) rather than just (algo, network): an
+// unresolved XMR-side RXM payout must never halt XTM-side RXM
+// disbursement, since the two are independent wallets with
+// independent failure domains.
+func (r *Repository) RecordPendingPayout(ctx context.Context, algo, network, currency string, entries []DisburseEntry, amount int64) (int64, error) {
 	if err := ValidateAlgo(algo); err != nil {
+		return 0, err
+	}
+	if err := ValidateCurrency(currency); err != nil {
 		return 0, err
 	}
 	if len(entries) == 0 {
@@ -700,11 +743,11 @@ func (r *Repository) RecordPendingPayout(ctx context.Context, algo, network stri
 	}
 
 	const stmt = `
-		INSERT INTO payouts (algo, network, status, balance_ids, amount, pending_entries)
-		VALUES ($1, $2, 'PENDING', $3, $4, $5)
+		INSERT INTO payouts (algo, network, currency, status, balance_ids, amount, pending_entries)
+		VALUES ($1, $2, $3, 'PENDING', $4, $5, $6)
 		RETURNING id`
 	var id int64
-	if err := r.pool.QueryRow(ctx, stmt, algo, network, balanceIDs, amount, entriesJSON).Scan(&id); err != nil {
+	if err := r.pool.QueryRow(ctx, stmt, algo, network, currency, balanceIDs, amount, entriesJSON).Scan(&id); err != nil {
 		return 0, fmt.Errorf("db: recording pending payout: %w", err)
 	}
 	return id, nil
