@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -174,6 +175,56 @@ func ListHeightPartitions(ctx context.Context, pool *pgxpool.Pool, algo, poolTyp
 	return out, nil
 }
 
+// SkippedPartition describes one leaf partition that DropOldPartitions
+// found otherwise eligible to drop (its whole range is below the
+// caller's belowHeight cutoff) but did NOT drop, because the `blocks`
+// table still has an unresolved (unlocked = FALSE) row whose height
+// falls inside that partition's [RangeStart, RangeEnd) range. See
+// DropOldPartitions's doc comment for why this check exists: dropping
+// this partition would destroy a still-pending (or forever-retrying
+// payout) block's winning shares before the unlocker/payout pass ever
+// gets to read them — silent, unrecoverable data loss on the
+// money-critical path.
+//
+// BlockID/BlockHeight identify the EARLIEST (lowest-height) unresolved
+// block found in range — there may be more than one, but this is
+// sufficient for an operator to go look at `blocks` themselves, and
+// picking a single deterministic row keeps this type (and its log
+// line) simple.
+type SkippedPartition struct {
+	Name       string
+	RangeStart int64
+	RangeEnd   int64
+
+	BlockID     int64
+	BlockHeight int64
+}
+
+// unresolvedBlockInRange reports the earliest (lowest height) `blocks`
+// row for (algo, poolType) with unlocked = FALSE and height in
+// [rangeStart, rangeEnd), or found = false if no such row exists. Uses
+// a real, indexed WHERE clause (idx_blocks_algo_pool_type covers
+// algo+pool_type, idx_blocks_height covers height) rather than loading
+// candidate rows into memory and filtering in Go — see
+// migrations/0001_initial_schema.up.sql for the exact index names.
+func unresolvedBlockInRange(ctx context.Context, pool *pgxpool.Pool, algo, poolType string, rangeStart, rangeEnd int64) (blockID, blockHeight int64, found bool, err error) {
+	const stmt = `
+		SELECT id, height
+		FROM blocks
+		WHERE algo = $1 AND pool_type = $2 AND unlocked = FALSE
+		  AND height >= $3 AND height < $4
+		ORDER BY height ASC
+		LIMIT 1`
+	err = pool.QueryRow(ctx, stmt, algo, poolType, rangeStart, rangeEnd).Scan(&blockID, &blockHeight)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, fmt.Errorf("db: querying unresolved blocks for %s/%s in range [%d,%d): %w", algo, poolType, rangeStart, rangeEnd, err)
+	}
+	return blockID, blockHeight, true, nil
+}
+
 // DropOldPartitions implements the shares retention model: "delete all
 // shares of a given algo+pool_type with a block height lower than X".
 // It identifies every block_height leaf partition whose entire range is
@@ -184,25 +235,53 @@ func ListHeightPartitions(ctx context.Context, pool *pgxpool.Pool, algo, poolTyp
 // choose belowHeight to land on a bucket boundary, or accept that
 // retention is bucket-granular.
 //
+// CRITICAL SAFETY CHECK: before actually dropping an otherwise-eligible
+// partition, this checks whether `blocks` still has any unresolved
+// (unlocked = FALSE) row whose height falls inside that partition's
+// range — see unresolvedBlockInRange and SkippedPartition's doc
+// comments for why (a genuinely pending block, or one stuck forever
+// retrying a failed payout, needs that partition's shares to still
+// exist when the unlocker/payout pass finally reads it). A partition
+// with such a row is left alone (added to the returned skipped slice
+// instead of dropped) — this does NOT abort the whole call: every
+// OTHER eligible partition for this same (algo, poolType) with no
+// unresolved blocks in its own range is still dropped normally. The
+// skipped partition is simply retried on the next call (nothing about
+// it is special-cased or remembered between calls), since it is still
+// a candidate every time belowHeight advances past it again.
+//
 // This function is a mechanism, not a policy: nothing in this package
 // calls it on a schedule. Wiring it into a periodic job (e.g. a cron/
 // ticker in cmd/backend) is future work.
-func DropOldPartitions(ctx context.Context, pool *pgxpool.Pool, algo, poolType string, belowHeight int64) ([]string, error) {
+func DropOldPartitions(ctx context.Context, pool *pgxpool.Pool, algo, poolType string, belowHeight int64) (dropped []string, skipped []SkippedPartition, err error) {
 	partitions, err := ListHeightPartitions(ctx, pool, algo, poolType)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var dropped []string
 	for _, p := range partitions {
 		if p.RangeEnd > belowHeight {
 			continue
 		}
+		blockID, blockHeight, unresolved, err := unresolvedBlockInRange(ctx, pool, algo, poolType, p.RangeStart, p.RangeEnd)
+		if err != nil {
+			return dropped, skipped, err
+		}
+		if unresolved {
+			skipped = append(skipped, SkippedPartition{
+				Name:        p.Name,
+				RangeStart:  p.RangeStart,
+				RangeEnd:    p.RangeEnd,
+				BlockID:     blockID,
+				BlockHeight: blockHeight,
+			})
+			continue
+		}
 		name := pgx.Identifier{p.Name}.Sanitize()
 		if _, err := pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", name)); err != nil {
-			return dropped, fmt.Errorf("db: dropping partition %s: %w", p.Name, err)
+			return dropped, skipped, fmt.Errorf("db: dropping partition %s: %w", p.Name, err)
 		}
 		dropped = append(dropped, p.Name)
 	}
-	return dropped, nil
+	return dropped, skipped, nil
 }

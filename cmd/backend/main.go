@@ -1462,8 +1462,22 @@ func (a retentionRepositoryAdapter) ListHeightPartitions(ctx context.Context, al
 	return out, nil
 }
 
-func (a retentionRepositoryAdapter) DropOldPartitions(ctx context.Context, algo, poolType string, belowHeight int64) ([]string, error) {
-	return db.DropOldPartitions(ctx, a.pool, algo, poolType, belowHeight)
+func (a retentionRepositoryAdapter) DropOldPartitions(ctx context.Context, algo, poolType string, belowHeight int64) ([]string, []retention.SkippedPartition, error) {
+	dropped, skipped, err := db.DropOldPartitions(ctx, a.pool, algo, poolType, belowHeight)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make([]retention.SkippedPartition, 0, len(skipped))
+	for _, s := range skipped {
+		out = append(out, retention.SkippedPartition{
+			Name:        s.Name,
+			RangeStart:  s.RangeStart,
+			RangeEnd:    s.RangeEnd,
+			BlockID:     s.BlockID,
+			BlockHeight: s.BlockHeight,
+		})
+	}
+	return dropped, out, nil
 }
 
 // payoutTrigger adapts a *payout.Calculator into unlocker.PayoutTrigger

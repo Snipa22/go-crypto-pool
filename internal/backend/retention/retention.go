@@ -21,6 +21,13 @@
 // interface, own local types instead of importing internal/backend/db
 // directly — cmd/backend is the only place this package and db need
 // to meet, via the adapter it defines).
+//
+// CRITICAL: a leaf partition is never dropped purely because it is
+// old — Repository.DropOldPartitions also checks `blocks` for any
+// still-unresolved (unlocked = FALSE) row inside that partition's
+// height range, and leaves that ONE partition alone (skipped, not an
+// error) if one exists. See SkippedPartition's doc comment for the
+// data-loss scenario this guards against.
 package retention
 
 import (
@@ -65,8 +72,18 @@ type Repository interface {
 	// DropOldPartitions drops every leaf partition whose entire
 	// range already falls below belowHeight and returns the names
 	// dropped — mirrors db.DropOldPartitions exactly (whole-
-	// partition DROP TABLE, never row-level DELETE).
-	DropOldPartitions(ctx context.Context, algo, poolType string, belowHeight int64) ([]string, error)
+	// partition DROP TABLE, never row-level DELETE). A partition
+	// that would otherwise be eligible (its whole range is below
+	// belowHeight) but still has an unresolved (unlocked = FALSE)
+	// `blocks` row inside its height range is NOT dropped — it is
+	// returned in skipped instead, and every other eligible
+	// partition for this same (algo, poolType) is still dropped
+	// normally (this call never aborts early because of one
+	// skipped partition). See SkippedPartition's doc comment for
+	// why: destroying that partition would delete a still-pending
+	// (or forever-retrying-payout) block's winning shares before
+	// the unlocker/payout pass ever reads them.
+	DropOldPartitions(ctx context.Context, algo, poolType string, belowHeight int64) (dropped []string, skipped []SkippedPartition, err error)
 }
 
 // HeightPartition mirrors db.HeightPartition field-for-field (see
@@ -75,6 +92,23 @@ type HeightPartition struct {
 	Name       string
 	RangeStart int64
 	RangeEnd   int64
+}
+
+// SkippedPartition mirrors db.SkippedPartition field-for-field (see
+// that type's doc comment in internal/backend/db/partition.go) — one
+// leaf partition RunOnce found otherwise eligible to drop (fully
+// below its target's retention cutoff) but did NOT drop, because
+// `blocks` still has an unresolved (unlocked = FALSE) row inside that
+// partition's height range. BlockID/BlockHeight identify the
+// earliest such row found, purely so an operator has somewhere to
+// start looking; there may be more than one.
+type SkippedPartition struct {
+	Name       string
+	RangeStart int64
+	RangeEnd   int64
+
+	BlockID     int64
+	BlockHeight int64
 }
 
 // Config configures a Runner.
@@ -98,6 +132,7 @@ type Config struct {
 
 	// Metrics, if non-nil, is the metrics.Metrics instance RunOnce
 	// records retention_partitions_dropped_total/
+	// retention_partitions_skipped_unresolved_total/
 	// retention_run_duration_seconds/retention_run_errors_total on.
 	// If nil, metrics are simply not recorded.
 	Metrics *metrics.Metrics
@@ -129,7 +164,16 @@ type TargetResult struct {
 	Algo     string
 	PoolType string
 	Dropped  []string
-	Err      error
+
+	// Skipped lists every partition this target's pass found
+	// otherwise eligible to drop but did NOT drop because `blocks`
+	// still has an unresolved row in its height range — see
+	// SkippedPartition's doc comment. This is expected, healthy
+	// behavior (a genuinely pending block, or one stuck retrying a
+	// failed payout forever), never counted as an Err.
+	Skipped []SkippedPartition
+
+	Err error
 }
 
 // PassResult summarizes the outcome of one RunOnce call, primarily for
@@ -137,8 +181,16 @@ type TargetResult struct {
 type PassResult struct {
 	TargetsChecked    int
 	PartitionsDropped int
-	Errors            int
-	Targets           []TargetResult
+
+	// PartitionsSkipped is the total count of partitions skipped
+	// across every target in this pass because they still hold an
+	// unresolved block — see TargetResult.Skipped. Not an error
+	// count: a skip here is expected, healthy behavior, distinct
+	// from both "dropped" and "errored".
+	PartitionsSkipped int
+
+	Errors  int
+	Targets []TargetResult
 }
 
 // RunOnce performs exactly one retention pass: for every configured
@@ -147,7 +199,15 @@ type PassResult struct {
 // so far minus that target's RetentionBlocks, and drops every leaf
 // partition that falls entirely below the cutoff via
 // Repository.DropOldPartitions (a whole-partition DROP TABLE, never a
-// row-level DELETE — see this package's doc comment).
+// row-level DELETE — see this package's doc comment) — EXCEPT a
+// partition that still has an unresolved (unlocked = FALSE) `blocks`
+// row inside its height range, which is left alone (skipped, not
+// dropped, not an error) so a genuinely pending block — or one stuck
+// retrying a failed payout forever, see internal/backend/unlocker's
+// outcomePayoutRetry — never loses the shares its payout calculation
+// will eventually need to replay. A skipped partition is retried
+// automatically on the next RunOnce pass; nothing about it is
+// special-cased or remembered between calls.
 //
 // The "frontier" used as the cutoff's basis is simply the highest
 // RangeEnd among that target's OWN currently-existing partitions —
@@ -201,7 +261,7 @@ func (r *Runner) RunOnce(ctx context.Context) PassResult {
 		}
 		belowHeight := frontier - target.RetentionBlocks
 
-		dropped, err := r.repo.DropOldPartitions(ctx, target.Algo, target.PoolType, belowHeight)
+		dropped, skipped, err := r.repo.DropOldPartitions(ctx, target.Algo, target.PoolType, belowHeight)
 		if err != nil {
 			tr.Err = fmt.Errorf("dropping partitions below height %d: %w", belowHeight, err)
 			total.Errors++
@@ -212,10 +272,19 @@ func (r *Runner) RunOnce(ctx context.Context) PassResult {
 		}
 
 		tr.Dropped = dropped
+		tr.Skipped = skipped
 		total.PartitionsDropped += len(dropped)
+		total.PartitionsSkipped += len(skipped)
 		if len(dropped) > 0 {
 			r.logf("retention: %s/%s: frontier=%d retention_blocks=%d cutoff=%d: dropped %d partition(s): %v",
 				target.Algo, target.PoolType, frontier, target.RetentionBlocks, belowHeight, len(dropped), dropped)
+		}
+		for _, sp := range skipped {
+			r.logf("retention: %s/%s: partition %s NOT dropped (block id=%d height=%d still unresolved, unlocked=false)",
+				target.Algo, target.PoolType, sp.Name, sp.BlockID, sp.BlockHeight)
+			if r.cfg.Metrics != nil {
+				r.cfg.Metrics.RetentionPartitionsSkippedUnresolvedTotal.WithLabelValues(target.Algo, target.PoolType).Inc()
+			}
 		}
 		total.Targets = append(total.Targets, tr)
 		r.observeRun(target.Algo, target.PoolType, true, time.Since(passStart))

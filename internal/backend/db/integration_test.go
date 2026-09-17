@@ -307,12 +307,15 @@ func TestIntegrationDropOldPartitions(t *testing.T) {
 	// Drop everything strictly below height 100000 - should remove only
 	// the seed bucket (and its one row), leaving the new-address row
 	// intact.
-	dropped, err := db.DropOldPartitions(ctx, pool, "SHA3X", "PROP", 100000)
+	dropped, skipped, err := db.DropOldPartitions(ctx, pool, "SHA3X", "PROP", 100000)
 	if err != nil {
 		t.Fatalf("DropOldPartitions: %v", err)
 	}
 	if len(dropped) != 1 {
 		t.Fatalf("expected exactly 1 partition dropped, got %d: %v", len(dropped), dropped)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("expected 0 partitions skipped (no unresolved blocks exist), got %d: %+v", len(skipped), skipped)
 	}
 
 	var remainingOld, remainingNew int
