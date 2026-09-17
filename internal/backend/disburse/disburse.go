@@ -41,6 +41,9 @@
 //     attempting any batch for that cycle, and skips (does not
 //     partially attempt) any batch whose total would exceed it — see
 //     Engine.RunOnce's insufficient-funds handling.
+//   - A single *Engine instance never runs two disbursement cycles
+//     for itself at once, even if RunOnce is somehow invoked twice
+//     concurrently — see the OVERLAP GATE section below.
 //
 // # Ambiguous outcomes and why this package halts instead of retrying
 //
@@ -91,6 +94,42 @@
 // `get_balance`; Tari's only adds a by-transaction-id lookup, which
 // is useless when the ambiguity is precisely that no id came back),
 // so any "automatic" recovery would have to guess about real money.
+//
+// # OVERLAP GATE: in-process-only mutual exclusion on RunOnce
+//
+// RunOnce has no built-in reason to ever be called twice
+// concurrently for the same *Engine instance today — the only caller
+// is RunLoop's own ticker, one tick at a time. But nothing enforced
+// that invariant, and a future caller (e.g. a manual "run now"
+// trigger racing the ticker loop) or a test that happens to invoke
+// RunOnce from two goroutines would otherwise both reach
+// Repository.PayableBalances, see the SAME payable rows (nothing
+// locks them), and both call the real wallet.Transfer RPC for the
+// same balances — a genuine double-payment of real money, and a
+// different bug from everything above.
+//
+// So every *Engine instance guards itself with an in-process
+// sync.Mutex (Engine.runMu). RunOnce's very first action, before the
+// HALT GATE, before any balance query, before any wallet or
+// repository call of any kind, is an e.runMu.TryLock(). If that
+// fails — another call on this SAME instance is already running —
+// RunOnce returns immediately with Result.Overlapped set and an
+// error wrapping ErrOverlapped, touching nothing else at all. If it
+// succeeds, the lock is held (via defer) for the ENTIRE rest of the
+// cycle, all the way through the final return, so it covers every
+// balance query and every real Transfer call this cycle makes.
+//
+// This is deliberately IN-PROCESS-ONLY: it is a plain in-memory
+// mutex on one *Engine value, not a cross-process/DB mechanism (no
+// Postgres advisory lock, no `SELECT ... FOR UPDATE`/`SKIP LOCKED`).
+// Two separate backend processes each running their own *Engine for
+// the same (algo, network) are NOT protected against each other by
+// this gate — that would be a different problem, and this codebase
+// has no existing convention assuming or requiring a cross-process
+// lock for this code path (repository.go's PayableBalances is a
+// plain SELECT with no row locking). If multi-process disbursement
+// ever becomes a real deployment shape, that is a separate, explicit
+// design decision, not something this gate silently half-solves.
 package disburse
 
 import (
@@ -98,6 +137,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
@@ -114,6 +154,20 @@ import (
 // distinctly, and RunLoop keeps logging it once per tick (loudly, on
 // purpose: a halted payout pipeline must not fade into silence).
 var ErrHalted = errors.New("disburse: disbursement halted: unresolved payout(s) require manual resolution")
+
+// ErrOverlapped is returned by RunOnce when it refuses to run a
+// disbursement cycle for a given *Engine instance because another
+// call to RunOnce on that SAME instance is already in progress — see
+// the OVERLAP GATE paragraph in this package's doc comment and
+// RunOnce's own doc comment. This is purely an in-process guard (a
+// sync.Mutex.TryLock on the Engine), not a cross-process/DB lock: it
+// exists to make a same-instance double-invoke (e.g. a future manual
+// "run now" trigger racing the RunLoop ticker) refuse cleanly instead
+// of racing two real Transfer calls against the same balance rows.
+// Callers can use errors.Is to distinguish this deliberate rejection
+// from a genuine repository/wallet failure, mirroring ErrHalted's
+// pattern exactly.
+var ErrOverlapped = errors.New("disburse: disbursement cycle already running for this engine instance (in-process overlap)")
 
 // errAmbiguous is the internal marker runBatch returns (wrapped)
 // when a batch ended in an ambiguous state, so RunOnce can abandon
@@ -333,6 +387,12 @@ type Engine struct {
 	repo Repository
 	cfg  Config
 	logf func(format string, args ...any)
+
+	// runMu is the OVERLAP GATE (see this package's doc comment): an
+	// in-process-only mutex ensuring this SAME *Engine instance never
+	// runs two RunOnce cycles at once. TryLock'd at the very top of
+	// RunOnce, before any other work, and held for the entire cycle.
+	runMu sync.Mutex
 }
 
 // New constructs an Engine.
@@ -373,6 +433,16 @@ type Result struct {
 	// Halted is "something is wrong with real money and a human has
 	// to look".
 	Halted int
+	// Overlapped is 1 if RunOnce refused to run at all because
+	// another call to RunOnce on this SAME *Engine instance was
+	// already in progress (RunOnce also returns an error wrapping
+	// ErrOverlapped in that case), 0 otherwise. See the OVERLAP GATE
+	// section of this package's doc comment. Distinct from BOTH
+	// Skipped and Halted: those describe a cycle that ran and made a
+	// real decision about funds/unresolved payouts; Overlapped means
+	// this call never got to run at all — no balance query, no
+	// wallet call, no repository call of any kind was made.
+	Overlapped int
 	// Unresolved is how many unresolved (PENDING/AMBIGUOUS) payout
 	// rows this cycle observed for this (algo, network) at its
 	// start. Zero on a healthy cycle.
@@ -419,7 +489,37 @@ type Result struct {
 // cmd/backend/payoutcli.go for the resolution path. Likewise, if a
 // batch goes ambiguous partway through a cycle, the remaining batches
 // are abandoned rather than attempted.
+//
+// OVERLAP GATE: before even the HALT GATE — the very first thing
+// RunOnce does at all — it tries to take this *Engine instance's
+// in-process runMu lock. If another call to RunOnce on this SAME
+// instance is already running, this call returns IMMEDIATELY with
+// Result.Overlapped = 1 and an error wrapping ErrOverlapped, having
+// made no balance query, no wallet call, and no repository call of
+// any kind. This guard is in-process-only — it protects one *Engine
+// value against being re-entered concurrently (e.g. a future manual
+// "run now" trigger racing RunLoop's ticker), NOT multiple processes
+// running their own Engine against the same (algo, network); see the
+// OVERLAP GATE section of this package's doc comment for why that
+// broader problem is deliberately out of scope here. If the lock is
+// acquired, it is held for the ENTIRE rest of this cycle (via defer),
+// released on every exit path.
 func (e *Engine) RunOnce(ctx context.Context, algo, network string) (Result, error) {
+	// OVERLAP GATE. See this function's doc comment and this
+	// package's doc comment's "OVERLAP GATE" section. Deliberately
+	// the ABSOLUTE first thing RunOnce does: no balance query, no
+	// wallet call, no repository call of any kind happens while
+	// another call on this same *Engine is still running.
+	if !e.runMu.TryLock() {
+		var result Result
+		result.Overlapped = 1
+		e.logf("disburse: %s/%s: OVERLAPPED: another RunOnce call is already running on this engine instance — this call is refusing to run at all (no balance query, no wallet call) rather than race it. This is an in-process guard only; see disburse.go's OVERLAP GATE doc.",
+			algo, network)
+		e.observeBatch(algo, network, metrics.DisbursementResultOverlapped)
+		return result, fmt.Errorf("disburse: RunOnce: %s/%s: %w", algo, network, ErrOverlapped)
+	}
+	defer e.runMu.Unlock()
+
 	start := time.Now()
 	var result Result
 	defer func() {

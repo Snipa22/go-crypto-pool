@@ -170,6 +170,14 @@ const (
 	DisbursementResultFailed    = "failed"
 	DisbursementResultSkipped   = "skipped"
 	DisbursementResultAmbiguous = "ambiguous"
+	// DisbursementResultOverlapped — RunOnce refused to run at all
+	// because another call to RunOnce was already in progress on
+	// the SAME *disburse.Engine instance (see that package's
+	// in-process-only OVERLAP GATE). Like "skipped", this is
+	// recorded once per whole REJECTED call rather than per batch —
+	// no batch was ever built, since the call returned before the
+	// balance query.
+	DisbursementResultOverlapped = "overlapped"
 )
 
 // Cause label values for disbursement_ambiguous_payouts_total — which
