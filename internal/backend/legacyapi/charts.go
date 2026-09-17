@@ -165,8 +165,8 @@ func (h *Handler) handleMinerHashrateChartAllWorkers(w http.ResponseWriter, r *h
 		return
 	}
 
-	sums := make(map[string]int64, len(workerStats))
-	for _, ws := range workerStats {
+	sums := make(map[string]int64, len(workerStats.Rows))
+	for _, ws := range workerStats.Rows {
 		sums[ws.Identifier] = ws.SharesSum
 	}
 
@@ -205,7 +205,7 @@ func (h *Handler) handleMinerHashrateChartWorker(w http.ResponseWriter, r *http.
 	}
 
 	var sharesSum int64
-	for _, ws := range workerStats {
+	for _, ws := range workerStats.Rows {
 		if ws.Identifier == identifier {
 			sharesSum = ws.SharesSum
 			break

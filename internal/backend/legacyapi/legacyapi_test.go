@@ -47,7 +47,7 @@ func (f *fakeNetworkRepo) NetworkStatsSince(_ context.Context, algo, network str
 type fakeStatsRepo struct {
 	balances    []statsapi.BalanceRecord
 	shareStats  statsapi.ShareStatsRecord
-	workerStats []statsapi.WorkerShareStatsRecord
+	workerStats statsapi.WorkerShareStatsResultRecord
 	err         error
 
 	gotAlgo, gotNetwork, gotAddr string
@@ -70,16 +70,16 @@ func (f *fakeStatsRepo) ShareStatsSince(_ context.Context, algo, network, paymen
 	return f.shareStats, nil
 }
 
-func (f *fakeStatsRepo) WorkerShareStatsSince(_ context.Context, algo, network, paymentAddress string, paymentID *string, _ int64) ([]statsapi.WorkerShareStatsRecord, error) {
+func (f *fakeStatsRepo) WorkerShareStatsSince(_ context.Context, algo, network, paymentAddress string, paymentID *string, _ int64) (statsapi.WorkerShareStatsResultRecord, error) {
 	if f.err != nil {
-		return nil, f.err
+		return statsapi.WorkerShareStatsResultRecord{}, f.err
 	}
 	f.gotAlgo, f.gotNetwork, f.gotAddr, f.gotPaymentID = algo, network, paymentAddress, paymentID
 	return f.workerStats, nil
 }
 
-func (f *fakeStatsRepo) PoolSourceShareStatsSince(_ context.Context, _, _, _ string, _ *string, _ int64) ([]statsapi.PoolSourceShareStatsRecord, error) {
-	return nil, nil
+func (f *fakeStatsRepo) PoolSourceShareStatsSince(_ context.Context, _, _, _ string, _ *string, _ int64) (statsapi.PoolSourceShareStatsResultRecord, error) {
+	return statsapi.PoolSourceShareStatsResultRecord{}, nil
 }
 
 type fakeAddrMapRepo struct {
@@ -381,7 +381,7 @@ func TestHandleNetworkDifficultyChart_NilRendersZero(t *testing.T) {
 func TestHandleMinerHashrateChartAllWorkers_Shape(t *testing.T) {
 	h, d := newTestHandler(Config{})
 	d.stats.shareStats = statsapi.ShareStatsRecord{SharesSum: 100}
-	d.stats.workerStats = []statsapi.WorkerShareStatsRecord{{Identifier: "rig1", SharesSum: 60}}
+	d.stats.workerStats = statsapi.WorkerShareStatsResultRecord{Rows: []statsapi.WorkerShareStatsRecord{{Identifier: "rig1", SharesSum: 60}}}
 	d.idents.rows = []IdentifierRecord{{WorkerName: "rig1"}, {WorkerName: "rig2"}}
 
 	rr := doGet(t, h.Mux(), "/miner/addr-1/chart/hashrate/allWorkers")
@@ -615,7 +615,7 @@ func TestHandleMinerStats_Bare(t *testing.T) {
 func TestHandleMinerStatsAllWorkers_IncludesInactiveWorkers(t *testing.T) {
 	h, d := newTestHandler(Config{})
 	d.stats.shareStats = statsapi.ShareStatsRecord{SharesSum: 4294967296, ShareCount: 11}
-	d.stats.workerStats = []statsapi.WorkerShareStatsRecord{{Identifier: "rig1", SharesSum: 10, ShareCount: 1}}
+	d.stats.workerStats = statsapi.WorkerShareStatsResultRecord{Rows: []statsapi.WorkerShareStatsRecord{{Identifier: "rig1", SharesSum: 10, ShareCount: 1}}}
 	lastShare := time.Unix(9999, 0)
 	d.idents.rows = []IdentifierRecord{{WorkerName: "rig1", LastShare: &lastShare}, {WorkerName: "rig2"}}
 
@@ -664,7 +664,7 @@ func TestHandleMinerStatsAllWorkers_IncludesInactiveWorkers(t *testing.T) {
 
 func TestHandleMinerStatsWorker_Specific(t *testing.T) {
 	h, d := newTestHandler(Config{})
-	d.stats.workerStats = []statsapi.WorkerShareStatsRecord{{Identifier: "rig1", SharesSum: 4294967296, ShareCount: 5}}
+	d.stats.workerStats = statsapi.WorkerShareStatsResultRecord{Rows: []statsapi.WorkerShareStatsRecord{{Identifier: "rig1", SharesSum: 4294967296, ShareCount: 5}}}
 
 	rr := doGet(t, h.Mux(), "/miner/addr-1/stats/rig1")
 	if rr.Code != http.StatusOK {

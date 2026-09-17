@@ -15,8 +15,8 @@ import (
 type fakeRepo struct {
 	balances    []BalanceRecord
 	shareStats  ShareStatsRecord
-	workerStats []WorkerShareStatsRecord
-	poolSources []PoolSourceShareStatsRecord
+	workerStats WorkerShareStatsResultRecord
+	poolSources PoolSourceShareStatsResultRecord
 	err         error
 
 	gotAlgo, gotNetwork, gotAddr string
@@ -40,17 +40,17 @@ func (f *fakeRepo) ShareStatsSince(_ context.Context, algo, network, paymentAddr
 	return f.shareStats, nil
 }
 
-func (f *fakeRepo) WorkerShareStatsSince(_ context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]WorkerShareStatsRecord, error) {
+func (f *fakeRepo) WorkerShareStatsSince(_ context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (WorkerShareStatsResultRecord, error) {
 	if f.err != nil {
-		return nil, f.err
+		return WorkerShareStatsResultRecord{}, f.err
 	}
 	f.gotAlgo, f.gotNetwork, f.gotAddr, f.gotPaymentID, f.gotSince = algo, network, paymentAddress, paymentID, sinceUnix
 	return f.workerStats, nil
 }
 
-func (f *fakeRepo) PoolSourceShareStatsSince(_ context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]PoolSourceShareStatsRecord, error) {
+func (f *fakeRepo) PoolSourceShareStatsSince(_ context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (PoolSourceShareStatsResultRecord, error) {
 	if f.err != nil {
-		return nil, f.err
+		return PoolSourceShareStatsResultRecord{}, f.err
 	}
 	f.gotAlgo, f.gotNetwork, f.gotAddr, f.gotPaymentID, f.gotSince = algo, network, paymentAddress, paymentID, sinceUnix
 	return f.poolSources, nil
@@ -206,10 +206,10 @@ func TestHandleHashrate_WindowTooLarge(t *testing.T) {
 }
 
 func TestHandleHashrateWorkers_OK(t *testing.T) {
-	repo := &fakeRepo{workerStats: []WorkerShareStatsRecord{
+	repo := &fakeRepo{workerStats: WorkerShareStatsResultRecord{Rows: []WorkerShareStatsRecord{
 		{Identifier: "rig-1", SharesSum: 500, ShareCount: 5},
 		{Identifier: "rig-2", SharesSum: 200, ShareCount: 2},
-	}}
+	}}}
 	h := NewHandler(repo, Config{})
 	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/workers?payment_address=addr-1&algo=RXT&network=TESTNET&window=100")
 
@@ -218,6 +218,7 @@ func TestHandleHashrateWorkers_OK(t *testing.T) {
 	}
 	var resp struct {
 		Workers []workerHashrateRow `json:"workers"`
+		Other   *otherWorkersBucket `json:"other"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -228,13 +229,56 @@ func TestHandleHashrateWorkers_OK(t *testing.T) {
 	if resp.Workers[0].Identifier != "rig-1" || resp.Workers[0].SharesSum != 500 {
 		t.Errorf("unexpected worker[0]: %+v", resp.Workers[0])
 	}
+	if resp.Other != nil {
+		t.Errorf("expected no other bucket when repo returned none, got %+v", resp.Other)
+	}
+}
+
+// TestHandleHashrateWorkers_OtherBucket proves the collapsed
+// cardinality-cap "other" bucket (Finding 2's fix) round-trips
+// through the JSON response as a distinct, unambiguous field.
+func TestHandleHashrateWorkers_OtherBucket(t *testing.T) {
+	repo := &fakeRepo{workerStats: WorkerShareStatsResultRecord{
+		Rows: []WorkerShareStatsRecord{
+			{Identifier: "rig-1", SharesSum: 500, ShareCount: 5},
+		},
+		Other: &WorkerShareStatsOtherRecord{SharesSum: 300, ShareCount: 30, IdentifierCount: 150},
+	}}
+	h := NewHandler(repo, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/workers?payment_address=addr-1&algo=RXT&network=TESTNET&window=100")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Workers []workerHashrateRow `json:"workers"`
+		Other   *otherWorkersBucket `json:"other"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Workers) != 1 {
+		t.Fatalf("expected 1 kept worker, got %d", len(resp.Workers))
+	}
+	if resp.Other == nil {
+		t.Fatal("expected a non-nil other bucket")
+	}
+	if !resp.Other.IsOther {
+		t.Error("other bucket IsOther = false, want true")
+	}
+	if resp.Other.IdentifierCount != 150 {
+		t.Errorf("other.IdentifierCount = %d, want 150", resp.Other.IdentifierCount)
+	}
+	if resp.Other.SharesSum != 300 || resp.Other.ShareCount != 30 {
+		t.Errorf("other = %+v, want SharesSum=300 ShareCount=30", resp.Other)
+	}
 }
 
 func TestHandleHashrateSources_OK(t *testing.T) {
-	repo := &fakeRepo{poolSources: []PoolSourceShareStatsRecord{
+	repo := &fakeRepo{poolSources: PoolSourceShareStatsResultRecord{Rows: []PoolSourceShareStatsRecord{
 		{PoolID: 1, SharesSum: 700, ShareCount: 7},
 		{PoolID: 2, SharesSum: 300, ShareCount: 3},
-	}}
+	}}}
 	h := NewHandler(repo, Config{})
 	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/sources?payment_address=addr-1&algo=RXT&network=TESTNET&window=100")
 
@@ -243,6 +287,7 @@ func TestHandleHashrateSources_OK(t *testing.T) {
 	}
 	var resp struct {
 		Sources []poolSourceHashrateRow `json:"sources"`
+		Other   *otherSourcesBucket     `json:"other"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -256,6 +301,46 @@ func TestHandleHashrateSources_OK(t *testing.T) {
 	wantHS := float64(700) / 100
 	if resp.Sources[0].EstimatedHashrateHS != wantHS {
 		t.Errorf("estimated hashrate = %v, want %v", resp.Sources[0].EstimatedHashrateHS, wantHS)
+	}
+	if resp.Other != nil {
+		t.Errorf("expected no other bucket when repo returned none, got %+v", resp.Other)
+	}
+}
+
+// TestHandleHashrateSources_OtherBucket is
+// TestHandleHashrateWorkers_OtherBucket's pool_id analogue.
+func TestHandleHashrateSources_OtherBucket(t *testing.T) {
+	repo := &fakeRepo{poolSources: PoolSourceShareStatsResultRecord{
+		Rows:  []PoolSourceShareStatsRecord{{PoolID: 1, SharesSum: 700, ShareCount: 7}},
+		Other: &PoolSourceShareStatsOtherRecord{SharesSum: 400, ShareCount: 40, PoolIDCount: 60},
+	}}
+	h := NewHandler(repo, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/sources?payment_address=addr-1&algo=RXT&network=TESTNET&window=100")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Sources []poolSourceHashrateRow `json:"sources"`
+		Other   *otherSourcesBucket     `json:"other"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Sources) != 1 {
+		t.Fatalf("expected 1 kept source, got %d", len(resp.Sources))
+	}
+	if resp.Other == nil {
+		t.Fatal("expected a non-nil other bucket")
+	}
+	if !resp.Other.IsOther {
+		t.Error("other bucket IsOther = false, want true")
+	}
+	if resp.Other.PoolIDCount != 60 {
+		t.Errorf("other.PoolIDCount = %d, want 60", resp.Other.PoolIDCount)
+	}
+	if resp.Other.SharesSum != 400 || resp.Other.ShareCount != 40 {
+		t.Errorf("other = %+v, want SharesSum=400 ShareCount=40", resp.Other)
 	}
 }
 

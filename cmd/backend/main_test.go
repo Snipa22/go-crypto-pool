@@ -151,6 +151,131 @@ func TestLoadConfig_InsecureAllowUnauthenticatedIngestion_FlagAndEnv(t *testing.
 	})
 }
 
+// TestLoadConfig_StatsAPIRateLimit_FlagEnvFileDefault proves the new
+// -stats-api-rate-limit-per-second/GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND
+// and -stats-api-rate-limit-burst/GCPOOL_STATS_API_RATE_LIMIT_BURST
+// flags/env vars/TOML fields are wired into loadConfig() following
+// the same flag > env > file > hardcoded-default precedence as every
+// other setting in this file.
+func TestLoadConfig_StatsAPIRateLimit_FlagEnvFileDefault(t *testing.T) {
+	cases := []precedenceCase{
+		// -- float64 field: stats-api-rate-limit-per-second --------------
+		{
+			name: "rate-per-second/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitPerSecond != defaultStatsAPIRateLimitPerSecond {
+					t.Errorf("statsAPIRateLimitPerSecond = %v, want hardcoded default %v", cfg.statsAPIRateLimitPerSecond, defaultStatsAPIRateLimitPerSecond)
+				}
+			},
+		},
+		{
+			name: "rate-per-second/file-only",
+			toml: `stats_api_rate_limit_per_second = 15.5`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitPerSecond != 15.5 {
+					t.Errorf("statsAPIRateLimitPerSecond = %v, want file value %v", cfg.statsAPIRateLimitPerSecond, 15.5)
+				}
+			},
+		},
+		{
+			name: "rate-per-second/env-only",
+			env:  map[string]string{"GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND": "25.5"},
+			toml: `stats_api_rate_limit_per_second = 15.5`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitPerSecond != 25.5 {
+					t.Errorf("statsAPIRateLimitPerSecond = %v, want env value %v (env must beat file)", cfg.statsAPIRateLimitPerSecond, 25.5)
+				}
+			},
+		},
+		{
+			name: "rate-per-second/flag-only",
+			args: []string{"-stats-api-rate-limit-per-second=35.5"},
+			toml: `stats_api_rate_limit_per_second = 15.5`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitPerSecond != 35.5 {
+					t.Errorf("statsAPIRateLimitPerSecond = %v, want flag value %v (flag must beat env absence and file)", cfg.statsAPIRateLimitPerSecond, 35.5)
+				}
+			},
+		},
+		{
+			name: "rate-per-second/flag-env-file-all-set",
+			args: []string{"-stats-api-rate-limit-per-second=35.5"},
+			env:  map[string]string{"GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND": "25.5"},
+			toml: `stats_api_rate_limit_per_second = 15.5`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitPerSecond != 35.5 {
+					t.Errorf("statsAPIRateLimitPerSecond = %v, want flag value %v (flag must win full precedence)", cfg.statsAPIRateLimitPerSecond, 35.5)
+				}
+			},
+		},
+		{
+			name: "rate-per-second/env-zero-disables",
+			env:  map[string]string{"GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND": "0"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitPerSecond != 0 {
+					t.Errorf("statsAPIRateLimitPerSecond = %v, want 0 (explicit disable)", cfg.statsAPIRateLimitPerSecond)
+				}
+			},
+		},
+
+		// -- int field: stats-api-rate-limit-burst ------------------------
+		{
+			name: "burst/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitBurst != defaultStatsAPIRateLimitBurst {
+					t.Errorf("statsAPIRateLimitBurst = %d, want hardcoded default %d", cfg.statsAPIRateLimitBurst, defaultStatsAPIRateLimitBurst)
+				}
+			},
+		},
+		{
+			name: "burst/file-only",
+			toml: `stats_api_rate_limit_burst = 45`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitBurst != 45 {
+					t.Errorf("statsAPIRateLimitBurst = %d, want file value %d", cfg.statsAPIRateLimitBurst, 45)
+				}
+			},
+		},
+		{
+			name: "burst/env-only",
+			env:  map[string]string{"GCPOOL_STATS_API_RATE_LIMIT_BURST": "55"},
+			toml: `stats_api_rate_limit_burst = 45`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitBurst != 55 {
+					t.Errorf("statsAPIRateLimitBurst = %d, want env value %d (env must beat file)", cfg.statsAPIRateLimitBurst, 55)
+				}
+			},
+		},
+		{
+			name: "burst/flag-only",
+			args: []string{"-stats-api-rate-limit-burst=65"},
+			toml: `stats_api_rate_limit_burst = 45`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitBurst != 65 {
+					t.Errorf("statsAPIRateLimitBurst = %d, want flag value %d (flag must beat env absence and file)", cfg.statsAPIRateLimitBurst, 65)
+				}
+			},
+		},
+		{
+			name: "burst/flag-env-file-all-set",
+			args: []string{"-stats-api-rate-limit-burst=65"},
+			env:  map[string]string{"GCPOOL_STATS_API_RATE_LIMIT_BURST": "55"},
+			toml: `stats_api_rate_limit_burst = 45`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.statsAPIRateLimitBurst != 65 {
+					t.Errorf("statsAPIRateLimitBurst = %d, want flag value %d (flag must win full precedence)", cfg.statsAPIRateLimitBurst, 65)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runPrecedenceCase(t, tc)
+		})
+	}
+}
+
 // precedenceCase drives one subtest of TestLoadConfigPrecedence. toml, if
 // non-empty, is written to a temp file and wired in via "-config=<path>";
 // env is applied with t.Setenv (auto-restored); args are appended after the

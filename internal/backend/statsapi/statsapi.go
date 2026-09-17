@@ -114,11 +114,45 @@ type WorkerShareStatsRecord struct {
 	ShareCount int64
 }
 
+// WorkerShareStatsOtherRecord mirrors db.WorkerShareStatsOther — the
+// single collapsed aggregate row representing every identifier
+// beyond the cardinality cap db.WorkerShareStatsSince enforces
+// server-side. See WorkerShareStatsResultRecord's doc comment.
+type WorkerShareStatsOtherRecord struct {
+	SharesSum       int64
+	ShareCount      int64
+	IdentifierCount int
+}
+
+// WorkerShareStatsResultRecord mirrors db.WorkerShareStatsResult:
+// Rows is the capped set of top-ranked identifiers; Other, if
+// non-nil, is the single aggregate row for every identifier beyond
+// that cap (nil means nothing was collapsed).
+type WorkerShareStatsResultRecord struct {
+	Rows  []WorkerShareStatsRecord
+	Other *WorkerShareStatsOtherRecord
+}
+
 // PoolSourceShareStatsRecord mirrors db.PoolSourceShareStats.
 type PoolSourceShareStatsRecord struct {
 	PoolID     int32
 	SharesSum  int64
 	ShareCount int64
+}
+
+// PoolSourceShareStatsOtherRecord mirrors db.PoolSourceShareStatsOther
+// — see WorkerShareStatsOtherRecord's doc comment.
+type PoolSourceShareStatsOtherRecord struct {
+	SharesSum   int64
+	ShareCount  int64
+	PoolIDCount int
+}
+
+// PoolSourceShareStatsResultRecord mirrors db.PoolSourceShareStatsResult
+// — see WorkerShareStatsResultRecord's doc comment.
+type PoolSourceShareStatsResultRecord struct {
+	Rows  []PoolSourceShareStatsRecord
+	Other *PoolSourceShareStatsOtherRecord
 }
 
 // Repository is the narrow, read-only persistence surface this
@@ -127,8 +161,8 @@ type PoolSourceShareStatsRecord struct {
 type Repository interface {
 	MinerBalances(ctx context.Context, paymentAddress, algo, network string, paymentID *string) ([]BalanceRecord, error)
 	ShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (ShareStatsRecord, error)
-	WorkerShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]WorkerShareStatsRecord, error)
-	PoolSourceShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]PoolSourceShareStatsRecord, error)
+	WorkerShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (WorkerShareStatsResultRecord, error)
+	PoolSourceShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (PoolSourceShareStatsResultRecord, error)
 }
 
 // StatsMetrics is the narrow metrics surface this package's handlers
@@ -457,6 +491,24 @@ type workerHashrateRow struct {
 	EstimatedHashrateHS float64 `json:"estimated_hashrate_hs"`
 }
 
+// otherWorkersBucket is /api/v1/stats/hashrate/workers' optional
+// "other" field: present only when the true distinct-identifier
+// count for this query exceeded db.DefaultShareStatsCardinalityCap,
+// representing every identifier beyond the "workers" array's own
+// (still individually-named, cap-bounded) entries. IsOther is a
+// belt-and-suspenders explicit marker for clients that deserialize
+// this generically; the field's mere presence in the response is
+// already unambiguous against a real identifier literally named
+// "other" -- that case only ever appears as its own entry inside the
+// "workers" array, never inside this dedicated field.
+type otherWorkersBucket struct {
+	IsOther             bool    `json:"is_other"`
+	IdentifierCount     int     `json:"identifier_count"`
+	ShareCount          int64   `json:"share_count"`
+	SharesSum           int64   `json:"shares_sum"`
+	EstimatedHashrateHS float64 `json:"estimated_hashrate_hs"`
+}
+
 func (h *Handler) handleHashrateWorkers(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	algo, network, paymentAddress, paymentID, windowSeconds, err := h.parseHashrateQuery(r)
@@ -467,15 +519,15 @@ func (h *Handler) handleHashrateWorkers(w http.ResponseWriter, r *http.Request) 
 	}
 
 	since := time.Now().Add(-time.Duration(windowSeconds) * time.Second).Unix()
-	rows, err := h.repo.WorkerShareStatsSince(r.Context(), algo, network, paymentAddress, paymentID, since)
+	result, err := h.repo.WorkerShareStatsSince(r.Context(), algo, network, paymentAddress, paymentID, since)
 	if err != nil {
 		h.m.ObserveRequest("hashrate_workers", "error", time.Since(start))
 		writeJSONErr(w, http.StatusInternalServerError, "query failed")
 		return
 	}
 
-	out := make([]workerHashrateRow, 0, len(rows))
-	for _, wr := range rows {
+	out := make([]workerHashrateRow, 0, len(result.Rows))
+	for _, wr := range result.Rows {
 		out = append(out, workerHashrateRow{
 			Identifier:          wr.Identifier,
 			ShareCount:          wr.ShareCount,
@@ -485,20 +537,41 @@ func (h *Handler) handleHashrateWorkers(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.m.ObserveRequest("hashrate_workers", "ok", time.Since(start))
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"algo":            algo,
 		"network":         network,
 		"payment_address": paymentAddress,
 		"payment_id":      paymentID,
 		"window_seconds":  windowSeconds,
 		"workers":         out,
-	})
+	}
+	if result.Other != nil {
+		resp["other"] = otherWorkersBucket{
+			IsOther:             true,
+			IdentifierCount:     result.Other.IdentifierCount,
+			ShareCount:          result.Other.ShareCount,
+			SharesSum:           result.Other.SharesSum,
+			EstimatedHashrateHS: EstimateHashrateHS(result.Other.SharesSum, windowSeconds),
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // poolSourceHashrateRow is one pool-server-source's entry in
 // /api/v1/stats/hashrate/sources' response.
 type poolSourceHashrateRow struct {
 	PoolID              int32   `json:"pool_id"`
+	ShareCount          int64   `json:"share_count"`
+	SharesSum           int64   `json:"shares_sum"`
+	EstimatedHashrateHS float64 `json:"estimated_hashrate_hs"`
+}
+
+// otherSourcesBucket is /api/v1/stats/hashrate/sources' optional
+// "other" field -- otherWorkersBucket's pool_id analogue, see that
+// type's doc comment.
+type otherSourcesBucket struct {
+	IsOther             bool    `json:"is_other"`
+	PoolIDCount         int     `json:"pool_id_count"`
 	ShareCount          int64   `json:"share_count"`
 	SharesSum           int64   `json:"shares_sum"`
 	EstimatedHashrateHS float64 `json:"estimated_hashrate_hs"`
@@ -518,15 +591,15 @@ func (h *Handler) handleHashrateSources(w http.ResponseWriter, r *http.Request) 
 	}
 
 	since := time.Now().Add(-time.Duration(windowSeconds) * time.Second).Unix()
-	rows, err := h.repo.PoolSourceShareStatsSince(r.Context(), algo, network, paymentAddress, paymentID, since)
+	result, err := h.repo.PoolSourceShareStatsSince(r.Context(), algo, network, paymentAddress, paymentID, since)
 	if err != nil {
 		h.m.ObserveRequest("hashrate_sources", "error", time.Since(start))
 		writeJSONErr(w, http.StatusInternalServerError, "query failed")
 		return
 	}
 
-	out := make([]poolSourceHashrateRow, 0, len(rows))
-	for _, sr := range rows {
+	out := make([]poolSourceHashrateRow, 0, len(result.Rows))
+	for _, sr := range result.Rows {
 		out = append(out, poolSourceHashrateRow{
 			PoolID:              sr.PoolID,
 			ShareCount:          sr.ShareCount,
@@ -536,14 +609,24 @@ func (h *Handler) handleHashrateSources(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.m.ObserveRequest("hashrate_sources", "ok", time.Since(start))
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"algo":            algo,
 		"network":         network,
 		"payment_address": paymentAddress,
 		"payment_id":      paymentID,
 		"window_seconds":  windowSeconds,
 		"sources":         out,
-	})
+	}
+	if result.Other != nil {
+		resp["other"] = otherSourcesBucket{
+			IsOther:             true,
+			PoolIDCount:         result.Other.PoolIDCount,
+			ShareCount:          result.Other.ShareCount,
+			SharesSum:           result.Other.SharesSum,
+			EstimatedHashrateHS: EstimateHashrateHS(result.Other.SharesSum, windowSeconds),
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // validateAlgoParam mirrors internal/backend/db.ValidateAlgo without

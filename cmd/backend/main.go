@@ -172,6 +172,21 @@
 //	                         defaultWalletRPCTimeout and
 //	                         internal/backend/disburse). Set it
 //	                         generously.
+//	GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND (optional) sustained
+//	                         requests/second, per source IP, allowed
+//	                         against the public, unauthenticated GET
+//	                         routes registered by
+//	                         internal/backend/statsapi,
+//	                         internal/backend/networkapi, and
+//	                         internal/backend/legacyconfig (see run()'s
+//	                         wiring of internal/backend/ratelimit).
+//	                         Default 30. <= 0 disables rate limiting
+//	                         entirely for those three route groups.
+//	GCPOOL_STATS_API_RATE_LIMIT_BURST (optional) token-bucket burst
+//	                         size (per source IP) for
+//	                         GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND
+//	                         above. Default 90. Only consulted when
+//	                         the rate limit is enabled.
 //	GCPOOL_JWT_SECRET        (required) HMAC-SHA256 signing secret for
 //	                         internal/backend/authapi's JWTs (also
 //	                         reused as its password-hashing key --
@@ -217,6 +232,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/networkpoller"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/payout"
+	"github.com/Snipa22/go-crypto-pool/internal/backend/ratelimit"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/retention"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/statsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
@@ -293,6 +309,39 @@ const (
 	defaultNetworkPollerInterval = 60 * time.Second
 )
 
+// defaultStatsAPIRateLimitPerSecond/defaultStatsAPIRateLimitBurst are
+// this command's defaults for the internal/backend/ratelimit
+// per-source-IP token-bucket limiter applied to the public,
+// unauthenticated, read-only statsapi/networkapi/legacyconfig routes
+// (see run()'s wiring). Deliberately set MATERIALLY HIGHER than a
+// sane default would be for the leaf-to-backend share/block
+// ingestion endpoint: these are public stats-page endpoints, which a
+// browser dashboard, a monitoring script, and any number of
+// legitimate distinct miners behind the SAME NAT/source IP may all
+// poll concurrently and far more frequently than a single leaf's own
+// periodic ingestion poll -- a low, ingestion-appropriate value here
+// would produce false-positive 429s against ordinary legitimate
+// traffic, not just an actual flood. 30 req/s sustained with a burst
+// of 90 (3x) is picked as a reasonable middle of the brief's
+// suggested 20-50 req/s-sustained / 2-4x-burst range: generous enough
+// for a dashboard auto-refreshing every few seconds across all 3
+// wrapped route groups from one shared source IP, while still
+// bounding a single IP's worst-case request rate against this
+// backend's Postgres-backed queries to a small, fixed number.
+const (
+	defaultStatsAPIRateLimitPerSecond = 30
+	defaultStatsAPIRateLimitBurst     = 90
+
+	// statsAPIRateLimitJanitorInterval/statsAPIRateLimitJanitorMaxAge
+	// bound the per-source-IP limiter map's memory footprint (see
+	// internal/backend/ratelimit.Limiter.RunJanitor): every 5 minutes,
+	// any source IP not seen again in the last 15 minutes has its
+	// token-bucket entry evicted, so a flood of distinct/rotating
+	// source IPs cannot grow this map without bound forever.
+	statsAPIRateLimitJanitorInterval = 5 * time.Minute
+	statsAPIRateLimitJanitorMaxAge   = 15 * time.Minute
+)
+
 // Version is the backend's build version, recorded on the
 // backend_build_info Prometheus gauge. Overridable at build time via
 // -ldflags "-X main.Version=...", e.g. from a CI-set git tag/commit;
@@ -366,6 +415,16 @@ type config struct {
 	// Local/dev use only — false is the only safe production value,
 	// and false is this field's default.
 	insecureAllowUnauthenticatedIngestion bool
+
+	// statsAPIRateLimitPerSecond/statsAPIRateLimitBurst configure the
+	// per-source-IP token-bucket rate limiter (internal/backend/
+	// ratelimit) applied to the public, unauthenticated, read-only
+	// statsapi/networkapi/legacyconfig routes -- see run()'s wiring
+	// and defaultStatsAPIRateLimitPerSecond's doc comment for the
+	// default rationale. statsAPIRateLimitPerSecond <= 0 disables
+	// this limiter entirely.
+	statsAPIRateLimitPerSecond float64
+	statsAPIRateLimitBurst     int
 
 	tariGRPCAddr  string
 	moneroRPCAddr string
@@ -494,6 +553,9 @@ func loadConfig() (config, error) {
 	flag.BoolVar(&cfg.insecureAllowUnauthenticatedIngestion, "insecure-allow-unauthenticated-ingestion", envOr("GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION", "false") == "true", "LOCAL/DEV USE ONLY: explicit, loudly-logged override that allows this command to start with -auth-header-name/-auth-header-value both unset, leaving /api/v1/share and /api/v1/block completely unauthenticated. Disabled by default -- with no flags/env set at all, run() refuses to start rather than silently accepting every share/block. Env: GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION (\"true\" to enable)")
 	flag.StringVar(&cfg.network, "network", envOr("GCPOOL_NETWORK", ""), "(required) the network this backend is configured for. Accepts \"mainnet\" or \"testnet\" (case-insensitive). There is no default -- startup fails fast if this is missing or does not parse to a valid network. Env: GCPOOL_NETWORK")
 
+	flag.Float64Var(&cfg.statsAPIRateLimitPerSecond, "stats-api-rate-limit-per-second", envOrFloat64("GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND", defaultStatsAPIRateLimitPerSecond), "sustained requests/second, per source IP, allowed against the public, unauthenticated GET routes registered by internal/backend/statsapi, internal/backend/networkapi, and internal/backend/legacyconfig (see run()'s wiring). <= 0 disables rate limiting entirely. Env: GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND")
+	flag.IntVar(&cfg.statsAPIRateLimitBurst, "stats-api-rate-limit-burst", envOrInt("GCPOOL_STATS_API_RATE_LIMIT_BURST", defaultStatsAPIRateLimitBurst), "token-bucket burst size (per source IP) for -stats-api-rate-limit-per-second above. Only consulted when the rate limit is enabled. Env: GCPOOL_STATS_API_RATE_LIMIT_BURST")
+
 	flag.StringVar(&cfg.tariGRPCAddr, "tari-grpc-addr", envOr("GCPOOL_TARI_GRPC_ADDR", ""), "host:port of a real Tari base node's GRPC endpoint. When set, the block unlocker polls every pending ALGO_RXT/ALGO_C29/ALGO_SHA3X block against it to detect maturity/orphaning. When unset, those algos' blocks are simply never auto-unlocked. Env: GCPOOL_TARI_GRPC_ADDR")
 	flag.StringVar(&cfg.moneroRPCAddr, "monero-rpc-addr", envOr("GCPOOL_MONERO_RPC_ADDR", ""), "base URL of a real monerod JSON-RPC endpoint (e.g. \"http://127.0.0.1:18081\"). When set, the unlocker polls every pending ALGO_RXM block against it. Same opt-in behavior as -tari-grpc-addr above. Env: GCPOOL_MONERO_RPC_ADDR")
 
@@ -579,6 +641,9 @@ type fileConfig struct {
 
 	InsecureAllowUnauthenticatedIngestion *bool `toml:"insecure_allow_unauthenticated_ingestion"`
 
+	StatsAPIRateLimitPerSecond *float64 `toml:"stats_api_rate_limit_per_second"`
+	StatsAPIRateLimitBurst     *int     `toml:"stats_api_rate_limit_burst"`
+
 	TariGRPCAddr  *string `toml:"tari_grpc_addr"`
 	MoneroRPCAddr *string `toml:"monero_rpc_addr"`
 
@@ -649,6 +714,9 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "GCPOOL_NETWORK")
 
 	cfgfile.ApplyBool(&cfg.insecureAllowUnauthenticatedIngestion, fc.InsecureAllowUnauthenticatedIngestion, visited, "insecure-allow-unauthenticated-ingestion", "GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION")
+
+	cfgfile.ApplyFloat64(&cfg.statsAPIRateLimitPerSecond, fc.StatsAPIRateLimitPerSecond, visited, "stats-api-rate-limit-per-second", "GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND")
+	cfgfile.ApplyInt(&cfg.statsAPIRateLimitBurst, fc.StatsAPIRateLimitBurst, visited, "stats-api-rate-limit-burst", "GCPOOL_STATS_API_RATE_LIMIT_BURST")
 
 	cfgfile.ApplyString(&cfg.tariGRPCAddr, fc.TariGRPCAddr, visited, "tari-grpc-addr", "GCPOOL_TARI_GRPC_ADDR")
 	cfgfile.ApplyString(&cfg.moneroRPCAddr, fc.MoneroRPCAddr, visited, "monero-rpc-addr", "GCPOOL_MONERO_RPC_ADDR")
@@ -933,18 +1001,25 @@ func (a statsRepositoryAdapter) ShareStatsSince(ctx context.Context, algo, netwo
 	return statsapi.ShareStatsRecord{SharesSum: s.SharesSum, ShareCount: s.ShareCount}, nil
 }
 
-func (a statsRepositoryAdapter) WorkerShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]statsapi.WorkerShareStatsRecord, error) {
-	rows, err := a.repo.WorkerShareStatsSince(ctx, algo, network, paymentAddress, paymentID, sinceUnix)
+func (a statsRepositoryAdapter) WorkerShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (statsapi.WorkerShareStatsResultRecord, error) {
+	result, err := a.repo.WorkerShareStatsSince(ctx, algo, network, paymentAddress, paymentID, sinceUnix)
 	if err != nil {
-		return nil, err
+		return statsapi.WorkerShareStatsResultRecord{}, err
 	}
-	out := make([]statsapi.WorkerShareStatsRecord, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, statsapi.WorkerShareStatsRecord{
+	out := statsapi.WorkerShareStatsResultRecord{Rows: make([]statsapi.WorkerShareStatsRecord, 0, len(result.Rows))}
+	for _, r := range result.Rows {
+		out.Rows = append(out.Rows, statsapi.WorkerShareStatsRecord{
 			Identifier: r.Identifier,
 			SharesSum:  r.SharesSum,
 			ShareCount: r.ShareCount,
 		})
+	}
+	if result.Other != nil {
+		out.Other = &statsapi.WorkerShareStatsOtherRecord{
+			SharesSum:       result.Other.SharesSum,
+			ShareCount:      result.Other.ShareCount,
+			IdentifierCount: result.Other.IdentifierCount,
+		}
 	}
 	return out, nil
 }
@@ -954,18 +1029,25 @@ func (a statsRepositoryAdapter) WorkerShareStatsSince(ctx context.Context, algo,
 // to statsapi.Repository's PoolSourceShareStatsSince (which operates
 // on statsapi.PoolSourceShareStatsRecord), mirroring
 // WorkerShareStatsSince's adapter above.
-func (a statsRepositoryAdapter) PoolSourceShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) ([]statsapi.PoolSourceShareStatsRecord, error) {
-	rows, err := a.repo.PoolSourceShareStatsSince(ctx, algo, network, paymentAddress, paymentID, sinceUnix)
+func (a statsRepositoryAdapter) PoolSourceShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (statsapi.PoolSourceShareStatsResultRecord, error) {
+	result, err := a.repo.PoolSourceShareStatsSince(ctx, algo, network, paymentAddress, paymentID, sinceUnix)
 	if err != nil {
-		return nil, err
+		return statsapi.PoolSourceShareStatsResultRecord{}, err
 	}
-	out := make([]statsapi.PoolSourceShareStatsRecord, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, statsapi.PoolSourceShareStatsRecord{
+	out := statsapi.PoolSourceShareStatsResultRecord{Rows: make([]statsapi.PoolSourceShareStatsRecord, 0, len(result.Rows))}
+	for _, r := range result.Rows {
+		out.Rows = append(out.Rows, statsapi.PoolSourceShareStatsRecord{
 			PoolID:     r.PoolID,
 			SharesSum:  r.SharesSum,
 			ShareCount: r.ShareCount,
 		})
+	}
+	if result.Other != nil {
+		out.Other = &statsapi.PoolSourceShareStatsOtherRecord{
+			SharesSum:   result.Other.SharesSum,
+			ShareCount:  result.Other.ShareCount,
+			PoolIDCount: result.Other.PoolIDCount,
+		}
 	}
 	return out, nil
 }
@@ -2684,13 +2766,32 @@ func run(cfg config) error {
 	// RegisterIngestionRoutes deliberately excludes GET /metrics --
 	// see metricsSrv below and PROD_HARDENING_REVIEW.md finding #12.
 	handler.RegisterIngestionRoutes(mux)
-	statsHandler.RegisterRoutes(mux)
+
+	// statsAPIMux carries the public, unauthenticated, read-only
+	// route groups this backend's own rate limiter protects (see
+	// internal/backend/ratelimit's package doc comment and
+	// defaultStatsAPIRateLimitPerSecond's doc comment above for why):
+	// statsHandler/networkAPIHandler/legacyConfigHandler ONLY.
+	// addressMapHandler/leafFlagsHandler/legacyAPIHandler/authHandler
+	// are deliberately registered directly on mux below, NOT through
+	// this sub-mux, and so are never subject to this limiter.
+	statsAPILimiter := ratelimit.New(cfg.statsAPIRateLimitPerSecond, cfg.statsAPIRateLimitBurst)
+	if statsAPILimiter.Enabled() {
+		log.Printf("backend: public stats/network/legacy-config API rate limiting ENABLED: %.2f req/s per source IP, burst %d (-stats-api-rate-limit-per-second/-stats-api-rate-limit-burst)", cfg.statsAPIRateLimitPerSecond, cfg.statsAPIRateLimitBurst)
+		go statsAPILimiter.RunJanitor(ctx, statsAPIRateLimitJanitorInterval, statsAPIRateLimitJanitorMaxAge)
+	} else {
+		log.Print("backend: public stats/network/legacy-config API rate limiting DISABLED (-stats-api-rate-limit-per-second/GCPOOL_STATS_API_RATE_LIMIT_PER_SECOND <= 0)")
+	}
+	statsAPIMux := http.NewServeMux()
+	statsHandler.RegisterRoutes(statsAPIMux)
+	networkAPIHandler.RegisterRoutes(statsAPIMux)
+	legacyConfigHandler.RegisterRoutes(statsAPIMux)
+	mux.Handle("/", ratelimit.Middleware(statsAPIMux, statsAPILimiter))
+
 	addressMapHandler.RegisterRoutes(mux)
-	networkAPIHandler.RegisterRoutes(mux)
 	leafFlagsHandler.RegisterRoutes(mux)
 	legacyAPIHandler.RegisterRoutes(mux)
 	authHandler.RegisterRoutes(mux)
-	legacyConfigHandler.RegisterRoutes(mux)
 
 	// HTTP server hardening (PROD_HARDENING_REVIEW.md finding #12):
 	// ReadHeaderTimeout alone (5s, unchanged from before this fix)
