@@ -377,6 +377,28 @@ type Metrics struct {
 	// partition, not per row — this is a partition-count metric,
 	// not a rows-reclaimed estimate.
 	RetentionPartitionsDroppedTotal *prometheus.CounterVec
+	// RetentionPartitionsSkippedUnresolvedTotal counts every
+	// `shares` block_height leaf partition that the
+	// internal/backend/retention poll loop found otherwise eligible
+	// to drop (fully below its target's retention cutoff) but did
+	// NOT drop, because the `blocks` table still has an unresolved
+	// (unlocked = FALSE) row inside that partition's height range —
+	// labeled by algo and pool_type, incremented once per skipped
+	// partition (not once per pass). This is the load-bearing
+	// observability for the CRITICAL data-loss bug this metric was
+	// added alongside the fix for: without this check, retention
+	// could DROP TABLE a partition holding a still-pending (or
+	// forever-retrying-payout, see internal/backend/unlocker's
+	// outcomePayoutRetry) block's winning shares before the
+	// unlocker/payout pass ever read them. A skip is expected,
+	// healthy behavior on its own (a genuinely pending block is
+	// normal) — but a SUSTAINED non-zero rate for one (algo,
+	// pool_type), or one that never clears, means some block is
+	// stuck unresolved long enough for retention to keep bumping
+	// into it every pass, which an operator should go investigate
+	// (e.g. via the unlocker's pending-blocks-age gauge and
+	// `backend block` CLI) rather than assume will resolve itself.
+	RetentionPartitionsSkippedUnresolvedTotal *prometheus.CounterVec
 	// RetentionRunDuration observes wall-clock time for one
 	// target's (algo, pool_type) worth of one retention RunOnce
 	// pass (listing existing partitions + dropping any that aged
@@ -601,6 +623,11 @@ func New(version string) *Metrics {
 	m.RetentionPartitionsDroppedTotal = registerCounterVec(reg, prometheus.CounterOpts{
 		Name: "retention_partitions_dropped_total",
 		Help: "Total number of shares block_height leaf partitions dropped by the retention job's whole-partition DROP TABLE, by algo and pool_type.",
+	}, []string{"algo", "pool_type"})
+
+	m.RetentionPartitionsSkippedUnresolvedTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "retention_partitions_skipped_unresolved_total",
+		Help: "Total number of shares block_height leaf partitions the retention job found otherwise eligible to drop but skipped because a blocks row inside that partition's height range is still unresolved (unlocked = false), by algo and pool_type. A sustained non-zero rate means a block is stuck unresolved long enough for retention to keep bumping into it.",
 	}, []string{"algo", "pool_type"})
 
 	m.RetentionRunDuration = registerHistogramVec(reg, prometheus.HistogramOpts{

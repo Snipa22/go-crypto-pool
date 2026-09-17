@@ -180,8 +180,13 @@ func runRetentionRun(args []string) error {
 			continue
 		}
 		log.Printf("retention run: %s/%s: dropped %d partition(s): %v", tr.Algo, tr.PoolType, len(tr.Dropped), tr.Dropped)
+		for _, sp := range tr.Skipped {
+			log.Printf("retention run: %s/%s: partition %s NOT dropped (block id=%d height=%d still unresolved, unlocked=false)",
+				tr.Algo, tr.PoolType, sp.Name, sp.BlockID, sp.BlockHeight)
+		}
 	}
-	log.Printf("retention run: done: %d target(s) checked, %d partition(s) dropped, %d error(s)", result.TargetsChecked, result.PartitionsDropped, result.Errors)
+	log.Printf("retention run: done: %d target(s) checked, %d partition(s) dropped, %d partition(s) skipped (unresolved block), %d error(s)",
+		result.TargetsChecked, result.PartitionsDropped, result.PartitionsSkipped, result.Errors)
 	if result.Errors > 0 {
 		return fmt.Errorf("retention run: completed with %d target error(s)", result.Errors)
 	}
