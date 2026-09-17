@@ -43,6 +43,16 @@ const (
 	ResultRejected     = "rejected"
 	ResultError        = "error"
 	ResultUnauthorized = "unauthorized"
+	// ResultRateLimited — the share/block was rejected before any
+	// decode/DB work because its source IP exceeded the configured
+	// per-IP ingestion rate limit (see internal/backend/api's
+	// checkRateLimit / Config.IngestionRateLimit). Distinct from
+	// ResultUnauthorized/ResultRejected: this is a DoS-focused
+	// per-source throttle outcome, not an auth or validation
+	// failure, and is worth its own queryable/alertable count for
+	// telling "a leaf is being throttled" apart from either of
+	// those.
+	ResultRateLimited = "rate_limited"
 
 	// UnknownLabel is used for algo/network/pool_type when a
 	// share/block is rejected before it could be decoded far enough

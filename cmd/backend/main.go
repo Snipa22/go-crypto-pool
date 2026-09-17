@@ -238,6 +238,33 @@ const defaultListenAddr = ":8080"
 // override via -metrics-listen-addr/GCPOOL_METRICS_LISTEN_ADDR.
 const defaultMetricsListenAddr = "127.0.0.1:9602"
 
+// defaultIngestionRateLimit/defaultIngestionRateBurst are this
+// command's defaults for -ingestion-rate-limit/-ingestion-rate-burst
+// (GCPOOL_INGESTION_RATE_LIMIT/GCPOOL_INGESTION_RATE_BURST) — the
+// per-source-IP requests-per-second cap (and its burst allowance)
+// applied across /api/v1/share and /api/v1/block combined (see
+// api.Config.IngestionRateLimit/IngestionRateBurst).
+//
+// Sizing rationale: this pool's own leaf-proxy vardiff already
+// targets roughly one share every 15-30s PER WORKER (see recent
+// commit history: "lower vardiff target-time/retarget-interval
+// defaults to 15s/30s"). But a single leaf can aggregate hundreds of
+// individual miner workers behind ONE backend-facing IP
+// (proxy-aggregator mode is an explicitly supported leaf mode per
+// AGENTS.md) -- e.g. 300 workers submitting once every ~20s each is
+// already ~15 req/s sustained from that one IP, well before
+// accounting for any bursty/uneven submit timing across workers. 200
+// req/s sustained with a burst of 400 is chosen to comfortably exceed
+// that kind of aggregate submit rate for a single legitimate
+// high-hashrate proxy-aggregator leaf, while still bounding a single
+// misbehaving/malicious source to a fraction of what this process can
+// otherwise sink. Deliberately NOT a stingy value like 5-10 req/s —
+// that WOULD throttle real proxy-aggregator leaves.
+const (
+	defaultIngestionRateLimit = 200
+	defaultIngestionRateBurst = 400
+)
+
 // defaultUnlockerPollInterval/defaultTariMaturity/defaultMoneroMaturity
 // are this command's PLACEHOLDER defaults for the unlocker's env vars
 // — see this file's package doc comment for why these are
@@ -317,6 +344,19 @@ type config struct {
 	// DefaultLeafMaxConnections), but this backend previously had
 	// none at all for its own public HTTP listener.
 	maxConnections int
+
+	// ingestionRateLimit/ingestionRateBurst configure the per-source-
+	// IP rate limiter in front of /api/v1/share and /api/v1/block
+	// (see api.Config.IngestionRateLimit/IngestionRateBurst and
+	// defaultIngestionRateLimit/defaultIngestionRateBurst's doc
+	// comment for sizing rationale). ingestionRateLimit <= 0 means
+	// "disabled" (no rate limiting), mirroring maxConnections' own
+	// 0 = unlimited convention above. This is a genuinely different
+	// defense than maxConnections: that caps total concurrent TCP
+	// connections across ALL sources combined, this bounds the
+	// request RATE of any one individual source.
+	ingestionRateLimit float64
+	ingestionRateBurst int
 
 	// insecureAllowUnauthenticatedIngestion is the explicit,
 	// loudly-logged escape hatch that allows run() to start with
@@ -447,6 +487,8 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.listenAddr, "listen-addr", envOr("GCPOOL_LISTEN_ADDR", defaultListenAddr), "HTTP listen address. Env: GCPOOL_LISTEN_ADDR")
 	flag.StringVar(&cfg.metricsListenAddr, "metrics-listen-addr", envOr("GCPOOL_METRICS_LISTEN_ADDR", defaultMetricsListenAddr), "HTTP listen address for GET /metrics ONLY -- deliberately separate from -listen-addr (see PROD_HARDENING_REVIEW.md finding #12: /metrics exposes wallet_balance_atomic, the real hot-wallet balance, and must not share a public listener with share/block ingestion). Defaults to loopback-only, matching the leaf binaries' own -metrics-listen-address convention. Empty disables the /metrics endpoint entirely. Env: GCPOOL_METRICS_LISTEN_ADDR")
 	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("GCPOOL_MAX_CONNECTIONS", leaflib.DefaultLeafMaxConnections), "max concurrent TCP connections the main HTTP listener (-listen-addr) will accept, 0 = unlimited. Env: GCPOOL_MAX_CONNECTIONS")
+	flag.Float64Var(&cfg.ingestionRateLimit, "ingestion-rate-limit", envOrFloat64("GCPOOL_INGESTION_RATE_LIMIT", defaultIngestionRateLimit), "sustained requests-per-second allowed per source IP across /api/v1/share and /api/v1/block combined, 0 (or negative) = disabled (no rate limiting). Default chosen to comfortably exceed the aggregate submit rate of a single leaf proxying hundreds of workers at the pool's own ~15-30s per-worker vardiff target, while still bounding a single misbehaving/malicious source. Env: GCPOOL_INGESTION_RATE_LIMIT")
+	flag.IntVar(&cfg.ingestionRateBurst, "ingestion-rate-burst", envOrInt("GCPOOL_INGESTION_RATE_BURST", defaultIngestionRateBurst), "burst size (rate.Limiter's burst parameter) for the same per-source-IP limiter -ingestion-rate-limit configures. Only consulted when -ingestion-rate-limit > 0. Env: GCPOOL_INGESTION_RATE_BURST")
 	flag.StringVar(&cfg.authHeaderName, "auth-header-name", envOr("GCPOOL_AUTH_HEADER_NAME", ""), "(required, unless -insecure-allow-unauthenticated-ingestion is set) shared-secret auth header name to require on /api/v1/share and /api/v1/block, e.g. \"Authorization\". Must be set together with -auth-header-value -- run() refuses to start if both are empty and the override flag below isn't set. Env: GCPOOL_AUTH_HEADER_NAME")
 	flag.StringVar(&cfg.authHeaderValue, "auth-header-value", envOr("GCPOOL_AUTH_HEADER_VALUE", ""), "(required, unless -insecure-allow-unauthenticated-ingestion is set) expected value for -auth-header-name above. Env: GCPOOL_AUTH_HEADER_VALUE")
 	flag.BoolVar(&cfg.insecureAllowUnauthenticatedIngestion, "insecure-allow-unauthenticated-ingestion", envOr("GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION", "false") == "true", "LOCAL/DEV USE ONLY: explicit, loudly-logged override that allows this command to start with -auth-header-name/-auth-header-value both unset, leaving /api/v1/share and /api/v1/block completely unauthenticated. Disabled by default -- with no flags/env set at all, run() refuses to start rather than silently accepting every share/block. Env: GCPOOL_INSECURE_ALLOW_UNAUTHENTICATED_INGESTION (\"true\" to enable)")
@@ -525,13 +567,15 @@ func loadConfig() (config, error) {
 // seconds (go-toml/v2 does not natively decode into time.Duration)
 // and converted with time.Duration(v) * time.Second when applied.
 type fileConfig struct {
-	DBDSN             *string `toml:"db_dsn"`
-	ListenAddr        *string `toml:"listen_addr"`
-	MetricsListenAddr *string `toml:"metrics_listen_addr"`
-	MaxConnections    *int    `toml:"max_connections"`
-	AuthHeaderName    *string `toml:"auth_header_name"`
-	AuthHeaderValue   *string `toml:"auth_header_value"`
-	Network           *string `toml:"network"`
+	DBDSN              *string  `toml:"db_dsn"`
+	ListenAddr         *string  `toml:"listen_addr"`
+	MetricsListenAddr  *string  `toml:"metrics_listen_addr"`
+	MaxConnections     *int     `toml:"max_connections"`
+	IngestionRateLimit *float64 `toml:"ingestion_rate_limit"`
+	IngestionRateBurst *int     `toml:"ingestion_rate_burst"`
+	AuthHeaderName     *string  `toml:"auth_header_name"`
+	AuthHeaderValue    *string  `toml:"auth_header_value"`
+	Network            *string  `toml:"network"`
 
 	InsecureAllowUnauthenticatedIngestion *bool `toml:"insecure_allow_unauthenticated_ingestion"`
 
@@ -598,6 +642,8 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.listenAddr, fc.ListenAddr, visited, "listen-addr", "GCPOOL_LISTEN_ADDR")
 	cfgfile.ApplyString(&cfg.metricsListenAddr, fc.MetricsListenAddr, visited, "metrics-listen-addr", "GCPOOL_METRICS_LISTEN_ADDR")
 	cfgfile.ApplyInt(&cfg.maxConnections, fc.MaxConnections, visited, "max-connections", "GCPOOL_MAX_CONNECTIONS")
+	cfgfile.ApplyFloat64(&cfg.ingestionRateLimit, fc.IngestionRateLimit, visited, "ingestion-rate-limit", "GCPOOL_INGESTION_RATE_LIMIT")
+	cfgfile.ApplyInt(&cfg.ingestionRateBurst, fc.IngestionRateBurst, visited, "ingestion-rate-burst", "GCPOOL_INGESTION_RATE_BURST")
 	cfgfile.ApplyString(&cfg.authHeaderName, fc.AuthHeaderName, visited, "auth-header-name", "GCPOOL_AUTH_HEADER_NAME")
 	cfgfile.ApplyString(&cfg.authHeaderValue, fc.AuthHeaderValue, visited, "auth-header-value", "GCPOOL_AUTH_HEADER_VALUE")
 	cfgfile.ApplyString(&cfg.network, fc.Network, visited, "network", "GCPOOL_NETWORK")
@@ -2405,11 +2451,13 @@ func run(cfg config) error {
 	// listener just for the backend's internal poll loops.
 	m := metrics.New(Version)
 	handler := api.NewHandler(repositoryAdapter{repo: repo}, api.Config{
-		AuthHeaderName:  cfg.authHeaderName,
-		AuthHeaderValue: cfg.authHeaderValue,
-		Network:         network,
-		Version:         Version,
-		Metrics:         m,
+		AuthHeaderName:     cfg.authHeaderName,
+		AuthHeaderValue:    cfg.authHeaderValue,
+		Network:            network,
+		Version:            Version,
+		Metrics:            m,
+		IngestionRateLimit: cfg.ingestionRateLimit,
+		IngestionRateBurst: cfg.ingestionRateBurst,
 	})
 
 	// statsHandler serves the read-only, unauthenticated miner stats
