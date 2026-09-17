@@ -30,6 +30,21 @@ metrics_listen_addr = "127.0.0.1:9602"
 # accept, 0 = unlimited. (default: 10000)
 max_connections = 10000
 
+# Sustained requests-per-second allowed per source IP across /api/v1/share
+# and /api/v1/block combined, 0 (or negative) = disabled (no rate limiting).
+# This is a genuinely different defense than max_connections above: that
+# caps total concurrent TCP connections across ALL sources combined, this
+# bounds the request RATE of any one individual source (e.g. a single
+# misbehaving/malicious leaf). Default chosen to comfortably exceed the
+# aggregate submit rate of a single leaf proxying hundreds of workers at
+# the pool's own ~15-30s per-worker vardiff target. (default: 200)
+ingestion_rate_limit = 200
+
+# Burst size (rate.Limiter's burst parameter) for the same per-source-IP
+# limiter ingestion_rate_limit configures. Only consulted when
+# ingestion_rate_limit > 0. (default: 400)
+ingestion_rate_burst = 400
+
 # Shared-secret auth header name to require on /api/v1/share and
 # /api/v1/block, e.g. "Authorization". Must be set together with
 # auth_header_value.

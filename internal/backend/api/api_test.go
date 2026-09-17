@@ -77,6 +77,25 @@ func postProto(t *testing.T, mux *http.ServeMux, path string, msg proto.Message,
 	return rr
 }
 
+// postProtoFromIP mirrors postProto but lets the caller control the
+// request's RemoteAddr (used by the per-source-IP rate limiter tests
+// below to deterministically exercise separate/shared limiter
+// buckets without relying on httptest.NewRequest's fixed default
+// RemoteAddr).
+func postProtoFromIP(t *testing.T, mux *http.ServeMux, path string, msg proto.Message, remoteAddr string) *httptest.ResponseRecorder {
+	t.Helper()
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatalf("proto.Marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.RemoteAddr = remoteAddr
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	return rr
+}
+
 func TestHandleShare_ValidRoundTrip(t *testing.T) {
 	repo := &fakeRepo{}
 	h := NewHandler(repo, Config{})
@@ -684,5 +703,134 @@ func TestMetrics_InsertDurationHistograms_ObserveRealTiming(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected %q in /metrics output, got:\n%s", want, body)
 		}
+	}
+}
+
+// --- Finding 2: per-source-IP ingestion rate limiting ---
+//
+// These tests use a deliberately tiny burst (1) so the SECOND
+// immediate request from the same source IP deterministically
+// exceeds it without any wall-clock sleep — fast and non-flaky.
+
+// TestRateLimit_WithinBurstSucceeds proves requests within the
+// configured rate/burst from one source IP succeed normally.
+func TestRateLimit_WithinBurstSucceeds(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{IngestionRateLimit: 1000, IngestionRateBurst: 5})
+	mux := h.Mux()
+
+	for i := 0; i < 3; i++ {
+		rr := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.5:1234")
+		if rr.Code < 200 || rr.Code >= 300 {
+			t.Fatalf("request %d: status = %d, want 2xx; body=%s", i, rr.Code, rr.Body.String())
+		}
+	}
+	if len(repo.shares) != 3 {
+		t.Errorf("expected 3 inserts, got %d", len(repo.shares))
+	}
+}
+
+// TestRateLimit_ExceedingBurstReturns429 proves a request that
+// exceeds the configured rate/burst from the SAME source IP gets
+// HTTP 429, and is not inserted.
+func TestRateLimit_ExceedingBurstReturns429(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{IngestionRateLimit: 1, IngestionRateBurst: 1})
+	mux := h.Mux()
+
+	rr1 := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.6:1234")
+	if rr1.Code < 200 || rr1.Code >= 300 {
+		t.Fatalf("first request: status = %d, want 2xx; body=%s", rr1.Code, rr1.Body.String())
+	}
+
+	rr2 := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.6:1234")
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request: status = %d, want 429; body=%s", rr2.Code, rr2.Body.String())
+	}
+	if len(repo.shares) != 1 {
+		t.Errorf("expected exactly 1 insert (second request rate-limited), got %d", len(repo.shares))
+	}
+}
+
+// TestRateLimit_DifferentSourceIPNotAffected proves per-IP keying: a
+// DIFFERENT source IP is not affected by the first IP's limiter
+// state.
+func TestRateLimit_DifferentSourceIPNotAffected(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{IngestionRateLimit: 1, IngestionRateBurst: 1})
+	mux := h.Mux()
+
+	rrA1 := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.10:1111")
+	if rrA1.Code < 200 || rrA1.Code >= 300 {
+		t.Fatalf("ipA request 1: status = %d, want 2xx", rrA1.Code)
+	}
+	rrA2 := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.10:1111")
+	if rrA2.Code != http.StatusTooManyRequests {
+		t.Fatalf("ipA request 2: status = %d, want 429", rrA2.Code)
+	}
+
+	// A different source IP must have its OWN, unaffected bucket.
+	rrB1 := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.20:2222")
+	if rrB1.Code < 200 || rrB1.Code >= 300 {
+		t.Fatalf("ipB request 1: status = %d, want 2xx; body=%s", rrB1.Code, rrB1.Body.String())
+	}
+}
+
+// TestRateLimit_CombinedAcrossShareAndBlock proves the chosen design
+// (ONE combined limiter per source IP shared across BOTH endpoints,
+// see rateLimiterFor's doc comment): hitting /api/v1/block
+// immediately after exhausting the burst on /api/v1/share from the
+// SAME source IP must still be rate-limited, not given a fresh,
+// independent bucket.
+func TestRateLimit_CombinedAcrossShareAndBlock(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{IngestionRateLimit: 1, IngestionRateBurst: 1})
+	mux := h.Mux()
+
+	rrShare := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.50:5555")
+	if rrShare.Code < 200 || rrShare.Code >= 300 {
+		t.Fatalf("share request: status = %d, want 2xx; body=%s", rrShare.Code, rrShare.Body.String())
+	}
+
+	rrBlock := postProtoFromIP(t, mux, "/api/v1/block", validBlock(), "203.0.113.50:5555")
+	if rrBlock.Code != http.StatusTooManyRequests {
+		t.Fatalf("block request: status = %d, want 429 (combined per-IP bucket shared with share endpoint); body=%s", rrBlock.Code, rrBlock.Body.String())
+	}
+}
+
+// TestRateLimit_DisabledWhenNonPositive proves IngestionRateLimit <=
+// 0 disables rate limiting entirely, mirroring -max-connections' own
+// 0 = unlimited convention.
+func TestRateLimit_DisabledWhenNonPositive(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{IngestionRateLimit: 0})
+	mux := h.Mux()
+
+	for i := 0; i < 10; i++ {
+		rr := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.30:3333")
+		if rr.Code < 200 || rr.Code >= 300 {
+			t.Fatalf("request %d: status = %d, want 2xx (rate limiting should be disabled); body=%s", i, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+// TestMetrics_RateLimited_IncrementsSpecificResult proves an
+// exceeded-rate rejection increments shares_total{result="rate_limited"}
+// (metrics.ResultRateLimited), distinct from "rejected"/"unauthorized".
+func TestMetrics_RateLimited_IncrementsSpecificResult(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{IngestionRateLimit: 1, IngestionRateBurst: 1})
+	mux := h.Mux()
+
+	postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.40:4444")
+	rr := postProtoFromIP(t, mux, "/api/v1/share", validShare(), "203.0.113.40:4444")
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request: status = %d, want 429", rr.Code)
+	}
+
+	body := scrapeMetrics(t, h)
+	want := `shares_total{algo="unknown",network="unknown",pool_type="unknown",result="rate_limited"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("expected %q in /metrics output, got:\n%s", want, body)
 	}
 }

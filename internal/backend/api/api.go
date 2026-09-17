@@ -35,14 +35,18 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
+	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -148,6 +152,27 @@ type Config struct {
 	// Handler creates its own default Metrics (i.e. when Metrics
 	// above is left nil). Ignored if Metrics is set explicitly.
 	Version string
+
+	// IngestionRateLimit is the sustained requests-per-second rate
+	// allowed per source IP, shared across BOTH /api/v1/share and
+	// /api/v1/block combined (see rateLimiterFor's doc comment for
+	// why a single combined limiter per IP, rather than one per
+	// endpoint). <= 0 means "disabled" (no rate limiting at all) —
+	// mirrors cmd/backend's -max-connections' own 0 = unlimited
+	// convention. This is the only defense in this package against
+	// a single misbehaving/malicious leaf flooding
+	// /api/v1/share or /api/v1/block as fast as it can open
+	// requests — cmd/backend's -max-connections/
+	// GCPOOL_MAX_CONNECTIONS caps total concurrent TCP connections
+	// across ALL sources combined, not any individual source's
+	// request rate.
+	IngestionRateLimit float64
+
+	// IngestionRateBurst is the burst size (rate.Limiter's burst
+	// parameter) for the same per-source-IP limiter
+	// IngestionRateLimit configures. Only consulted when
+	// IngestionRateLimit > 0.
+	IngestionRateBurst int
 }
 
 // Handler implements the backend's share/block ingestion HTTP endpoints.
@@ -155,6 +180,20 @@ type Handler struct {
 	repo ShareBlockRepository
 	cfg  Config
 	m    *metrics.Metrics
+
+	// ipLimitersMu guards ipLimiters.
+	ipLimitersMu sync.Mutex
+	// ipLimiters holds one *rate.Limiter per source IP seen on the
+	// ingestion routes, created lazily on first sight of that IP
+	// (see rateLimiterFor). This is a per-process, in-memory-only
+	// map with no eviction: a stale/unbounded-growth map is an
+	// accepted tradeoff at this package's scope (a private/internal
+	// pool backend with a bounded, known set of leaf IPs in
+	// practice, not an internet-facing service exposed to an
+	// unbounded set of source IPs) — do not add eviction here
+	// without a real, observed growth problem to justify the added
+	// complexity.
+	ipLimiters map[string]*rate.Limiter
 }
 
 // NewHandler constructs a Handler backed by repo, using cfg for optional
@@ -170,7 +209,7 @@ func NewHandler(repo ShareBlockRepository, cfg Config) *Handler {
 	if m == nil {
 		m = metrics.New(cfg.Version)
 	}
-	return &Handler{repo: repo, cfg: cfg, m: m}
+	return &Handler{repo: repo, cfg: cfg, m: m, ipLimiters: make(map[string]*rate.Limiter)}
 }
 
 // Metrics returns this Handler's metrics.Metrics instance (the same
@@ -254,6 +293,16 @@ func (h *Handler) authConfigured() bool {
 
 // checkAuth returns true if the request passes the configured auth
 // check (or if no auth is configured at all).
+//
+// The final comparison uses hmac.Equal (constant-time) rather than
+// Go's built-in == operator, matching internal/backend/authapi's own
+// password-check pattern exactly. A shared-secret leaf-to-backend
+// trust-boundary credential compared with == is a real timing side
+// channel: == on strings short-circuits on the first mismatched byte,
+// so a network-adjacent attacker able to measure response latency can
+// recover the secret byte-by-byte. hmac.Equal always compares the
+// full length of both inputs in constant time regardless of where
+// (or whether) they first differ.
 func (h *Handler) checkAuth(r *http.Request) bool {
 	if !h.authConfigured() {
 		return true
@@ -262,10 +311,77 @@ func (h *Handler) checkAuth(r *http.Request) bool {
 	if got == "" {
 		return false
 	}
-	return got == h.cfg.AuthHeaderValue
+	return hmac.Equal([]byte(got), []byte(h.cfg.AuthHeaderValue))
+}
+
+// sourceIP extracts the bare IP (no port) that h's per-IP ingestion
+// rate limiter keys on, from r.RemoteAddr. net/http guarantees
+// RemoteAddr is normally "IP:port" for a real network connection;
+// mirrors this repo's existing net.Addr-based IP-extraction
+// convention (see internal/leaflib/metrics.RemoteIPOf) by falling
+// back to the raw, unparsed RemoteAddr value on a net.SplitHostPort
+// error (e.g. a test transport that sets a bare host with no port)
+// rather than collapsing every unparsable RemoteAddr onto a single
+// shared "" bucket.
+func sourceIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// rateLimiterFor returns h's *rate.Limiter for ip, constructing one
+// lazily (using h.cfg.IngestionRateLimit/IngestionRateBurst) on first
+// sight of that IP and caching it in h.ipLimiters for every
+// subsequent call. Safe for concurrent use.
+//
+// Design choice: ONE combined limiter per source IP, shared across
+// BOTH /api/v1/share and /api/v1/block, rather than a separate
+// limiter per endpoint. RegisterIngestionRoutes wires both handlers
+// as a single ingestion surface for one leaf, and cmd/backend only
+// exposes a single -ingestion-rate-limit/-ingestion-rate-burst knob
+// pair (not one per endpoint) — a combined bucket per IP is the more
+// natural fit for that shape, and it is simpler than maintaining two
+// independent limiter maps for what is, from one leaf's perspective,
+// one aggregate submit rate.
+func (h *Handler) rateLimiterFor(ip string) *rate.Limiter {
+	h.ipLimitersMu.Lock()
+	defer h.ipLimitersMu.Unlock()
+	if lim, ok := h.ipLimiters[ip]; ok {
+		return lim
+	}
+	lim := rate.NewLimiter(rate.Limit(h.cfg.IngestionRateLimit), h.cfg.IngestionRateBurst)
+	h.ipLimiters[ip] = lim
+	return lim
+}
+
+// checkRateLimit reports whether r's source IP is currently within
+// its configured per-IP ingestion rate limit. Always true (no
+// limiting performed at all, not even bucket construction) when
+// h.cfg.IngestionRateLimit <= 0 — mirrors -max-connections' own 0 =
+// unlimited convention.
+func (h *Handler) checkRateLimit(r *http.Request) bool {
+	if h.cfg.IngestionRateLimit <= 0 {
+		return true
+	}
+	return h.rateLimiterFor(sourceIP(r)).Allow()
 }
 
 func (h *Handler) handleShare(w http.ResponseWriter, r *http.Request) {
+	// Rate limit is checked BEFORE auth: this is a DoS-focused
+	// per-source throttle, not part of the auth trust boundary, so
+	// either ordering is defensible (see brief/PROD_HARDENING_
+	// REVIEW.md finding). Checking it first sheds excess load from
+	// a single source as early as possible, before doing any other
+	// per-request work (including the auth comparison). Kept
+	// consistent with handleBlock below.
+	if !h.checkRateLimit(r) {
+		h.m.SharesTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRateLimited).Inc()
+		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
 	if !h.checkAuth(r) {
 		h.m.SharesTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultUnauthorized).Inc()
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
@@ -320,6 +436,15 @@ func (h *Handler) handleShare(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleBlock(w http.ResponseWriter, r *http.Request) {
+	// See handleShare's identical rate-limit-before-auth comment
+	// above for why this ordering was picked; kept consistent
+	// between the two handlers.
+	if !h.checkRateLimit(r) {
+		h.m.BlocksTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultRateLimited).Inc()
+		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
 	if !h.checkAuth(r) {
 		h.m.BlocksTotal.WithLabelValues(metrics.UnknownLabel, metrics.UnknownLabel, metrics.ResultUnauthorized).Inc()
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
