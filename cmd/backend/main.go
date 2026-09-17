@@ -157,6 +157,54 @@
 //	                         GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH,
 //	                         GCPOOL_DISBURSE_POLL_INTERVAL,
 //	                         GCPOOL_FORCE_PAYOUT_FEE_ATOMIC).
+//	GCPOOL_<TICKER>_WALLET_RPC_ADDR (optional, env-var-only -- not a
+//	                         flag, since the name is only known at
+//	                         runtime; see this file's package doc
+//	                         comment's note on
+//	                         GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS
+//	                         for the same pattern) base URL of a real
+//	                         monero-wallet-rpc-COMPATIBLE endpoint for
+//	                         one of the 7 standalone monerod-family
+//	                         coins added via internal/coinprofile.Registry
+//	                         (TICKER is that coin's own Ticker, e.g.
+//	                         GCPOOL_ARQ_WALLET_RPC_ADDR,
+//	                         GCPOOL_XEQ_WALLET_RPC_ADDR, ...). When
+//	                         set, that coin gets its own, genuinely
+//	                         separate internal/backend/disburse.Engine
+//	                         (wallet.NewMoneroWalletRPC is already a
+//	                         generic monero-wallet-rpc-compatible
+//	                         client, so it is reused as-is -- no new
+//	                         per-coin wallet client code). When unset
+//	                         (the default for every one of the 7 coins
+//	                         until an operator configures it), that
+//	                         coin's balances still accrue correctly,
+//	                         they simply are not auto-disbursed
+//	                         on-chain -- exactly the same "absent env
+//	                         var = disabled, never fatal" contract as
+//	                         GCPOOL_MONERO_WALLET_RPC_ADDR/
+//	                         GCPOOL_TARI_WALLET_GRPC_ADDR above. See
+//	                         buildCoinDisburseEngines' doc comment.
+//	GCPOOL_<TICKER>_WALLET_RPC_USER,
+//	GCPOOL_<TICKER>_WALLET_RPC_PASSWORD (optional, env-var-only) HTTP
+//	                         Digest auth credentials for the same
+//	                         per-coin wallet RPC endpoint, mirroring
+//	                         GCPOOL_MONERO_WALLET_RPC_{USER,PASSWORD}.
+//	                         Both empty means no auth is attempted.
+//	                         GCPOOL_DISBURSE_MIN_PAYOUT_ATOMIC,
+//	                         GCPOOL_DISBURSE_MAX_DESTINATIONS_PER_BATCH,
+//	                         GCPOOL_DISBURSE_POLL_INTERVAL,
+//	                         GCPOOL_FORCE_PAYOUT_FEE_ATOMIC, and
+//	                         GCPOOL_WALLET_RPC_TIMEOUT are all SHARED
+//	                         with the Monero engine's identically-named
+//	                         knobs above (and with each other, across
+//	                         every one of the 7 new coins) -- see
+//	                         buildCoinDisburseEngines' doc comment for
+//	                         why a per-coin override of any of these
+//	                         was deliberately not added: there is no
+//	                         known coin-specific reason (fee-per-KB,
+//	                         batch limit, or wallet-rpc auth quirk)
+//	                         to need one, and this dispatch does not
+//	                         invent one speculatively.
 //	GCPOOL_WALLET_RPC_TIMEOUT (optional) timeout for real wallet RPC
 //	                         calls -- the monero-wallet-rpc HTTP
 //	                         client's timeout, and the bound on
@@ -2218,6 +2266,123 @@ func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics
 	return disburse.New(disburseRepositoryAdapter{repo: repo}, dcfg), walletClient, cfg.disbursePollInterval, true, nil
 }
 
+// buildCoinDisburseEngines is buildDisburseEngine/buildTariDisburseEngine's
+// counterpart for every standalone monerod-family coin in
+// internal/coinprofile.Registry (XMR, ARQ, XEQ, GRFT, SFX, ZEPH,
+// SAL) -- generalized into ONE loop over the real Registry, per
+// payoutbrief.md dispatch #3's explicit instruction, rather than 7
+// more hand-copied near-identical build*DisburseEngine functions.
+//
+// wallet.NewMoneroWalletRPC is already a generic monero-wallet-rpc-
+// COMPATIBLE client (no Monero-specific wire assumption beyond what
+// every one of these forks' own `*-wallet-rpc` binary also
+// implements, per the brief's own framing), so it is reused as-is
+// for every coin here -- there is no new per-coin wallet client type
+// anywhere in this codebase, only new wiring.
+//
+// For each coin with ticker T (e.g. "ARQ"), reads, env-var-only (see
+// this file's package doc comment's GCPOOL_<TICKER>_WALLET_RPC_ADDR
+// entry -- not exposed as a flag, since the name is only known at
+// runtime, exactly like GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS in
+// buildRetentionConfig above):
+//
+//	GCPOOL_<T>_WALLET_RPC_ADDR      (required to enable T's engine)
+//	                                 base URL of a real
+//	                                 monero-wallet-rpc-compatible
+//	                                 endpoint. Absent means T's engine
+//	                                 is simply not built -- never
+//	                                 fatal, mirroring
+//	                                 GCPOOL_MONERO_WALLET_RPC_ADDR/
+//	                                 GCPOOL_TARI_WALLET_GRPC_ADDR's own
+//	                                 "config knob absent -> feature
+//	                                 disabled" contract.
+//	GCPOOL_<T>_WALLET_RPC_USER,
+//	GCPOOL_<T>_WALLET_RPC_PASSWORD  (optional) HTTP Digest auth,
+//	                                 mirroring
+//	                                 GCPOOL_MONERO_WALLET_RPC_{USER,PASSWORD}.
+//
+// Every other Config knob -- MinPayoutAtomic, MaxDestinationsPerBatch,
+// ForcePayoutFeeAtomic, the poll interval, and the wallet RPC timeout
+// -- is DELIBERATELY shared across every coin built here AND with the
+// existing Monero engine (cfg.disburseMinPayoutAtomic/
+// cfg.disburseMaxDestinationsPerBatch/cfg.forcePayoutFeeAtomic/
+// cfg.disbursePollInterval/cfg.walletRPCTimeout), exactly like
+// buildTariDisburseEngine already shares those same fields with
+// buildDisburseEngine today. No per-coin override of any of these
+// exists: this dispatch does not invent a coin-specific fee-per-KB,
+// batch limit, or wallet-rpc auth quirk it cannot verify (see
+// payoutbrief.md's explicit "out of scope" list) -- if a real
+// deployment of one of these coins genuinely needs one, that is a
+// real, separate follow-up once that coin's actual wallet-rpc
+// behavior is observed, not something to guess here.
+//
+// MaxDestinationsPerBatch is NOT hardcoded to 1 the way
+// buildTariDisburseEngine's is: that constraint is specific to
+// Tari's own GRPC Transfer semantics (see that function's doc
+// comment), not a general multi-destination concern -- every one of
+// these 7 coins speaks real monero-wallet-rpc-style multi-destination
+// `transfer`/`transfer_split` semantics, exactly like the existing
+// Monero engine already relies on.
+//
+// Returns one *disburse.Engine plus its wallet.WalletClient per
+// ENABLED coin, keyed by uppercase Ticker -- which is simultaneously
+// that coin's db.ValidAlgos entry (the `algo` this engine's
+// RunOnce/Target should use) AND the currency its balance/payout rows
+// use (see fix #1/#2 elsewhere in this change-set: blockPayoutCurrency
+// and db.ValidCurrencies both key on exactly this same Ticker string).
+// A coin absent from the returned maps had no
+// GCPOOL_<TICKER>_WALLET_RPC_ADDR set and was simply not built.
+//
+// Every safety property disburse.Engine/wallet.WalletClient already
+// has for the Monero/Tari engines (the AMBIGUOUS-status halt-on-
+// unresolved-payout gate CheckTargets/RunOnce enforce, the
+// in-process TryLock overlap guard, ErrNotBroadcast disambiguation)
+// applies automatically to every engine built here too, because this
+// function does nothing but construct the SAME disburse.Engine/
+// wallet.WalletClient types every other coin already uses -- see
+// TestCoinDisburseEngineRunOnceCreditsAndPaysOutARQCurrency for a
+// real, from-scratch proof of this for one representative coin
+// (ARQ), run against a real Postgres instance and a fake
+// wallet-rpc test server.
+func buildCoinDisburseEngines(cfg config, repo *db.Repository, m *metrics.Metrics, debug *leaflib.DebugLogger) (engines map[string]*disburse.Engine, clients map[string]wallet.WalletClient) {
+	engines = make(map[string]*disburse.Engine)
+	clients = make(map[string]wallet.WalletClient)
+
+	tickers := make([]string, 0, len(coinprofile.Registry))
+	for _, p := range coinprofile.Registry {
+		tickers = append(tickers, p.Ticker)
+	}
+	sort.Strings(tickers)
+
+	for _, ticker := range tickers {
+		addr := os.Getenv(fmt.Sprintf("GCPOOL_%s_WALLET_RPC_ADDR", ticker))
+		if addr == "" {
+			continue
+		}
+		user := os.Getenv(fmt.Sprintf("GCPOOL_%s_WALLET_RPC_USER", ticker))
+		pass := os.Getenv(fmt.Sprintf("GCPOOL_%s_WALLET_RPC_PASSWORD", ticker))
+
+		opts := []wallet.Option{wallet.WithTimeout(cfg.walletRPCTimeout)}
+		if user != "" || pass != "" {
+			opts = append(opts, wallet.WithDigestAuth(user, pass))
+		}
+		walletClient := wallet.NewMoneroWalletRPC(addr, opts...)
+
+		dcfg := disburse.Config{
+			Wallet:                  walletClient,
+			MaxDestinationsPerBatch: cfg.disburseMaxDestinationsPerBatch,
+			MinPayoutAtomic:         cfg.disburseMinPayoutAtomic,
+			ForcePayoutFeeAtomic:    cfg.forcePayoutFeeAtomic,
+			Metrics:                 m,
+			Debug:                   debug,
+		}
+		engines[ticker] = disburse.New(disburseRepositoryAdapter{repo: repo}, dcfg)
+		clients[ticker] = walletClient
+	}
+
+	return engines, clients
+}
+
 // startDisburseLoop runs the money-critical startup check for one
 // disbursement engine and then starts its RunLoop for only the
 // (algo, network) targets that passed.
@@ -2834,6 +2999,33 @@ func run(cfg config) error {
 		log.Print("backend: Tari payout disbursement engine disabled (GCPOOL_TARI_WALLET_GRPC_ADDR not set); pending_balance will still accrue, it just won't be auto-paid out on-chain")
 	}
 
+	// Standalone monerod-family coins (internal/coinprofile.Registry:
+	// XMR, ARQ, XEQ, GRFT, SFX, ZEPH, SAL) -- one genuinely separate
+	// *disburse.Engine per coin that has a GCPOOL_<TICKER>_WALLET_RPC_ADDR
+	// configured, exactly like the Monero/Tari engines above but built
+	// via a single generalized loop (see buildCoinDisburseEngines'
+	// doc comment). Every one of Algo/Currency here is that coin's
+	// own Ticker (matches fix #1/#2 elsewhere in this change-set:
+	// blockPayoutCurrency/db.ValidCurrencies both key on exactly the
+	// same string).
+	coinDisburseEngines, coinWalletClients := buildCoinDisburseEngines(cfg, repo, m, debugLogger)
+	if len(coinDisburseEngines) == 0 {
+		log.Print("backend: no standalone-coin (ARQ/XEQ/GRFT/SFX/ZEPH/SAL/XMR) payout disbursement engines enabled (no GCPOOL_<TICKER>_WALLET_RPC_ADDR set for any of them); their balances will still accrue, they just won't be auto-paid out on-chain")
+	} else {
+		enabledTickers := make([]string, 0, len(coinDisburseEngines))
+		for ticker := range coinDisburseEngines {
+			enabledTickers = append(enabledTickers, ticker)
+		}
+		sort.Strings(enabledTickers)
+		for _, ticker := range enabledTickers {
+			targets := []disburse.Target{{Algo: ticker, Network: networkDBString(network), Currency: ticker}}
+			label := fmt.Sprintf("%s payout disbursement engine", ticker)
+			if err := startDisburseLoop(ctx, coinDisburseEngines[ticker], label, targets, cfg.disbursePollInterval); err != nil {
+				return err
+			}
+		}
+	}
+
 	var walletStatsTargets []walletStatsTarget
 	if moneroWalletClient != nil {
 		walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: "RXM", network: networkDBString(network), currency: "XMR", client: moneroWalletClient})
@@ -2853,6 +3045,16 @@ func run(cfg config) error {
 		// one on the shared WalletBalance/WalletBalancePollErrorsTotal
 		// gauges above, even though both share the algo="RXM" label.
 		walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: "RXM", network: networkDBString(network), currency: "XTM", client: tariWalletClient})
+	}
+	if len(coinWalletClients) > 0 {
+		coinTickers := make([]string, 0, len(coinWalletClients))
+		for ticker := range coinWalletClients {
+			coinTickers = append(coinTickers, ticker)
+		}
+		sort.Strings(coinTickers)
+		for _, ticker := range coinTickers {
+			walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: ticker, network: networkDBString(network), currency: ticker, client: coinWalletClients[ticker]})
+		}
 	}
 	if len(walletStatsTargets) > 0 {
 		walletStatsInterval := cfg.walletStatsPollInterval

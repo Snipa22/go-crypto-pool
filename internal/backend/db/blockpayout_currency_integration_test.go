@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/db"
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -193,6 +194,65 @@ func TestIntegrationNonRXMBlockPayoutAlwaysCreditsXTM(t *testing.T) {
 		}
 		if currency != "XTM" {
 			t.Errorf("%s balance currency = %q, want XTM (non-RXM algos have no other leg)", algo, currency)
+		}
+	}
+}
+
+// TestIntegrationStandaloneCoinBlockPayoutCreditsOwnTicker is the
+// regression test for this dispatch's fix #1: db.blockPayoutCurrency
+// previously fell through to the `else` branch ("XTM") for every one
+// of the 7 new standalone monerod-family coins added via
+// internal/coinprofile.Registry, silently mislabeling e.g. an
+// ALGO_ARQ block's payout currency as "XTM" instead of "ARQ". Every
+// one of coinprofile.Registry's algos must instead credit its own
+// Ticker — this iterates the real Registry (not a hardcoded literal
+// list) so a future 8th coin is covered automatically.
+func TestIntegrationStandaloneCoinBlockPayoutCreditsOwnTicker(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+	repo := db.NewRepository(pool)
+
+	for _, profile := range coinprofile.Registry {
+		algo := profile.Ticker
+		blockID := insertTestBlock(t, pool, algo, "TESTNET", "PPS", "hash-standalone-"+algo)
+		outcome, err := repo.ApplyBlockPayout(ctx, db.BlockPayoutRun{
+			BlockID:  blockID,
+			Algo:     algo,
+			Network:  "TESTNET",
+			PoolType: "PPS",
+			Height:   testBlockHeight,
+			Reward:   600000000000,
+			Credits: []db.BlockCredit{
+				{PayoutBucket: "pps", PaymentAddress: "miner-" + algo, Amount: 7777},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ApplyBlockPayout (%s): %v", algo, err)
+		}
+		if outcome.TotalPaid != 7777 {
+			t.Fatalf("ApplyBlockPayout (%s): got %+v, want TotalPaid=7777", algo, outcome)
+		}
+
+		var balanceCurrency string
+		if err := pool.QueryRow(ctx, `
+			SELECT currency FROM balance WHERE algo = $1 AND network = 'TESTNET' AND payment_address = $2`,
+			algo, "miner-"+algo).Scan(&balanceCurrency); err != nil {
+			t.Fatalf("querying %s balance currency: %v", algo, err)
+		}
+		if balanceCurrency != algo {
+			t.Errorf("%s balance currency = %q, want %q (its own ticker, not XTM)", algo, balanceCurrency, algo)
+		}
+
+		var ledgerCurrency string
+		if err := pool.QueryRow(ctx, `SELECT currency FROM block_payout_credits WHERE block_id = $1`, blockID).Scan(&ledgerCurrency); err != nil {
+			t.Fatalf("querying %s block_payout_credits.currency: %v", algo, err)
+		}
+		if ledgerCurrency != algo {
+			t.Errorf("%s block_payout_credits.currency = %q, want %q", algo, ledgerCurrency, algo)
 		}
 	}
 }
