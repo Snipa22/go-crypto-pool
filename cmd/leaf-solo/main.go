@@ -271,7 +271,7 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.payoutAddress, "payout-address", envOr("LEAF_SOLO_PAYOUT_ADDRESS", ""), "solo payout address; found-block coinbase rewards go here. Env: LEAF_SOLO_PAYOUT_ADDRESS")
 	flag.StringVar(&cfg.network, "network", envOr("LEAF_SOLO_NETWORK", "testnet"), "network tag for share/diagnostic records: mainnet|testnet. Env: LEAF_SOLO_NETWORK")
 	flag.StringVar(&cfg.coin, "coin", envOr("LEAF_SOLO_COIN", "tari"), "which coin/PoW family this leaf-solo process serves: tari (default, unchanged behavior) or monero (real MoneroNodeClient against a real monerod JSON-RPC daemon -- see -monerod-url). Env: LEAF_SOLO_COIN")
-	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_SOLO_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081), no trailing slash or /json_rpc suffix required. REQUIRED when -coin=monero; ignored for -coin=tari. Env: LEAF_SOLO_MONEROD_URL")
+	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_SOLO_MONEROD_URL", ""), "real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081), no trailing slash or /json_rpc suffix required. REQUIRED when -coin=monero; ignored for -coin=tari. For RXM/merge-mining, point this at your local minotari_merge_mining_proxy listener, NOT raw monerod directly -- pointing at raw monerod will mine Monero-only with no Tari merge-mine revenue. Env: LEAF_SOLO_MONEROD_URL")
 	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_SOLO_RANDOMX_WORKERS", 0), "RandomX-family (RXT/RXM) async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_SOLO_RANDOMX_WORKERS")
 	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a session after too many CONSECUTIVE real RandomX-family (RXT/RXM) block-find-level validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
 	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD")
@@ -814,6 +814,7 @@ func main() {
 	var node solo.NodeClient
 	if isMoneroCoin(cfg.coin) {
 		logger.Printf("connecting to Monero daemon (monerod JSON-RPC) at %s", cfg.monerodURL)
+		logger.Printf("NOTE: for RXM/merge-mining revenue, -monerod-url must point at a local minotari_merge_mining_proxy listener, NOT raw monerod -- pointing at raw monerod mines Monero-only with zero Tari merge-mine revenue")
 		node = solo.NewMoneroNodeClient(cfg.monerodURL)
 	} else {
 		logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
