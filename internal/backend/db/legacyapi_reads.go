@@ -59,7 +59,7 @@ func (r *Repository) ListBlocks(ctx context.Context, algo, network, poolType str
 	var sb strings.Builder
 	sb.WriteString(`
 		SELECT algo, network, pool_type, hash, height, difficulty, shares,
-		       block_timestamp, unlocked, valid, value, pool_id
+		       block_timestamp, unlocked, valid, value, pool_id, merge_mine_chain
 		FROM blocks
 		WHERE algo = $1 AND network = $2`)
 	args := []any{algo, network}
@@ -80,7 +80,7 @@ func (r *Repository) ListBlocks(ctx context.Context, algo, network, poolType str
 	for rows.Next() {
 		var b Block
 		if err := rows.Scan(&b.Algo, &b.Network, &b.PoolType, &b.Hash, &b.Height, &b.Difficulty, &b.Shares,
-			&b.Timestamp, &b.Unlocked, &b.Valid, &b.Value, &b.PoolID); err != nil {
+			&b.Timestamp, &b.Unlocked, &b.Valid, &b.Value, &b.PoolID, &b.MergeMineChain); err != nil {
 			return nil, fmt.Errorf("db: scanning block row: %w", err)
 		}
 		out = append(out, b)
