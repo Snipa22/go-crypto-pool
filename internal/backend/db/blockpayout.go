@@ -30,7 +30,8 @@ import (
 )
 
 // block_payouts statuses. See migrations/0013_block_payouts.up.sql's
-// doc comment for the full meaning of each; the short version:
+// and migrations/0014_block_payout_reversal.up.sql's doc comments for
+// the full meaning of each; the short version:
 //
 //   - PENDING is UNRESOLVED and blocks all further automatic payout
 //     for that block (the analog of an AMBIGUOUS `payouts` row).
@@ -38,10 +39,18 @@ import (
 //   - FAILED is operator-asserted "nothing landed", and is
 //     deliberately re-claimable (the analog of a FAILED `payouts`
 //     row).
+//   - REVERSED is the opposite of FAILED's "re-claimable": an
+//     operator-asserted "this DID land, but for a block later found
+//     to be invalid/orphaned, and its credits have now been debited
+//     back out." Like APPLIED (and unlike FAILED), ApplyBlockPayout
+//     treats REVERSED as a permanent, non-re-claimable no-op — a
+//     REVERSED block must never be paid again. See
+//     ReverseBlockPayoutCredits and migration 0014's doc comment.
 const (
-	BlockPayoutStatusPending = "PENDING"
-	BlockPayoutStatusApplied = "APPLIED"
-	BlockPayoutStatusFailed  = "FAILED"
+	BlockPayoutStatusPending  = "PENDING"
+	BlockPayoutStatusApplied  = "APPLIED"
+	BlockPayoutStatusFailed   = "FAILED"
+	BlockPayoutStatusReversed = "REVERSED"
 )
 
 // ErrBlockPayoutPending is returned by ApplyBlockPayout when the target
@@ -73,6 +82,30 @@ var ErrBlockPayoutNotFound = errors.New("db: block payout not found")
 // automatic payout path, so applying either to an already-resolved
 // row is precisely the class of bug this file exists to prevent.
 var ErrBlockPayoutAlreadyResolved = errors.New("db: block payout is not in the unresolved (PENDING) status")
+
+// ErrBlockPayoutNotApplied is returned by ReverseBlockPayoutCredits
+// when the target `block_payouts` row is not (and never was) APPLIED
+// — i.e. it is PENDING or FAILED. Only an APPLIED run ever credited
+// any `balance` row, so only an APPLIED run has anything to reverse;
+// a PENDING row needs `resolve-credited`/`resolve-not-credited`
+// first (see ResolveBlockPayoutCredited/ResolveBlockPayoutNotCredited),
+// and a FAILED row already credited nobody. This is a hard refusal,
+// not a no-op, because silently treating either of those as "nothing
+// to reverse" would hide a real state mismatch from the operator
+// calling this expecting a real debit.
+var ErrBlockPayoutNotApplied = errors.New("db: block payout is not APPLIED (only an APPLIED run has credits to reverse)")
+
+// ErrBlockStillValid is returned by ReverseBlockPayoutCredits when
+// the target block's own `blocks.valid` column is still TRUE — i.e.
+// the block has not been found orphaned/invalid by the unlocker's
+// real chain re-verification or an operator's own `backend block
+// invalidate`. Reversing a payout for a block that is, as far as
+// this schema currently knows, still a real block would debit miners
+// for coin they may genuinely be owed. This is a HARD REFUSAL: the
+// invalid/orphaned fact must come from `blocks.valid`, never from a
+// caller-supplied "trust me" flag — see ReverseBlockPayoutCredits'
+// doc comment for the full reasoning.
+var ErrBlockStillValid = errors.New("db: the underlying block is still valid (blocks.valid = TRUE) — refusing to reverse a payout for a block that is not (yet) orphaned/invalidated")
 
 // BlockCredit is one payee's credit within a single block's payout
 // run — the DB-facing counterpart of payout.BlockCredit (kept as this
@@ -169,6 +202,13 @@ type BlockPayoutCredit struct {
 	PayoutBucket   string
 	Amount         int64
 	CreditedAt     time.Time
+	// ReversedAt is non-nil once ReverseBlockPayoutCredits has debited
+	// this row's Amount back out of balance_id — see migrations/
+	// 0014_block_payout_reversal.up.sql's doc comment on why this is a
+	// marker column rather than a deletion. Nil for every credit that
+	// still stands, which as of this writing is every credit on any
+	// block whose block_payouts.status is not REVERSED.
+	ReversedAt *time.Time
 }
 
 // ApplyBlockPayout is the single money-critical transaction behind
@@ -354,7 +394,22 @@ func claimBlockPayout(ctx context.Context, tx pgx.Tx, run BlockPayoutRun) (claim
 	}
 
 	switch existing.Status {
-	case BlockPayoutStatusApplied:
+	case BlockPayoutStatusApplied, BlockPayoutStatusReversed:
+		// REVERSED is deliberately handled exactly like APPLIED here:
+		// a no-op that credits nothing and does NOT reset the row
+		// back to PENDING. This is the load-bearing correctness
+		// property migration 0014 exists for — a REVERSED block is
+		// not a real block, and must never become payable again, no
+		// matter how it is re-triggered (a relocked block, a future
+		// multi-transaction payout path, an operator retry). Note
+		// existing.TotalPaid/Credited for a REVERSED row report what
+		// the REVERSAL debited back, not what was originally paid
+		// out (see migration 0014's doc comment on the reused
+		// columns) — callers that only branch on AlreadyApplied
+		// (every one as of this writing; see payout.Apply and
+		// cmd/backend's payoutTrigger) are unaffected because they
+		// never inspect those totals for anything but logging an
+		// already-a-no-op outcome.
 		return false, existing, nil
 	case BlockPayoutStatusPending:
 		return false, BlockPayout{}, fmt.Errorf("db: applying block payout for block %d (%s/%s height %d, claimed %s): %w — inspect with `backend block-payout show -block-id=%d`, then resolve with `backend block-payout resolve-credited` or `resolve-not-credited`",
@@ -553,7 +608,7 @@ func (r *Repository) UnresolvedBlockPayouts(ctx context.Context, algo, network s
 // to base a resolution on.
 func (r *Repository) BlockPayoutCredits(ctx context.Context, blockID int64) ([]BlockPayoutCredit, error) {
 	const stmt = `
-		SELECT balance_id, payment_address, payment_id, payout_bucket, amount, credited_at
+		SELECT balance_id, payment_address, payment_id, payout_bucket, amount, credited_at, reversed_at
 		FROM block_payout_credits
 		WHERE block_id = $1
 		ORDER BY balance_id ASC`
@@ -566,7 +621,7 @@ func (r *Repository) BlockPayoutCredits(ctx context.Context, blockID int64) ([]B
 	var out []BlockPayoutCredit
 	for rows.Next() {
 		var c BlockPayoutCredit
-		if err := rows.Scan(&c.BalanceID, &c.PaymentAddress, &c.PaymentID, &c.PayoutBucket, &c.Amount, &c.CreditedAt); err != nil {
+		if err := rows.Scan(&c.BalanceID, &c.PaymentAddress, &c.PaymentID, &c.PayoutBucket, &c.Amount, &c.CreditedAt, &c.ReversedAt); err != nil {
 			return nil, fmt.Errorf("db: scanning block payout credit row: %w", err)
 		}
 		out = append(out, c)
@@ -712,6 +767,259 @@ func (r *Repository) ResolveBlockPayoutNotCredited(ctx context.Context, blockID 
 		return fmt.Errorf("db: resolving block payout %d as not credited: committing transaction: %w", blockID, err)
 	}
 	return nil
+}
+
+// BlockPayoutReversalOutcome summarizes one ReverseBlockPayoutCredits
+// call, mirroring BlockPayoutOutcome's own AlreadyApplied/TotalPaid/
+// Credited shape for the exact same reason: the caller (the CLI's
+// `block-payout reverse-credits`, today) needs to tell a real,
+// money-moving reversal apart from a safe no-op that touched nothing.
+type BlockPayoutReversalOutcome struct {
+	// AlreadyReversed is true when this block's `block_payouts` row
+	// was ALREADY REVERSED on entry, meaning this call debited
+	// nothing at all and rolled back without touching a single
+	// `balance` row. CreditsReversed/TotalReversed then report what
+	// the ORIGINAL, committed reversal recorded, not this call's
+	// (zero) work — this is the property that makes calling this
+	// twice safe: the second call must debit exactly zero times,
+	// ever.
+	AlreadyReversed bool
+	// CreditsReversed is the number of `block_payout_credits` rows
+	// debited back, and TotalReversed their atomic-unit sum.
+	CreditsReversed int
+	TotalReversed   int64
+}
+
+// ReverseBlockPayoutCredits reverses a single block's ALREADY-APPLIED
+// matured-block payout: it debits every `balance` row that block's
+// `block_payout_credits` ledger recorded a credit for, by EXACTLY the
+// amount recorded for THAT block (never a miner's whole balance,
+// never anything another block's credits added to the same payee),
+// and flips the block's `block_payouts` row to the new REVERSED
+// terminal status — see migrations/0014_block_payout_reversal.up.sql
+// for the full schema-level writeup this mirrors.
+//
+// This is the other half of the gap `backend block invalidate`'s own
+// "NOTE ON PAYOUTS" comment names directly: relocking or invalidating
+// an APPLIED block's `blocks` row already makes ApplyBlockPayout a
+// safe no-op (it will never credit that block's miners a second
+// time), but until this method existed nothing anywhere DEBITED the
+// credit that already landed on what turned out to be bad data.
+// Miners kept coin they were never actually owed, permanently. This
+// closes that.
+//
+// PRECONDITION — the most important correctness property in this
+// file: this reverses a block ONLY when both of the following hold,
+// checked inside ONE transaction with a row lock on each:
+//
+//   - `block_payouts.status` for blockID is APPLIED. Anything else
+//     (PENDING, FAILED) is refused with ErrBlockPayoutNotApplied — a
+//     PENDING run needs `resolve-credited`/`resolve-not-credited`
+//     first (see those methods), and a FAILED run already credited
+//     nobody, so there is nothing here to reverse.
+//   - The block's own `blocks.valid` column is FALSE. If it is still
+//     TRUE, this is refused with ErrBlockStillValid. This is a HARD
+//     REFUSAL, deliberately: there is no caller-supplied "trust me,
+//     it's orphaned" parameter anywhere on this method's signature.
+//     The invalid/orphaned fact must come from the real, chain-
+//     verified `blocks.valid` column — written either by the
+//     unlocker's own checkBlock on a genuine reorg-past-maturity
+//     orphan detection, or by an operator's `backend block
+//     invalidate` after their own independent investigation (see
+//     cmd/backend/blockcli.go). Accepting a bare boolean flag here
+//     instead would let a caller reverse a payout for a block that,
+//     as far as this schema can otherwise tell, is still real — this
+//     precondition is the entire reason this feature is safe to
+//     expose at all.
+//
+// IDEMPOTENCY: if `block_payouts.status` is ALREADY REVERSED (checked
+// under the same row lock, before either precondition above is even
+// evaluated), this is a safe no-op: BlockPayoutReversalOutcome.
+// AlreadyReversed is true, CreditsReversed/TotalReversed report the
+// ORIGINAL reversal's totals (reusing `credited`/`total_paid` — see
+// migration 0014's doc comment on why that reuse is safe), and NOT A
+// SINGLE `balance` OR `block_payout_credits` ROW IS TOUCHED. This is
+// the single most important test case for this method: reversing
+// twice must debit exactly once, ever — a caller retrying after a
+// crash, or an operator re-running this by hand not realizing it
+// already ran, must never double-debit a miner for the pool's own
+// mistake on top of correcting the original one.
+//
+// THE DEBIT, scoped to exactly this block's own ledger rows: every
+// `block_payout_credits` row for blockID (this is the itemised,
+// per-balance-row, per-amount record ApplyBlockPayout itself wrote —
+// it already names exactly which balance rows got exactly how much
+// FOR THIS BLOCK, nothing else) is read, its balance_id debited by
+// its own amount (`pending_balance = pending_balance - amount`, the
+// same statement shape every other debit in this codebase uses), and
+// then marked `reversed_at = now()` — never deleted, preserving the
+// audit trail for the same reason ResolveBlockPayoutNotCredited's own
+// doc comment already argues against deleting ledger rows.
+//
+// `balance.pending_balance` already carries `CHECK (pending_balance
+// >= 0)` (migration 0011). If any of these debits would drive a
+// balance negative — the real, documented edge case where that
+// miner's balance has, since this bad block's payout, been reduced
+// by something else legitimate (most plausibly a real disbursement
+// built in part on the now-void credit) — Postgres rejects the whole
+// statement and this method returns that error, rolling the ENTIRE
+// reversal back (no partial debit, no status flip). That is the
+// correct, auditable outcome: it surfaces a real incident (a miner
+// already received real coin built on a credit that turns out to be
+// void) that needs its own manual resolution, rather than silently
+// clamping the debit or corrupting the row.
+//
+// All of this — the two locked reads (block_payouts row, blocks.valid),
+// every `block_payout_credits`/`balance` UPDATE, and the status flip
+// to REVERSED — happens in ONE Postgres transaction, exactly like
+// ApplyBlockPayout. Any error anywhere rolls EVERYTHING back.
+func (r *Repository) ReverseBlockPayoutCredits(ctx context.Context, blockID int64, resolvedBy, note string) (BlockPayoutReversalOutcome, error) {
+	if blockID <= 0 {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits: a positive blocks.id is required, got %d", blockID)
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: beginning transaction: %w", blockID, err)
+	}
+	defer tx.Rollback(ctx)
+
+	existing, found, err := selectBlockPayoutForUpdate(ctx, tx, blockID)
+	if err != nil {
+		return BlockPayoutReversalOutcome{}, err
+	}
+	if !found {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: %w", blockID, ErrBlockPayoutNotFound)
+	}
+
+	if existing.Status == BlockPayoutStatusReversed {
+		// Idempotent no-op: the deferred Rollback above is the
+		// correct exit here — this call must not write anything at
+		// all, and must report the ORIGINAL reversal's totals, not
+		// this call's (zero) work.
+		return BlockPayoutReversalOutcome{
+			AlreadyReversed: true,
+			CreditsReversed: derefInt(existing.Credited),
+			TotalReversed:   derefInt64(existing.TotalPaid),
+		}, nil
+	}
+	if existing.Status != BlockPayoutStatusApplied {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: status is %s, not APPLIED: %w",
+			blockID, existing.Status, ErrBlockPayoutNotApplied)
+	}
+
+	// Lock the underlying blocks row and check the real, chain-
+	// verified (or operator-asserted via `backend block invalidate`)
+	// orphan/invalid signal. FOR UPDATE serializes this against a
+	// concurrent SetBlockStatus (the unlocker marking it orphaned
+	// right now, or an operator's own invalidate/relock) so this
+	// reversal's view of blocks.valid cannot be stale by the time it
+	// decides whether to proceed.
+	var blockValid bool
+	if err := tx.QueryRow(ctx, `SELECT valid FROM blocks WHERE id = $1 FOR UPDATE`, blockID).Scan(&blockValid); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: no such blocks row (block_payouts.block_id should never outlive its blocks row — the foreign key is ON DELETE CASCADE): %w", blockID, err)
+		}
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: locking the blocks row: %w", blockID, err)
+	}
+	if blockValid {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: %w — this block has not been found orphaned/invalid (see the unlocker's real chain re-verification, or `backend block invalidate`); reversing its payout would debit miners for coin they may genuinely be owed",
+			blockID, ErrBlockStillValid)
+	}
+
+	// Read every not-yet-reversed credit this block's run itemised.
+	// The reversed_at filter is a defensive, not a load-bearing,
+	// guard: a block_payouts row can only ever transition APPLIED ->
+	// REVERSED once (this method's own idempotency check above
+	// refuses a second attempt before reaching here), so in practice
+	// every row for an APPLIED block has reversed_at IS NULL. FOR
+	// UPDATE takes the same per-row lock creditBlockPayoutEntry does,
+	// serializing against anything else that might touch these
+	// specific ledger rows.
+	rows, err := tx.Query(ctx, `
+		SELECT id, balance_id, amount
+		FROM block_payout_credits
+		WHERE block_id = $1 AND reversed_at IS NULL
+		FOR UPDATE`, blockID)
+	if err != nil {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: reading the credit ledger: %w", blockID, err)
+	}
+	type ledgerRow struct {
+		id        int64
+		balanceID int64
+		amount    int64
+	}
+	var toReverse []ledgerRow
+	for rows.Next() {
+		var lr ledgerRow
+		if err := rows.Scan(&lr.id, &lr.balanceID, &lr.amount); err != nil {
+			rows.Close()
+			return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: scanning credit ledger row: %w", blockID, err)
+		}
+		toReverse = append(toReverse, lr)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: iterating credit ledger rows: %w", blockID, err)
+	}
+
+	var out BlockPayoutReversalOutcome
+	for _, lr := range toReverse {
+		const debitStmt = `
+			UPDATE balance
+			SET pending_balance = pending_balance - $2, updated_at = now()
+			WHERE id = $1`
+		tag, err := tx.Exec(ctx, debitStmt, lr.balanceID, lr.amount)
+		if err != nil {
+			// Most plausibly the balance_pending_balance_nonnegative
+			// CHECK constraint (migration 0011) — see this method's
+			// doc comment on why that is the correct, auditable
+			// outcome here rather than something to work around.
+			return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: debiting balance %d by %d: %w", blockID, lr.balanceID, lr.amount, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: debiting balance %d: no such balance row", blockID, lr.balanceID)
+		}
+
+		const markReversedStmt = `UPDATE block_payout_credits SET reversed_at = now() WHERE id = $1`
+		if _, err := tx.Exec(ctx, markReversedStmt, lr.id); err != nil {
+			return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: marking credit ledger row %d reversed: %w", blockID, lr.id, err)
+		}
+
+		out.TotalReversed += lr.amount
+		out.CreditsReversed++
+	}
+
+	// Flip to REVERSED, reusing credited/total_paid/resolved_by/
+	// resolution_note for the reversal's own totals and audit trail
+	// (see migration 0014's doc comment on why that reuse is safe).
+	// applied_at is deliberately left untouched — it keeps recording
+	// the original apply time, not this reversal.
+	const reverseStmt = `
+		UPDATE block_payouts
+		SET status = 'REVERSED',
+		    credited = $2,
+		    total_paid = $3,
+		    error = COALESCE(error || ' | ', '') || 'credits REVERSED by ' || $4 || ': ' || $5,
+		    resolved_by = $4,
+		    resolution_note = $5
+		WHERE block_id = $1 AND status = 'APPLIED'`
+	tag, err := tx.Exec(ctx, reverseStmt, blockID, out.CreditsReversed, out.TotalReversed, resolvedBy, note)
+	if err != nil {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: recording REVERSED status: %w", blockID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Cannot happen with the claim-row lock held above; treated
+		// as a hard error rather than ignored because the
+		// alternative is committing debits without the durable
+		// REVERSED marker that stops them being made again.
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: the locked block_payouts row is no longer APPLIED — refusing to commit debits without a durable REVERSED marker", blockID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return BlockPayoutReversalOutcome{}, fmt.Errorf("db: reversing block payout credits for block %d: committing transaction: %w", blockID, err)
+	}
+	return out, nil
 }
 
 // derefInt64/derefInt flatten the nullable credited/total_paid columns

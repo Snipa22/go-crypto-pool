@@ -5,9 +5,11 @@
 //	backend block-payout show                 -block-id=<id> [-dsn=...]
 //	backend block-payout resolve-credited     -block-id=<id> -reason=<text> [-by=<operator>] [-dsn=...] -yes
 //	backend block-payout resolve-not-credited -block-id=<id> -reason=<text> [-by=<operator>] [-dsn=...] -yes
+//	backend block-payout reverse-credits      -block-id=<id> -reason=<text> [-by=<operator>] [-dsn=...] -yes
 //
 // THIS IS THE HUMAN HALF OF A MONEY-CRITICAL SAFETY MECHANISM. Read
-// migrations/0013_block_payouts.up.sql and
+// migrations/0013_block_payouts.up.sql,
+// migrations/0014_block_payout_reversal.up.sql, and
 // internal/backend/db/blockpayout.go's own doc comments before using
 // it.
 //
@@ -43,10 +45,29 @@
 // completeness is in doubt. Guessing moves real money, so the design
 // choice is an explicit, well-logged, human-gated flow instead.
 //
+// `reverse-credits` is a DIFFERENT gap, closed by migration 0014: an
+// APPLIED block whose payout genuinely landed, but whose block was
+// LATER discovered -- via the unlocker's own real chain
+// re-verification finding it orphaned by a reorg past MaturityDepth,
+// or an operator's own `backend block invalidate` -- to not be a
+// real block after all. Neither `backend block relock` nor the
+// unlocker's automatic retry credits anybody again for such a block
+// (that has been true since migration 0013), but until this
+// subcommand existed nothing anywhere DEBITED the credit that
+// already landed on what turned out to be bad data. Unlike the two
+// resolve-* subcommands above, `reverse-credits` does NOT rely on an
+// operator's unverifiable judgement call about whether coin already
+// moved -- it requires the real, chain-verified (or operator-
+// asserted via `backend block invalidate`) `blocks.valid = FALSE`
+// signal to already exist before it will touch anything (see
+// db.Repository.ReverseBlockPayoutCredits' precondition). It is
+// still every bit as dangerous as the other two: it debits real
+// miner balances, hence the same mandatory -reason and -yes.
+//
 // Mirrors payoutcli.go/blockcli.go/addresscli.go's conventions
-// exactly: the two mutating subcommands require -yes (without it they
+// exactly: every mutating subcommand requires -yes (without it they
 // print the current row plus the change that WOULD be made and exit
-// nonzero), and both require -reason so the resolution is auditable
+// nonzero), and requires -reason so the resolution is auditable
 // (resolved_by/resolution_note columns). list-unresolved/show are
 // read-only and never require -yes.
 package main
@@ -75,7 +96,7 @@ const blockPayoutCLITimeout = 30 * time.Second
 // name).
 func runBlockPayoutCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New(`block-payout: missing subcommand, want "list-unresolved", "show", "resolve-credited", or "resolve-not-credited"`)
+		return errors.New(`block-payout: missing subcommand, want "list-unresolved", "show", "resolve-credited", "resolve-not-credited", or "reverse-credits"`)
 	}
 
 	switch args[0] {
@@ -87,8 +108,10 @@ func runBlockPayoutCommand(args []string) error {
 		return runBlockPayoutResolveCredited(args[1:])
 	case "resolve-not-credited":
 		return runBlockPayoutResolveNotCredited(args[1:])
+	case "reverse-credits":
+		return runBlockPayoutReverseCredits(args[1:])
 	default:
-		return fmt.Errorf(`block-payout: unrecognized subcommand %q, want "list-unresolved", "show", "resolve-credited", or "resolve-not-credited"`, args[0])
+		return fmt.Errorf(`block-payout: unrecognized subcommand %q, want "list-unresolved", "show", "resolve-credited", "resolve-not-credited", or "reverse-credits"`, args[0])
 	}
 }
 
@@ -137,18 +160,32 @@ func logBlockPayoutCredits(prefix string, blockID int64, credits []db.BlockPayou
 			prefix, blockID)
 		return
 	}
-	var total int64
+	var total, standing, reversed int64
+	var reversedCount int
 	for _, c := range credits {
 		total += c.Amount
 		payID := "(none)"
 		if c.PaymentID != nil && *c.PaymentID != "" {
 			payID = *c.PaymentID
 		}
-		log.Printf("%s: block_id=%d credit: balance_id=%d address=%s payment_id=%s bucket=%s amount=%d credited_at=%s",
-			prefix, blockID, c.BalanceID, c.PaymentAddress, payID, c.PayoutBucket, c.Amount, c.CreditedAt.UTC().Format(time.RFC3339))
+		reversedAt := "(not reversed)"
+		if c.ReversedAt != nil {
+			reversedAt = c.ReversedAt.UTC().Format(time.RFC3339)
+			reversed += c.Amount
+			reversedCount++
+		} else {
+			standing += c.Amount
+		}
+		log.Printf("%s: block_id=%d credit: balance_id=%d address=%s payment_id=%s bucket=%s amount=%d credited_at=%s reversed_at=%s",
+			prefix, blockID, c.BalanceID, c.PaymentAddress, payID, c.PayoutBucket, c.Amount, c.CreditedAt.UTC().Format(time.RFC3339), reversedAt)
 	}
-	log.Printf("%s: block_id=%d recorded credits: %d row(s) totalling %d atomic units, ALREADY added to those miners' pending_balance",
-		prefix, blockID, len(credits), total)
+	if reversedCount == 0 {
+		log.Printf("%s: block_id=%d recorded credits: %d row(s) totalling %d atomic units, ALREADY added to those miners' pending_balance",
+			prefix, blockID, len(credits), total)
+		return
+	}
+	log.Printf("%s: block_id=%d recorded credits: %d row(s) totalling %d atomic units (%d row(s)/%d atomic units already REVERSED and debited back out, %d row(s)/%d atomic units still standing)",
+		prefix, blockID, len(credits), total, reversedCount, reversed, len(credits)-reversedCount, standing)
 }
 
 // orNone renders a nullable text column for operator output.
@@ -424,6 +461,160 @@ func runBlockPayoutResolveNotCredited(args []string) error {
 		"on the unlocker's next poll pass.",
 		*blockID, before.Status, after.Status, len(credits))
 	return nil
+}
+
+// runBlockPayoutReverseCredits implements `block-payout
+// reverse-credits`: reverses (debits back out) the credits an
+// ALREADY-APPLIED block payout run recorded, for a block that has
+// SINCE been found orphaned/invalid -- via the unlocker's own real
+// chain re-verification writing `blocks.valid = FALSE` on a genuine
+// reorg-past-maturity orphan (see internal/backend/unlocker/
+// unlocker.go's checkBlock), or an operator's own `backend block
+// invalidate` (see cmd/backend/blockcli.go).
+//
+// Unlike resolve-credited/resolve-not-credited, this subcommand does
+// NOT ask the operator to make an unverifiable judgement call about
+// whether coin already moved -- the whole precondition lives in
+// db.Repository.ReverseBlockPayoutCredits, which hard-refuses
+// (ErrBlockStillValid) unless the real blocks.valid column is already
+// FALSE. This subcommand's job is narrower: show exactly what WOULD
+// be debited, refuse a dry run without -yes, and report what actually
+// happened. It is still every bit as dangerous as the other two --
+// it debits real miner balances -- hence the same mandatory -reason
+// and -yes.
+//
+// Idempotent: running this a second time against an already-REVERSED
+// block prints a clear "already reversed, nothing to do" message and
+// writes nothing. This is expected, SAFE behavior (mirroring
+// ApplyBlockPayout's AlreadyApplied messaging tone in the other
+// direction), not a refusal that looks like a failure.
+func runBlockPayoutReverseCredits(args []string) error {
+	fs := flag.NewFlagSet("backend block-payout reverse-credits", flag.ContinueOnError)
+	blockID := fs.Int64("block-id", 0, "REQUIRED: blocks.id of the APPLIED payout run whose credits to reverse")
+	reason := fs.String("reason", "", "REQUIRED: how you established that this block is invalid/orphaned and its credits must be reversed (recorded on the row)")
+	by := fs.String("by", "", "operator identifier recorded on this resolution (e.g. your name/handle)")
+	dsn := fs.String("dsn", os.Getenv("GCPOOL_DB_DSN"), "Postgres DSN. Defaults to GCPOOL_DB_DSN if unset.")
+	yes := fs.Bool("yes", false, "actually perform the reversal. Without this flag, the run's current state and intended debit are printed and nothing is written.")
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: backend block-payout reverse-credits -block-id=<blocks.id> -reason=<text> [-by=<operator>] [-dsn=...] [-yes]\n\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *blockID <= 0 {
+		fs.Usage()
+		return errors.New("block-payout reverse-credits: -block-id is required and must be a positive blocks.id")
+	}
+	if *reason == "" {
+		fs.Usage()
+		return errors.New("block-payout reverse-credits: -reason is required -- this debits real miner balances (backed by the real blocks.valid=FALSE signal), so it must record how you established the block is invalid/orphaned")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), blockPayoutCLITimeout)
+	defer cancel()
+
+	repo, closeFn, err := openBlockPayoutRepo(ctx, *dsn)
+	if err != nil {
+		return fmt.Errorf("block-payout reverse-credits: %w", err)
+	}
+	defer closeFn()
+
+	before, credits, blockValid, err := loadBlockPayoutForReversal(ctx, repo, *blockID)
+	if err != nil {
+		return err
+	}
+
+	if before.Status == db.BlockPayoutStatusReversed {
+		log.Printf("block-payout reverse-credits: block_id=%d: already REVERSED (resolved_by=%s resolution_note=%s) -- nothing to do. This is expected, safe behavior: reversing an already-reversed block would double-debit, so this call writes nothing.",
+			*blockID, orNone(before.ResolvedBy), orNone(before.ResolutionNote))
+		return nil
+	}
+	if before.Status != db.BlockPayoutStatusApplied {
+		return fmt.Errorf("block-payout reverse-credits: block_id=%d: status is %s, not APPLIED (or already REVERSED) -- only an APPLIED run has credits to reverse; a PENDING row needs `resolve-credited`/`resolve-not-credited` first, and a FAILED row already credited nobody",
+			*blockID, before.Status)
+	}
+	if blockValid {
+		return fmt.Errorf("block-payout reverse-credits: block_id=%d: refusing -- blocks.valid = TRUE for this block, so it has not been found orphaned/invalid (see the unlocker's real chain re-verification, or `backend block invalidate`); reversing its payout would debit miners for coin they may genuinely be owed",
+			*blockID)
+	}
+
+	var total int64
+	for _, c := range credits {
+		if c.ReversedAt == nil {
+			total += c.Amount
+		}
+	}
+
+	if !*yes {
+		log.Printf("block-payout reverse-credits: block_id=%d: -yes not set, no change made. Would mark this run REVERSED and debit %d atomic units back out across %d balance row(s) (itemised above), and record resolved_by=%q resolution_note=%q. Re-run with -yes to apply.",
+			*blockID, total, len(credits), *by, *reason)
+		return fmt.Errorf("block-payout reverse-credits: block_id=%d: dry run only (pass -yes to apply)", *blockID)
+	}
+
+	outcome, err := repo.ReverseBlockPayoutCredits(ctx, *blockID, *by, *reason)
+	if err != nil {
+		return fmt.Errorf("block-payout reverse-credits: block_id=%d: %w", *blockID, err)
+	}
+	if outcome.AlreadyReversed {
+		// A concurrent reversal won the race between this process's
+		// own pre-write state read above and its real call. Report it
+		// exactly like the up-front idempotent case, not as an error.
+		log.Printf("block-payout reverse-credits: block_id=%d: already REVERSED by a concurrent caller (credits_reversed=%d total_reversed=%d) -- nothing further to do.",
+			*blockID, outcome.CreditsReversed, outcome.TotalReversed)
+		return nil
+	}
+
+	after, err := repo.GetBlockPayout(ctx, *blockID)
+	if err != nil {
+		log.Printf("block-payout reverse-credits: block_id=%d: reversal applied (status REVERSED, %d atomic units debited back across %d balance row(s)), but re-reading the row to confirm failed: %v",
+			*blockID, outcome.TotalReversed, outcome.CreditsReversed, err)
+		return nil
+	}
+	logBlockPayoutRow("block-payout reverse-credits: after", after)
+	if afterCredits, err := repo.BlockPayoutCredits(ctx, *blockID); err == nil {
+		logBlockPayoutCredits("block-payout reverse-credits: after", *blockID, afterCredits)
+	}
+	log.Printf("block-payout reverse-credits: block_id=%d: resolved. status %s -> %s. %d atomic units debited back out across %d balance row(s); this block can never be paid again.",
+		*blockID, before.Status, after.Status, outcome.TotalReversed, outcome.CreditsReversed)
+	return nil
+}
+
+// loadBlockPayoutForReversal is reverse-credits' own "read the row,
+// read its ledger, read the block's real valid flag, print all
+// three" preamble. It deliberately does NOT enforce any status
+// precondition itself (unlike loadBlockPayoutForResolution below) --
+// reverse-credits has to distinguish three different non-identical
+// outcomes (APPLIED and reversible; already REVERSED and therefore a
+// safe no-op; or neither and therefore refused) with three different
+// messages, so that branching lives in runBlockPayoutReverseCredits
+// right next to the messages it produces.
+func loadBlockPayoutForReversal(ctx context.Context, repo *db.Repository, blockID int64) (db.BlockPayout, []db.BlockPayoutCredit, bool, error) {
+	const prefix = "block-payout reverse-credits"
+	before, err := repo.GetBlockPayout(ctx, blockID)
+	if err != nil {
+		if errors.Is(err, db.ErrBlockPayoutNotFound) {
+			return db.BlockPayout{}, nil, false, fmt.Errorf("%s: no payout run has ever been claimed for block id=%d, so there is nothing to reverse", prefix, blockID)
+		}
+		return db.BlockPayout{}, nil, false, fmt.Errorf("%s: %w", prefix, err)
+	}
+	logBlockPayoutRow(prefix+": before", before)
+
+	credits, err := repo.BlockPayoutCredits(ctx, blockID)
+	if err != nil {
+		return db.BlockPayout{}, nil, false, fmt.Errorf("%s: reading the credit ledger: %w", prefix, err)
+	}
+	logBlockPayoutCredits(prefix+": before", blockID, credits)
+
+	block, err := repo.GetBlockByID(ctx, blockID)
+	if err != nil {
+		return db.BlockPayout{}, nil, false, fmt.Errorf("%s: looking up the underlying blocks row: %w", prefix, err)
+	}
+	log.Printf("%s: block_id=%d: underlying blocks row: valid=%t unlocked=%t (reversal requires valid=FALSE -- the real, chain-verified or operator-asserted orphan/invalid signal)",
+		prefix, blockID, block.Valid, block.Unlocked)
+
+	return before, credits, block.Valid, nil
 }
 
 // loadBlockPayoutForResolution is the shared "read the row, read its

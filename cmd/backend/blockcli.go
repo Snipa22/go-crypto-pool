@@ -55,6 +55,23 @@
 //     genuinely stuck, the tool for it is `backend block-payout`, not
 //     this one.
 //
+//     NOTE ON REVERSING AN ALREADY-APPLIED PAYOUT: neither `invalidate`
+//     nor `relock` above DEBITS anything -- they only ever touch
+//     blocks.valid/blocks.unlocked. If a block's payout already
+//     APPLIED (real credits, real balance.pending_balance increments)
+//     and is THEN invalidated here (or found orphaned by the
+//     unlocker's own real chain re-verification), those credits stay
+//     on the miners' balances until an operator separately runs
+//     `backend block-payout reverse-credits -block-id=<id> ...` (see
+//     migrations/0014_block_payout_reversal.up.sql and
+//     internal/backend/db/blockpayout.go's ReverseBlockPayoutCredits).
+//     That command REQUIRES blocks.valid = FALSE first, which is
+//     exactly what `invalidate` (or a real orphan detection) writes --
+//     so the correct order for a bad-but-already-paid block is:
+//     `block invalidate` (or wait for the unlocker to find it
+//     orphaned) THEN `block-payout reverse-credits`, never the other
+//     way around.
+//
 // Both subcommands are deliberately NOT wired into any HTTP endpoint
 // or automatic trigger -- see this file's own flag set: -yes is
 // mandatory (bare -id alone prints what WOULD change and exits

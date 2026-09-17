@@ -1,0 +1,136 @@
+-- 0014_block_payout_reversal.up.sql
+--
+-- Adds the REVERSED terminal status to `block_payouts`, plus a
+-- `reversed_at` marker on `block_payout_credits`, so an already-
+-- APPLIED matured-block payout can be correctly, permanently, and
+-- auditably UNDONE when the block it paid out is later discovered to
+-- be orphaned/invalid.
+--
+-- WHY THIS EXISTS (money-critical, read this before touching any of
+-- it): migration 0013 made a matured block's payout an idempotent,
+-- one-transaction claim (`block_payouts` APPLIED + itemised
+-- `block_payout_credits`), which fixed double-crediting on retry.
+-- It did NOT give the pool any way to react to the other real failure
+-- mode: a block that matured, had its payout APPLIED (miners' real
+-- `balance.pending_balance` incremented), and was ONLY LATER
+-- discovered -- via a reorg deeper than the coin's configured
+-- MaturityDepth, or an operator's own investigation -- to not be a
+-- real block after all. cmd/backend/blockcli.go's `backend block
+-- invalidate`/`relock` NOTE ON PAYOUTS already says this plainly: once
+-- a block's payout is APPLIED, re-triggering it (via `relock`, or the
+-- unlocker's own automatic retry) is a safe no-op that credits
+-- NOBODY -- but nothing anywhere DEBITS the credit that already
+-- landed on bad data. Miners keep coin they were never actually owed,
+-- permanently, with no recovery path. This migration is step one
+-- (the schema) of closing that gap; internal/backend/db/blockpayout.go's
+-- ReverseBlockPayoutCredits is step two (the transaction), and
+-- cmd/backend's `backend block-payout reverse-credits` is the
+-- operator-facing trigger for it -- see both files' own doc comments.
+--
+-- STATUS: REVERSED
+--
+--   REVERSED is a NEW terminal status, and is deliberately NOT the
+--   same thing as FAILED even though both are "this block's payout
+--   is not standing":
+--
+--     - FAILED means "an operator established nothing landed, or
+--       already hand-reversed whatever did" (see migration 0013's
+--       doc comment). It is RE-CLAIMABLE: ApplyBlockPayout resets a
+--       FAILED row back to PENDING and runs the payout again from
+--       scratch, because FAILED is a statement about THIS attempt,
+--       not about the block itself -- the block may still mature and
+--       be genuinely payable.
+--
+--     - REVERSED means the exact opposite: "this block's payout DID
+--       apply for real, was later found to be for an invalid/orphaned
+--       block, and its credits have now been correctly debited back
+--       out." A REVERSED block must NEVER be paid again, because it
+--       is not a real block -- there is no scenario where re-running
+--       its payout calculation would produce a legitimate result.
+--       ApplyBlockPayout / claimBlockPayout therefore treat REVERSED
+--       exactly like APPLIED for claim purposes: a safe no-op that
+--       credits nothing and does NOT reset the row back to PENDING
+--       (see blockpayout.go's claimBlockPayout switch). This is the
+--       one-line, load-bearing correctness property of this whole
+--       migration: without REVERSED being a claim-blocking status in
+--       its own right, an operator (or the unlocker, if the block
+--       were ever relocked) could re-run the payout for a block that
+--       is provably not real.
+--
+-- REUSED COLUMNS, DOCUMENTED MEANING FOR A REVERSED ROW
+--
+--   Rather than add a second, parallel set of "reversed_credited" /
+--   "reversed_total_paid" columns, a REVERSED row reuses
+--   block_payouts' existing `credited` / `total_paid` columns, with a
+--   documented meaning shift:
+--
+--     - For an APPLIED row (unchanged): credited = number of
+--       block_payout_credits rows this run wrote; total_paid = their
+--       atomic-unit sum. Both describe what was PAID OUT.
+--     - For a REVERSED row: credited = number of block_payout_credits
+--       rows debited back by the reversal; total_paid = their
+--       atomic-unit sum. Both describe what was DEBITED BACK.
+--
+--   This is safe specifically because APPLIED and REVERSED are
+--   mutually exclusive states of the SAME row (a block_payouts row
+--   transitions APPLIED -> REVERSED at most once, never back), so
+--   there is never a moment where these columns need to carry both
+--   meanings at once, and `status` itself is always right there to
+--   disambiguate which meaning currently applies. `applied_at` is
+--   deliberately LEFT ALONE by the reversal (it keeps recording the
+--   original apply time -- see blockpayout.go's ReverseBlockPayoutCredits,
+--   which does not touch it) so that history is not lost; there is no
+--   new `reversed_at` column on `block_payouts` itself for the same
+--   reason `resolved_by`/`resolution_note` already exist and are
+--   reused for the reversal's audit trail (who reversed it and why) --
+--   adding a third audit-timestamp column here would be redundant
+--   with the per-credit `reversed_at` this migration DOES add (below),
+--   which is the more useful of the two: it timestamps the itemised
+--   entries an operator would actually need to check, not just the
+--   parent row.
+--
+-- NEW COLUMN: block_payout_credits.reversed_at
+--
+--   Nullable TIMESTAMPTZ, set on each `block_payout_credits` row when
+--   ReverseBlockPayoutCredits debits it back. This mirrors
+--   ResolveBlockPayoutNotCredited's own reasoning (see migration
+--   0013's doc comment on that method) for NOT deleting ledger rows:
+--   deleting a reversed credit would destroy the only durable record
+--   of exactly which balance row got exactly how much from this
+--   specific block, which is precisely the itemised detail an
+--   operator needs to audit a reversal after the fact (and the exact
+--   detail ReverseBlockPayoutCredits itself reads to compute the
+--   debit in the first place). A row with reversed_at IS NOT NULL is
+--   simply "this credit's amount has been debited back out of the
+--   named balance row"; the row otherwise reads exactly as it always
+--   did (block_id, balance_id, amount, payout_bucket, credited_at).
+--
+-- ON A DEBIT DRIVING pending_balance NEGATIVE
+--
+--   `balance.pending_balance` already carries `CHECK
+--   (pending_balance >= 0)` (migration 0011). ReverseBlockPayoutCredits'
+--   debit is a plain `pending_balance = pending_balance - amount`,
+--   exactly like every other debit in this codebase, so it is subject
+--   to that same constraint: if a miner's balance has, since this
+--   bad block's payout, been reduced by something else legitimate
+--   (most plausibly a real disbursement built in part on the bad
+--   credit) such that this debit would take it negative, Postgres
+--   REJECTS the whole reversal transaction rather than silently
+--   clamping to zero or corrupting the row. That is the CORRECT,
+--   auditable outcome, not a bug to work around here: it surfaces
+--   exactly the case where the miner has already been paid real coin
+--   built on a credit that turns out to be void, which is a distinct
+--   incident an operator must resolve by hand (see
+--   internal/backend/db/blockpayout.go's ReverseBlockPayoutCredits
+--   doc comment), not something this migration or its Go code should
+--   paper over.
+
+BEGIN;
+
+ALTER TABLE block_payouts DROP CONSTRAINT IF EXISTS block_payouts_status_check;
+ALTER TABLE block_payouts ADD CONSTRAINT block_payouts_status_check
+    CHECK (status IN ('PENDING', 'APPLIED', 'FAILED', 'REVERSED'));
+
+ALTER TABLE block_payout_credits ADD COLUMN reversed_at TIMESTAMPTZ;
+
+COMMIT;
