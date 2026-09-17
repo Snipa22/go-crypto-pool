@@ -30,6 +30,14 @@ coin = "tari"
 # when -coin=monero; ignored for -coin=tari. (default: "")
 monerod_url = ""
 
+# Comma-separated NAME:auxid pairs naming every merge-mined chain this leaf should ALSO
+# check the same PoW submission against, on top of the primary chain -- only meaningful
+# for coin=monero, ignored for coin=tari. auxid is the aux-chain identifier a merge-mining
+# proxy's own submit_block response tags that chain's aux_chain_data entry with (Tari's own
+# real minotari_merge_mining_proxy convention, confirmed live, is "xtr"). Empty (default)
+# disables merge-mine-chain checking entirely. Example: 'TARI:xtr'. (default: "")
+merge_mine_chains = ""
+
 # Enable the real, legacy-ported probabilistic RandomX-validation-skip
 # mechanism for RXT/RXM shares. Disabled by default. (default: false)
 #
