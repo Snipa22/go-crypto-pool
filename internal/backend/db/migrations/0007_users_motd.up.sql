@@ -9,10 +9,13 @@
 --
 -- `users` is keyed on `username`, which -- per the legacy schema -- IS
 -- the miner's payment address (there is no separate registration
--- flow; a miner's first authenticated action against this address
--- implicitly "creates" their account, see
--- Repository.UpsertUserThreshold). `pass` is nullable: a user with no
--- password set can never authenticate via POST /authenticate (see
+-- flow). Note: despite that legacy lineage, there is deliberately no
+-- implicit-create-on-first-use behavior here -- Repository.
+-- UpdateUserThreshold (backing the unauthenticated POST
+-- /user/updateThreshold route) is UPDATE-only and never creates a row;
+-- some other admin/auth path is expected to provision a `users` row
+-- before that endpoint can touch it. `pass` is nullable: a user with
+-- no password set can never authenticate via POST /authenticate (see
 -- authapi's package doc comment for the deliberate, stated deviation
 -- from legacy's NULL/email-fallback quirk here).
 

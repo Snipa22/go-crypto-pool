@@ -943,7 +943,7 @@ func (a addressMapRepositoryAdapter) Get(ctx context.Context, xmrAddress string)
 // authRepositoryAdapter adapts *db.Repository (whose
 // GetUserByUsername/GetUserByID/UpdateUserPassword/
 // ToggleUserEnableEmail/ToggleUserEnableEmailByUsername/
-// UpdateUserPayoutThreshold/UpsertUserThreshold/SetForcePayout
+// UpdateUserPayoutThreshold/UpdateUserThreshold/SetForcePayout
 // operate on db.User) to authapi.Repository (which operates on
 // authapi.User), mirroring addressMapRepositoryAdapter's role above
 // for the SXMR-legacy authentication/account-settings API.
@@ -1001,8 +1001,12 @@ func (a authRepositoryAdapter) UpdateUserPayoutThreshold(ctx context.Context, id
 	return a.repo.UpdateUserPayoutThreshold(ctx, id, threshold)
 }
 
-func (a authRepositoryAdapter) UpsertUserThreshold(ctx context.Context, username string, threshold int64) error {
-	return a.repo.UpsertUserThreshold(ctx, username, threshold)
+func (a authRepositoryAdapter) UpdateUserThreshold(ctx context.Context, username string, threshold int64) error {
+	err := a.repo.UpdateUserThreshold(ctx, username, threshold)
+	if err != nil && errors.Is(err, db.ErrUserNotFound) {
+		return authapi.ErrUserNotFound
+	}
+	return err
 }
 
 func (a authRepositoryAdapter) SetForcePayout(ctx context.Context, algo, network, paymentAddress string, paymentID *string) error {

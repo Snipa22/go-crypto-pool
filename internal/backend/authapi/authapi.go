@@ -45,8 +45,11 @@
 //     `earlyPayout` queue push -- there is no Redis in this stack).
 //
 //   - POST /user/updateThreshold (NOT JWT-gated)
-//     Body: {"username": "...", "threshold": <number>}. Upserts a
-//     `users` row for that username.
+//     Body: {"username": "...", "threshold": <number>}. Updates the
+//     EXISTING `users` row's payout_threshold for that username --
+//     UPDATE-only, never creates a row (an unauthenticated caller who
+//     merely knows/guesses a username must not be able to conjure a
+//     new `users` row into existence).
 //
 //   - GET /user/{address} (NOT JWT-gated)
 //     Returns {payout_threshold, email_enabled} for that username,
@@ -115,7 +118,7 @@ const maxBodyBytes = 1 << 16 // 64 KiB
 // maxMinerStringLen caps every miner-supplied, address/username-shaped
 // string field these handlers accept before it reaches a Repository
 // call that persists it to an unbounded `TEXT` column (users.username
-// via UpsertUserThreshold, in particular -- see db/users.go). Mirrors
+// via UpdateUserThreshold, in particular -- see db/users.go). Mirrors
 // internal/backend/api's identically-named/valued constant and
 // PROD_HARDENING_REVIEW.md finding #17's own reasoning: 256 bytes is
 // generous for anything actually shaped like a real address or
@@ -164,7 +167,14 @@ type Repository interface {
 	ToggleUserEnableEmail(ctx context.Context, id int64) error
 	ToggleUserEnableEmailByUsername(ctx context.Context, username string) error
 	UpdateUserPayoutThreshold(ctx context.Context, id int64, threshold int64) error
-	UpsertUserThreshold(ctx context.Context, username string, threshold int64) error
+
+	// UpdateUserThreshold implements the public POST
+	// /user/updateThreshold path: it must be UPDATE-only and must
+	// NEVER create a new `users` row. Implementations must return
+	// this package's own ErrUserNotFound sentinel (not db's) when
+	// username matches no row, so Handler can translate that into
+	// the endpoint's legacy-parity 400 response.
+	UpdateUserThreshold(ctx context.Context, username string, threshold int64) error
 	SetForcePayout(ctx context.Context, algo, network, paymentAddress string, paymentID *string) error
 }
 
@@ -711,7 +721,11 @@ func (h *Handler) handleUpdateThreshold(w http.ResponseWriter, r *http.Request) 
 	// shape does not). Rather than inventing new address-decode
 	// logic, address-format validation is deliberately skipped here.
 
-	if err := h.repo.UpsertUserThreshold(r.Context(), req.Username, threshold); err != nil {
+	if err := h.repo.UpdateUserThreshold(r.Context(), req.Username, threshold); err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "msg": "Error updating threshold, username not found"})
+			return
+		}
 		writeJSONErr(w, http.StatusInternalServerError, "update failed")
 		return
 	}

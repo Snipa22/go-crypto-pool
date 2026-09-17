@@ -3,6 +3,7 @@ package authapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -99,12 +100,12 @@ func (f *fakeRepo) UpdateUserPayoutThreshold(_ context.Context, id int64, thresh
 	return nil
 }
 
-func (f *fakeRepo) UpsertUserThreshold(_ context.Context, username string, threshold int64) error {
-	if u, ok := f.byUsername[username]; ok {
-		u.PayoutThreshold = threshold
-		return nil
+func (f *fakeRepo) UpdateUserThreshold(_ context.Context, username string, threshold int64) error {
+	u, ok := f.byUsername[username]
+	if !ok {
+		return ErrUserNotFound
 	}
-	f.addUser(User{Username: username, Email: "null@null.null", PayoutThreshold: threshold})
+	u.PayoutThreshold = threshold
 	return nil
 }
 
@@ -503,28 +504,50 @@ func TestForcePayment_MissingUsername(t *testing.T) {
 	}
 }
 
-func TestUpdateThreshold_CreatesUserIfMissing(t *testing.T) {
+func TestUpdateThreshold_NotFound_DoesNotCreateUser(t *testing.T) {
 	repo := newFakeRepo()
 	h := newTestHandler(t, repo)
 
 	rr := doReq(t, h.Mux(), http.MethodPost, "/user/updateThreshold", `{"username":"newuser","threshold":123}`, nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s, want 400", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if success, ok := resp["success"].(bool); !ok || success {
+		t.Fatalf("expected success:false in response, got: %+v", resp)
+	}
+	if _, err := repo.GetUserByUsername(context.Background(), "newuser"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("expected no user to be created, GetUserByUsername err = %v", err)
+	}
+}
+
+func TestUpdateThreshold_UpdatesExistingUser(t *testing.T) {
+	repo := newFakeRepo()
+	h := newTestHandler(t, repo)
+	repo.addUser(User{Username: "existinguser", PayoutThreshold: 1})
+
+	rr := doReq(t, h.Mux(), http.MethodPost, "/user/updateThreshold", `{"username":"existinguser","threshold":123}`, nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
-	u, err := repo.GetUserByUsername(context.Background(), "newuser")
+	u, err := repo.GetUserByUsername(context.Background(), "existinguser")
 	if err != nil {
-		t.Fatalf("expected user to be created: %v", err)
+		t.Fatalf("expected user to still exist: %v", err)
 	}
-	if u.PayoutThreshold != 123 || u.Email != "null@null.null" {
-		t.Fatalf("unexpected created user: %+v", u)
+	if u.PayoutThreshold != 123 {
+		t.Fatalf("unexpected updated user: %+v", u)
 	}
 }
 
 func TestUpdateThreshold_DecimalValueRoundsToNearestAtomicUnit(t *testing.T) {
 	repo := newFakeRepo()
 	h := newTestHandler(t, repo)
+	repo.addUser(User{Username: "existinguser", PayoutThreshold: 0})
 
-	rr := doReq(t, h.Mux(), http.MethodPost, "/user/updateThreshold", `{"username":"newuser","threshold":1.5}`, nil)
+	rr := doReq(t, h.Mux(), http.MethodPost, "/user/updateThreshold", `{"username":"existinguser","threshold":1.5}`, nil)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
@@ -533,9 +556,9 @@ func TestUpdateThreshold_DecimalValueRoundsToNearestAtomicUnit(t *testing.T) {
 	if resp["msg"] != "Threshold updated, set to: 2" {
 		t.Fatalf("unexpected msg: %q", resp["msg"])
 	}
-	u, err := repo.GetUserByUsername(context.Background(), "newuser")
+	u, err := repo.GetUserByUsername(context.Background(), "existinguser")
 	if err != nil {
-		t.Fatalf("expected user to be created: %v", err)
+		t.Fatalf("expected user to still exist: %v", err)
 	}
 	if u.PayoutThreshold != 2 {
 		t.Fatalf("threshold not persisted as rounded int64: %+v", u)

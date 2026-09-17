@@ -138,19 +138,27 @@ func (r *Repository) UpdateUserPayoutThreshold(ctx context.Context, id int64, th
 	return nil
 }
 
-// UpsertUserThreshold implements the public POST /user/updateThreshold
-// path's exact legacy semantics: insert a new `users` row for
-// username (with the legacy placeholder email 'null@null.null') if
-// none exists yet, or simply update payout_threshold on the existing
-// one -- relying on uq_users_username for the ON CONFLICT target.
-func (r *Repository) UpsertUserThreshold(ctx context.Context, username string, threshold int64) error {
-	const stmt = `
-		INSERT INTO users (username, email, payout_threshold)
-		VALUES ($1, 'null@null.null', $2)
-		ON CONFLICT (username)
-		DO UPDATE SET payout_threshold = EXCLUDED.payout_threshold, updated_at = now()`
-	if _, err := r.pool.Exec(ctx, stmt, username, threshold); err != nil {
-		return fmt.Errorf("db: upserting threshold for %q: %w", username, err)
+// UpdateUserThreshold implements the public POST /user/updateThreshold
+// path's persistence: UPDATE-only, mirroring
+// UpdateUserPayoutThreshold above but keyed by username instead of
+// id. It never creates a `users` row -- an unauthenticated caller who
+// merely knows/guesses a username must not be able to conjure a new
+// row into existence (that route has zero identity validation on
+// username). Returns ErrUserNotFound if username matches no row.
+//
+// This function was previously named UpsertUserThreshold and did
+// INSERT ... ON CONFLICT DO UPDATE, which let any unauthenticated
+// caller fabricate a brand-new `users` row with an attacker-chosen
+// payout_threshold for any username, existing or not. Renamed
+// because it is no longer an upsert.
+func (r *Repository) UpdateUserThreshold(ctx context.Context, username string, threshold int64) error {
+	const stmt = `UPDATE users SET payout_threshold = $2, updated_at = now() WHERE username = $1`
+	tag, err := r.pool.Exec(ctx, stmt, username, threshold)
+	if err != nil {
+		return fmt.Errorf("db: updating threshold for %q: %w", username, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUserNotFound
 	}
 	return nil
 }
