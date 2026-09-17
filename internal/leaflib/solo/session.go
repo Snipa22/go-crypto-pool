@@ -16,6 +16,7 @@ import (
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
@@ -542,6 +543,16 @@ func ClaimedRandomXFamilyDifficulty(algo poolpb.Algo, resultHex string) (uint64,
 	case poolpb.Algo_ALGO_RXM:
 		return moneroDifficultyFromHash(hashBytes)
 	default:
+		// Every standalone monerod-family coin algo added via
+		// internal/coinprofile.Registry (ALGO_XMR and below) shares
+		// RXM's own real Monero check_hash_128 difficulty formula --
+		// they are all confirmed, unmodified-RandomX monero-project/
+		// monero source forks (see that package's doc comment), so
+		// their claimed result hash has the exact same real
+		// on-wire/on-chain shape Monero's own does.
+		if _, ok := coinprofile.ByAlgo(algo); ok {
+			return moneroDifficultyFromHash(hashBytes)
+		}
 		return 0, fmt.Errorf("ClaimedRandomXFamilyDifficulty: algo %v is not a RandomX-family algo", algo)
 	}
 }
@@ -688,7 +699,7 @@ func (s *Session) handleSubmit(req Request) {
 	// Monero-family miner (xmrig, etc.) treats the full nonce field as
 	// one opaque value it controls end-to-end, with no xn hex-prefix
 	// partitioning convention on this leaf's wire protocol.
-	if job.Algo != poolpb.Algo_ALGO_RXT && job.Algo != poolpb.Algo_ALGO_RXM {
+	if !IsRandomXFamily(job.Algo) {
 		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 			return
@@ -721,7 +732,7 @@ func (s *Session) handleSubmit(req Request) {
 	// (lenient: or 8-byte) nonce width ALGO_RXM already does, not the
 	// strict 8-byte gate every other algo keeps.
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
-	if job.Algo == poolpb.Algo_ALGO_RXM || job.Algo == poolpb.Algo_ALGO_RXT {
+	if IsRandomXFamily(job.Algo) {
 		if err != nil || (len(nonceBytes) != 4 && len(nonceBytes) != 8) {
 			s.writeShareResponse(req.ID, false, "nonce must be 4 bytes for RandomX-family (rx/0) jobs, hex-encoded uint32")
 			return
@@ -738,9 +749,15 @@ func (s *Session) handleSubmit(req Request) {
 		share *poolpb.Share
 	)
 	switch job.Algo {
-	case poolpb.Algo_ALGO_RXM:
-		// Real Monero submit wire shape: no "pow" field (C29-only);
-		// the miner's claimed RandomX result hash rides in the
+	case poolpb.Algo_ALGO_RXM, poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, poolpb.Algo_ALGO_XEQ,
+		poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL:
+		// Real Monero-family submit wire shape (RXM, and every other
+		// confirmed monerod-compatible coin in
+		// internal/coinprofile.Registry -- ALGO_XMR and below, all
+		// sharing this exact wire shape since they all speak the
+		// same monerod-family JSON-RPC/blob conventions): no "pow"
+		// field (C29-only); the miner's claimed RandomX result hash
+		// rides in the
 		// existing generic "result" field (submit.Result), matching
 		// RXT's own convention. Nonce is decoded LITTLE-ENDIAN,
 		// matching MoneroNodeClient.BuildCandidateBlock's own
@@ -793,7 +810,7 @@ func (s *Session) handleSubmit(req Request) {
 			return
 		}
 		share = &poolpb.Share{
-			Algo:           poolpb.Algo_ALGO_RXM,
+			Algo:           job.Algo,
 			Network:        s.server.network,
 			BlockDiff:      safeInt64(job.StaticDifficulty),
 			BlockHeight:    int64(job.Height),
@@ -1480,7 +1497,7 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	// Go zero value (empty string) here — JobPayload.XN's
 	// `json:"xn,omitempty"` tag then omits the field from the wire
 	// JSON entirely for those two algos, rather than sending `"xn":""`.
-	if job.Algo != poolpb.Algo_ALGO_RXT && job.Algo != poolpb.Algo_ALGO_RXM {
+	if !IsRandomXFamily(job.Algo) {
 		payload.XN = s.xn
 	}
 	// RXT-only: surface the real RandomX seed/key (job.go's Job.VmKey,
@@ -1488,7 +1505,7 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	// "seed_hash" field — mirrors XMRig's own stratum job-JSON
 	// convention for RandomX-family coins. SHA3X/C29 jobs have no
 	// VmKey, so this is simply omitted (omitempty) for them.
-	if (job.Algo == poolpb.Algo_ALGO_RXT || job.Algo == poolpb.Algo_ALGO_RXM) && len(job.VmKey) > 0 {
+	if IsRandomXFamily(job.Algo) && len(job.VmKey) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.VmKey)
 	}
 	// XNP-PROXY SHAPE (see protocol.go's JobPayload doc comment for
@@ -1516,8 +1533,10 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	// jobs served to a non-proxy agent.
 	if IsXNPProxyAgent(s.agent.Load().(string)) {
 		switch job.Algo {
-		case poolpb.Algo_ALGO_RXM:
-			// RXM: the raw, unconverted monerod blocktemplate_blob
+		case poolpb.Algo_ALGO_RXM, poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, poolpb.Algo_ALGO_XEQ,
+			poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL:
+			// RXM (and every other confirmed monerod-family coin in
+			// internal/coinprofile.Registry): the raw, unconverted monerod blocktemplate_blob
 			// (job.go's Job.RawTemplateBlob — kept deliberately
 			// separate from job.Header/payload.Blob, which is
 			// already the CONVERTED blockhashing_blob every

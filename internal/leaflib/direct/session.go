@@ -355,7 +355,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// same reason as ALGO_RXT (see solo.Session's own handleSubmit doc
 	// comment): a real Monero-family miner treats the full nonce field
 	// as one opaque value it controls end-to-end.
-	if job.Algo != poolpb.Algo_ALGO_RXT && job.Algo != poolpb.Algo_ALGO_RXM {
+	if !solo.IsRandomXFamily(job.Algo) {
 		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 			return
@@ -373,7 +373,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// takes the SAME lenient 4-or-8-byte gate as RXM instead of the
 	// strict 8-byte-only gate SHA3X/C29 keep.
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
-	if job.Algo == poolpb.Algo_ALGO_RXM || job.Algo == poolpb.Algo_ALGO_RXT {
+	if solo.IsRandomXFamily(job.Algo) {
 		if err != nil || (len(nonceBytes) != 4 && len(nonceBytes) != 8) {
 			s.writeShareResponse(req.ID, false, "nonce must be 4 bytes for RandomX-family (rx/0) jobs, hex-encoded uint32")
 			return
@@ -390,7 +390,8 @@ func (s *Session) handleSubmit(req solo.Request) {
 		share *poolpb.Share
 	)
 	switch job.Algo {
-	case poolpb.Algo_ALGO_RXM:
+	case poolpb.Algo_ALGO_RXM, poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, poolpb.Algo_ALGO_XEQ,
+		poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL:
 		// Mirrors solo.Session's own ALGO_RXM handling exactly (same
 		// little-endian nonce convention, same
 		// solo.MoneroHashingBlobForSubmit escape hatch for the real
@@ -433,7 +434,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			return
 		}
 		share = &poolpb.Share{
-			Algo: poolpb.Algo_ALGO_RXM, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
+			Algo: job.Algo, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
@@ -774,7 +775,8 @@ func (s *Session) handleSubmit(req solo.Request) {
 			mergeMineForwards []mergeMineBlockForward
 		)
 		switch job.Algo {
-		case poolpb.Algo_ALGO_RXM:
+		case poolpb.Algo_ALGO_RXM, poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, poolpb.Algo_ALGO_XEQ,
+			poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL:
 			moneroCandidate, ok := candidate.(*solo.MoneroCandidate)
 			if !ok || moneroCandidate == nil {
 				s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
@@ -1203,10 +1205,10 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	// Go zero value (empty string) here — JobPayload.XN's
 	// `json:"xn,omitempty"` tag then omits the field from the wire
 	// JSON entirely for those two algos, rather than sending `"xn":""`.
-	if job.Algo != poolpb.Algo_ALGO_RXT && job.Algo != poolpb.Algo_ALGO_RXM {
+	if !solo.IsRandomXFamily(job.Algo) {
 		payload.XN = s.xn
 	}
-	if (job.Algo == poolpb.Algo_ALGO_RXT || job.Algo == poolpb.Algo_ALGO_RXM) && len(job.VmKey) > 0 {
+	if solo.IsRandomXFamily(job.Algo) && len(job.VmKey) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.VmKey)
 	}
 	// XNP-PROXY SHAPE: mirrors solo.Session's own identical jobPayload
@@ -1231,7 +1233,8 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	// this.
 	if solo.IsXNPProxyAgent(s.agent.Load().(string)) {
 		switch job.Algo {
-		case poolpb.Algo_ALGO_RXM:
+		case poolpb.Algo_ALGO_RXM, poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, poolpb.Algo_ALGO_XEQ,
+			poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL:
 			// BOUNDS-CHECK GATE (real production bug fix -- see
 			// job.go's Job.ReservedOffsetUsable doc comment and
 			// monero_node.go's GetBlockTemplate for the full

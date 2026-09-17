@@ -8,7 +8,7 @@
 # "30s"), since go-toml/v2 does not natively decode into time.Duration.
 
 # Tari base node GRPC address (host:port). REQUIRED when -coin=tari (the
-# default); ignored for -coin=monero. (default: "")
+# default); ignored for any monerod-family coin. (default: "")
 node_grpc_address = ""
 
 # Miner-facing TCP listen address. (default: ":4444")
@@ -20,14 +20,30 @@ payout_address = ""
 # Network tag for share/diagnostic records: mainnet|testnet. (default: "testnet")
 network = "testnet"
 
-# Which coin/PoW family this leaf-solo process serves: tari (default,
-# unchanged behavior) or monero (real MoneroNodeClient against a real monerod
-# JSON-RPC daemon -- see monerod_url). (default: "tari")
+# Which coin/PoW family this leaf-solo process serves: "tari" (default,
+# unchanged behavior) or a coin ticker from internal/coinprofile.Registry --
+# see that package for the current, authoritative list of supported tickers
+# (as of this writing: xmr, arq, xeq, grft, sfx, zeph, sal; case-insensitive).
+# "monero" remains a backward-compatible alias for "xmr" in its EXACT
+# existing merge-mine (ALGO_RXM) behavior -- see `standalone` below to run
+# non-merge-mined XMR instead. An unregistered ticker fails fast at startup
+# rather than silently falling back to any default. (default: "tari")
 coin = "tari"
 
-# Real monerod JSON-RPC base URL (e.g. http://148.163.90.157:28081), no
-# trailing slash or /json_rpc suffix required. REQUIRED when -coin=monero;
-# ignored for -coin=tari. (default: "")
+# Only meaningful for coin="xmr" (or its "monero" alias): when true, runs
+# standalone (non-merge-mined) XMR against monerod_url, tracked under its own
+# new ALGO_XMR value, instead of the default Tari-merge-mined ALGO_RXM
+# behavior. Has no effect for coin="tari" or any OTHER registered coin ticker
+# (arq, xeq, grft, sfx, zeph, sal), which have no merge-mine concept at all
+# and are therefore always standalone already. (default: false)
+standalone = false
+
+# Real monerod-JSON-RPC-compatible base URL (e.g. http://148.163.90.157:28081),
+# no trailing slash or /json_rpc suffix required. REQUIRED when `coin`
+# resolves to any monerod-family coin; ignored for coin="tari". For
+# coin="monero" (or coin="xmr" without standalone=true), point this at your
+# local minotari_merge_mining_proxy listener, NOT raw monerod -- pointing at
+# raw monerod mines Monero-only with no Tari merge-mine revenue. (default: "")
 monerod_url = ""
 
 # Enable the real, legacy-ported probabilistic RandomX-validation-skip
@@ -66,20 +82,22 @@ invalid_share_disconnect_enabled = true
 invalid_share_disconnect_threshold = 0
 
 # Which single mining algorithm this leaf-solo process serves: sha3x
-# (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/
-# plain RandomX) when -coin=monero. (default: "sha3x")
+# (default), c29, or rxt -- for coin="tari" only. Ignored (always resolves
+# to that coin's own dedicated algo instead) for any monerod-family coin.
+# (default: "sha3x")
 algo = "sha3x"
 
-# RandomX-verification HTTP daemon address (consulted for -algo=rxt, and for
-# -coin=monero's real RandomX/rx validation -- both share the same real
-# randomx-service-backed RandomXValidator).
+# RandomX-verification HTTP daemon address (consulted for algo="rxt", and for
+# every monerod-family coin's real RandomX/rx validation -- they all share
+# the same real randomx-service-backed RandomXValidator).
 # (default: "http://127.0.0.1:39093")
 randomx_service_url = "http://127.0.0.1:39093"
 
 # Coinbase-extra ownership tag appended to every fetched Tari block template
 # (identifies this leaf's found blocks on-chain). Left unset (the default), a
 # per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 /
-# supportxtm-rxt / supportxtm-rxm. (default: "")
+# supportxtm-rxt / supportxtm-rxm / supportxtm-<ticker> (e.g. supportxtm-arq)
+# -- see internal/coinprofile.Registry for the per-coin default. (default: "")
 coinbase_extra_tag = ""
 
 # Starting share difficulty for a newly-connected session; vardiff adjusts it

@@ -77,8 +77,13 @@ func TestIntegrationMigrationCreatesPartitionTree(t *testing.T) {
 		t.Fatalf("ApplyMigrations: %v", err)
 	}
 
-	// Expect: 1 top-level + 4 algo-level + 16 pool_type-level = 21
-	// partitioned tables, all rooted at `shares`.
+	// Expect: 1 top-level + len(ValidAlgos) algo-level +
+	// len(ValidAlgos)*len(ValidPoolTypes) pool_type-level partitioned
+	// tables, all rooted at `shares`. Computed from db.ValidAlgos/
+	// db.ValidPoolTypes (rather than a hardcoded literal) so this
+	// assertion stays correct as new algos are added via
+	// internal/coinprofile.Registry + migrations/0016_multicoin_algos.
+	wantPartitioned := 1 + len(db.ValidAlgos) + len(db.ValidAlgos)*len(db.ValidPoolTypes)
 	var partitionedCount int
 	err := pool.QueryRow(ctx, `
 		SELECT count(*)
@@ -89,8 +94,8 @@ func TestIntegrationMigrationCreatesPartitionTree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("querying pg_partitioned_table: %v", err)
 	}
-	if partitionedCount != 21 {
-		t.Errorf("expected 21 partitioned tables (1 + 4 + 16), got %d", partitionedCount)
+	if partitionedCount != wantPartitioned {
+		t.Errorf("expected %d partitioned tables (1 + %d + %d), got %d", wantPartitioned, len(db.ValidAlgos), len(db.ValidAlgos)*len(db.ValidPoolTypes), partitionedCount)
 	}
 
 	// Every algo x pool_type combination should have at least the seed
@@ -121,6 +126,61 @@ func TestIntegrationMigrationCreatesPartitionTree(t *testing.T) {
 	}
 	if isPartitioned {
 		t.Error("blocks table must NOT be partitioned, but pg_partitioned_table has an entry for it")
+	}
+}
+
+// TestIntegrationInsertShareForEveryNewCoinAlgo proves the new
+// standalone monerod-family coin algos added via
+// internal/coinprofile.Registry (migrations/0016_multicoin_algos)
+// genuinely work end-to-end against a real Postgres schema -- a real
+// InsertShare/InsertBlock for each one, not just a widened CHECK
+// constraint with nothing behind it. LIST partitioning by algo has no
+// implicit "any other value" fallback, so this specifically also
+// proves 0016's new `shares_<algo>` leaf partitions exist and accept
+// rows.
+func TestIntegrationInsertShareForEveryNewCoinAlgo(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	resetSchema(t, pool)
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations: %v", err)
+	}
+
+	repo := db.NewRepository(pool)
+
+	for _, algo := range []string{"XMR", "ARQ", "XEQ", "GRFT", "SFX", "ZEPH", "SAL"} {
+		share := db.Share{
+			Algo: algo, Network: "TESTNET", PoolType: "SOLO", PoolID: 1,
+			BlockHeight: 42, Shares: 100, PaymentAddress: "addr-" + algo,
+			Identifier: "worker-" + algo, Timestamp: 1700000000,
+		}
+		if err := repo.InsertShare(ctx, share, db.HeightPartitionBucketSize); err != nil {
+			t.Fatalf("InsertShare(algo=%s): %v", algo, err)
+		}
+		if err := repo.InsertBlock(ctx, db.Block{
+			Algo: algo, Network: "TESTNET", PoolType: "SOLO",
+			Hash: "0x" + algo, Height: 42, Difficulty: 1, Shares: 100,
+			Timestamp: 1700000001, Unlocked: false, Valid: true,
+		}); err != nil {
+			t.Fatalf("InsertBlock(algo=%s): %v", algo, err)
+		}
+
+		var count int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM shares WHERE algo = $1", algo).Scan(&count); err != nil {
+			t.Fatalf("counting shares for algo=%s: %v", algo, err)
+		}
+		if count != 1 {
+			t.Errorf("algo=%s: expected 1 share row, got %d", algo, count)
+		}
+	}
+
+	// An unregistered algo string must still be rejected outright --
+	// this schema change is additive, not a removal of validation.
+	if err := repo.InsertShare(ctx, db.Share{
+		Algo: "NOTACOIN", Network: "TESTNET", PoolType: "SOLO", PoolID: 1,
+		BlockHeight: 1, Shares: 1, PaymentAddress: "addr", Identifier: "w", Timestamp: 1,
+	}, db.HeightPartitionBucketSize); err == nil {
+		t.Error("InsertShare(algo=NOTACOIN): expected error, got nil")
 	}
 }
 

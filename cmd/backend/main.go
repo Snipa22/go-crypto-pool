@@ -237,6 +237,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/backend/statsapi"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/unlocker"
 	"github.com/Snipa22/go-crypto-pool/internal/backend/wallet"
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/cfgfile"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -440,11 +441,24 @@ type config struct {
 	payoutMoneroFeeAddress      string
 	payoutTariDonationAddress   string
 	payoutMoneroDonationAddress string
-	payoutPPSFeePercent         float64
-	payoutPPLNSFeePercent       float64
-	payoutSoloFeePercent        float64
-	payoutDonationPercent       float64
-	payoutPPLNSShareMulti       float64
+	// payoutExtraFeeAddressesRaw/payoutExtraDonationAddressesRaw
+	// generalize payoutTariFeeAddress/payoutMoneroFeeAddress (and
+	// their donation counterparts) to the new standalone
+	// monerod-family coins added via internal/coinprofile.Registry --
+	// see payout.Config.ExtraFeeAddresses's doc comment for why each
+	// one needs its own independent address rather than sharing
+	// RXM's Monero address. Format: comma-separated
+	// "TICKER=address" pairs, e.g. "ARQ=ar2...,XEQ=Tvz...". Parsed by
+	// parseExtraCoinAddresses, which fails fast (refuses to start) on
+	// an unregistered ticker or an address that doesn't validate
+	// against that coin's own CoinProfile.
+	payoutExtraFeeAddressesRaw      string
+	payoutExtraDonationAddressesRaw string
+	payoutPPSFeePercent             float64
+	payoutPPLNSFeePercent           float64
+	payoutSoloFeePercent            float64
+	payoutDonationPercent           float64
+	payoutPPLNSShareMulti           float64
 
 	retentionPollInterval time.Duration
 	retentionBlocks       int64
@@ -570,6 +584,8 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.payoutMoneroFeeAddress, "payout-monero-fee-address", envOr("GCPOOL_PAYOUT_MONERO_FEE_ADDRESS", ""), "pool operator fee-collection payment address for RXM (Monero). When set, every matured RXM block also triggers a real payout cycle for that block, crediting miner balances. When unset, RXM blocks still mature/unlock correctly, they are simply never auto-paid out. Env: GCPOOL_PAYOUT_MONERO_FEE_ADDRESS")
 	flag.StringVar(&cfg.payoutTariDonationAddress, "payout-tari-donation-address", envOr("GCPOOL_PAYOUT_TARI_DONATION_ADDRESS", ""), "donation address for Tari-family (RXT/C29/SHA3X) payout cycles. Env: GCPOOL_PAYOUT_TARI_DONATION_ADDRESS")
 	flag.StringVar(&cfg.payoutMoneroDonationAddress, "payout-monero-donation-address", envOr("GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS", ""), "donation address for RXM (Monero) payout cycles. Env: GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS")
+	flag.StringVar(&cfg.payoutExtraFeeAddressesRaw, "payout-extra-fee-addresses", envOr("GCPOOL_PAYOUT_EXTRA_FEE_ADDRESSES", ""), "comma-separated TICKER=address pairs of pool operator fee-collection addresses for standalone monerod-family coins from internal/coinprofile.Registry (e.g. \"ARQ=ar2...,XEQ=Tvz...\") -- each coin is independent and needs its own address (see -payout-monero-fee-address's doc comment for why RXM's Monero address cannot be shared). Env: GCPOOL_PAYOUT_EXTRA_FEE_ADDRESSES")
+	flag.StringVar(&cfg.payoutExtraDonationAddressesRaw, "payout-extra-donation-addresses", envOr("GCPOOL_PAYOUT_EXTRA_DONATION_ADDRESSES", ""), "comma-separated TICKER=address pairs of donation addresses for the same standalone monerod-family coins as -payout-extra-fee-addresses. Env: GCPOOL_PAYOUT_EXTRA_DONATION_ADDRESSES")
 	flag.Float64Var(&cfg.payoutPPSFeePercent, "payout-pps-fee-percent", envOrFloat64("GCPOOL_PAYOUT_PPS_FEE_PERCENT", 0), "PPS pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_PPS_FEE_PERCENT")
 	flag.Float64Var(&cfg.payoutPPLNSFeePercent, "payout-pplns-fee-percent", envOrFloat64("GCPOOL_PAYOUT_PPLNS_FEE_PERCENT", 0), "PPLNS pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_PPLNS_FEE_PERCENT")
 	flag.Float64Var(&cfg.payoutSoloFeePercent, "payout-solo-fee-percent", envOrFloat64("GCPOOL_PAYOUT_SOLO_FEE_PERCENT", 0), "Solo pool-type operator fee percentage (0-100). Env: GCPOOL_PAYOUT_SOLO_FEE_PERCENT")
@@ -654,15 +670,17 @@ type fileConfig struct {
 
 	NetworkPollerPollIntervalSeconds *int `toml:"network_poller_poll_interval_seconds"`
 
-	PayoutTariFeeAddress        *string  `toml:"payout_tari_fee_address"`
-	PayoutMoneroFeeAddress      *string  `toml:"payout_monero_fee_address"`
-	PayoutTariDonationAddress   *string  `toml:"payout_tari_donation_address"`
-	PayoutMoneroDonationAddress *string  `toml:"payout_monero_donation_address"`
-	PayoutPPSFeePercent         *float64 `toml:"payout_pps_fee_percent"`
-	PayoutPPLNSFeePercent       *float64 `toml:"payout_pplns_fee_percent"`
-	PayoutSoloFeePercent        *float64 `toml:"payout_solo_fee_percent"`
-	PayoutDonationPercent       *float64 `toml:"payout_donation_percent"`
-	PayoutPPLNSShareMulti       *float64 `toml:"payout_pplns_share_multi"`
+	PayoutTariFeeAddress         *string  `toml:"payout_tari_fee_address"`
+	PayoutMoneroFeeAddress       *string  `toml:"payout_monero_fee_address"`
+	PayoutTariDonationAddress    *string  `toml:"payout_tari_donation_address"`
+	PayoutMoneroDonationAddress  *string  `toml:"payout_monero_donation_address"`
+	PayoutExtraFeeAddresses      *string  `toml:"payout_extra_fee_addresses"`
+	PayoutExtraDonationAddresses *string  `toml:"payout_extra_donation_addresses"`
+	PayoutPPSFeePercent          *float64 `toml:"payout_pps_fee_percent"`
+	PayoutPPLNSFeePercent        *float64 `toml:"payout_pplns_fee_percent"`
+	PayoutSoloFeePercent         *float64 `toml:"payout_solo_fee_percent"`
+	PayoutDonationPercent        *float64 `toml:"payout_donation_percent"`
+	PayoutPPLNSShareMulti        *float64 `toml:"payout_pplns_share_multi"`
 
 	RetentionPollIntervalSeconds *int   `toml:"retention_poll_interval_seconds"`
 	RetentionBlocks              *int64 `toml:"retention_blocks"`
@@ -741,6 +759,8 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.payoutMoneroFeeAddress, fc.PayoutMoneroFeeAddress, visited, "payout-monero-fee-address", "GCPOOL_PAYOUT_MONERO_FEE_ADDRESS")
 	cfgfile.ApplyString(&cfg.payoutTariDonationAddress, fc.PayoutTariDonationAddress, visited, "payout-tari-donation-address", "GCPOOL_PAYOUT_TARI_DONATION_ADDRESS")
 	cfgfile.ApplyString(&cfg.payoutMoneroDonationAddress, fc.PayoutMoneroDonationAddress, visited, "payout-monero-donation-address", "GCPOOL_PAYOUT_MONERO_DONATION_ADDRESS")
+	cfgfile.ApplyString(&cfg.payoutExtraFeeAddressesRaw, fc.PayoutExtraFeeAddresses, visited, "payout-extra-fee-addresses", "GCPOOL_PAYOUT_EXTRA_FEE_ADDRESSES")
+	cfgfile.ApplyString(&cfg.payoutExtraDonationAddressesRaw, fc.PayoutExtraDonationAddresses, visited, "payout-extra-donation-addresses", "GCPOOL_PAYOUT_EXTRA_DONATION_ADDRESSES")
 	cfgfile.ApplyFloat64(&cfg.payoutPPSFeePercent, fc.PayoutPPSFeePercent, visited, "payout-pps-fee-percent", "GCPOOL_PAYOUT_PPS_FEE_PERCENT")
 	cfgfile.ApplyFloat64(&cfg.payoutPPLNSFeePercent, fc.PayoutPPLNSFeePercent, visited, "payout-pplns-fee-percent", "GCPOOL_PAYOUT_PPLNS_FEE_PERCENT")
 	cfgfile.ApplyFloat64(&cfg.payoutSoloFeePercent, fc.PayoutSoloFeePercent, visited, "payout-solo-fee-percent", "GCPOOL_PAYOUT_SOLO_FEE_PERCENT")
@@ -1795,28 +1815,81 @@ func buildNetworkPollerConfig(cfg config, network poolpb.Network, m *metrics.Met
 //	                                tunable value — see payout.Config's
 //	                                doc comment).
 func buildPayoutCalculator(cfg config, repo *db.Repository, m *metrics.Metrics) (calc *payout.Calculator, ok bool, err error) {
-	if strings.TrimSpace(cfg.payoutTariFeeAddress) == "" && strings.TrimSpace(cfg.payoutMoneroFeeAddress) == "" {
+	extraFee, err := parseExtraCoinAddresses(cfg.payoutExtraFeeAddressesRaw, "-payout-extra-fee-addresses/GCPOOL_PAYOUT_EXTRA_FEE_ADDRESSES")
+	if err != nil {
+		return nil, false, err
+	}
+	extraDonation, err := parseExtraCoinAddresses(cfg.payoutExtraDonationAddressesRaw, "-payout-extra-donation-addresses/GCPOOL_PAYOUT_EXTRA_DONATION_ADDRESSES")
+	if err != nil {
+		return nil, false, err
+	}
+
+	if strings.TrimSpace(cfg.payoutTariFeeAddress) == "" && strings.TrimSpace(cfg.payoutMoneroFeeAddress) == "" && len(extraFee) == 0 {
 		return nil, false, nil
 	}
 
-	if err := validateDonationConfig(cfg); err != nil {
+	if err := validateDonationConfig(cfg, extraFee, extraDonation); err != nil {
 		return nil, false, err
 	}
 
 	pcfg := payout.Config{
-		TariFeeAddress:        cfg.payoutTariFeeAddress,
-		MoneroFeeAddress:      cfg.payoutMoneroFeeAddress,
-		TariDonationAddress:   cfg.payoutTariDonationAddress,
-		MoneroDonationAddress: cfg.payoutMoneroDonationAddress,
-		PPSFeePercent:         cfg.payoutPPSFeePercent,
-		PPLNSFeePercent:       cfg.payoutPPLNSFeePercent,
-		SoloFeePercent:        cfg.payoutSoloFeePercent,
-		DonationPercent:       cfg.payoutDonationPercent,
-		PPLNSShareMulti:       cfg.payoutPPLNSShareMulti,
-		Metrics:               m,
+		TariFeeAddress:         cfg.payoutTariFeeAddress,
+		MoneroFeeAddress:       cfg.payoutMoneroFeeAddress,
+		TariDonationAddress:    cfg.payoutTariDonationAddress,
+		MoneroDonationAddress:  cfg.payoutMoneroDonationAddress,
+		ExtraFeeAddresses:      extraFee,
+		ExtraDonationAddresses: extraDonation,
+		PPSFeePercent:          cfg.payoutPPSFeePercent,
+		PPLNSFeePercent:        cfg.payoutPPLNSFeePercent,
+		SoloFeePercent:         cfg.payoutSoloFeePercent,
+		DonationPercent:        cfg.payoutDonationPercent,
+		PPLNSShareMulti:        cfg.payoutPPLNSShareMulti,
+		Metrics:                m,
 	}
 
 	return payout.New(payoutRepositoryAdapter{repo: repo}, pcfg), true, nil
+}
+
+// parseExtraCoinAddresses parses raw ("TICKER=address,TICKER2=address2")
+// into a map keyed by that coin's exact uppercase algo string (e.g.
+// "ARQ") -- see payout.Config.ExtraFeeAddresses's doc comment. Fails
+// fast (a real error, never a silently-skipped entry) on a malformed
+// entry, an unregistered ticker, or an address that does not validate
+// against that coin's own internal/coinprofile.CoinProfile -- a
+// misconfigured payout address here would misroute real funds, not
+// just misfile a log line. An empty/whitespace-only raw string (the
+// default) returns a nil map -- no extra coins configured, matching
+// every other optional-flag convention in this codebase.
+func parseExtraCoinAddresses(raw, flagLabel string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	out := make(map[string]string)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("%s: entry %q is not TICKER=address", flagLabel, entry)
+		}
+		ticker := strings.TrimSpace(parts[0])
+		address := strings.TrimSpace(parts[1])
+		if ticker == "" || address == "" {
+			return nil, fmt.Errorf("%s: entry %q has an empty ticker or address", flagLabel, entry)
+		}
+		profile, ok := coinprofile.Lookup(ticker)
+		if !ok {
+			return nil, fmt.Errorf("%s: entry %q: unknown/unregistered coin ticker %q -- see internal/coinprofile.Registry for supported tickers", flagLabel, entry, ticker)
+		}
+		if err := coinprofile.ValidateAddress(profile, address); err != nil {
+			return nil, fmt.Errorf("%s: entry %q: %w", flagLabel, entry, err)
+		}
+		out[profile.Ticker] = address
+	}
+	return out, nil
 }
 
 // validateDonationConfig fails fast (returning a real error, never
@@ -1836,7 +1909,7 @@ func buildPayoutCalculator(cfg config, repo *db.Repository, m *metrics.Metrics) 
 // enabled (its fee address is set) -- an operator running Tari-only
 // should not be forced to configure a Monero donation address they
 // will never use.
-func validateDonationConfig(cfg config) error {
+func validateDonationConfig(cfg config, extraFee, extraDonation map[string]string) error {
 	if cfg.payoutDonationPercent <= 0 {
 		return nil
 	}
@@ -1851,6 +1924,13 @@ func validateDonationConfig(cfg config) error {
 			"refusing to start: an empty donation address would credit a real balance row with payment_address='', "+
 			"which poisons its entire disbursement batch every cycle (see PROD_HARDENING_REVIEW.md finding #10)",
 			cfg.payoutDonationPercent)
+	}
+	for ticker := range extraFee {
+		if _, ok := extraDonation[ticker]; !ok {
+			return fmt.Errorf("GCPOOL_PAYOUT_DONATION_PERCENT is %v (> 0) and -payout-extra-fee-addresses configures %s, but -payout-extra-donation-addresses has no entry for it -- "+
+				"refusing to start (see PROD_HARDENING_REVIEW.md finding #10)",
+				cfg.payoutDonationPercent, ticker)
+		}
 	}
 	return nil
 }

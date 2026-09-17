@@ -13,6 +13,7 @@ import (
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -96,7 +97,15 @@ func NewSessionXN() (string, error) {
 // both map to "rx/0" — real RandomX-family miner software (XMRig et
 // al.) has no concept of an algorithm called "rxt"/"rxm"; they only
 // dispatch on their own fixed algo-name set (see commit 0659143's own
-// live-production root-cause analysis, ported here unchanged).
+// live-production root-cause analysis, ported here unchanged). Every
+// standalone monerod-family coin algo added via
+// internal/coinprofile.Registry (ALGO_XMR and below) ALSO maps to
+// "rx/0" for the exact same reason — every confirmed coin there is a
+// genuine, unmodified-RandomX monero-project/monero source fork (see
+// that package's doc comment), so a real RandomX-aware miner client
+// needs the SAME "rx/0" wire label to select the right hashing
+// algorithm, not the "sha3x" fallback below (which would tell the
+// miner to hash the wrong algorithm entirely).
 // ALGO_UNSPECIFIED falls back to "sha3x" for defensive backward
 // compatibility.
 func AlgoWireName(algo poolpb.Algo) string {
@@ -106,6 +115,9 @@ func AlgoWireName(algo poolpb.Algo) string {
 	case poolpb.Algo_ALGO_RXT, poolpb.Algo_ALGO_RXM:
 		return "rx/0"
 	default:
+		if _, ok := coinprofile.ByAlgo(algo); ok {
+			return "rx/0"
+		}
 		return "sha3x"
 	}
 }

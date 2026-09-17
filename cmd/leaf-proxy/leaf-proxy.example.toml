@@ -6,6 +6,15 @@
 #
 # Durations are given in plain integer seconds (not Go duration strings like
 # "30s"), since go-toml/v2 does not natively decode into time.Duration.
+#
+# NOTE on coin scope: leaf-proxy has no coin/algo flag at all -- it is a
+# wire-protocol-level, coin-generic proxy that forwards whatever
+# monerod-shaped block-template/submit traffic the configured upstream pool
+# hands it, regardless of which monerod-family coin (see
+# internal/coinprofile.Registry for the full list this repo's leaf-solo/
+# leaf-direct binaries can now serve directly) that upstream pool actually
+# mines. Point upstream_host/upstream_port at that coin's own real upstream
+# pool; there is nothing else to configure here per-coin.
 
 # Real upstream Monero-family pool hostname. (default: "pool.supportxmr.com")
 upstream_host = "pool.supportxmr.com"

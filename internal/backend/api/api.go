@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/backend/metrics"
+	"github.com/Snipa22/go-crypto-pool/internal/coinprofile"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
@@ -663,7 +664,15 @@ func validateBlock(b *poolpb.Block) error {
 // algoString/networkString/poolTypeString map the proto enums to the
 // short string codes used as Postgres partition keys (see
 // internal/backend/db.ValidAlgos/ValidPoolTypes). These must stay in
-// sync with that package's fixed value sets.
+// sync with that package's fixed value sets. algoString's default
+// case additionally consults internal/coinprofile.ByAlgo for every
+// standalone monerod-family coin algo (ALGO_XMR and below) added via
+// internal/coinprofile.Registry, rather than returning "" for them --
+// without this, real leaf-direct ingestion for any new coin would
+// silently label every one of its shares/blocks with an empty algo
+// string and fail db.ValidateAlgo downstream (share/block rejected,
+// not corrupted, but that new coin's whole ingestion path would be
+// completely broken).
 func algoString(a poolpb.Algo) string {
 	switch a {
 	case poolpb.Algo_ALGO_RXT:
@@ -675,6 +684,9 @@ func algoString(a poolpb.Algo) string {
 	case poolpb.Algo_ALGO_RXM:
 		return "RXM"
 	default:
+		if profile, ok := coinprofile.ByAlgo(a); ok {
+			return profile.Ticker
+		}
 		return ""
 	}
 }
