@@ -218,6 +218,27 @@ type config struct {
 	relayNATSURL string
 	relaySubject string
 
+	// relayNATSUsername/relayNATSPassword are
+	// LEAF_DIRECT_RELAY_NATS_USERNAME/LEAF_DIRECT_RELAY_NATS_PASSWORD:
+	// optional NATS username/password auth (mirrors nats.UserInfo --
+	// see relay.Config.Username/Password's doc comment). Both empty
+	// (the default) preserves today's plaintext-no-auth connect
+	// behavior byte-for-byte. relayNATSPassword is a plain string
+	// secret, never logged, exactly like legacyAuthKey above.
+	relayNATSUsername string
+	relayNATSPassword string
+
+	// relayNATSTLSCAFile/relayNATSTLSCertFile/relayNATSTLSKeyFile are
+	// LEAF_DIRECT_RELAY_NATS_TLS_CA_FILE/
+	// LEAF_DIRECT_RELAY_NATS_TLS_CERT_FILE/
+	// LEAF_DIRECT_RELAY_NATS_TLS_KEY_FILE: optional TLS options for
+	// the NATS connection (mirrors nats.RootCAs/nats.ClientCert --
+	// see relay.Config's own doc comment). All empty (the default)
+	// appends no TLS option at all.
+	relayNATSTLSCAFile   string
+	relayNATSTLSCertFile string
+	relayNATSTLSKeyFile  string
+
 	// templateRelaySubject is LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT:
 	// overrides relay.DefaultTemplateSubject for the template-relay
 	// fast-invalidation broadcast (see internal/leaflib/relay's
@@ -313,6 +334,11 @@ func loadConfig() (config, error) {
 
 	flag.StringVar(&cfg.relayNATSURL, "relay-nats-url", envOr("LEAF_DIRECT_RELAY_NATS_URL", ""), "NATS server URL for the best-effort found-block relay broadcast/resubmit mechanism. Empty (default) fully disables the relay -- a complete no-op, never required. Env: LEAF_DIRECT_RELAY_NATS_URL")
 	flag.StringVar(&cfg.relaySubject, "relay-subject", envOr("LEAF_DIRECT_RELAY_SUBJECT", ""), "NATS subject for the relay (empty = relay package default). Env: LEAF_DIRECT_RELAY_SUBJECT")
+	flag.StringVar(&cfg.relayNATSUsername, "relay-nats-username", envOr("LEAF_DIRECT_RELAY_NATS_USERNAME", ""), "optional NATS username for the relay connection above (mirrors nats.UserInfo). Empty (default) connects with no auth. Env: LEAF_DIRECT_RELAY_NATS_USERNAME")
+	flag.StringVar(&cfg.relayNATSPassword, "relay-nats-password", envOr("LEAF_DIRECT_RELAY_NATS_PASSWORD", ""), "optional NATS password paired with -relay-nats-username (mirrors nats.UserInfo). Never logged. Env: LEAF_DIRECT_RELAY_NATS_PASSWORD")
+	flag.StringVar(&cfg.relayNATSTLSCAFile, "relay-nats-tls-ca-file", envOr("LEAF_DIRECT_RELAY_NATS_TLS_CA_FILE", ""), "optional CA bundle file to verify the NATS server's TLS certificate against (mirrors nats.RootCAs). Empty (default) appends no TLS CA option. Env: LEAF_DIRECT_RELAY_NATS_TLS_CA_FILE")
+	flag.StringVar(&cfg.relayNATSTLSCertFile, "relay-nats-tls-cert-file", envOr("LEAF_DIRECT_RELAY_NATS_TLS_CERT_FILE", ""), "optional client certificate file for mutual TLS against the NATS server (mirrors nats.ClientCert; must be set together with -relay-nats-tls-key-file). Env: LEAF_DIRECT_RELAY_NATS_TLS_CERT_FILE")
+	flag.StringVar(&cfg.relayNATSTLSKeyFile, "relay-nats-tls-key-file", envOr("LEAF_DIRECT_RELAY_NATS_TLS_KEY_FILE", ""), "optional client private key file paired with -relay-nats-tls-cert-file (mirrors nats.ClientCert). Env: LEAF_DIRECT_RELAY_NATS_TLS_KEY_FILE")
 	flag.StringVar(&cfg.templateRelaySubject, "template-relay-subject", envOr("LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT", ""), "NATS subject for the template (new-tip) relay fast-invalidation broadcast (empty = relay.DefaultTemplateSubject). Reuses the SAME -relay-nats-url connection above -- no second NATS URL flag. Env: LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT")
 	flag.StringVar(&cfg.moneroZMQURL, "monero-zmq-url", envOr("LEAF_DIRECT_MONERO_ZMQ_URL", ""), "real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL, faster block-invalidation trigger on top of the existing tip-poll baseline (see internal/leaflib/monero/zmq). Empty (default) disables this entirely -- a complete no-op. Ignored for -coin=tari. Env: LEAF_DIRECT_MONERO_ZMQ_URL")
 
@@ -400,6 +426,12 @@ type fileConfig struct {
 
 	RelayNATSURL *string `toml:"relay_nats_url"`
 	RelaySubject *string `toml:"relay_subject"`
+
+	RelayNATSUsername    *string `toml:"relay_nats_username"`
+	RelayNATSPassword    *string `toml:"relay_nats_password"`
+	RelayNATSTLSCAFile   *string `toml:"relay_nats_tls_ca_file"`
+	RelayNATSTLSCertFile *string `toml:"relay_nats_tls_cert_file"`
+	RelayNATSTLSKeyFile  *string `toml:"relay_nats_tls_key_file"`
 
 	TemplateRelaySubject *string `toml:"template_relay_subject"`
 	MoneroZMQURL         *string `toml:"monero_zmq_url"`
@@ -510,6 +542,11 @@ func applyConfigFile(cfg *config) error {
 
 	cfgfile.ApplyString(&cfg.relayNATSURL, fc.RelayNATSURL, visited, "relay-nats-url", "LEAF_DIRECT_RELAY_NATS_URL")
 	cfgfile.ApplyString(&cfg.relaySubject, fc.RelaySubject, visited, "relay-subject", "LEAF_DIRECT_RELAY_SUBJECT")
+	cfgfile.ApplyString(&cfg.relayNATSUsername, fc.RelayNATSUsername, visited, "relay-nats-username", "LEAF_DIRECT_RELAY_NATS_USERNAME")
+	cfgfile.ApplyString(&cfg.relayNATSPassword, fc.RelayNATSPassword, visited, "relay-nats-password", "LEAF_DIRECT_RELAY_NATS_PASSWORD")
+	cfgfile.ApplyString(&cfg.relayNATSTLSCAFile, fc.RelayNATSTLSCAFile, visited, "relay-nats-tls-ca-file", "LEAF_DIRECT_RELAY_NATS_TLS_CA_FILE")
+	cfgfile.ApplyString(&cfg.relayNATSTLSCertFile, fc.RelayNATSTLSCertFile, visited, "relay-nats-tls-cert-file", "LEAF_DIRECT_RELAY_NATS_TLS_CERT_FILE")
+	cfgfile.ApplyString(&cfg.relayNATSTLSKeyFile, fc.RelayNATSTLSKeyFile, visited, "relay-nats-tls-key-file", "LEAF_DIRECT_RELAY_NATS_TLS_KEY_FILE")
 
 	cfgfile.ApplyString(&cfg.templateRelaySubject, fc.TemplateRelaySubject, visited, "template-relay-subject", "LEAF_DIRECT_TEMPLATE_RELAY_SUBJECT")
 	cfgfile.ApplyString(&cfg.moneroZMQURL, fc.MoneroZMQURL, visited, "monero-zmq-url", "LEAF_DIRECT_MONERO_ZMQ_URL")
@@ -912,6 +949,8 @@ func main() {
 	// into solo.JobManagerConfig.Relay at construction time.
 	blockRelay := relay.NewRelay(relay.Config{
 		URL: cfg.relayNATSURL, Subject: cfg.relaySubject, TemplateSubject: cfg.templateRelaySubject, Logger: logger,
+		Username: cfg.relayNATSUsername, Password: cfg.relayNATSPassword,
+		TLSCAFile: cfg.relayNATSTLSCAFile, TLSCertFile: cfg.relayNATSTLSCertFile, TLSKeyFile: cfg.relayNATSTLSKeyFile,
 	})
 	defer func() { _ = blockRelay.Close() }()
 	if blockRelay.Enabled() {

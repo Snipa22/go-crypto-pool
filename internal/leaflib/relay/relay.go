@@ -181,7 +181,70 @@ type Config struct {
 	// PublishTemplate/SubscribeTemplate.
 	TemplateSubject string
 
+	// Username/Password optionally configure NATS username/password
+	// auth (mirrors nats.UserInfo). Both empty (the default) preserve
+	// today's plaintext-no-auth connect behavior byte-for-byte — see
+	// buildNatsOptions. Username alone with an empty Password is
+	// still applied (some NATS server auth configurations use a
+	// username with no password); the option is only appended at all
+	// when Username != "".
+	Username string
+	Password string
+
+	// TLSCAFile optionally supplies a CA bundle file an operator's
+	// NATS server certificate should be verified against (mirrors
+	// nats.RootCAs). Empty (the default) does not append any TLS
+	// option at all — see buildNatsOptions.
+	TLSCAFile string
+
+	// TLSCertFile/TLSKeyFile optionally supply a client certificate/
+	// key pair for mutual TLS against a NATS server that requires
+	// one (mirrors nats.ClientCert). Both must be non-empty together
+	// for the option to be appended — see buildNatsOptions.
+	TLSCertFile string
+	TLSKeyFile  string
+
 	Logger *log.Logger
+}
+
+// buildNatsOptions constructs the []nats.Option slice NewRelay passes
+// to nats.Connect, exported as its own small, pure, side-effect-free
+// function (rather than left inline in NewRelay) SPECIFICALLY so
+// relay_test.go can assert its real output against a Config without
+// needing a live NATS server — nats.Option values are opaque
+// functions, not inspectable directly, so tests apply each returned
+// Option against a fresh nats.Options{} zero value and assert on the
+// resulting fields instead.
+//
+// Auth/TLS options are appended CONDITIONALLY, matching this package's
+// existing "empty/zero means disabled, byte-identical to today's
+// behavior" convention used throughout (see Config's own field
+// comments):
+//   - nats.UserInfo(cfg.Username, cfg.Password) is appended only when
+//     cfg.Username != "".
+//   - nats.RootCAs(cfg.TLSCAFile) is appended only when
+//     cfg.TLSCAFile != "".
+//   - nats.ClientCert(cfg.TLSCertFile, cfg.TLSKeyFile) is appended
+//     only when BOTH cfg.TLSCertFile and cfg.TLSKeyFile are non-empty.
+//
+// base carries every option NewRelay already applies unconditionally
+// (Name/MaxReconnects/ReconnectWait/etc, and the disconnect/reconnect/
+// closed handlers) so this function's output is the COMPLETE options
+// slice NewRelay passes to nats.Connect, not just the new auth/TLS
+// additions.
+func buildNatsOptions(cfg Config, base []nats.Option) []nats.Option {
+	opts := make([]nats.Option, len(base), len(base)+3)
+	copy(opts, base)
+	if cfg.Username != "" {
+		opts = append(opts, nats.UserInfo(cfg.Username, cfg.Password))
+	}
+	if cfg.TLSCAFile != "" {
+		opts = append(opts, nats.RootCAs(cfg.TLSCAFile))
+	}
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		opts = append(opts, nats.ClientCert(cfg.TLSCertFile, cfg.TLSKeyFile))
+	}
+	return opts
 }
 
 // Relay is a best-effort NATS pub/sub wrapper for found-block
@@ -247,13 +310,16 @@ func NewRelay(cfg Config) *Relay {
 	// disconnect/reconnect/close transition — this relay is meant to
 	// eventually carry primary traffic (see package doc comment), so it
 	// is built with real operational visibility from day one, not a
-	// throwaway connect-and-hope.
-	conn, err := nats.Connect(cfg.URL,
+	// throwaway connect-and-hope. Auth/TLS options (Config.Username/
+	// Password/TLSCAFile/TLSCertFile/TLSKeyFile) are appended
+	// conditionally by buildNatsOptions -- see that function's doc
+	// comment for the exact, individually-optional precedence.
+	conn, err := nats.Connect(cfg.URL, buildNatsOptions(cfg, []nats.Option{
 		nats.Name("go-crypto-pool-leaf-direct"),
 		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2*time.Second),
+		nats.ReconnectWait(2 * time.Second),
 		nats.RetryOnFailedConnect(true),
-		nats.Timeout(5*time.Second),
+		nats.Timeout(5 * time.Second),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			if err != nil {
 				logger.Printf("relay: NATS disconnected: %v", err)
@@ -265,7 +331,7 @@ func NewRelay(cfg Config) *Relay {
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			logger.Printf("relay: NATS connection closed")
 		}),
-	)
+	})...)
 	if err != nil {
 		// Best-effort: log and keep going with a nil conn — Publish/
 		// Subscribe below treat a nil conn as "temporarily

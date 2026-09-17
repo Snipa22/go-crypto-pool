@@ -3,10 +3,18 @@ package relay
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
 	"testing"
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 )
 
 // startEmbeddedNATSServer starts a REAL, in-process, embedded NATS
@@ -631,5 +639,209 @@ func TestRelayBlockAndTemplateSubjectsAreIndependent(t *testing.T) {
 	case got := <-templateReceived:
 		t.Fatalf("template handler unexpectedly received a second message: %+v (template/block subjects are leaking into each other)", got)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// generateTestCertKeyPEM writes a fresh, throwaway self-signed
+// certificate/key PEM pair to two files under t.TempDir() and returns
+// their paths — used by TestBuildNatsOptions_TLS below so
+// nats.RootCAs/nats.ClientCert (both of which genuinely read and
+// parse the file from disk, see relay.go's buildNatsOptions doc
+// comment) have a real, valid PEM to load, without needing a live
+// NATS server anywhere in this test.
+func generateTestCertKeyPEM(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating test RSA key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "relay-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:         true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("creating test certificate: %v", err)
+	}
+
+	dir := t.TempDir()
+	certPath = dir + "/cert.pem"
+	keyPath = dir + "/key.pem"
+
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		t.Fatalf("creating cert file: %v", err)
+	}
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		t.Fatalf("encoding cert PEM: %v", err)
+	}
+	_ = certOut.Close()
+
+	keyOut, err := os.Create(keyPath)
+	if err != nil {
+		t.Fatalf("creating key file: %v", err)
+	}
+	if err := pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
+		t.Fatalf("encoding key PEM: %v", err)
+	}
+	_ = keyOut.Close()
+
+	return certPath, keyPath
+}
+
+// applyNatsOptions applies each returned nats.Option against a fresh
+// nats.Options{} zero value and returns the resulting struct, so
+// tests can inspect the real fields buildNatsOptions' options set --
+// without ever dialing a real NATS server (this is exactly what
+// nats.Connect itself does internally with the options it's given,
+// just without the final network dial).
+func applyNatsOptions(t *testing.T, opts []nats.Option) nats.Options {
+	t.Helper()
+	var o nats.Options
+	for _, opt := range opts {
+		if err := opt(&o); err != nil {
+			t.Fatalf("applying nats.Option: %v", err)
+		}
+	}
+	return o
+}
+
+// TestBuildNatsOptions_AllEmptyPreservesBaselineBehavior is the
+// required Finding #2 (NATS relay auth/TLS) baseline test: when every
+// new Config auth/TLS field is left at its zero value, buildNatsOptions
+// appends NOTHING beyond the caller-supplied base options -- today's
+// plaintext-no-auth behavior must be preserved byte-for-byte.
+func TestBuildNatsOptions_AllEmptyPreservesBaselineBehavior(t *testing.T) {
+	base := []nats.Option{nats.Name("test-base-option")}
+	opts := buildNatsOptions(Config{}, base)
+	if len(opts) != len(base) {
+		t.Fatalf("expected buildNatsOptions to append nothing for an all-empty Config, got %d options (base had %d)", len(opts), len(base))
+	}
+
+	o := applyNatsOptions(t, opts)
+	if o.User != "" || o.Password != "" {
+		t.Errorf("expected no auth applied, got User=%q Password=%q", o.User, o.Password)
+	}
+	if o.TLSConfig != nil {
+		t.Errorf("expected no TLS option applied (TLSConfig nil), got %+v", o.TLSConfig)
+	}
+	if o.Secure {
+		t.Error("expected Secure=false when no TLS option was configured")
+	}
+}
+
+// TestBuildNatsOptions_UsernamePasswordApplied confirms Config.
+// Username/Password (when Username is non-empty) results in a real
+// nats.UserInfo option landing on the resulting nats.Options.
+func TestBuildNatsOptions_UsernamePasswordApplied(t *testing.T) {
+	opts := buildNatsOptions(Config{Username: "alice", Password: "s3cret"}, nil)
+	o := applyNatsOptions(t, opts)
+	if o.User != "alice" || o.Password != "s3cret" {
+		t.Errorf("expected User=%q Password=%q, got User=%q Password=%q", "alice", "s3cret", o.User, o.Password)
+	}
+}
+
+// TestBuildNatsOptions_UsernameEmptyPasswordIgnored confirms the
+// documented precedence: the auth option is appended ONLY when
+// Username != "" -- a non-empty Password with an EMPTY Username must
+// not, on its own, cause any auth option to be applied (mirrors
+// buildNatsOptions' own doc comment on this precedence exactly).
+func TestBuildNatsOptions_UsernameEmptyPasswordIgnored(t *testing.T) {
+	opts := buildNatsOptions(Config{Password: "orphaned-password"}, nil)
+	o := applyNatsOptions(t, opts)
+	if o.User != "" || o.Password != "" {
+		t.Errorf("expected no auth applied when Username is empty (even with a non-empty Password), got User=%q Password=%q", o.User, o.Password)
+	}
+}
+
+// TestBuildNatsOptions_TLSCAFileApplied confirms Config.TLSCAFile
+// results in a real nats.RootCAs option landing on the resulting
+// nats.Options (TLSConfig set, Secure forced true, RootCAsCB
+// populated) -- using a real, valid, throwaway self-signed
+// certificate file so nats.RootCAs' own real file-read-and-parse
+// logic succeeds without needing a live NATS server.
+func TestBuildNatsOptions_TLSCAFileApplied(t *testing.T) {
+	certPath, _ := generateTestCertKeyPEM(t)
+	opts := buildNatsOptions(Config{TLSCAFile: certPath}, nil)
+	o := applyNatsOptions(t, opts)
+	if o.TLSConfig == nil {
+		t.Fatal("expected TLSConfig to be set by nats.RootCAs")
+	}
+	if !o.Secure {
+		t.Error("expected Secure=true after applying nats.RootCAs")
+	}
+	if o.RootCAsCB == nil {
+		t.Error("expected RootCAsCB to be populated by nats.RootCAs")
+	}
+}
+
+// TestBuildNatsOptions_ClientCertAppliedOnlyWhenBothCertAndKeySet
+// confirms Config.TLSCertFile/TLSKeyFile only append nats.ClientCert
+// when BOTH are non-empty -- a lone cert (or lone key) file must not,
+// on its own, apply any TLS option at all.
+func TestBuildNatsOptions_ClientCertAppliedOnlyWhenBothCertAndKeySet(t *testing.T) {
+	certPath, keyPath := generateTestCertKeyPEM(t)
+
+	t.Run("both set", func(t *testing.T) {
+		opts := buildNatsOptions(Config{TLSCertFile: certPath, TLSKeyFile: keyPath}, nil)
+		o := applyNatsOptions(t, opts)
+		if o.TLSConfig == nil {
+			t.Fatal("expected TLSConfig to be set by nats.ClientCert")
+		}
+		if o.TLSCertCB == nil {
+			t.Error("expected TLSCertCB to be populated by nats.ClientCert")
+		}
+	})
+
+	t.Run("cert only, no key", func(t *testing.T) {
+		opts := buildNatsOptions(Config{TLSCertFile: certPath}, nil)
+		o := applyNatsOptions(t, opts)
+		if o.TLSConfig != nil {
+			t.Errorf("expected no TLS option applied with only TLSCertFile set (TLSKeyFile empty), got %+v", o.TLSConfig)
+		}
+	})
+
+	t.Run("key only, no cert", func(t *testing.T) {
+		opts := buildNatsOptions(Config{TLSKeyFile: keyPath}, nil)
+		o := applyNatsOptions(t, opts)
+		if o.TLSConfig != nil {
+			t.Errorf("expected no TLS option applied with only TLSKeyFile set (TLSCertFile empty), got %+v", o.TLSConfig)
+		}
+	})
+}
+
+// TestBuildNatsOptions_AllAuthAndTLSFieldsCombined confirms every new
+// Config field can be set together and each corresponding option is
+// applied -- proving the three conditional appends in buildNatsOptions
+// are independent of one another, not mutually exclusive.
+func TestBuildNatsOptions_AllAuthAndTLSFieldsCombined(t *testing.T) {
+	certPath, keyPath := generateTestCertKeyPEM(t)
+	opts := buildNatsOptions(Config{
+		Username:    "bob",
+		Password:    "hunter2",
+		TLSCAFile:   certPath,
+		TLSCertFile: certPath,
+		TLSKeyFile:  keyPath,
+	}, []nats.Option{nats.Name("base")})
+
+	o := applyNatsOptions(t, opts)
+	if o.User != "bob" || o.Password != "hunter2" {
+		t.Errorf("expected User=bob Password=hunter2, got User=%q Password=%q", o.User, o.Password)
+	}
+	if o.TLSConfig == nil {
+		t.Fatal("expected TLSConfig to be set")
+	}
+	if !o.Secure {
+		t.Error("expected Secure=true")
+	}
+	if o.RootCAsCB == nil {
+		t.Error("expected RootCAsCB to be populated (from TLSCAFile)")
+	}
+	if o.TLSCertCB == nil {
+		t.Error("expected TLSCertCB to be populated (from TLSCertFile/TLSKeyFile)")
 	}
 }

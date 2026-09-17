@@ -186,6 +186,28 @@ relay_subject = ""
 # connection above -- no second NATS URL. (default: "")
 template_relay_subject = ""
 
+# Optional NATS username for the relay connection above (mirrors
+# nats.UserInfo). Empty (default) connects with no auth. (default: "")
+relay_nats_username = ""
+
+# Optional NATS password paired with relay_nats_username (mirrors
+# nats.UserInfo). Never logged. (default: "")
+relay_nats_password = ""
+
+# Optional CA bundle file to verify the NATS server's TLS certificate
+# against (mirrors nats.RootCAs). Empty (default) appends no TLS CA
+# option. (default: "")
+relay_nats_tls_ca_file = ""
+
+# Optional client certificate file for mutual TLS against the NATS server
+# (mirrors nats.ClientCert; must be set together with relay_nats_tls_key_file).
+# (default: "")
+relay_nats_tls_cert_file = ""
+
+# Optional client private key file paired with relay_nats_tls_cert_file
+# (mirrors nats.ClientCert). (default: "")
+relay_nats_tls_key_file = ""
+
 # Real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL,
 # faster block-invalidation trigger on top of the existing tip-poll baseline.
 # Empty (default) disables this entirely -- a complete no-op. Ignored for
