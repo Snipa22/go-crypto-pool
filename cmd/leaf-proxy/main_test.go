@@ -329,8 +329,10 @@ func TestLoadConfigPrecedence(t *testing.T) {
 		// -- uint64 fields: starting-difficulty/min-difficulty base
 		// defaults (DISPATCH_BRIEF.md 2026-09-13, Alex: "lets set
 		// reasonable defaults. 20-30k diff floors in the base
-		// config" -- confirmed exact bump from 10000->20000 and
-		// 100->10000 respectively; -max-difficulty's default is
+		// config" -- confirmed exact bump from 10000->20000 for
+		// starting-difficulty, and (BUNDLE7_BRIEF.md item #6,
+		// operator's stated 20-30k floor preference) from 10000->20000
+		// for min-difficulty too; -max-difficulty's default is
 		// explicitly out of scope and unchanged).
 		{
 			name: "starting-difficulty/default",
@@ -343,8 +345,8 @@ func TestLoadConfigPrecedence(t *testing.T) {
 		{
 			name: "min-difficulty/default",
 			check: func(t *testing.T, cfg config) {
-				if cfg.minDifficulty != 10000 {
-					t.Errorf("minDifficulty = %d, want the new hardcoded default %d", cfg.minDifficulty, 10000)
+				if cfg.minDifficulty != 20000 {
+					t.Errorf("minDifficulty = %d, want the new hardcoded default %d", cfg.minDifficulty, 20000)
 				}
 			},
 		},
