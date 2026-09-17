@@ -1501,8 +1501,8 @@ type disburseRepositoryAdapter struct {
 	repo *db.Repository
 }
 
-func (a disburseRepositoryAdapter) PayableBalances(ctx context.Context, algo, network string, minPayout int64) ([]disburse.PayableBalance, error) {
-	rows, err := a.repo.PayableBalances(ctx, algo, network, minPayout)
+func (a disburseRepositoryAdapter) PayableBalances(ctx context.Context, algo, network, currency string, minPayout int64) ([]disburse.PayableBalance, error) {
+	rows, err := a.repo.PayableBalances(ctx, algo, network, currency, minPayout)
 	if err != nil {
 		return nil, err
 	}
@@ -1519,8 +1519,8 @@ func (a disburseRepositoryAdapter) PayableBalances(ctx context.Context, algo, ne
 	return out, nil
 }
 
-func (a disburseRepositoryAdapter) UnresolvedPayouts(ctx context.Context, algo, network string) ([]disburse.UnresolvedPayout, error) {
-	rows, err := a.repo.UnresolvedPayouts(ctx, algo, network)
+func (a disburseRepositoryAdapter) UnresolvedPayouts(ctx context.Context, algo, network, currency string) ([]disburse.UnresolvedPayout, error) {
+	rows, err := a.repo.UnresolvedPayouts(ctx, algo, network, currency)
 	if err != nil {
 		return nil, err
 	}
@@ -1551,8 +1551,8 @@ func derefString(s *string) string {
 	return *s
 }
 
-func (a disburseRepositoryAdapter) RecordPendingPayout(ctx context.Context, algo, network string, entries []disburse.DebitEntry, amount int64) (int64, error) {
-	return a.repo.RecordPendingPayout(ctx, algo, network, disburseEntriesToDB(entries), amount)
+func (a disburseRepositoryAdapter) RecordPendingPayout(ctx context.Context, algo, network, currency string, entries []disburse.DebitEntry, amount int64) (int64, error) {
+	return a.repo.RecordPendingPayout(ctx, algo, network, currency, disburseEntriesToDB(entries), amount)
 }
 
 func (a disburseRepositoryAdapter) CompletePayoutSent(ctx context.Context, payoutID int64, entries []disburse.DebitEntry, txHash string, fee int64) error {
@@ -2305,12 +2305,18 @@ func main() {
 }
 
 // walletStatsTarget pairs a coin-agnostic wallet.WalletClient with
-// the algo/network labels its GetBalance results should be reported
-// under on the shared WalletBalance gauge.
+// the algo/network/currency labels its GetBalance results should be
+// reported under on the shared WalletBalance gauge. currency (see
+// migrations/0014_balance_payouts_currency.up.sql) is what lets
+// ALGO_RXM's two independent real wallet connections -- the Monero
+// wallet backing its primary/XMR leg and the Tari wallet backing its
+// secondary/XTM leg -- report under the same algo/network pair
+// without one gauge overwriting the other.
 type walletStatsTarget struct {
-	algo    string
-	network string
-	client  wallet.WalletClient
+	algo     string
+	network  string
+	currency string
+	client   wallet.WalletClient
 }
 
 // walletBalanceKind* are the four real, distinct balance components
@@ -2368,14 +2374,14 @@ func runWalletStatsPoller(ctx context.Context, m *metrics.Metrics, targets []wal
 		for _, t := range targets {
 			bal, err := t.client.GetBalance(ctx)
 			if err != nil {
-				m.WalletBalancePollErrorsTotal.WithLabelValues(t.algo, t.network).Inc()
-				log.Printf("backend: wallet-stats poller: %s/%s: GetBalance: %v", t.algo, t.network, err)
+				m.WalletBalancePollErrorsTotal.WithLabelValues(t.algo, t.network, t.currency).Inc()
+				log.Printf("backend: wallet-stats poller: %s/%s/%s: GetBalance: %v", t.algo, t.network, t.currency, err)
 				continue
 			}
-			m.WalletBalance.WithLabelValues(t.algo, t.network, walletBalanceKindAvailable).Set(float64(bal.Unlocked))
-			m.WalletBalance.WithLabelValues(t.algo, t.network, walletBalanceKindPendingOutgoing).Set(float64(bal.Total - bal.Unlocked))
-			m.WalletBalance.WithLabelValues(t.algo, t.network, walletBalanceKindPendingIncoming).Set(0)
-			m.WalletBalance.WithLabelValues(t.algo, t.network, walletBalanceKindTimelocked).Set(0)
+			m.WalletBalance.WithLabelValues(t.algo, t.network, t.currency, walletBalanceKindAvailable).Set(float64(bal.Unlocked))
+			m.WalletBalance.WithLabelValues(t.algo, t.network, t.currency, walletBalanceKindPendingOutgoing).Set(float64(bal.Total - bal.Unlocked))
+			m.WalletBalance.WithLabelValues(t.algo, t.network, t.currency, walletBalanceKindPendingIncoming).Set(0)
+			m.WalletBalance.WithLabelValues(t.algo, t.network, t.currency, walletBalanceKindTimelocked).Set(0)
 		}
 	}
 
@@ -2711,7 +2717,13 @@ func run(cfg config) error {
 		return fmt.Errorf("configuring payout disbursement engine: %w", err)
 	}
 	if disburseEnabled {
-		targets := []disburse.Target{{Algo: "RXM", Network: networkDBString(network)}}
+		// Currency: "XMR" -- this engine wraps moneroWalletClient
+		// (a real monero-wallet-rpc connection), so it can only ever
+		// legitimately move ALGO_RXM's primary/Monero leg's balance
+		// (see migrations/0014_balance_payouts_currency.up.sql). The
+		// secondary/Tari leg's XTM balance is a genuinely separate
+		// wallet and is not disbursed by this engine at all today.
+		targets := []disburse.Target{{Algo: "RXM", Network: networkDBString(network), Currency: "XMR"}}
 		if err := startDisburseLoop(ctx, disburseEngine, "payout disbursement engine", targets, disburseInterval); err != nil {
 			return err
 		}
@@ -2726,7 +2738,10 @@ func run(cfg config) error {
 	if tariDisburseEnabled {
 		targets := make([]disburse.Target, 0, len(tariAlgos))
 		for _, algo := range tariAlgos {
-			targets = append(targets, disburse.Target{Algo: algo, Network: networkDBString(network)})
+			// Currency: "XTM" for every Tari-family algo -- these
+			// never have any other leg/currency (see
+			// migrations/0014_balance_payouts_currency.up.sql).
+			targets = append(targets, disburse.Target{Algo: algo, Network: networkDBString(network), Currency: "XTM"})
 		}
 		if err := startDisburseLoop(ctx, tariDisburseEngine, "Tari payout disbursement engine (max 1 destination/batch, see buildTariDisburseEngine)", targets, tariDisburseInterval); err != nil {
 			return err
@@ -2737,12 +2752,23 @@ func run(cfg config) error {
 
 	var walletStatsTargets []walletStatsTarget
 	if moneroWalletClient != nil {
-		walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: "RXM", network: networkDBString(network), client: moneroWalletClient})
+		walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: "RXM", network: networkDBString(network), currency: "XMR", client: moneroWalletClient})
 	}
 	if tariWalletClient != nil {
 		for _, algo := range tariAlgos {
-			walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: algo, network: networkDBString(network), client: tariWalletClient})
+			walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: algo, network: networkDBString(network), currency: "XTM", client: tariWalletClient})
 		}
+		// ALGO_RXM's secondary/Tari leg (see
+		// migrations/0012_blocks_merge_mine_chain.up.sql and
+		// migrations/0014_balance_payouts_currency.up.sql) is paid
+		// out of THIS SAME Tari wallet gRPC connection, not the
+		// Monero one above -- a genuinely separate real wallet from
+		// RXM's primary/XMR leg, which previously had no wallet
+		// target registered here at all. currency: "XTM" (not
+		// "XMR") is what keeps this series distinct from the RXM/XMR
+		// one on the shared WalletBalance/WalletBalancePollErrorsTotal
+		// gauges above, even though both share the algo="RXM" label.
+		walletStatsTargets = append(walletStatsTargets, walletStatsTarget{algo: "RXM", network: networkDBString(network), currency: "XTM", client: tariWalletClient})
 	}
 	if len(walletStatsTargets) > 0 {
 		walletStatsInterval := cfg.walletStatsPollInterval

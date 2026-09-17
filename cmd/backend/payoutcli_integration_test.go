@@ -58,10 +58,10 @@ func payoutTestRepo(t *testing.T, dsn string) (*db.Repository, context.Context) 
 // detail recorded.
 func fabricateAmbiguousPayout(t *testing.T, repo *db.Repository, ctx context.Context, address string, amount int64, txHash string) (payoutID, balanceID int64) {
 	t.Helper()
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", address, nil, amount); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", address, nil, amount); err != nil {
 		t.Fatalf("CreditBalance: %v", err)
 	}
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 1)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 1)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -73,7 +73,7 @@ func fabricateAmbiguousPayout(t *testing.T, repo *db.Repository, ctx context.Con
 	if balanceID == 0 {
 		t.Fatalf("PayableBalances: no row for %s: %+v", address, payable)
 	}
-	payoutID, err = repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+	payoutID, err = repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR",
 		[]db.DisburseEntry{{BalanceID: balanceID, Amount: amount}}, amount)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
@@ -176,7 +176,7 @@ func TestIntegrationPayoutCLIResolveSentAppliesExactDebit(t *testing.T) {
 	if p.Status != "SENT" {
 		t.Errorf("got status=%s, want SENT", p.Status)
 	}
-	if rows, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET"); err != nil || len(rows) != 0 {
+	if rows, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET", ""); err != nil || len(rows) != 0 {
 		t.Errorf("UnresolvedPayouts: got %d rows err=%v, want 0 — disbursement must no longer be blocked", len(rows), err)
 	}
 
@@ -230,7 +230,7 @@ func TestIntegrationPayoutCLIResolveNotSentReleasesBalance(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "dry run only") {
 		t.Fatalf("dry run: got %v, want a dry-run refusal", err)
 	}
-	if payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 1); err != nil || len(payable) != 0 {
+	if payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 1); err != nil || len(payable) != 0 {
 		t.Fatalf("after dry run: got payable=%+v err=%v, want the balance still frozen", payable, err)
 	}
 
@@ -252,7 +252,7 @@ func TestIntegrationPayoutCLIResolveNotSentReleasesBalance(t *testing.T) {
 	if p.Status != "FAILED" {
 		t.Errorf("got status=%s, want FAILED", p.Status)
 	}
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 1)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 1)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}

@@ -25,13 +25,13 @@ func TestIntegrationMinerBalancesAndShareStats(t *testing.T) {
 
 	// Credit balances across two algos/networks for the same address,
 	// plus a second payment_id variant.
-	if err := repo.CreditBalance(ctx, "RXT", "TESTNET", "addr-1", nil, 1000); err != nil {
+	if err := repo.CreditBalance(ctx, "RXT", "TESTNET", "XTM", "addr-1", nil, 1000); err != nil {
 		t.Fatalf("CreditBalance RXT: %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "C29", "TESTNET", "addr-1", nil, 2000); err != nil {
+	if err := repo.CreditBalance(ctx, "C29", "TESTNET", "XTM", "addr-1", nil, 2000); err != nil {
 		t.Fatalf("CreditBalance C29: %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXT", "TESTNET", "addr-1", &pidA, 500); err != nil {
+	if err := repo.CreditBalance(ctx, "RXT", "TESTNET", "XTM", "addr-1", &pidA, 500); err != nil {
 		t.Fatalf("CreditBalance RXT/pid-a: %v", err)
 	}
 

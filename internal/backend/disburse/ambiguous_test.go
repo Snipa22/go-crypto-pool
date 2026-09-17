@@ -30,7 +30,7 @@ import (
 // out nothing at all.
 func TestRunOnce_AmbiguousTransferErrorFreezesBalanceAndHalts(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "alice", PendingBalance: 500},
 		},
 	}}
@@ -41,7 +41,7 @@ func TestRunOnce_AmbiguousTransferErrorFreezesBalanceAndHalts(t *testing.T) {
 		transferErr: fmt.Errorf("wallet: monero: transfer: wallet: monero: transfer request failed: context deadline exceeded")}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err == nil {
 		t.Fatal("RunOnce: expected an error for an ambiguous transfer outcome")
 	}
@@ -62,7 +62,7 @@ func TestRunOnce_AmbiguousTransferErrorFreezesBalanceAndHalts(t *testing.T) {
 	}
 
 	// THE POINT OF THE WHOLE FIX: the balance is no longer payable.
-	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestRunOnce_AmbiguousTransferErrorFreezesBalanceAndHalts(t *testing.T) {
 
 	// And the next cycle refuses outright rather than paying anything.
 	transfersBefore := len(w.transferCall)
-	result2, err2 := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result2, err2 := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if !errors.Is(err2, ErrHalted) {
 		t.Fatalf("second RunOnce: got err=%v, want one wrapping ErrHalted", err2)
 	}
@@ -97,7 +97,7 @@ func TestRunOnce_AmbiguousTransferErrorFreezesBalanceAndHalts(t *testing.T) {
 func TestRunOnce_CompletePayoutSentFailureHaltsInsteadOfRetrying(t *testing.T) {
 	repo := &fakeRepo{
 		balances: map[string][]PayableBalance{
-			key("RXM", "TESTNET"): {
+			key("RXM", "TESTNET", "XMR"): {
 				{ID: 1, PaymentAddress: "alice", PendingBalance: 500},
 			},
 		},
@@ -106,7 +106,7 @@ func TestRunOnce_CompletePayoutSentFailureHaltsInsteadOfRetrying(t *testing.T) {
 	w := &fakeWallet{unlocked: 10000, total: 10000, transferFee: 9}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err == nil {
 		t.Fatal("RunOnce: expected an error when CompletePayoutSent fails after a successful Transfer")
 	}
@@ -130,7 +130,7 @@ func TestRunOnce_CompletePayoutSentFailureHaltsInsteadOfRetrying(t *testing.T) {
 	}
 
 	// Balance frozen, and the next cycle halts rather than re-sending.
-	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestRunOnce_CompletePayoutSentFailureHaltsInsteadOfRetrying(t *testing.T) {
 		t.Fatalf("got payable=%+v, want NONE — the coin already moved, re-paying would be a double payment", payable)
 	}
 
-	result2, err2 := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result2, err2 := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if !errors.Is(err2, ErrHalted) {
 		t.Fatalf("second RunOnce: got err=%v, want one wrapping ErrHalted", err2)
 	}
@@ -156,7 +156,7 @@ func TestRunOnce_CompletePayoutSentFailureHaltsInsteadOfRetrying(t *testing.T) {
 // moving coin for the same (algo, network).
 func TestRunOnce_AmbiguousBatchAbandonsRemainingBatches(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "a", PendingBalance: 100},
 			{ID: 2, PaymentAddress: "b", PendingBalance: 100},
 			{ID: 3, PaymentAddress: "c", PendingBalance: 100},
@@ -170,7 +170,7 @@ func TestRunOnce_AmbiguousBatchAbandonsRemainingBatches(t *testing.T) {
 	w := &fakeWallet{unlocked: 100000, total: 100000, transferErr: errors.New("i/o timeout")}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err == nil {
 		t.Fatal("RunOnce: expected an error for an ambiguous batch")
 	}
@@ -194,12 +194,12 @@ func TestRunOnce_AmbiguousBatchAbandonsRemainingBatches(t *testing.T) {
 func TestRunOnce_HaltsOnPreexistingPendingPayout(t *testing.T) {
 	repo := &fakeRepo{
 		balances: map[string][]PayableBalance{
-			key("RXM", "TESTNET"): {
+			key("RXM", "TESTNET", "XMR"): {
 				{ID: 1, PaymentAddress: "alice", PendingBalance: 500},
 			},
 		},
 		unresolved: map[string][]UnresolvedPayout{
-			key("RXM", "TESTNET"): {{
+			key("RXM", "TESTNET", "XMR"): {{
 				ID: 77, Status: "PENDING", Amount: 500, BalanceIDs: []int64{1},
 				Created: time.Now().Add(-time.Hour),
 			}},
@@ -208,7 +208,7 @@ func TestRunOnce_HaltsOnPreexistingPendingPayout(t *testing.T) {
 	w := &fakeWallet{unlocked: 10000, total: 10000}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if !errors.Is(err, ErrHalted) {
 		t.Fatalf("RunOnce: got err=%v, want one wrapping ErrHalted", err)
 	}
@@ -230,26 +230,150 @@ func TestRunOnce_HaltsOnPreexistingPendingPayout(t *testing.T) {
 func TestRunOnce_HaltIsScopedToItsOwnAlgoNetwork(t *testing.T) {
 	repo := &fakeRepo{
 		balances: map[string][]PayableBalance{
-			key("RXM", "TESTNET"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
-			key("RXM", "MAINNET"): {{ID: 2, PaymentAddress: "bob", PendingBalance: 700}},
+			key("RXM", "TESTNET", "XMR"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
+			key("RXM", "MAINNET", "XMR"): {{ID: 2, PaymentAddress: "bob", PendingBalance: 700}},
 		},
 		unresolved: map[string][]UnresolvedPayout{
-			key("RXM", "TESTNET"): {{ID: 5, Status: "AMBIGUOUS", Amount: 500, BalanceIDs: []int64{1}}},
+			key("RXM", "TESTNET", "XMR"): {{ID: 5, Status: "AMBIGUOUS", Amount: 500, BalanceIDs: []int64{1}}},
 		},
 	}
 	w := &fakeWallet{unlocked: 100000, total: 100000}
 	e := New(repo, testConfig(w))
 
-	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); !errors.Is(err, ErrHalted) {
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); !errors.Is(err, ErrHalted) {
 		t.Fatalf("RXM/TESTNET: got err=%v, want ErrHalted", err)
 	}
 
-	result, err := e.RunOnce(context.Background(), "RXM", "MAINNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "MAINNET", "XMR")
 	if err != nil {
 		t.Fatalf("RXM/MAINNET: unexpected error: %v", err)
 	}
 	if result.Halted != 0 || result.BatchesSent != 1 || result.TotalSent != 700 {
 		t.Fatalf("RXM/MAINNET: got %+v, want an unaffected, fully successful cycle (1 batch, 700 sent)", result)
+	}
+}
+
+// TestRunOnce_HaltIsScopedToItsOwnCurrency is the core regression
+// test for this package's RXM dual-currency change
+// (migrations/0014_balance_payouts_currency.up.sql): ALGO_RXM has TWO
+// genuinely independent real wallets/legs for the SAME (algo,
+// network) — XMR (primary/Monero) and XTM (secondary/Tari). An
+// unresolved AMBIGUOUS payout on the XMR leg must halt ONLY XMR-side
+// RXM disbursement; a concurrent XTM-side RXM disbursement cycle for
+// the exact same (algo, network) must proceed completely normally,
+// because the two legs have independent failure domains (see
+// disburse.go's package doc comment) — a stuck Monero wallet must
+// never freeze a healthy Tari wallet's payouts, or vice versa.
+//
+// This mirrors TestRunOnce_HaltIsScopedToItsOwnAlgoNetwork's shape
+// exactly, but scopes the halt/health split by CURRENCY within the
+// SAME algo/network instead of by algo/network itself — the new
+// dimension this change adds.
+func TestRunOnce_HaltIsScopedToItsOwnCurrency(t *testing.T) {
+	repo := &fakeRepo{
+		balances: map[string][]PayableBalance{
+			key("RXM", "TESTNET", "XMR"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
+			key("RXM", "TESTNET", "XTM"): {{ID: 2, PaymentAddress: "alice", PendingBalance: 700}},
+		},
+		unresolved: map[string][]UnresolvedPayout{
+			// An unresolved AMBIGUOUS payout on the XMR leg only.
+			key("RXM", "TESTNET", "XMR"): {{ID: 5, Status: "AMBIGUOUS", Amount: 500, BalanceIDs: []int64{1}}},
+		},
+	}
+	w := &fakeWallet{unlocked: 100000, total: 100000}
+	e := New(repo, testConfig(w))
+
+	// The XMR leg must halt: it has its own unresolved payout.
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); !errors.Is(err, ErrHalted) {
+		t.Fatalf("RXM/TESTNET/XMR: got err=%v, want ErrHalted", err)
+	}
+
+	// The XTM leg, for the exact SAME algo and network, must proceed
+	// normally and completely unaffected -- this is the whole point
+	// of scoping the halt gate by currency, not just (algo, network).
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XTM")
+	if err != nil {
+		t.Fatalf("RXM/TESTNET/XTM: unexpected error: %v", err)
+	}
+	if result.Halted != 0 || result.BatchesSent != 1 || result.TotalSent != 700 {
+		t.Fatalf("RXM/TESTNET/XTM: got %+v, want an unaffected, fully successful cycle (1 batch, 700 sent) despite the XMR leg being halted", result)
+	}
+
+	// And the wallet the XTM leg used must be a completely distinct
+	// call: the halted XMR leg never touched the wallet at all.
+	if len(w.transferCall) != 1 {
+		t.Fatalf("got %d Transfer calls, want exactly 1 (only the healthy XTM leg's) — the halted XMR leg must never reach the wallet", len(w.transferCall))
+	}
+}
+
+// TestRunLoop_HaltedCurrencyNeverMovesCoinForThatCurrencyAlone mirrors
+// TestRunLoop_HaltedTargetNeverMovesCoin's belt-and-braces coverage of
+// RunLoop itself, but for the currency-scoped halt: a halted RXM/XMR
+// Target embedded in the SAME RunLoop call as a healthy RXM/XTM
+// Target must never move XMR coin, while the XTM target keeps paying
+// out normally on every tick.
+func TestRunLoop_HaltedCurrencyNeverMovesCoinForThatCurrencyAlone(t *testing.T) {
+	w := &fakeWallet{unlocked: 10000, total: 10000}
+	repo := &fakeRepo{
+		balances: map[string][]PayableBalance{
+			key("RXM", "TESTNET", "XMR"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
+			key("RXM", "TESTNET", "XTM"): {{ID: 2, PaymentAddress: "alice", PendingBalance: 500}},
+		},
+		unresolved: map[string][]UnresolvedPayout{
+			// A large, non-sequential ID so it can never collide
+			// with fakeRepo.nextPayoutID's own auto-incrementing
+			// sequence (started fresh at 0 in this test) once the
+			// healthy XTM leg starts recording real pending payouts
+			// of its own on later ticks — a collision there would
+			// let CompletePayoutSent's resolveUnresolved(id)
+			// accidentally resolve THIS pre-existing row too, which
+			// a real Postgres BIGSERIAL id could never do but a
+			// naive test double's counter could.
+			key("RXM", "TESTNET", "XMR"): {{ID: 999, Status: "AMBIGUOUS", Amount: 500, BalanceIDs: []int64{1}}},
+		},
+	}
+	// Both Targets below share one Engine/wallet here purely because
+	// Engine has exactly one Config.Wallet slot; in production
+	// cmd/backend runs a genuinely separate *disburse.Engine per
+	// currency (a Monero-backed one for XMR, a Tari-backed one for
+	// XTM), each with its own RunLoop. This test's real assertion is
+	// on RecordPendingPayout/CompletePayoutSent call counts scoped by
+	// currency via the repository, not on which Go wallet value
+	// happened to back the call.
+	e := New(repo, testConfig(w))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.RunLoop(ctx, []Target{
+			{Algo: "RXM", Network: "TESTNET", Currency: "XMR"},
+			{Algo: "RXM", Network: "TESTNET", Currency: "XTM"},
+		}, time.Millisecond)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	// Exactly the XTM leg's balance must have been paid; the XMR
+	// leg's must remain untouched (still payable, still frozen by
+	// its own unresolved row).
+	xmrPayable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", "XMR", 100)
+	if err != nil {
+		t.Fatalf("PayableBalances(XMR): %v", err)
+	}
+	if len(xmrPayable) != 0 {
+		t.Fatalf("got XMR payable=%+v, want NONE — the XMR leg's own unresolved payout must keep freezing it across every tick", xmrPayable)
+	}
+	xtmPayable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", "XTM", 100)
+	if err != nil {
+		t.Fatalf("PayableBalances(XTM): %v", err)
+	}
+	if len(xtmPayable) != 0 {
+		t.Fatalf("got XTM payable=%+v, want NONE — the healthy XTM leg should have been paid out and debited by now", xtmPayable)
+	}
+	if len(repo.sentCalls) != 1 {
+		t.Fatalf("got %d CompletePayoutSent calls across many ticks, want exactly 1 (the XTM leg, once)", len(repo.sentCalls))
 	}
 }
 
@@ -260,14 +384,14 @@ func TestRunOnce_HaltIsScopedToItsOwnAlgoNetwork(t *testing.T) {
 func TestRunOnce_UnresolvedPayoutsQueryErrorIsFatalToTheCycle(t *testing.T) {
 	repo := &fakeRepo{
 		balances: map[string][]PayableBalance{
-			key("RXM", "TESTNET"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
+			key("RXM", "TESTNET", "XMR"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
 		},
 		unresolvedErr: errors.New("connection refused"),
 	}
 	w := &fakeWallet{unlocked: 10000, total: 10000}
 	e := New(repo, testConfig(w))
 
-	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); err == nil {
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); err == nil {
 		t.Fatal("RunOnce: expected an error when the unresolved-payout check itself fails")
 	}
 	if len(w.transferCall) != 0 {
@@ -283,25 +407,25 @@ func TestRunOnce_UnresolvedPayoutsQueryErrorIsFatalToTheCycle(t *testing.T) {
 func TestRunOnce_MarkPayoutAmbiguousFailureStillLeavesBalanceFrozen(t *testing.T) {
 	repo := &fakeRepo{
 		balances: map[string][]PayableBalance{
-			key("RXM", "TESTNET"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
+			key("RXM", "TESTNET", "XMR"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
 		},
 		ambiguousErr: errors.New("db: marking payout ambiguous: connection reset"),
 	}
 	w := &fakeWallet{unlocked: 10000, total: 10000, transferErr: errors.New("i/o timeout")}
 	e := New(repo, testConfig(w))
 
-	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); err == nil {
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); err == nil {
 		t.Fatal("RunOnce: expected an error for an ambiguous transfer outcome")
 	}
 
-	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
 	if len(payable) != 0 {
 		t.Fatalf("got payable=%+v, want NONE — the PENDING row alone must still freeze the balance", payable)
 	}
-	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); !errors.Is(err, ErrHalted) {
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); !errors.Is(err, ErrHalted) {
 		t.Fatalf("second RunOnce: got err=%v, want ErrHalted from the still-PENDING row", err)
 	}
 }
@@ -314,7 +438,7 @@ func TestRunOnce_MarkPayoutAmbiguousFailureStillLeavesBalanceFrozen(t *testing.T
 // the exact debit instead of guessing from live balances.
 func TestRecordPendingPayoutPersistsPerEntryDebitDetail(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "forced", PendingBalance: 40, ForcePayout: true},
 			{ID: 2, PaymentAddress: "normal", PendingBalance: 500},
 		},
@@ -324,7 +448,7 @@ func TestRecordPendingPayoutPersistsPerEntryDebitDetail(t *testing.T) {
 	cfg.ForcePayoutFeeAtomic = 10
 	e := New(repo, cfg)
 
-	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); err != nil {
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
 	if len(repo.pendingCalls) != 1 {
@@ -373,15 +497,15 @@ func TestRecordPendingPayoutPersistsPerEntryDebitDetail(t *testing.T) {
 func TestCheckTargets_PartitionsSafeAndBlockedTargets(t *testing.T) {
 	repo := &fakeRepo{
 		unresolved: map[string][]UnresolvedPayout{
-			key("SHA3X", "MAINNET"): {{ID: 9, Status: "AMBIGUOUS", Amount: 1234, BalanceIDs: []int64{3}}},
+			key("SHA3X", "MAINNET", "XTM"): {{ID: 9, Status: "AMBIGUOUS", Amount: 1234, BalanceIDs: []int64{3}}},
 		},
 	}
 	e := New(repo, testConfig(&fakeWallet{}))
 
 	targets := []Target{
-		{Algo: "RXT", Network: "MAINNET"},
-		{Algo: "SHA3X", Network: "MAINNET"},
-		{Algo: "C29", Network: "MAINNET"},
+		{Algo: "RXT", Network: "MAINNET", Currency: "XTM"},
+		{Algo: "SHA3X", Network: "MAINNET", Currency: "XTM"},
+		{Algo: "C29", Network: "MAINNET", Currency: "XTM"},
 	}
 	safe, blocked, err := e.CheckTargets(context.Background(), targets)
 	if err != nil {
@@ -406,7 +530,7 @@ func TestCheckTargets_RepositoryErrorIsReturnedNotSwallowed(t *testing.T) {
 	repo := &fakeRepo{unresolvedErr: errors.New("connection refused")}
 	e := New(repo, testConfig(&fakeWallet{}))
 
-	safe, blocked, err := e.CheckTargets(context.Background(), []Target{{Algo: "RXM", Network: "TESTNET"}})
+	safe, blocked, err := e.CheckTargets(context.Background(), []Target{{Algo: "RXM", Network: "TESTNET", Currency: "XMR"}})
 	if err == nil {
 		t.Fatal("CheckTargets: expected an error when the repository query fails")
 	}
@@ -422,10 +546,10 @@ func TestCheckTargets_RepositoryErrorIsReturnedNotSwallowed(t *testing.T) {
 func TestRunLoop_HaltedTargetNeverMovesCoin(t *testing.T) {
 	repo := &fakeRepo{
 		balances: map[string][]PayableBalance{
-			key("RXM", "TESTNET"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
+			key("RXM", "TESTNET", "XMR"): {{ID: 1, PaymentAddress: "alice", PendingBalance: 500}},
 		},
 		unresolved: map[string][]UnresolvedPayout{
-			key("RXM", "TESTNET"): {{ID: 1, Status: "AMBIGUOUS", Amount: 500, BalanceIDs: []int64{1}}},
+			key("RXM", "TESTNET", "XMR"): {{ID: 1, Status: "AMBIGUOUS", Amount: 500, BalanceIDs: []int64{1}}},
 		},
 	}
 	w := &fakeWallet{unlocked: 10000, total: 10000}
@@ -435,7 +559,7 @@ func TestRunLoop_HaltedTargetNeverMovesCoin(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		e.RunLoop(ctx, []Target{{Algo: "RXM", Network: "TESTNET"}}, time.Millisecond)
+		e.RunLoop(ctx, []Target{{Algo: "RXM", Network: "TESTNET", Currency: "XMR"}}, time.Millisecond)
 	}()
 	// Let several ticks elapse, then stop the loop.
 	time.Sleep(50 * time.Millisecond)

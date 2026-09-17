@@ -50,6 +50,22 @@ func ValidateNetwork(network string) error {
 	return fmt.Errorf("db: unknown network %q (want one of %v)", network, ValidNetworks)
 }
 
+// ValidateCurrency reports whether currency is one of the known
+// `currency` column values (see ValidCurrencies). Every write path
+// that touches `balance`/`payouts`/`block_payout_credits` must state
+// an explicit, valid currency -- there is deliberately no "any"/empty
+// meaning here, unlike ValidateAlgo/ValidateNetwork's use in the
+// handful of optional survey-style filters (e.g.
+// Repository.UnresolvedPayouts) that predate the currency dimension.
+func ValidateCurrency(currency string) error {
+	for _, c := range ValidCurrencies {
+		if c == currency {
+			return nil
+		}
+	}
+	return fmt.Errorf("db: unknown currency %q (want one of %v)", currency, ValidCurrencies)
+}
+
 // heightPartitionParent returns the name of the (algo, pool_type)
 // partitioned table that owns block_height RANGE leaf partitions, e.g.
 // "shares_rxt_pplns". Caller must have already validated algo/poolType.

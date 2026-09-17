@@ -506,6 +506,22 @@ type ApplyResult struct {
 // Apply durably applies every entry in data as one atomic,
 // idempotent payout run for block b.
 //
+// CURRENCY (see migrations/0014_balance_payouts_currency.up.sql):
+// this function deliberately does NOT carry a currency field on
+// Payment/BlockCredit/MaturedBlock, even though ALGO_RXM can credit
+// either "XMR" (primary/Monero leg) or "XTM" (secondary/Tari leg).
+// Every credit in ONE call to Apply belongs to the SAME matured
+// block, and Repository.ApplyBlockPayout derives that block's
+// currency itself, directly from the real `blocks` row's own
+// algo/merge_mine_chain columns (see
+// internal/backend/db/blockpayout.go's blockPayoutCurrency), rather
+// than trusting anything this package supplies. That is deliberate
+// defense in depth: a caller-supplied currency field here could, in
+// principle, disagree with the block it is actually being applied
+// against; deriving it from the real row instead means this package
+// cannot mis-credit a payee's balance onto the wrong currency even
+// if it tried to. For RXT/C29/SHA3X every credit is always "XTM".
+//
 // This replaced a straight `for each payment { CreditBalance(...) }`
 // loop — the faithful port of legacy's
 // `Object.keys(paymentData).forEach(key => balanceQueue.push(...))`.

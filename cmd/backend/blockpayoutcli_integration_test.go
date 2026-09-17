@@ -68,7 +68,7 @@ func fabricateStuckBlockPayout(t *testing.T, repo *db.Repository, ctx context.Co
 	if creditedAddress == "" {
 		return blockID
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", creditedAddress, nil, creditedAmount); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", creditedAddress, nil, creditedAmount); err != nil {
 		t.Fatalf("crediting %s: %v", creditedAddress, err)
 	}
 	var balanceID int64
@@ -76,8 +76,8 @@ func fabricateStuckBlockPayout(t *testing.T, repo *db.Repository, ctx context.Co
 		t.Fatalf("looking up %s's balance id: %v", creditedAddress, err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payout_bucket, amount)
-		VALUES ($1, $2, $3, 'pps', $4)`, blockID, balanceID, creditedAddress, creditedAmount); err != nil {
+		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payout_bucket, amount, currency)
+		VALUES ($1, $2, $3, 'pps', $4, 'XMR')`, blockID, balanceID, creditedAddress, creditedAmount); err != nil {
 		t.Fatalf("fabricating %s's credit ledger row: %v", creditedAddress, err)
 	}
 	return blockID

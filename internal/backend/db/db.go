@@ -47,6 +47,14 @@ var ValidPoolTypes = []string{"SOLO", "PPS", "PPLNS", "PROP"}
 // algo everywhere else in this package.
 var ValidNetworks = []string{"MAINNET", "TESTNET"}
 
+// ValidCurrencies is the fixed set of `currency` column values added
+// by migrations/0014_balance_payouts_currency.up.sql to `balance`,
+// `payouts`, and `block_payout_credits` -- XTM (Tari, always used by
+// RXT/C29/SHA3X, and by ALGO_RXM's secondary/merge-mined leg) and XMR
+// (Monero, ALGO_RXM's primary leg). See that migration's doc comment
+// for the full rationale.
+var ValidCurrencies = []string{"XMR", "XTM"}
+
 // Config holds the settings needed to establish the backend's Postgres
 // connection pool.
 type Config struct {

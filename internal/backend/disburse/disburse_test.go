@@ -69,12 +69,12 @@ type ambiguousCall struct {
 	errMsg   string
 }
 
-func key(algo, network string) string { return algo + "/" + network }
+func key(algo, network, currency string) string { return algo + "/" + network + "/" + currency }
 
-func (f *fakeRepo) PayableBalances(_ context.Context, algo, network string, minPayout int64) ([]PayableBalance, error) {
+func (f *fakeRepo) PayableBalances(_ context.Context, algo, network, currency string, minPayout int64) ([]PayableBalance, error) {
 	f.payableBalancesCalls.Add(1)
 	var out []PayableBalance
-	for _, b := range f.balances[key(algo, network)] {
+	for _, b := range f.balances[key(algo, network, currency)] {
 		// Mirrors db.Repository.PayableBalances' real SQL: a row is
 		// payable if it meets minPayout on its own OR is
 		// force_payout-flagged, provided pending_balance > 0 either
@@ -87,7 +87,7 @@ func (f *fakeRepo) PayableBalances(_ context.Context, algo, network string, minP
 		if b.PendingBalance < minPayout && !b.ForcePayout {
 			continue
 		}
-		if f.frozenBalanceIDs(algo, network)[b.ID] {
+		if f.frozenBalanceIDs(algo, network, currency)[b.ID] {
 			continue
 		}
 		out = append(out, b)
@@ -97,11 +97,11 @@ func (f *fakeRepo) PayableBalances(_ context.Context, algo, network string, minP
 
 // frozenBalanceIDs models db.Repository.PayableBalances' real
 // in-flight exclusion: every balance row referenced by an unresolved
-// (PENDING/AMBIGUOUS) payout for this (algo, network) is frozen out
-// of the payable set until that payout is resolved.
-func (f *fakeRepo) frozenBalanceIDs(algo, network string) map[int64]bool {
+// (PENDING/AMBIGUOUS) payout for this (algo, network, currency) is
+// frozen out of the payable set until that payout is resolved.
+func (f *fakeRepo) frozenBalanceIDs(algo, network, currency string) map[int64]bool {
 	frozen := map[int64]bool{}
-	for _, p := range f.unresolved[key(algo, network)] {
+	for _, p := range f.unresolved[key(algo, network, currency)] {
 		for _, id := range p.BalanceIDs {
 			frozen[id] = true
 		}
@@ -109,14 +109,14 @@ func (f *fakeRepo) frozenBalanceIDs(algo, network string) map[int64]bool {
 	return frozen
 }
 
-func (f *fakeRepo) UnresolvedPayouts(_ context.Context, algo, network string) ([]UnresolvedPayout, error) {
+func (f *fakeRepo) UnresolvedPayouts(_ context.Context, algo, network, currency string) ([]UnresolvedPayout, error) {
 	if f.unresolvedErr != nil {
 		return nil, f.unresolvedErr
 	}
-	return f.unresolved[key(algo, network)], nil
+	return f.unresolved[key(algo, network, currency)], nil
 }
 
-func (f *fakeRepo) RecordPendingPayout(_ context.Context, algo, network string, entries []DebitEntry, amount int64) (int64, error) {
+func (f *fakeRepo) RecordPendingPayout(_ context.Context, algo, network, currency string, entries []DebitEntry, amount int64) (int64, error) {
 	if f.recordErr != nil {
 		return 0, f.recordErr
 	}
@@ -125,7 +125,7 @@ func (f *fakeRepo) RecordPendingPayout(_ context.Context, algo, network string, 
 	// Mirror the real repository: a PENDING row is durably recorded
 	// BEFORE the transfer is attempted, and PENDING is an unresolved
 	// status, so it freezes these balances immediately.
-	f.addUnresolved(algo, network, UnresolvedPayout{
+	f.addUnresolved(algo, network, currency, UnresolvedPayout{
 		ID:         f.nextPayoutID,
 		Status:     "PENDING",
 		Amount:     amount,
@@ -134,11 +134,11 @@ func (f *fakeRepo) RecordPendingPayout(_ context.Context, algo, network string, 
 	return f.nextPayoutID, nil
 }
 
-func (f *fakeRepo) addUnresolved(algo, network string, p UnresolvedPayout) {
+func (f *fakeRepo) addUnresolved(algo, network, currency string, p UnresolvedPayout) {
 	if f.unresolved == nil {
 		f.unresolved = map[string][]UnresolvedPayout{}
 	}
-	f.unresolved[key(algo, network)] = append(f.unresolved[key(algo, network)], p)
+	f.unresolved[key(algo, network, currency)] = append(f.unresolved[key(algo, network, currency)], p)
 }
 
 // resolveUnresolved removes payoutID from the unresolved set,
@@ -288,7 +288,7 @@ func TestRunOnce_NoPayableBalances(t *testing.T) {
 	w := &fakeWallet{unlocked: 1000, total: 1000}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestRunOnce_NoPayableBalances(t *testing.T) {
 
 func TestRunOnce_SendsBatchAndDebits(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "alice", PendingBalance: 500},
 			{ID: 2, PaymentAddress: "bob", PendingBalance: 300},
 		},
@@ -307,7 +307,7 @@ func TestRunOnce_SendsBatchAndDebits(t *testing.T) {
 	w := &fakeWallet{unlocked: 10000, total: 10000, transferFee: 10}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestRunOnce_SendsBatchAndDebits(t *testing.T) {
 
 func TestRunOnce_SplitsIntoMultipleBatches(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "a", PendingBalance: 100},
 			{ID: 2, PaymentAddress: "b", PendingBalance: 100},
 			{ID: 3, PaymentAddress: "c", PendingBalance: 100},
@@ -339,7 +339,7 @@ func TestRunOnce_SplitsIntoMultipleBatches(t *testing.T) {
 	w := &fakeWallet{unlocked: 10000, total: 10000}
 	e := New(repo, testConfig(w)) // MaxDestinationsPerBatch = 2
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestRunOnce_SplitsIntoMultipleBatches(t *testing.T) {
 func TestRunOnce_SeparatesDistinctPaymentIDsIntoOwnBatches(t *testing.T) {
 	pid1, pid2 := "paymentid-one", "paymentid-two"
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "a", PendingBalance: 100, PaymentID: &pid1},
 			{ID: 2, PaymentAddress: "b", PendingBalance: 100},
 			{ID: 3, PaymentAddress: "c", PendingBalance: 100, PaymentID: &pid2},
@@ -360,7 +360,7 @@ func TestRunOnce_SeparatesDistinctPaymentIDsIntoOwnBatches(t *testing.T) {
 	w := &fakeWallet{unlocked: 10000, total: 10000}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
@@ -382,14 +382,14 @@ func TestRunOnce_SeparatesDistinctPaymentIDsIntoOwnBatches(t *testing.T) {
 
 func TestRunOnce_SkipsWholeCycleOnInsufficientUnlockedBalance(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "alice", PendingBalance: 500},
 		},
 	}}
 	w := &fakeWallet{unlocked: 100, total: 10000}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestRunOnce_SkipsWholeCycleOnInsufficientUnlockedBalance(t *testing.T) {
 // TestRunOnce_AmbiguousTransferErrorFreezesBalanceAndHalts.
 func TestRunOnce_ProvablyUnbroadcastTransferFailsAndStaysPayable(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "alice", PendingBalance: 500},
 		},
 	}}
@@ -418,7 +418,7 @@ func TestRunOnce_ProvablyUnbroadcastTransferFailsAndStaysPayable(t *testing.T) {
 		transferErr: wallet.NotBroadcast(errors.New("monero wallet rpc error -37: not enough unlocked money"))}
 	e := New(repo, testConfig(w))
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err != nil {
 		t.Fatalf("RunOnce: unexpected top-level error: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestRunOnce_ProvablyUnbroadcastTransferFailsAndStaysPayable(t *testing.T) {
 
 	// The whole point of FAILED: the balance is payable again next
 	// cycle, and the next cycle is NOT halted.
-	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(context.Background(), "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -451,10 +451,10 @@ func TestRunOnce_ProvablyUnbroadcastTransferFailsAndStaysPayable(t *testing.T) {
 
 func TestRunOnce_RequiresWalletAndMaxDestinations(t *testing.T) {
 	repo := &fakeRepo{}
-	if _, err := New(repo, Config{MaxDestinationsPerBatch: 1}).RunOnce(context.Background(), "RXM", "TESTNET"); err == nil {
+	if _, err := New(repo, Config{MaxDestinationsPerBatch: 1}).RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); err == nil {
 		t.Fatal("RunOnce: expected an error when Config.Wallet is nil")
 	}
-	if _, err := New(repo, Config{Wallet: &fakeWallet{}}).RunOnce(context.Background(), "RXM", "TESTNET"); err == nil {
+	if _, err := New(repo, Config{Wallet: &fakeWallet{}}).RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); err == nil {
 		t.Fatal("RunOnce: expected an error when Config.MaxDestinationsPerBatch <= 0")
 	}
 }
@@ -468,7 +468,7 @@ func TestRunOnce_RequiresWalletAndMaxDestinations(t *testing.T) {
 // same batch is completely unaffected by the fee.
 func TestRunOnce_ForcePayoutRowBelowThresholdIsPaidWithFeeDeducted(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			// Below MinPayoutAtomic (100) but force_payout=TRUE --
 			// must still be included and paid.
 			{ID: 1, PaymentAddress: "forced", PendingBalance: 40, ForcePayout: true},
@@ -481,7 +481,7 @@ func TestRunOnce_ForcePayoutRowBelowThresholdIsPaidWithFeeDeducted(t *testing.T)
 	cfg.ForcePayoutFeeAtomic = 10
 	e := New(repo, cfg)
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestRunOnce_ForcePayoutRowBelowThresholdIsPaidWithFeeDeducted(t *testing.T)
 // qualified anyway" exemption.
 func TestRunOnce_ForcePayoutFeeAppliesEvenIfRowAlreadyClearedThreshold(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "forced-but-qualified", PendingBalance: 1000, ForcePayout: true},
 		},
 	}}
@@ -542,7 +542,7 @@ func TestRunOnce_ForcePayoutFeeAppliesEvenIfRowAlreadyClearedThreshold(t *testin
 	cfg.ForcePayoutFeeAtomic = 25
 	e := New(repo, cfg)
 
-	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); err != nil {
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
 	if len(w.transferCall) != 1 || len(w.transferCall[0].Destinations) != 1 {
@@ -561,7 +561,7 @@ func TestRunOnce_ForcePayoutFeeAppliesEvenIfRowAlreadyClearedThreshold(t *testin
 // real wallet RPC or silently skipping the row.
 func TestRunOnce_ForcePayoutFeeEdgeCaseCapsAtOneAtomicUnit(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "tiny-forced", PendingBalance: 5, ForcePayout: true},
 		},
 	}}
@@ -570,7 +570,7 @@ func TestRunOnce_ForcePayoutFeeEdgeCaseCapsAtOneAtomicUnit(t *testing.T) {
 	cfg.ForcePayoutFeeAtomic = 500 // way more than the 5-atomic-unit balance
 	e := New(repo, cfg)
 
-	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET")
+	result, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR")
 	if err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
@@ -601,14 +601,14 @@ func TestRunOnce_ForcePayoutFeeEdgeCaseCapsAtOneAtomicUnit(t *testing.T) {
 // zero default.
 func TestRunOnce_ForcePayoutFeeDefaultZeroMeansNoFee(t *testing.T) {
 	repo := &fakeRepo{balances: map[string][]PayableBalance{
-		key("RXM", "TESTNET"): {
+		key("RXM", "TESTNET", "XMR"): {
 			{ID: 1, PaymentAddress: "forced", PendingBalance: 40, ForcePayout: true},
 		},
 	}}
 	w := &fakeWallet{unlocked: 10000, total: 10000}
 	e := New(repo, testConfig(w)) // ForcePayoutFeeAtomic left at zero default
 
-	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET"); err != nil {
+	if _, err := e.RunOnce(context.Background(), "RXM", "TESTNET", "XMR"); err != nil {
 		t.Fatalf("RunOnce: unexpected error: %v", err)
 	}
 	if len(w.transferCall) != 1 || len(w.transferCall[0].Destinations) != 1 {

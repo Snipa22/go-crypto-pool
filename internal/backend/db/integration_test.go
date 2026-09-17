@@ -356,14 +356,14 @@ func TestIntegrationDisbursementLifecycle(t *testing.T) {
 
 	repo := db.NewRepository(pool)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 1000); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 1000); err != nil {
 		t.Fatalf("CreditBalance(alice): %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "bob", nil, 50); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "bob", nil, 50); err != nil {
 		t.Fatalf("CreditBalance(bob): %v", err)
 	}
 
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -371,7 +371,7 @@ func TestIntegrationDisbursementLifecycle(t *testing.T) {
 		t.Fatalf("PayableBalances(min=100): got %+v, want exactly alice (bob is below the threshold)", payable)
 	}
 
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR",
 		[]db.DisburseEntry{{BalanceID: payable[0].ID, Amount: payable[0].PendingBalance}}, payable[0].PendingBalance)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
@@ -409,7 +409,7 @@ func TestIntegrationDisbursementLifecycle(t *testing.T) {
 	// bob is still owed 50 and never touched by the above -- a second,
 	// separate cycle attempt for him that fails must not touch his
 	// balance at all.
-	payoutID2, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+	payoutID2, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR",
 		[]db.DisburseEntry{{BalanceID: payable[0].ID + 1, Amount: 50}}, 50)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout(bob): %v", err)
@@ -449,22 +449,22 @@ func TestIntegrationPayableBalancesForcePayoutOverride(t *testing.T) {
 	repo := db.NewRepository(pool)
 
 	// Both rows are below the minPayout=100 threshold used below.
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "forced-below", nil, 40); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "forced-below", nil, 40); err != nil {
 		t.Fatalf("CreditBalance(forced-below): %v", err)
 	}
 	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "forced-below", nil); err != nil {
 		t.Fatalf("SetForcePayout(forced-below): %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "not-forced-below", nil, 40); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "not-forced-below", nil, 40); err != nil {
 		t.Fatalf("CreditBalance(not-forced-below): %v", err)
 	}
 	// A normal, above-threshold row for good measure -- must also be
 	// returned, unaffected by any of the above.
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "normal-above", nil, 500); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "normal-above", nil, 500); err != nil {
 		t.Fatalf("CreditBalance(normal-above): %v", err)
 	}
 
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestIntegrationPayableBalancesForcePayoutOverride(t *testing.T) {
 	// minPayout <= 0 must still return every positive-balance row
 	// regardless of force_payout -- the override is additive, not a
 	// replacement for the existing "no minimum" behavior.
-	all, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 0)
+	all, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 0)
 	if err != nil {
 		t.Fatalf("PayableBalances(min=0): %v", err)
 	}
@@ -532,17 +532,17 @@ func TestIntegrationPayableBalancesExcludesEmptyAddressRows(t *testing.T) {
 	// simulate a pre-existing row that predates that validation
 	// (exactly the scenario this defense-in-depth clause exists
 	// for).
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "", nil, 1_000_000); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "", nil, 1_000_000); err != nil {
 		t.Fatalf("CreditBalance(empty address): %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE balance SET force_payout = TRUE WHERE algo = 'RXM' AND network = 'TESTNET' AND payment_address = ''`); err != nil {
 		t.Fatalf("raw UPDATE force_payout for empty-address row: %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "real-address", nil, 500); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "real-address", nil, 500); err != nil {
 		t.Fatalf("CreditBalance(real-address): %v", err)
 	}
 
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 0)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 0)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -571,7 +571,7 @@ func TestIntegrationBalancePendingBalanceCannotGoNegative(t *testing.T) {
 	}
 	repo := db.NewRepository(pool)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "double-debit-victim", nil, 100); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "double-debit-victim", nil, 100); err != nil {
 		t.Fatalf("CreditBalance: %v", err)
 	}
 
@@ -611,18 +611,18 @@ func TestIntegrationPendingBalanceTotals(t *testing.T) {
 	}
 	repo := db.NewRepository(pool)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "addr-1", nil, 100); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "addr-1", nil, 100); err != nil {
 		t.Fatalf("CreditBalance(addr-1): %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "addr-2", nil, 250); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "addr-2", nil, 250); err != nil {
 		t.Fatalf("CreditBalance(addr-2): %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXT", "MAINNET", "addr-3", nil, 42); err != nil {
+	if err := repo.CreditBalance(ctx, "RXT", "MAINNET", "XTM", "addr-3", nil, 42); err != nil {
 		t.Fatalf("CreditBalance(addr-3): %v", err)
 	}
 	// A zero-balance row (e.g. fully paid out) must not contribute a
 	// spurious (algo, network) entry.
-	if err := repo.CreditBalance(ctx, "C29", "MAINNET", "addr-4", nil, 0); err != nil {
+	if err := repo.CreditBalance(ctx, "C29", "MAINNET", "XTM", "addr-4", nil, 0); err != nil {
 		t.Fatalf("CreditBalance(addr-4, zero): %v", err)
 	}
 
@@ -666,17 +666,17 @@ func TestIntegrationCompletePayoutSentForcePayoutFeeLedgerAndReset(t *testing.T)
 	}
 	repo := db.NewRepository(pool)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "forced", nil, 40); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "forced", nil, 40); err != nil {
 		t.Fatalf("CreditBalance(forced): %v", err)
 	}
 	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "forced", nil); err != nil {
 		t.Fatalf("SetForcePayout(forced): %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "normal", nil, 500); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "normal", nil, 500); err != nil {
 		t.Fatalf("CreditBalance(normal): %v", err)
 	}
 
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -701,7 +701,7 @@ func TestIntegrationCompletePayoutSentForcePayoutFeeLedgerAndReset(t *testing.T)
 		{BalanceID: normalID, Amount: 500, ForcePayout: false, ForcePayoutFeeAtomic: 0},
 	}
 
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", entries, 30+500)
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR", entries, 30+500)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
 	}

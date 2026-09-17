@@ -84,9 +84,15 @@ type PayoutEntryRecord struct {
 // that produced the state, and the per-entry debit detail a
 // resolve-sent would replay.
 type UnresolvedPayout struct {
-	ID         int64
-	Algo       string
-	Network    string
+	ID      int64
+	Algo    string
+	Network string
+	// Currency mirrors this row's `payouts.currency` column (see
+	// migrations/0014_balance_payouts_currency.up.sql) — which
+	// wallet/ledger this attempted transfer belongs to. Always "XTM"
+	// for RXT/C29/SHA3X; "XMR" or "XTM" for ALGO_RXM depending on
+	// which merge-mine leg produced the credits this payout drains.
+	Currency   string
 	Status     string
 	BalanceIDs []int64
 	// Amount is the batch's real on-chain destination total (after
@@ -106,18 +112,22 @@ type UnresolvedPayout struct {
 }
 
 // UnresolvedPayouts returns every unresolved (PENDING or AMBIGUOUS)
-// `payouts` row, oldest (lowest id) first. algo and/or network may be
-// empty to mean "any" — the engine's per-(algo, network) halt check
-// and cmd/backend's startup check pass both, while the operator-
-// facing `backend payout list-unresolved` passes neither (or just
-// one) to survey the whole deployment.
+// `payouts` row, oldest (lowest id) first. algo, network, AND/OR
+// currency may be empty to mean "any" — the operator-facing `backend
+// payout list-unresolved` passes any subset (or none) of the three to
+// survey the whole deployment or narrow it down, mirroring the
+// existing algo/network "empty means any" convention. Contrast this
+// with internal/backend/disburse.Repository's own currency parameter
+// (see PayableBalances/CreditBalance's doc comments), which is always
+// REQUIRED — the engine's own per-(algo, network, currency) halt gate
+// must always state exactly which wallet it means, never "any".
 //
-// A non-empty algo/network IS validated (ValidateAlgo/
-// ValidateNetwork): a typo'd algo silently returning "no unresolved
-// payouts" would be a catastrophic false all-clear for a check whose
-// entire job is to block disbursement, so it is reported as an error
-// instead.
-func (r *Repository) UnresolvedPayouts(ctx context.Context, algo, network string) ([]UnresolvedPayout, error) {
+// A non-empty algo/network/currency IS validated (ValidateAlgo/
+// ValidateNetwork/ValidateCurrency): a typo'd filter silently
+// returning "no unresolved payouts" would be a catastrophic false
+// all-clear for a check whose entire job is to block disbursement, so
+// it is reported as an error instead.
+func (r *Repository) UnresolvedPayouts(ctx context.Context, algo, network, currency string) ([]UnresolvedPayout, error) {
 	if algo != "" {
 		if err := ValidateAlgo(algo); err != nil {
 			return nil, err
@@ -128,15 +138,21 @@ func (r *Repository) UnresolvedPayouts(ctx context.Context, algo, network string
 			return nil, err
 		}
 	}
+	if currency != "" {
+		if err := ValidateCurrency(currency); err != nil {
+			return nil, err
+		}
+	}
 
 	const stmt = `
-		SELECT id, algo, network, status, balance_ids, amount, tx_hash, error, created_at, pending_entries
+		SELECT id, algo, network, currency, status, balance_ids, amount, tx_hash, error, created_at, pending_entries
 		FROM payouts
 		WHERE status IN ('PENDING', 'AMBIGUOUS')
 		  AND ($1 = '' OR algo = $1)
 		  AND ($2 = '' OR network = $2)
+		  AND ($3 = '' OR currency = $3)
 		ORDER BY id ASC`
-	rows, err := r.pool.Query(ctx, stmt, algo, network)
+	rows, err := r.pool.Query(ctx, stmt, algo, network, currency)
 	if err != nil {
 		return nil, fmt.Errorf("db: querying unresolved payouts: %w", err)
 	}
@@ -167,7 +183,7 @@ type payoutScanner interface {
 func scanUnresolvedPayout(s payoutScanner) (UnresolvedPayout, error) {
 	var p UnresolvedPayout
 	var entriesJSON []byte
-	if err := s.Scan(&p.ID, &p.Algo, &p.Network, &p.Status, &p.BalanceIDs, &p.Amount,
+	if err := s.Scan(&p.ID, &p.Algo, &p.Network, &p.Currency, &p.Status, &p.BalanceIDs, &p.Amount,
 		&p.TxHash, &p.Error, &p.CreatedAt, &entriesJSON); err != nil {
 		return UnresolvedPayout{}, err
 	}
@@ -189,7 +205,7 @@ func scanUnresolvedPayout(s payoutScanner) (UnresolvedPayout, error) {
 // such row exists.
 func (r *Repository) GetPayoutByID(ctx context.Context, id int64) (UnresolvedPayout, error) {
 	const stmt = `
-		SELECT id, algo, network, status, balance_ids, amount, tx_hash, error, created_at, pending_entries
+		SELECT id, algo, network, currency, status, balance_ids, amount, tx_hash, error, created_at, pending_entries
 		FROM payouts
 		WHERE id = $1`
 	p, err := scanUnresolvedPayout(r.pool.QueryRow(ctx, stmt, id))

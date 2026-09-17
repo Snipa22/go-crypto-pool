@@ -299,9 +299,14 @@ func (r *Repository) ApplyBlockPayout(ctx context.Context, run BlockPayoutRun) (
 		}, nil
 	}
 
+	currency, err := blockPayoutCurrency(ctx, tx, run.BlockID)
+	if err != nil {
+		return BlockPayoutOutcome{}, err
+	}
+
 	var out BlockPayoutOutcome
 	for _, c := range run.Credits {
-		applied, err := creditBlockPayoutEntry(ctx, tx, run, c)
+		applied, err := creditBlockPayoutEntry(ctx, tx, run, c, currency)
 		if err != nil {
 			return BlockPayoutOutcome{}, err
 		}
@@ -438,11 +443,48 @@ func claimBlockPayout(ctx context.Context, tx pgx.Tx, run BlockPayoutRun) (claim
 	}
 }
 
+// blockPayoutCurrency determines the currency ("XMR" or "XTM", see
+// migrations/0014_balance_payouts_currency.up.sql) that block
+// blockID's payout credits belong on, derived directly from a fresh
+// read of the REAL `blocks` row's own algo/merge_mine_chain columns —
+// never from anything the caller supplies. This is deliberate: the
+// migration's own doc comment on `block_payout_credits.currency`
+// requires this value be derived from the parent block, not accepted
+// as an independently-settable parameter, precisely so a caller bug
+// (a mismatched run.Algo, or a stale/wrong merge-mine-leg
+// assumption) can never mis-credit a payee's balance onto the wrong
+// currency's row. Every credit in one ApplyBlockPayout run shares the
+// same blockID and is therefore guaranteed the same currency, so this
+// is called exactly once per run rather than once per credit.
+//
+// Only ALGO_RXM's primary (Monero) leg — merge_mine_chain IS NULL —
+// is "XMR"; every other case (RXT/C29/SHA3X, whose merge_mine_chain
+// is always NULL too, and ALGO_RXM's secondary/Tari leg, whose
+// merge_mine_chain is "TARI") is "XTM". See
+// migrations/0012_blocks_merge_mine_chain.up.sql for the full
+// merge-mine mechanism this reads.
+func blockPayoutCurrency(ctx context.Context, tx pgx.Tx, blockID int64) (string, error) {
+	var algo string
+	var mergeMineChain *string
+	const stmt = `SELECT algo, merge_mine_chain FROM blocks WHERE id = $1`
+	if err := tx.QueryRow(ctx, stmt, blockID).Scan(&algo, &mergeMineChain); err != nil {
+		return "", fmt.Errorf("db: applying block payout for block %d: resolving currency from the real blocks row: %w", blockID, err)
+	}
+	if algo == "RXM" && mergeMineChain == nil {
+		return "XMR", nil
+	}
+	return "XTM", nil
+}
+
 // creditBlockPayoutEntry applies one BlockCredit inside
 // ApplyBlockPayout's transaction, returning applied = false (with no
 // error) when the row-level idempotency backstop fired — i.e. this
 // (block_id, balance_id) pair was already itemised by an earlier
 // committed run, so nothing was credited.
+//
+// currency is blockPayoutCurrency's result for this run's BlockID —
+// see that function's doc comment for why it is derived once, from
+// the real `blocks` row, rather than threaded in from run/c.
 //
 // Order is deliberate and must not be swapped: the `balance` row is
 // ensured/looked up, then the `block_payout_credits` ledger row is
@@ -450,27 +492,27 @@ func claimBlockPayout(ctx context.Context, tx pgx.Tx, run BlockPayoutRun) (claim
 // pending_balance incremented. Crediting first and itemising second
 // would make a unique-violation on the ledger leave a credit with no
 // record of it.
-func creditBlockPayoutEntry(ctx context.Context, tx pgx.Tx, run BlockPayoutRun, c BlockCredit) (bool, error) {
+func creditBlockPayoutEntry(ctx context.Context, tx pgx.Tx, run BlockPayoutRun, c BlockCredit, currency string) (bool, error) {
 	// Ensure the `balance` row exists and get its id. The DO UPDATE
 	// is a deliberate no-op touch (not an increment): all this step
 	// does is resolve uq_balance_identity to a balance_id, which
 	// plain ON CONFLICT DO NOTHING would not return on conflict.
 	const ensureStmt = `
-		INSERT INTO balance (algo, network, payment_address, payment_id, pending_balance)
-		VALUES ($1, $2, $3, $4, 0)
-		ON CONFLICT (algo, network, payment_address, (COALESCE(payment_id, '')))
+		INSERT INTO balance (algo, network, currency, payment_address, payment_id, pending_balance)
+		VALUES ($1, $2, $3, $4, $5, 0)
+		ON CONFLICT (algo, network, currency, payment_address, (COALESCE(payment_id, '')))
 		DO UPDATE SET updated_at = balance.updated_at
 		RETURNING id`
 	var balanceID int64
-	if err := tx.QueryRow(ctx, ensureStmt, run.Algo, run.Network, c.PaymentAddress, c.PaymentID).Scan(&balanceID); err != nil {
+	if err := tx.QueryRow(ctx, ensureStmt, run.Algo, run.Network, currency, c.PaymentAddress, c.PaymentID).Scan(&balanceID); err != nil {
 		return false, fmt.Errorf("db: applying block payout for block %d: resolving balance row for %s: %w", run.BlockID, c.PaymentAddress, err)
 	}
 
 	const ledgerStmt = `
-		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payment_id, payout_bucket, amount)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO block_payout_credits (block_id, balance_id, payment_address, payment_id, payout_bucket, amount, currency)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (block_id, balance_id) DO NOTHING`
-	tag, err := tx.Exec(ctx, ledgerStmt, run.BlockID, balanceID, c.PaymentAddress, c.PaymentID, c.PayoutBucket, c.Amount)
+	tag, err := tx.Exec(ctx, ledgerStmt, run.BlockID, balanceID, c.PaymentAddress, c.PaymentID, c.PayoutBucket, c.Amount, currency)
 	if err != nil {
 		return false, fmt.Errorf("db: applying block payout for block %d: recording credit ledger row for balance %d: %w", run.BlockID, balanceID, err)
 	}

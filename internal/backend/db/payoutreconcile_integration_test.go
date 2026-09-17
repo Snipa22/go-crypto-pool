@@ -69,7 +69,7 @@ func TestIntegrationMigration0010AppliesOnFreshSchema(t *testing.T) {
 	// Every status value, old and new, must be insertable.
 	for _, status := range []string{"PENDING", "SENT", "FAILED", "AMBIGUOUS"} {
 		if _, err := pool.Exec(ctx,
-			`INSERT INTO payouts (algo, network, status, balance_ids, amount) VALUES ('RXM', 'TESTNET', $1, '{1}', 1)`,
+			`INSERT INTO payouts (algo, network, currency, status, balance_ids, amount) VALUES ('RXM', 'TESTNET', 'XMR', $1, '{1}', 1)`,
 			status); err != nil {
 			t.Errorf("inserting a %s payout: %v", status, err)
 		}
@@ -77,7 +77,7 @@ func TestIntegrationMigration0010AppliesOnFreshSchema(t *testing.T) {
 	// And an unknown one must still be rejected — the constraint was
 	// widened, not dropped.
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO payouts (algo, network, status, balance_ids, amount) VALUES ('RXM', 'TESTNET', 'BOGUS', '{1}', 1)`,
+		`INSERT INTO payouts (algo, network, currency, status, balance_ids, amount) VALUES ('RXM', 'TESTNET', 'XMR', 'BOGUS', '{1}', 1)`,
 	); err == nil {
 		t.Error("inserting a BOGUS payout status succeeded, want the CHECK constraint to still reject unknown statuses")
 	}
@@ -111,7 +111,7 @@ func TestIntegrationMigration0010DownRefusesWhileAmbiguousRowsExist(t *testing.T
 
 	// Now with an unresolved AMBIGUOUS row present, it must refuse.
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO payouts (algo, network, status, balance_ids, amount) VALUES ('RXM', 'TESTNET', 'AMBIGUOUS', '{1}', 500)`,
+		`INSERT INTO payouts (algo, network, currency, status, balance_ids, amount) VALUES ('RXM', 'TESTNET', 'XMR', 'AMBIGUOUS', '{1}', 500)`,
 	); err != nil {
 		t.Fatalf("inserting an AMBIGUOUS payout: %v", err)
 	}
@@ -141,16 +141,16 @@ func TestIntegrationMigration0010DownRefusesWhileAmbiguousRowsExist(t *testing.T
 func TestIntegrationPayableBalancesExcludesRowsUnderUnresolvedPayouts(t *testing.T) {
 	_, repo, ctx := freshSchema(t)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "frozen", nil, 1000); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "frozen", nil, 1000); err != nil {
 		t.Fatalf("CreditBalance(frozen): %v", err)
 	}
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "healthy", nil, 900); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "healthy", nil, 900); err != nil {
 		t.Fatalf("CreditBalance(healthy): %v", err)
 	}
 	// A force_payout-flagged row too: the freeze must beat the
 	// force_payout override, which is otherwise the strongest
 	// "definitely pay this" signal in the system.
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "frozen-forced", nil, 10); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "frozen-forced", nil, 10); err != nil {
 		t.Fatalf("CreditBalance(frozen-forced): %v", err)
 	}
 	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "frozen-forced", nil); err != nil {
@@ -158,7 +158,7 @@ func TestIntegrationPayableBalancesExcludesRowsUnderUnresolvedPayouts(t *testing
 	}
 
 	ids := map[string]int64{}
-	initial, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	initial, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances (baseline): %v", err)
 	}
@@ -171,12 +171,12 @@ func TestIntegrationPayableBalancesExcludesRowsUnderUnresolvedPayouts(t *testing
 
 	// One PENDING payout covering "frozen", one AMBIGUOUS covering
 	// "frozen-forced".
-	pendingID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+	pendingID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR",
 		[]db.DisburseEntry{{BalanceID: ids["frozen"], Amount: 1000}}, 1000)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout(frozen): %v", err)
 	}
-	ambiguousID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+	ambiguousID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR",
 		[]db.DisburseEntry{{BalanceID: ids["frozen-forced"], Amount: 10, ForcePayout: true}}, 10)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout(frozen-forced): %v", err)
@@ -185,7 +185,7 @@ func TestIntegrationPayableBalancesExcludesRowsUnderUnresolvedPayouts(t *testing
 		t.Fatalf("MarkPayoutAmbiguous: %v", err)
 	}
 
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestIntegrationPayableBalancesExcludesRowsUnderUnresolvedPayouts(t *testing
 
 	// A minPayout of 0 ("pay everything") must not bypass the freeze
 	// either.
-	all, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 0)
+	all, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 0)
 	if err != nil {
 		t.Fatalf("PayableBalances(min=0): %v", err)
 	}
@@ -205,10 +205,10 @@ func TestIntegrationPayableBalancesExcludesRowsUnderUnresolvedPayouts(t *testing
 
 	// The freeze is scoped to its own (algo, network): the same
 	// balance ids under a different algo must be unaffected.
-	if err := repo.CreditBalance(ctx, "RXT", "TESTNET", "other-algo", nil, 800); err != nil {
+	if err := repo.CreditBalance(ctx, "RXT", "TESTNET", "XTM", "other-algo", nil, 800); err != nil {
 		t.Fatalf("CreditBalance(other-algo): %v", err)
 	}
-	otherAlgo, err := repo.PayableBalances(ctx, "RXT", "TESTNET", 100)
+	otherAlgo, err := repo.PayableBalances(ctx, "RXT", "TESTNET", "XTM", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances(RXT): %v", err)
 	}
@@ -220,7 +220,7 @@ func TestIntegrationPayableBalancesExcludesRowsUnderUnresolvedPayouts(t *testing
 	if err := repo.FailPayout(ctx, pendingID, "provably not broadcast"); err != nil {
 		t.Fatalf("FailPayout: %v", err)
 	}
-	afterFail, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	afterFail, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances after FailPayout: %v", err)
 	}
@@ -237,20 +237,20 @@ func TestIntegrationPayableBalancesExcludesRowsUnderUnresolvedPayouts(t *testing
 func TestIntegrationUnresolvedPayoutsAndGetPayoutByID(t *testing.T) {
 	_, repo, ctx := freshSchema(t)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 1000); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 1000); err != nil {
 		t.Fatalf("CreditBalance: %v", err)
 	}
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
 	entries := []db.DisburseEntry{{BalanceID: payable[0].ID, Amount: 1000, ForcePayout: true, ForcePayoutFeeAtomic: 25}}
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", entries, 975)
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR", entries, 975)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
 	}
 
-	unresolved, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET")
+	unresolved, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET", "")
 	if err != nil {
 		t.Fatalf("UnresolvedPayouts: %v", err)
 	}
@@ -272,14 +272,14 @@ func TestIntegrationUnresolvedPayoutsAndGetPayoutByID(t *testing.T) {
 	}
 
 	// The "" = any filters, and a non-matching filter.
-	if rows, err := repo.UnresolvedPayouts(ctx, "", ""); err != nil || len(rows) != 1 {
+	if rows, err := repo.UnresolvedPayouts(ctx, "", "", ""); err != nil || len(rows) != 1 {
 		t.Errorf("UnresolvedPayouts(any, any): got %d rows, err=%v; want 1 row", len(rows), err)
 	}
-	if rows, err := repo.UnresolvedPayouts(ctx, "RXT", "TESTNET"); err != nil || len(rows) != 0 {
+	if rows, err := repo.UnresolvedPayouts(ctx, "RXT", "TESTNET", ""); err != nil || len(rows) != 0 {
 		t.Errorf("UnresolvedPayouts(RXT, TESTNET): got %d rows, err=%v; want 0", len(rows), err)
 	}
 	// A typo'd algo must ERROR, never return a false all-clear.
-	if _, err := repo.UnresolvedPayouts(ctx, "NOTANALGO", ""); err == nil {
+	if _, err := repo.UnresolvedPayouts(ctx, "NOTANALGO", "", ""); err == nil {
 		t.Error("UnresolvedPayouts with an invalid algo returned no error; a silent empty result would be a catastrophic false all-clear")
 	}
 
@@ -299,7 +299,7 @@ func TestIntegrationUnresolvedPayoutsAndGetPayoutByID(t *testing.T) {
 	if err := repo.CompletePayoutSent(ctx, payoutID, entries, "txhash", 4); err != nil {
 		t.Fatalf("CompletePayoutSent: %v", err)
 	}
-	if rows, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET"); err != nil || len(rows) != 0 {
+	if rows, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET", ""); err != nil || len(rows) != 0 {
 		t.Errorf("UnresolvedPayouts after SENT: got %d rows, err=%v; want 0", len(rows), err)
 	}
 	if sent, err := repo.GetPayoutByID(ctx, payoutID); err != nil || sent.Status != "SENT" {
@@ -316,14 +316,14 @@ func TestIntegrationUnresolvedPayoutsAndGetPayoutByID(t *testing.T) {
 func TestIntegrationMarkPayoutAmbiguousRecordsTxHashAndKeepsRowOpen(t *testing.T) {
 	pool, repo, ctx := freshSchema(t)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 1000); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 1000); err != nil {
 		t.Fatalf("CreditBalance: %v", err)
 	}
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR",
 		[]db.DisburseEntry{{BalanceID: payable[0].ID, Amount: 1000}}, 1000)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
@@ -381,20 +381,20 @@ func TestIntegrationMarkPayoutAmbiguousRecordsTxHashAndKeepsRowOpen(t *testing.T
 func TestIntegrationResolvePayoutSentReplaysExactDebitWithoutRepaying(t *testing.T) {
 	pool, repo, ctx := freshSchema(t)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 400); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 400); err != nil {
 		t.Fatalf("CreditBalance: %v", err)
 	}
 	if err := repo.SetForcePayout(ctx, "RXM", "TESTNET", "alice", nil); err != nil {
 		t.Fatalf("SetForcePayout: %v", err)
 	}
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
 	balanceID := payable[0].ID
 
 	entries := []db.DisburseEntry{{BalanceID: balanceID, Amount: 400, ForcePayout: true, ForcePayoutFeeAtomic: 15}}
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", entries, 385)
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR", entries, 385)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestIntegrationResolvePayoutSentReplaysExactDebitWithoutRepaying(t *testing
 	// unresolved. resolve-sent must debit the RECORDED 400, not the
 	// current 900 — debiting the larger figure would overpay the
 	// pool against the miner.
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 500); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 500); err != nil {
 		t.Fatalf("CreditBalance (accrual while unresolved): %v", err)
 	}
 
@@ -446,10 +446,10 @@ func TestIntegrationResolvePayoutSentReplaysExactDebitWithoutRepaying(t *testing
 
 	// Now resolved, so no longer blocking — and the remaining 500 is
 	// payable again.
-	if rows, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET"); err != nil || len(rows) != 0 {
+	if rows, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET", ""); err != nil || len(rows) != 0 {
 		t.Errorf("UnresolvedPayouts after resolution: got %d rows err=%v, want 0", len(rows), err)
 	}
-	after, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	after, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances after resolution: %v", err)
 	}
@@ -477,15 +477,15 @@ func TestIntegrationResolvePayoutSentReplaysExactDebitWithoutRepaying(t *testing
 func TestIntegrationResolvePayoutNotSentReleasesBalances(t *testing.T) {
 	pool, repo, ctx := freshSchema(t)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 600); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 600); err != nil {
 		t.Fatalf("CreditBalance: %v", err)
 	}
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
 	balanceID := payable[0].ID
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET",
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR",
 		[]db.DisburseEntry{{BalanceID: balanceID, Amount: 600}}, 600)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
@@ -521,10 +521,10 @@ func TestIntegrationResolvePayoutNotSentReleasesBalances(t *testing.T) {
 	}
 
 	// Released: payable again, and nothing is blocking disbursement.
-	if rows, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET"); err != nil || len(rows) != 0 {
+	if rows, err := repo.UnresolvedPayouts(ctx, "RXM", "TESTNET", ""); err != nil || len(rows) != 0 {
 		t.Errorf("UnresolvedPayouts after resolution: got %d rows err=%v, want 0", len(rows), err)
 	}
-	after, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	after, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances after resolution: %v", err)
 	}
@@ -549,8 +549,8 @@ func TestIntegrationResolvePayoutSentRefusesRowWithoutRecordedEntries(t *testing
 	// pending_entries at all.
 	var payoutID int64
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO payouts (algo, network, status, balance_ids, amount)
-		VALUES ('RXM', 'TESTNET', 'AMBIGUOUS', '{1}', 500) RETURNING id`).Scan(&payoutID); err != nil {
+		INSERT INTO payouts (algo, network, currency, status, balance_ids, amount)
+		VALUES ('RXM', 'TESTNET', 'XMR', 'AMBIGUOUS', '{1}', 500) RETURNING id`).Scan(&payoutID); err != nil {
 		t.Fatalf("inserting a legacy-shaped payout: %v", err)
 	}
 
@@ -576,15 +576,15 @@ func TestIntegrationResolvePayoutSentRefusesRowWithoutRecordedEntries(t *testing
 func TestIntegrationCompletePayoutSentRefusesAlreadyResolvedRow(t *testing.T) {
 	pool, repo, ctx := freshSchema(t)
 
-	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "alice", nil, 300); err != nil {
+	if err := repo.CreditBalance(ctx, "RXM", "TESTNET", "XMR", "alice", nil, 300); err != nil {
 		t.Fatalf("CreditBalance: %v", err)
 	}
-	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", 100)
+	payable, err := repo.PayableBalances(ctx, "RXM", "TESTNET", "XMR", 100)
 	if err != nil {
 		t.Fatalf("PayableBalances: %v", err)
 	}
 	entries := []db.DisburseEntry{{BalanceID: payable[0].ID, Amount: 300}}
-	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", entries, 300)
+	payoutID, err := repo.RecordPendingPayout(ctx, "RXM", "TESTNET", "XMR", entries, 300)
 	if err != nil {
 		t.Fatalf("RecordPendingPayout: %v", err)
 	}

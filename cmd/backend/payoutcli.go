@@ -111,8 +111,8 @@ func logPayoutRow(prefix string, p db.UnresolvedPayout) {
 	if p.Error != nil && *p.Error != "" {
 		errMsg = *p.Error
 	}
-	log.Printf("%s: payout id=%d algo=%s network=%s status=%s amount=%d created=%s",
-		prefix, p.ID, p.Algo, p.Network, p.Status, p.Amount, p.CreatedAt.UTC().Format(time.RFC3339))
+	log.Printf("%s: payout id=%d algo=%s network=%s currency=%s status=%s amount=%d created=%s",
+		prefix, p.ID, p.Algo, p.Network, p.Currency, p.Status, p.Amount, p.CreatedAt.UTC().Format(time.RFC3339))
 	log.Printf("%s: payout id=%d tx_hash=%s", prefix, p.ID, txHash)
 	log.Printf("%s: payout id=%d error=%s", prefix, p.ID, errMsg)
 	log.Printf("%s: payout id=%d balance_ids=%v", prefix, p.ID, p.BalanceIDs)
@@ -136,9 +136,10 @@ func runPayoutListUnresolved(args []string) error {
 	fs := flag.NewFlagSet("backend payout list-unresolved", flag.ContinueOnError)
 	algo := fs.String("algo", "", "narrow to one algo (RXT/C29/SHA3X/RXM). Empty means all algos.")
 	network := fs.String("network", "", "narrow to one network (MAINNET/TESTNET). Empty means all networks.")
+	currency := fs.String("currency", "", "narrow to one currency (XMR/XTM). Empty means all currencies.")
 	dsn := fs.String("dsn", os.Getenv("GCPOOL_DB_DSN"), "Postgres DSN. Defaults to GCPOOL_DB_DSN if unset.")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: backend payout list-unresolved [-algo=<ALGO>] [-network=<NETWORK>] [-dsn=...]\n\n")
+		fmt.Fprintf(fs.Output(), "Usage: backend payout list-unresolved [-algo=<ALGO>] [-network=<NETWORK>] [-currency=<CURRENCY>] [-dsn=...]\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -154,7 +155,7 @@ func runPayoutListUnresolved(args []string) error {
 	}
 	defer closeFn()
 
-	rows, err := repo.UnresolvedPayouts(ctx, *algo, *network)
+	rows, err := repo.UnresolvedPayouts(ctx, *algo, *network, *currency)
 	if err != nil {
 		return fmt.Errorf("payout list-unresolved: %w", err)
 	}

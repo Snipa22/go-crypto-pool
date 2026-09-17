@@ -357,7 +357,7 @@ type Metrics struct {
 	DisbursementUnresolvedPayouts *prometheus.GaugeVec
 
 	// WalletBalance is the hot wallet's real, currently-reported
-	// balance, labeled by algo, network, and kind
+	// balance, labeled by algo, network, currency, and kind
 	// (available/pending_incoming/pending_outgoing/timelocked — see
 	// WalletBalanceKind* below). A Gauge, not a Counter: this is a
 	// live, point-in-time snapshot of what the wallet reports on
@@ -369,13 +369,23 @@ type Metrics struct {
 	// available/pending_outgoing here — see the poller's own doc
 	// comment for the exact mapping); Tari's GetBalanceResponse has
 	// all four real fields natively.
+	//
+	// The `currency` label (see
+	// migrations/0014_balance_payouts_currency.up.sql) exists
+	// specifically so ALGO_RXM's two independent real wallets — the
+	// Monero wallet backing its primary/XMR leg, and the Tari wallet
+	// backing its secondary/XTM leg — each get their own,
+	// non-colliding time series under the same algo/network label
+	// pair. Every non-RXM algo always reports "XTM" here.
 	WalletBalance *prometheus.GaugeVec
 	// WalletBalancePollErrorsTotal counts every failed
 	// WalletClient.GetBalance call the stats poller makes, labeled
-	// by algo and network — a stuck/unreachable wallet RPC should be
-	// visible here even though WalletBalance itself simply stops
-	// updating (a Gauge can't distinguish "still the last real
-	// value" from "the poller is broken"; this counter can).
+	// by algo, network, and currency (see WalletBalance's doc
+	// comment on why currency is needed) — a stuck/unreachable
+	// wallet RPC should be visible here even though WalletBalance
+	// itself simply stops updating (a Gauge can't distinguish "still
+	// the last real value" from "the poller is broken"; this counter
+	// can).
 	WalletBalancePollErrorsTotal *prometheus.CounterVec
 
 	// RetentionPartitionsDroppedTotal counts every `shares`
@@ -618,12 +628,12 @@ func New(version string) *Metrics {
 
 	m.WalletBalance = registerGaugeVec(reg, prometheus.GaugeOpts{
 		Name: "wallet_balance_atomic",
-		Help: "Real, currently-reported hot-wallet balance in atomic units, by algo, network, and kind (available/pending_incoming/pending_outgoing/timelocked).",
-	}, []string{"algo", "network", "kind"})
+		Help: "Real, currently-reported hot-wallet balance in atomic units, by algo, network, currency, and kind (available/pending_incoming/pending_outgoing/timelocked).",
+	}, []string{"algo", "network", "currency", "kind"})
 	m.WalletBalancePollErrorsTotal = registerCounterVec(reg, prometheus.CounterOpts{
 		Name: "wallet_balance_poll_errors_total",
-		Help: "Total number of failed WalletClient.GetBalance calls made by the wallet-stats poller, by algo and network.",
-	}, []string{"algo", "network"})
+		Help: "Total number of failed WalletClient.GetBalance calls made by the wallet-stats poller, by algo, network, and currency.",
+	}, []string{"algo", "network", "currency"})
 
 	m.StatsRequestsTotal = registerCounterVec(reg, prometheus.CounterOpts{
 		Name: "stats_requests_total",
