@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -85,6 +86,26 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 // writes in one transaction means a share can never be recorded without
 // its identifier's last_share being bumped (or vice versa) even if the
 // process crashes mid-call.
+//
+// Address-flags enforcement (see addressflags.go's checkAddressFlags):
+// the ban/forced-min-difficulty lookup for s.PaymentAddress runs here,
+// BEFORE EnsureHeightPartition/tx.Begin, via the plain r.pool -- a
+// read-before-write check that happens before any partitioning or
+// insert work, which is enough to satisfy checkAddressFlags' own
+// "called BEFORE InsertShare does any partitioning/insert work" doc
+// comment without needing a tx-scoped variant of the lookup.
+//   - ErrAddressBanned: returned immediately (wrapped), and the share
+//     is NEVER inserted -- a banned address's shares must never reach
+//     `shares` at all.
+//   - ErrShareDifficultyTooLow: deliberately NOT rejected here. Forced-
+//     min-difficulty floor enforcement is leaf/vardiff-side scope, not
+//     backend ingestion -- this backend cannot distinguish a leaf
+//     legitimately allowing a lower-diff share from a leaf-side
+//     vardiff bug. The breach is logged (informational) and the share
+//     proceeds through the normal insert exactly as if no flag existed.
+//   - any other error (e.g. a transient DB lookup failure): propagated
+//     as a real error rather than treated as "not flagged" -- failing
+//     open on a ban check would defeat the point of the control.
 func (r *Repository) InsertShare(ctx context.Context, s Share, bucketSize int64) error {
 	if err := ValidateAlgo(s.Algo); err != nil {
 		return err
@@ -92,6 +113,22 @@ func (r *Repository) InsertShare(ctx context.Context, s Share, bucketSize int64)
 	if err := ValidatePoolType(s.PoolType); err != nil {
 		return err
 	}
+
+	if err := r.checkAddressFlags(ctx, s.PaymentAddress, s.BlockDiff); err != nil {
+		switch {
+		case errors.Is(err, ErrAddressBanned):
+			return fmt.Errorf("db: inserting share: %w", err)
+		case errors.Is(err, ErrShareDifficultyTooLow):
+			// Explicitly out of scope for rejection -- see this
+			// method's doc comment above. Logged so an operator can
+			// still see it happening, then fall through to the
+			// normal insert path below.
+			log.Printf("db: WARN: share below operator-forced minimum difficulty accepted (floor enforcement is leaf/vardiff scope, not backend ingestion): payment_address=%s block_diff=%d detail=%v", s.PaymentAddress, s.BlockDiff, err)
+		default:
+			return fmt.Errorf("db: inserting share: checking address flags: %w", err)
+		}
+	}
+
 	if err := EnsureHeightPartition(ctx, r.pool, s.Algo, s.PoolType, s.BlockHeight, bucketSize); err != nil {
 		return err
 	}

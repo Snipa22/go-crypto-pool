@@ -800,8 +800,17 @@ type repositoryAdapter struct {
 	repo *db.Repository
 }
 
+// InsertShare forwards to *db.Repository.InsertShare, translating a
+// db.ErrAddressBanned (a banned payment address, see
+// addressflags.go) into this command's own api.ErrAddressBanned
+// sentinel so handleShare can map it to a 403 without
+// internal/backend/api needing to import internal/backend/db
+// directly -- see api.ErrAddressBanned's own doc comment for why
+// this translation happens here, at the one place both packages
+// meet, rather than either package reaching into the other's error
+// types itself.
 func (a repositoryAdapter) InsertShare(ctx context.Context, s api.ShareRecord, bucketSize int64) error {
-	return a.repo.InsertShare(ctx, db.Share{
+	err := a.repo.InsertShare(ctx, db.Share{
 		Algo:           s.Algo,
 		Network:        s.Network,
 		PoolType:       s.PoolType,
@@ -816,6 +825,10 @@ func (a repositoryAdapter) InsertShare(ctx context.Context, s api.ShareRecord, b
 		Identifier:     s.Identifier,
 		TrustedShare:   s.TrustedShare,
 	}, bucketSize)
+	if err != nil && errors.Is(err, db.ErrAddressBanned) {
+		return fmt.Errorf("%w: %v", api.ErrAddressBanned, err)
+	}
+	return err
 }
 
 func (a repositoryAdapter) InsertBlock(ctx context.Context, b api.BlockRecord) error {

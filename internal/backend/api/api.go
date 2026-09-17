@@ -61,6 +61,20 @@ type ShareBlockRepository interface {
 	InsertBlock(ctx context.Context, b BlockRecord) error
 }
 
+// ErrAddressBanned is this package's own sentinel for "the submitting
+// share's payment_address is operator-banned" -- the api-package-side
+// counterpart of internal/backend/db.ErrAddressBanned. It exists
+// separately (rather than this package importing db.ErrAddressBanned
+// directly) to preserve the same dependency direction ShareRecord/
+// BlockRecord already establish: this package depends on
+// internal/backend/db only through ShareBlockRepository's structural
+// interface shape, never a direct import. cmd/backend's
+// repositoryAdapter (the one place both packages meet) is responsible
+// for translating a db.ErrAddressBanned returned by the real
+// *db.Repository into this sentinel (wrapped, via errors.Is-compatible
+// %w) before it reaches handleShare below.
+var ErrAddressBanned = errors.New("api: payment address is banned")
+
 // ShareRecord/BlockRecord mirror db.Share/db.Block field-for-field. They
 // exist so this package does not need to import internal/backend/db
 // directly for its interface definition (keeping the dependency
@@ -310,6 +324,18 @@ func (h *Handler) handleShare(w http.ResponseWriter, r *http.Request) {
 	err = h.repo.InsertShare(r.Context(), record, HeightPartitionBucketSize)
 	h.m.ShareInsertDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
+		if errors.Is(err, ErrAddressBanned) {
+			// A banned address is a rejection, not a server error --
+			// same bucket as the validateShare/checkNetwork
+			// 4xx-mapped rejections above, and the same
+			// metrics.ResultRejected label those already use. 403
+			// (not 400/404): the caller is authenticated, the
+			// request itself is well-formed, the address is simply
+			// disallowed.
+			h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultRejected).Inc()
+			writeErr(w, http.StatusForbidden, "payment address is banned")
+			return
+		}
 		h.m.SharesTotal.WithLabelValues(algo, network, poolType, metrics.ResultError).Inc()
 		writeErr(w, http.StatusInternalServerError, "insert failed")
 		return
