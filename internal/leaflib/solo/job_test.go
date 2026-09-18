@@ -2,9 +2,12 @@
 package solo
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -189,6 +192,51 @@ func TestJobForXNBuildsJobFromTemplate(t *testing.T) {
 	}
 	if node.templateCalls.Load() != 1 {
 		t.Errorf("expected 1 template call, got %d", node.templateCalls.Load())
+	}
+}
+
+// TestJobForXNLogsNewBlockTemplateFetchUnconditionally confirms the
+// always-on (non-Debug-gated) "solo: new block template fetched" line
+// added alongside the existing jm.cfg.Debug.Debugf line: it must
+// appear on jm.logger even with debug logging disabled/unconfigured,
+// and must report the correct algo/height/network_target_difficulty
+// for the template that was actually just fetched.
+func TestJobForXNLogsNewBlockTemplateFetchUnconditionally(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+
+	node := &fakeNodeClient{height: 123, targetDifficulty: 456789, mergeMiningHash: []byte{1, 2, 3}}
+	jm := NewJobManager(JobManagerConfig{
+		Node:          node,
+		PayoutAddress: "solo-address",
+		Logger:        logger,
+		// Debug deliberately left nil/disabled: this new log line
+		// must not depend on debug logging being enabled.
+	})
+
+	job, err := jm.JobForXN(context.Background(), "aabb")
+	if err != nil {
+		t.Fatalf("JobForXN returned error: %v", err)
+	}
+
+	got := buf.String()
+	want := "solo: new block template fetched (algo=sha3x height=123 network_target_difficulty=456789)"
+	if !strings.Contains(got, want) {
+		t.Fatalf("expected log output to contain %q, got:\n%s", want, got)
+	}
+	if job.NetworkTargetDifficulty != 456789 {
+		t.Errorf("NetworkTargetDifficulty = %d, want 456789", job.NetworkTargetDifficulty)
+	}
+
+	// A repeat JobForXN call for the same (already-cached) xn must
+	// NOT log another "new block template fetched" line -- this is a
+	// cache hit, not a new fetch.
+	buf.Reset()
+	if _, err := jm.JobForXN(context.Background(), "aabb"); err != nil {
+		t.Fatalf("JobForXN (repeat): %v", err)
+	}
+	if got := buf.String(); strings.Contains(got, "new block template fetched") {
+		t.Errorf("expected no new-template-fetched log line on a cache hit, got:\n%s", got)
 	}
 }
 

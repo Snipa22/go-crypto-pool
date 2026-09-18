@@ -515,6 +515,18 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 	if result == nil {
 		return nil, fmt.Errorf("solo: GetBlockTemplate returned a nil job for xn %s", xn)
 	}
+	// Unconditional (always-on, non-Debug-gated) log line: a fresh
+	// block template was just fetched from the base node for a
+	// first-seen/cache-invalidated xn (this IS the "new block
+	// template" event -- a cache HIT for an already-cached xn returns
+	// early above, before this GetBlockTemplate call is ever made).
+	// Added so real network target difficulty is visible in a leaf's
+	// normal logs by default, without needing to restart with debug
+	// logging enabled -- see this line's own feature brief for the
+	// live-LWMA-testing motivation. Deliberately additive alongside
+	// (not a replacement for) the existing jm.cfg.Debug.Debugf line
+	// below, which keeps its own distinct verbose-debug role.
+	jm.logger.Printf("solo: new block template fetched (algo=%s height=%d network_target_difficulty=%d)", algoWireName(result.Algo), result.Height, result.NetworkTargetDifficulty)
 	job := result
 	job.StaticDifficulty = difficulty
 	if job.CreatedAt.IsZero() {
