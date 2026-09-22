@@ -364,7 +364,11 @@ func main() {
 		coinbaseExtraTag := solo.NormalizeCoinbaseExtraTag(coinbaseExtraTagStr, defaultCoinbaseExtraTag(algo))
 		logger.Printf("coinbase-extra tag: %q (%d bytes)", string(coinbaseExtraTag), len(coinbaseExtraTag))
 		logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
-		node = solo.NewGRPCNodeClient(cfg.nodeGRPCAddress, coinbaseExtraTag)
+		tariNode, err := solo.NewGRPCNodeClient(cfg.nodeGRPCAddress, coinbaseExtraTag)
+		if err != nil {
+			logger.Fatalf("failed to construct Tari node client for %s: %v", cfg.nodeGRPCAddress, err)
+		}
+		node = tariNode
 	case coinMonero:
 		if cfg.monerodURL == "" {
 			logger.Fatal("-monerod-url/RELAY_NODE_MONEROD_URL is required for -coin=monero")
