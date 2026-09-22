@@ -1,0 +1,90 @@
+# relay-node example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point relay-node at
+# a copy of this file (with real values) via -config <path> or
+# RELAY_NODE_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var
+# > this file > the hardcoded default shown below.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "5s"), since go-toml/v2 does not natively decode into time.Duration.
+#
+# relay-node is NOT a pool leaf: no miner-facing port, no share validation,
+# no backend transport, no wallet/payout code. It watches exactly ONE
+# configured upstream node and (1) pushes fresh block templates onto a
+# shared NATS relay on every genuine tip-height increase, and (2) subscribes
+# to found-block broadcasts on that same relay, attempting local
+# resubmission against its own configured node for any message matching its
+# own configured algo/network. See cmd/relay-node/main.go's own doc comment
+# for the full design writeup, and this repo's relay-node PR description for
+# the open design questions this config surface represents (payout-address
+# convention, TemplateData encoding choice, the Monero-family BlockData
+# wire-format gap).
+
+# Which coin/PoW family this instance watches: "tari" or "monero".
+# (default: "tari")
+coin = "tari"
+
+# Which single algo this instance watches: rxt|c29|sha3x (requires
+# coin="tari") or rxm|xmr (requires coin="monero"). REQUIRED -- no safe
+# default across two coin families. (default: "")
+algo = ""
+
+# Tari base node GRPC address (host:port). REQUIRED when coin="tari".
+# Deliberately the SAME key/env var (LEAF_NODE_GRPC_ADDRESS) every other
+# leaf in this repo uses for this value. (default: "")
+node_grpc_address = ""
+
+# Real monerod-JSON-RPC-compatible base URL (e.g. "http://127.0.0.1:28081").
+# REQUIRED when coin="monero". For algo="rxm" this must point at a local
+# minotari_merge_mining_proxy listener, NOT raw monerod. For algo="xmr",
+# point this at raw monerod directly. (default: "")
+monerod_url = ""
+
+# Real monerod ZMQ endpoint (e.g. "tcp://127.0.0.1:28082") for an
+# ADDITIONAL, faster tip-poll trigger on top of poll_interval_seconds below.
+# Empty disables this entirely. Ignored for coin="tari". (default: "")
+monero_zmq_url = ""
+
+# Payout address passed to every GetBlockTemplate call -- REQUIRED by the
+# underlying NodeClient interface contract even though this daemon does no
+# payouts of its own. See the PR description for the unresolved real-address
+# convention question. (default: "")
+payout_address = ""
+
+# Network tag stamped on every published/matched relay message:
+# mainnet|testnet. (default: "testnet")
+network = "testnet"
+
+# Coinbase-extra ownership tag appended to every fetched Tari block template
+# (only meaningful for coin="tari"). Left unset, a per-algo default is
+# computed: relay-node-rxt / relay-node-c29 / relay-node-sha3x.
+# (default: "")
+coinbase_extra_tag = ""
+
+# Chain-tip poll interval, in seconds. Matches leaf-solo's own
+# tip_poll_interval_seconds default. (default: 5)
+poll_interval_seconds = 5
+
+# NATS server URL for the shared best-effort relay (template push +
+# found-block subscribe/resubmit). Empty fully disables the relay -- a
+# complete no-op; this daemon's node-connectivity/poll-loop behavior is
+# fully functional without one. (default: "")
+relay_nats_url = ""
+
+# NATS subject for the found-block relay (empty = package default,
+# "pool.blocks.found"). (default: "")
+relay_subject = ""
+
+# Optional NATS username/password auth. (default: "")
+relay_nats_username = ""
+relay_nats_password = ""
+
+# Optional NATS TLS options (CA file to verify the server, client cert/key
+# for mutual TLS). All empty by default -- no TLS options applied.
+relay_nats_tls_ca_file = ""
+relay_nats_tls_cert_file = ""
+relay_nats_tls_key_file = ""
+
+# NATS subject for the template (new-tip) relay broadcast (empty = package
+# default, "pool.templates.new"). Reuses the SAME relay_nats_url connection
+# above -- there is no second NATS URL setting. (default: "")
+template_relay_subject = ""
