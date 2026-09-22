@@ -29,25 +29,29 @@ const defaultFeePerGram = 5
 // console/base wallet, because walletGRPC (like nodeGRPC) exposes a
 // package-level singleton connection with no injectable client type.
 type tariWalletRPC interface {
-	Transfer(recipients []*tari_generated.PaymentRecipient) (*tari_generated.TransferResponse, error)
-	GetBalance() (*tari_generated.GetBalanceResponse, error)
-	GetTransactionInfo(transactionID uint64) (*tari_generated.TransactionInfo, error)
+	Transfer(ctx context.Context, recipients []*tari_generated.PaymentRecipient) (*tari_generated.TransferResponse, error)
+	GetBalance(ctx context.Context) (*tari_generated.GetBalanceResponse, error)
+	GetTransactionInfo(ctx context.Context, transactionID uint64) (*tari_generated.TransactionInfo, error)
 }
 
 // tariWalletRPCAdapter adapts walletGRPC's package-level functions to
-// tariWalletRPC.
+// tariWalletRPC. As of go-tari-grpc-lib/v3 v3.3.0, every one of these
+// package-level functions takes a leading context.Context (see
+// NewTariWalletGRPC's doc comment) — this adapter passes straight
+// through whatever ctx its caller (TariWalletGRPC's own methods)
+// supplies, rather than manufacturing a context.Background() here.
 type tariWalletRPCAdapter struct{}
 
-func (tariWalletRPCAdapter) Transfer(recipients []*tari_generated.PaymentRecipient) (*tari_generated.TransferResponse, error) {
-	return walletGRPC.SendTransactions(recipients)
+func (tariWalletRPCAdapter) Transfer(ctx context.Context, recipients []*tari_generated.PaymentRecipient) (*tari_generated.TransferResponse, error) {
+	return walletGRPC.SendTransactions(ctx, recipients)
 }
 
-func (tariWalletRPCAdapter) GetBalance() (*tari_generated.GetBalanceResponse, error) {
-	return walletGRPC.GetBalances()
+func (tariWalletRPCAdapter) GetBalance(ctx context.Context) (*tari_generated.GetBalanceResponse, error) {
+	return walletGRPC.GetBalances(ctx)
 }
 
-func (tariWalletRPCAdapter) GetTransactionInfo(transactionID uint64) (*tari_generated.TransactionInfo, error) {
-	return walletGRPC.GetTransactionInfoByID(transactionID)
+func (tariWalletRPCAdapter) GetTransactionInfo(ctx context.Context, transactionID uint64) (*tari_generated.TransactionInfo, error) {
+	return walletGRPC.GetTransactionInfoByID(ctx, transactionID)
 }
 
 // TariWalletGRPC is the production WalletClient for Tari (ALGO_RXT/
@@ -98,25 +102,32 @@ func WithFeePerGram(feePerGram uint64) TariOption {
 // pre-existing behavior).
 //
 // WHY THIS DOES NOT BOUND Transfer — deliberate, not an oversight:
-// go-tari-grpc-lib/v3's walletGRPC package exposes only package-level
-// functions that each construct their own context.Background()
-// internally (see walletGRPC.SendTransactions), so there is no
-// supported way to attach a deadline to the real Transfer RPC. The
-// only thing this package could do unilaterally is run the call in a
-// goroutine and abandon it on a timer — which would not cancel the
-// in-flight RPC at all, it would merely stop looking at it while the
-// wallet quite possibly goes on to broadcast the transaction for
-// real. That MANUFACTURES the exact ambiguous "did the coin move?"
-// incident this codebase now has to halt disbursement over (see
+// as of go-tari-grpc-lib/v3 v3.3.0, walletGRPC.SendTransactions DOES
+// accept a caller-supplied context.Context (it no longer builds its
+// own context.Background() internally), and Transfer (below) passes
+// its own ctx parameter straight through to it — so a caller's ctx
+// (e.g. process shutdown) can genuinely cancel the in-flight RPC at
+// the transport level. What this package still deliberately does NOT
+// do is layer readTimeout (this artificial, package-local deadline)
+// on top of that real ctx for Transfer specifically: readTimeout's
+// only enforcement mechanism (see callWithReadTimeout) is running the
+// call in a goroutine and giving up on READING its result after a
+// timer — it does not itself cancel anything, it just stops waiting.
+// For a read-only lookup that costs nothing (abandoning a GetBalance
+// read has no side effect). For Transfer, the SAME abandon-after-timer
+// behavior would still let the wallet's transaction service go on to
+// broadcast the transaction for real, in the background, after this
+// package has already told its caller "timed out" — manufacturing the
+// exact ambiguous "did the coin move?" incident this codebase now has
+// to halt disbursement over (see
 // migrations/0010_payouts_ambiguous_status.up.sql), trading a visible
 // hang for a money-critical unknown. A blocked Transfer is bad and
 // needs an operator; a fabricated ambiguous broadcast is worse and
-// needs an operator AND a block-explorer investigation. Read-only
-// lookups have no such hazard — abandoning a GetBalance costs
-// nothing — so they are bounded here. Giving Tari's Transfer a real,
-// cancellable deadline requires an upstream change to
-// go-tari-grpc-lib (a ctx-accepting SendTransactions); that is a
-// deliberate dependency decision, not something to fake here.
+// needs an operator AND a block-explorer investigation. So: Transfer
+// is bounded ONLY by whatever real, already-in-scope ctx its caller
+// supplies (a genuine cancellation, not a fabricated one) — it is
+// never additionally wrapped in readTimeout's abandon-and-hope
+// mechanism.
 func WithTariReadTimeout(d time.Duration) TariOption {
 	return func(o *tariWalletGRPCOptions) {
 		if d <= 0 {
@@ -133,13 +144,22 @@ func WithTariReadTimeout(d time.Duration) TariOption {
 // nodeGRPC) and returns a ready-to-use TariWalletGRPC. Only one
 // TariWalletGRPC's worth of walletGRPC usage should exist per
 // process.
-func NewTariWalletGRPC(address string, opts ...TariOption) *TariWalletGRPC {
+//
+// As of go-tari-grpc-lib/v3 v3.3.0, InitWalletGRPC itself returns an
+// error (previously void) — a real dial-time failure (e.g. malformed
+// address) is now reported here instead of surfacing later as a
+// confusing failure from the first real RPC call made against an
+// unusable connection. Callers must check err and fail fast rather
+// than proceeding with a half-constructed TariWalletGRPC.
+func NewTariWalletGRPC(address string, opts ...TariOption) (*TariWalletGRPC, error) {
 	o := tariWalletGRPCOptions{feePerGram: defaultFeePerGram}
 	for _, opt := range opts {
 		opt(&o)
 	}
-	walletGRPC.InitWalletGRPC(address)
-	return &TariWalletGRPC{rpc: tariWalletRPCAdapter{}, feePerGram: o.feePerGram, readTimeout: o.readTimeout}
+	if err := walletGRPC.InitWalletGRPC(address); err != nil {
+		return nil, fmt.Errorf("wallet: tari: NewTariWalletGRPC: dialing %s: %w", address, err)
+	}
+	return &TariWalletGRPC{rpc: tariWalletRPCAdapter{}, feePerGram: o.feePerGram, readTimeout: o.readTimeout}, nil
 }
 
 // newTariWalletGRPCWithRPC is the test seam: constructs a
@@ -312,7 +332,7 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 		})
 	}
 
-	resp, err := w.rpc.Transfer(recipients)
+	resp, err := w.rpc.Transfer(ctx, recipients)
 	if err != nil {
 		// NOT marked NotBroadcast: a GRPC-level error (deadline,
 		// connection reset, ...) says nothing about whether the
@@ -353,7 +373,7 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 			// rather than reporting a fabricated zero fee/amount.
 			txID := result.GetTransactionId()
 			info, err = callWithReadTimeout(ctx, w.readTimeout, fmt.Sprintf("GetTransactionInfo(%d)", txID),
-				func() (*tari_generated.TransactionInfo, error) { return w.rpc.GetTransactionInfo(txID) })
+				func() (*tari_generated.TransactionInfo, error) { return w.rpc.GetTransactionInfo(ctx, txID) })
 			if err != nil {
 				// CRITICAL, and deliberately NOT marked
 				// NotBroadcast: this recipient's transfer already
@@ -426,7 +446,9 @@ func (w *TariWalletGRPC) Transfer(ctx context.Context, req TransferRequest) (Tra
 //     consumed), not additional funds the wallet still owns on top of
 //     available_balance.
 func (w *TariWalletGRPC) GetBalance(ctx context.Context) (Balance, error) {
-	resp, err := callWithReadTimeout(ctx, w.readTimeout, "GetBalance", w.rpc.GetBalance)
+	resp, err := callWithReadTimeout(ctx, w.readTimeout, "GetBalance", func() (*tari_generated.GetBalanceResponse, error) {
+		return w.rpc.GetBalance(ctx)
+	})
 	if err != nil {
 		return Balance{}, fmt.Errorf("wallet: tari: GetBalance: %w", err)
 	}

@@ -19,14 +19,14 @@ type fakeTariRPC struct {
 	netErr   error
 }
 
-func (f *fakeTariRPC) GetTipInfo() (*tari_generated.TipInfoResponse, error) {
+func (f *fakeTariRPC) GetTipInfo(_ context.Context) (*tari_generated.TipInfoResponse, error) {
 	if f.tipErr != nil {
 		return nil, f.tipErr
 	}
 	return f.tip, nil
 }
 
-func (f *fakeTariRPC) GetNetworkState() (*tari_generated.GetNetworkStateResponse, error) {
+func (f *fakeTariRPC) GetNetworkState(_ context.Context) (*tari_generated.GetNetworkStateResponse, error) {
 	if f.netErr != nil {
 		return nil, f.netErr
 	}

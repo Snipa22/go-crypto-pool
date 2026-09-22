@@ -342,16 +342,16 @@ type blockingTariRPC struct {
 	block chan struct{}
 }
 
-func (b *blockingTariRPC) Transfer([]*tari_generated.PaymentRecipient) (*tari_generated.TransferResponse, error) {
+func (b *blockingTariRPC) Transfer(context.Context, []*tari_generated.PaymentRecipient) (*tari_generated.TransferResponse, error) {
 	return nil, errors.New("not used")
 }
 
-func (b *blockingTariRPC) GetBalance() (*tari_generated.GetBalanceResponse, error) {
+func (b *blockingTariRPC) GetBalance(context.Context) (*tari_generated.GetBalanceResponse, error) {
 	<-b.block
 	return &tari_generated.GetBalanceResponse{}, nil
 }
 
-func (b *blockingTariRPC) GetTransactionInfo(uint64) (*tari_generated.TransactionInfo, error) {
+func (b *blockingTariRPC) GetTransactionInfo(context.Context, uint64) (*tari_generated.TransactionInfo, error) {
 	<-b.block
 	return &tari_generated.TransactionInfo{}, nil
 }

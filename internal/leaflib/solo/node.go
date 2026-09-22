@@ -71,7 +71,7 @@ type SubmitProof struct {
 //
 // GRPCNodeClient (below) is the production Tari implementation, backed
 // by go-tari-grpc-lib/v3's nodeGRPC package (the real, current API
-// surface for this library as of v3.2.0: a package-level
+// surface for this library as of v3.4.0: a package-level
 // InitNodeGRPC(address) call followed by package-level RPC wrapper
 // functions operating on that connection — there is no per-call
 // injectable *Client type in this version, so GRPCNodeClient wraps the
@@ -393,9 +393,19 @@ type GRPCNodeClient struct {
 // already-normalized (see NormalizeCoinbaseExtraTag) and is appended to
 // every fetched block template's coinbase-extra field ahead of the
 // per-xn random nonce (see GetBlockTemplate).
-func NewGRPCNodeClient(address string, coinbaseExtraTag []byte) *GRPCNodeClient {
-	nodeGRPC.InitNodeGRPC(address)
-	return &GRPCNodeClient{coinbaseExtraTag: coinbaseExtraTag}
+//
+// As of go-tari-grpc-lib/v3 v3.3.0, InitNodeGRPC itself returns an
+// error (previously void) — a real dial-time failure (e.g. malformed
+// address) is now reported here instead of surfacing later as a
+// confusing failure from the first real RPC call made against an
+// unusable connection. Callers must check err and fail fast (see
+// cmd/leaf-solo/main.go's call site) rather than proceeding with a
+// half-constructed GRPCNodeClient.
+func NewGRPCNodeClient(address string, coinbaseExtraTag []byte) (*GRPCNodeClient, error) {
+	if err := nodeGRPC.InitNodeGRPC(address); err != nil {
+		return nil, fmt.Errorf("solo: NewGRPCNodeClient: dialing %s: %w", address, err)
+	}
+	return &GRPCNodeClient{coinbaseExtraTag: coinbaseExtraTag}, nil
 }
 
 // MaxCoinbaseExtraTagLen is the real safety bound for a user-configured
@@ -559,7 +569,7 @@ func tariPowAlgo(algo poolpb.Algo) (tari_generated.PowAlgo_PowAlgos, error) {
 // even at the same chain height — this method did NOT need any new
 // randomization logic added for per-xn support; JobManager only needed
 // to call it once per newly-seen xn and cache the result (see job.go).
-func (c *GRPCNodeClient) GetBlockTemplate(_ context.Context, payoutAddress string, algo poolpb.Algo) (*Job, error) {
+func (c *GRPCNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress string, algo poolpb.Algo) (*Job, error) {
 	powAlgo, err := tariPowAlgo(algo)
 	if err != nil {
 		return nil, err
@@ -577,7 +587,7 @@ func (c *GRPCNodeClient) GetBlockTemplate(_ context.Context, payoutAddress strin
 		},
 	}
 
-	result, err := nodeGRPC.GetNewBlockTemplateWithCoinbases(&tari_generated.GetNewBlockTemplateWithCoinbasesRequest{
+	result, err := nodeGRPC.GetNewBlockTemplateWithCoinbases(ctx, &tari_generated.GetNewBlockTemplateWithCoinbasesRequest{
 		Algo:      &tari_generated.PowAlgo{PowAlgo: powAlgo},
 		Coinbases: coinbases,
 	})
@@ -649,8 +659,8 @@ func tariJobFromResult(result *tari_generated.GetNewBlockResult, algo poolpb.Alg
 }
 
 // GetTipInfo implements NodeClient, wrapping nodeGRPC.GetTipInfo.
-func (c *GRPCNodeClient) GetTipInfo(_ context.Context) (uint64, error) {
-	tip, err := nodeGRPC.GetTipInfo()
+func (c *GRPCNodeClient) GetTipInfo(ctx context.Context) (uint64, error) {
+	tip, err := nodeGRPC.GetTipInfo(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -710,11 +720,11 @@ func tariBuildCandidateBlock(job *Job, nonce uint64, proof SubmitProof) (diff ui
 // SubmitBlock implements NodeClient, wrapping nodeGRPC.SubmitBlock.
 // candidate must be a *tari_generated.Block produced by this SAME
 // implementation's own BuildCandidateBlock.
-func (c *GRPCNodeClient) SubmitBlock(_ context.Context, candidate any) error {
+func (c *GRPCNodeClient) SubmitBlock(ctx context.Context, candidate any) error {
 	block, ok := candidate.(*tari_generated.Block)
 	if !ok {
 		return fmt.Errorf("solo: SubmitBlock: candidate is not a *tari_generated.Block (got %T)", candidate)
 	}
-	_, err := nodeGRPC.SubmitBlock(block)
+	_, err := nodeGRPC.SubmitBlock(ctx, block)
 	return err
 }

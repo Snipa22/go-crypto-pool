@@ -1749,7 +1749,10 @@ func buildUnlockerConfig(cfg config, debug *leaflib.DebugLogger) (out unlocker.C
 	out.Debug = debug
 
 	if cfg.tariGRPCAddr != "" {
-		verifier := chain.NewTariVerifier(cfg.tariGRPCAddr)
+		verifier, err := chain.NewTariVerifier(cfg.tariGRPCAddr)
+		if err != nil {
+			return out, false, fmt.Errorf("connecting to Tari base node GRPC at %s: %w", cfg.tariGRPCAddr, err)
+		}
 		for _, algo := range tariAlgos {
 			out.Coins[algo] = unlocker.CoinConfig{Verifier: verifier, MaturityDepth: cfg.unlockerTariMaturity}
 		}
@@ -2249,7 +2252,11 @@ func buildTariDisburseEngine(cfg config, repo *db.Repository, m *metrics.Metrics
 	if cfg.tariWalletFeePerGram != 0 {
 		opts = append(opts, wallet.WithFeePerGram(cfg.tariWalletFeePerGram))
 	}
-	walletClient = wallet.NewTariWalletGRPC(cfg.tariWalletGRPCAddr, opts...)
+	tariWalletClient, err := wallet.NewTariWalletGRPC(cfg.tariWalletGRPCAddr, opts...)
+	if err != nil {
+		return nil, nil, 0, false, fmt.Errorf("connecting to Tari wallet GRPC at %s: %w", cfg.tariWalletGRPCAddr, err)
+	}
+	walletClient = tariWalletClient
 
 	dcfg := disburse.Config{
 		Wallet: walletClient,

@@ -23,7 +23,7 @@ type fakeTariRPC struct {
 	gotHeights []uint64
 }
 
-func (f *fakeTariRPC) GetHeaderByHash(hash []byte) (*tari_generated.BlockHeaderResponse, error) {
+func (f *fakeTariRPC) GetHeaderByHash(_ context.Context, hash []byte) (*tari_generated.BlockHeaderResponse, error) {
 	f.gotHash = hash
 	if f.headerErr != nil {
 		return nil, f.headerErr
@@ -31,7 +31,7 @@ func (f *fakeTariRPC) GetHeaderByHash(hash []byte) (*tari_generated.BlockHeaderR
 	return f.header, nil
 }
 
-func (f *fakeTariRPC) GetBlockByHeight(heights []uint64) ([]*tari_generated.Block, error) {
+func (f *fakeTariRPC) GetBlockByHeight(_ context.Context, heights []uint64) ([]*tari_generated.Block, error) {
 	f.gotHeights = heights
 	if f.blocksErr != nil {
 		return nil, f.blocksErr
@@ -157,19 +157,23 @@ func TestTariVerifier_NegativeHeight(t *testing.T) {
 }
 
 // blockingTariRPC is a tariNodeRPC whose GetHeaderByHash blocks until
-// release is closed -- simulating a hung base node with no way to
-// cancel the underlying call (exactly the real go-tari-grpc-lib/v3
-// nodeGRPC package's own constraint, see Verify's doc comment).
+// release is closed, IGNORING the ctx it's given -- simulating a
+// hung base node/underlying transport that (for whatever reason)
+// doesn't honor ctx cancellation as promptly as expected, exercising
+// callWithContext's belt-and-braces caller-side race (see that
+// function's and Verify's own doc comments for why this defensive
+// layer is kept even though the real go-tari-grpc-lib/v3 nodeGRPC
+// package DOES accept and honor ctx as of v3.3.0).
 type blockingTariRPC struct {
 	release chan struct{}
 }
 
-func (f *blockingTariRPC) GetHeaderByHash(hash []byte) (*tari_generated.BlockHeaderResponse, error) {
+func (f *blockingTariRPC) GetHeaderByHash(_ context.Context, hash []byte) (*tari_generated.BlockHeaderResponse, error) {
 	<-f.release
 	return nil, errors.New("blockingTariRPC: released after the test observed the timeout")
 }
 
-func (f *blockingTariRPC) GetBlockByHeight(heights []uint64) ([]*tari_generated.Block, error) {
+func (f *blockingTariRPC) GetBlockByHeight(_ context.Context, heights []uint64) ([]*tari_generated.Block, error) {
 	<-f.release
 	return nil, errors.New("blockingTariRPC: released after the test observed the timeout")
 }
@@ -177,9 +181,10 @@ func (f *blockingTariRPC) GetBlockByHeight(heights []uint64) ([]*tari_generated.
 // TestTariVerifier_CtxCancellationBoundsCallerWait is the regression
 // test for PROD_HARDENING_REVIEW.md finding #20's TariVerifier.Verify
 // item: a canceled/timed-out ctx must unblock Verify's CALLER
-// promptly, even though the underlying nodeGRPC call it raced against
-// cannot itself be canceled and keeps running in the background (see
-// callWithContext's own doc comment).
+// promptly, even if the underlying RPC call it raced against ignores
+// that same ctx and keeps running in the background (see
+// callWithContext's own doc comment for why this defensive race is
+// kept even now that the real nodeGRPC package itself accepts ctx).
 func TestTariVerifier_CtxCancellationBoundsCallerWait(t *testing.T) {
 	rpc := &blockingTariRPC{release: make(chan struct{})}
 	defer close(rpc.release) // let the leaked goroutine finish so the test doesn't leave anything running after it returns
