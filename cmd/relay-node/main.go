@@ -33,17 +33,25 @@
 // functional and independently verifiable even with no NATS server
 // deployed at all.
 //
-// OPEN DESIGN QUESTIONS this binary's own PR description calls out
-// explicitly rather than silently deciding (see that description for
-// the full writeup):
-//   - -payout-address's real operational convention (a dedicated
-//     "relay observer" address vs. reusing an existing pool payout
-//     address) -- this daemon does no payouts of its own.
+// SETTLED DESIGN DECISIONS (previously listed here as open questions
+// -- now resolved, per Alex's explicit direction):
+//   - -payout-address stays exactly what it already is: a plain
+//     required CLI flag/env var. No dedicated "relay observer address"
+//     convention was added -- this daemon does no payouts of its own,
+//     and reusing the existing plain-flag convention was confirmed
+//     sufficient.
+//   - BlockMessage.BlockData's wire format for every Monero-family
+//     algo is CLOSED: internal/leaflib/direct/session.go's ALGO_RXM/
+//     ALGO_XMR/etc block-find branch now publishes the raw,
+//     already-nonce-patched solo.MoneroCandidate.TemplateBlob bytes
+//     (see that file's handleSubmit doc comment), and this binary's
+//     own handleFoundBlock (daemon.go) decodes that back into a
+//     *solo.MoneroCandidate and resubmits it via NodeClient.SubmitBlock
+//     -- mirroring the Tari path exactly.
+//
+// OPEN DESIGN QUESTIONS still remaining:
 //   - TemplateMessage.TemplateData's real encoding (see daemon.go's
 //     templateDataForJob doc comment for the choice made and why).
-//   - BlockMessage.BlockData's real wire-format gap for every
-//     Monero-family algo (see daemon.go's handleFoundBlock doc
-//     comment) -- no producer in this codebase marshals it yet.
 //   - No pre-existing systemd unit convention was found anywhere in
 //     this repository (checked: no .service files, no deploy/
 //     directory) -- relay-node.service (this package's own directory)

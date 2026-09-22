@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -407,23 +408,66 @@ func TestHandleFoundBlock_MismatchedNetworkSkips(t *testing.T) {
 	}
 }
 
-// TestHandleFoundBlock_MoneroFamilySkipsKnownGap confirms the
-// documented, explicit BlockData wire-format gap for every
-// Monero-family algo: a genuinely MATCHING Algo/Network message still
-// results in zero SubmitBlock calls, since no real producer in this
-// codebase marshals BlockData for Monero-family blocks yet (see
-// handleFoundBlock's own doc comment) -- this must never silently
-// attempt a decode against an invented/incompatible format.
-func TestHandleFoundBlock_MoneroFamilySkipsKnownGap(t *testing.T) {
+// TestHandleFoundBlock_MatchingMoneroAlgoNetworkSubmits is this
+// follow-up fix's own required regression test: a genuinely MATCHING
+// Monero-family Algo/Network relay message now DOES trigger a real
+// local resubmission, decoding BlockMessage.BlockData straight back
+// into a *solo.MoneroCandidate (see handleFoundBlock's own doc
+// comment -- this mirrors internal/leaflib/direct/session.go's
+// producer side exactly: BlockData is the raw, already-nonce-patched
+// TemplateBlob bytes, no proto marshal step involved).
+func TestHandleFoundBlock_MatchingMoneroAlgoNetworkSubmits(t *testing.T) {
 	node := &mockNodeClient{}
 	d := NewDaemon(node, relay.NewRelay(relay.Config{URL: ""}), poolpb.Algo_ALGO_XMR, coinMonero, "testnet", "payout", nil)
 
+	wantBlob := []byte{1, 2, 3, 4, 5}
 	d.handleFoundBlock(relay.BlockMessage{
-		Algo: leaflib.AlgoWireName(poolpb.Algo_ALGO_XMR), Network: "testnet", Height: 7, Hash: "abc", BlockData: []byte{1, 2, 3},
+		Algo: leaflib.AlgoWireName(poolpb.Algo_ALGO_XMR), Network: "testnet", Height: 7, Hash: "abc", BlockData: wantBlob,
 	})
 
+	if _, _, submits := node.callCounts(); submits != 1 {
+		t.Fatalf("expected exactly 1 SubmitBlock call for a matching Monero-family Algo/Network message, got %d", submits)
+	}
+	got, ok := node.lastSubmitCandidate.(*solo.MoneroCandidate)
+	if !ok {
+		t.Fatalf("SubmitBlock candidate type = %T, want *solo.MoneroCandidate", node.lastSubmitCandidate)
+	}
+	if !bytes.Equal(got.TemplateBlob, wantBlob) {
+		t.Fatalf("decoded candidate TemplateBlob = %x, want %x", got.TemplateBlob, wantBlob)
+	}
+}
+
+// TestHandleFoundBlock_MismatchedAlgoSkipsMonero and
+// TestHandleFoundBlock_MismatchedNetworkSkipsMonero are the
+// Monero-family counterpart of the Tari mismatch tests above: SubmitBlock
+// must NOT be called for either kind of mismatch, even now that the
+// Monero-family decode+resubmit path is real.
+func TestHandleFoundBlock_MismatchedAlgoSkipsMonero(t *testing.T) {
+	node := &mockNodeClient{}
+	d := NewDaemon(node, relay.NewRelay(relay.Config{URL: ""}), poolpb.Algo_ALGO_XMR, coinMonero, "testnet", "payout", nil)
+
+	// NOTE: leaflib.AlgoWireName maps EVERY RandomX-family algo
+	// (ALGO_RXT, ALGO_RXM, and every internal/coinprofile.Registry
+	// entry including ALGO_XMR) to the SAME "rx/0" wire label (real
+	// miner software has no per-coin algo name -- see that function's
+	// own doc comment), so ALGO_RXM would NOT actually exercise a
+	// wire-level mismatch here. ALGO_C29 ("c29") is used instead to
+	// prove a genuine wire-algo mismatch is still correctly filtered.
+	d.handleFoundBlock(relay.BlockMessage{Algo: leaflib.AlgoWireName(poolpb.Algo_ALGO_C29), Network: "testnet", BlockData: []byte{1, 2, 3}})
+
 	if _, _, submits := node.callCounts(); submits != 0 {
-		t.Fatalf("expected 0 SubmitBlock calls for a Monero-family message (known BlockData wire-format gap), got %d", submits)
+		t.Fatalf("expected 0 SubmitBlock calls for a mismatched Monero-family algo, got %d", submits)
+	}
+}
+
+func TestHandleFoundBlock_MismatchedNetworkSkipsMonero(t *testing.T) {
+	node := &mockNodeClient{}
+	d := NewDaemon(node, relay.NewRelay(relay.Config{URL: ""}), poolpb.Algo_ALGO_XMR, coinMonero, "testnet", "payout", nil)
+
+	d.handleFoundBlock(relay.BlockMessage{Algo: leaflib.AlgoWireName(poolpb.Algo_ALGO_XMR), Network: "mainnet", BlockData: []byte{1, 2, 3}})
+
+	if _, _, submits := node.callCounts(); submits != 0 {
+		t.Fatalf("expected 0 SubmitBlock calls for a mismatched network, got %d", submits)
 	}
 }
 
