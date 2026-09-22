@@ -22,7 +22,7 @@ type fakeTariWalletRPC struct {
 	gotTxInfoIDs  []uint64
 }
 
-func (f *fakeTariWalletRPC) Transfer(recipients []*tari_generated.PaymentRecipient) (*tari_generated.TransferResponse, error) {
+func (f *fakeTariWalletRPC) Transfer(_ context.Context, recipients []*tari_generated.PaymentRecipient) (*tari_generated.TransferResponse, error) {
 	f.gotRecipients = recipients
 	if f.transferErr != nil {
 		return nil, f.transferErr
@@ -30,14 +30,14 @@ func (f *fakeTariWalletRPC) Transfer(recipients []*tari_generated.PaymentRecipie
 	return f.transferResp, nil
 }
 
-func (f *fakeTariWalletRPC) GetBalance() (*tari_generated.GetBalanceResponse, error) {
+func (f *fakeTariWalletRPC) GetBalance(_ context.Context) (*tari_generated.GetBalanceResponse, error) {
 	if f.balanceErr != nil {
 		return nil, f.balanceErr
 	}
 	return f.balanceResp, nil
 }
 
-func (f *fakeTariWalletRPC) GetTransactionInfo(transactionID uint64) (*tari_generated.TransactionInfo, error) {
+func (f *fakeTariWalletRPC) GetTransactionInfo(_ context.Context, transactionID uint64) (*tari_generated.TransactionInfo, error) {
 	f.gotTxInfoIDs = append(f.gotTxInfoIDs, transactionID)
 	if f.txInfoErr != nil {
 		return nil, f.txInfoErr

@@ -20,18 +20,18 @@ import (
 // internal/backend/chain.tariNodeRPC's identical role/rationale for
 // TariVerifier.
 type tariNodeRPC interface {
-	GetTipInfo() (*tari_generated.TipInfoResponse, error)
-	GetNetworkState() (*tari_generated.GetNetworkStateResponse, error)
+	GetTipInfo(ctx context.Context) (*tari_generated.TipInfoResponse, error)
+	GetNetworkState(ctx context.Context) (*tari_generated.GetNetworkStateResponse, error)
 }
 
 type tariNodeRPCAdapter struct{}
 
-func (tariNodeRPCAdapter) GetTipInfo() (*tari_generated.TipInfoResponse, error) {
-	return nodeGRPC.GetTipInfo()
+func (tariNodeRPCAdapter) GetTipInfo(ctx context.Context) (*tari_generated.TipInfoResponse, error) {
+	return nodeGRPC.GetTipInfo(ctx)
 }
 
-func (tariNodeRPCAdapter) GetNetworkState() (*tari_generated.GetNetworkStateResponse, error) {
-	return nodeGRPC.GetNetworkState()
+func (tariNodeRPCAdapter) GetNetworkState(ctx context.Context) (*tari_generated.GetNetworkStateResponse, error) {
+	return nodeGRPC.GetNetworkState(ctx)
 }
 
 // TariAlgo identifies which of the three real Tari-merge-mined PoW
@@ -120,9 +120,15 @@ func newTariNetworkSourceWithRPC(rpc tariNodeRPC, algo TariAlgo) *TariNetworkSou
 	return &TariNetworkSource{rpc: rpc, algo: algo}
 }
 
-// FetchNetworkState implements Source for Tari.
-func (s *TariNetworkSource) FetchNetworkState(_ context.Context) (State, error) {
-	tip, err := s.rpc.GetTipInfo()
+// FetchNetworkState implements Source for Tari. ctx is a real,
+// already-in-scope context (the poll loop's own per-cycle ctx) and is
+// threaded straight through to both real GRPC calls below — as of
+// go-tari-grpc-lib/v3 v3.3.0, nodeGRPC.GetTipInfo/GetNetworkState both
+// accept a leading context.Context (see tariNodeRPCAdapter), so a
+// canceled/timed-out ctx now genuinely cancels an in-flight call
+// rather than this method waiting on it unbounded.
+func (s *TariNetworkSource) FetchNetworkState(ctx context.Context) (State, error) {
+	tip, err := s.rpc.GetTipInfo(ctx)
 	if err != nil {
 		return State{}, fmt.Errorf("networkpoller: tari: GetTipInfo: %w", err)
 	}
@@ -131,7 +137,7 @@ func (s *TariNetworkSource) FetchNetworkState(_ context.Context) (State, error) 
 	}
 	meta := tip.GetMetadata()
 
-	netState, err := s.rpc.GetNetworkState()
+	netState, err := s.rpc.GetNetworkState(ctx)
 	if err != nil && !isTariMethodForbidden(err) {
 		return State{}, fmt.Errorf("networkpoller: tari: GetNetworkState: %w", err)
 	}

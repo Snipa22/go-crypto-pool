@@ -24,20 +24,23 @@ import (
 // the same constraint), so tariNodeRPCAdapter below is the one real
 // place this package touches that singleton.
 type tariNodeRPC interface {
-	GetHeaderByHash(hash []byte) (*tari_generated.BlockHeaderResponse, error)
-	GetBlockByHeight(heights []uint64) ([]*tari_generated.Block, error)
+	GetHeaderByHash(ctx context.Context, hash []byte) (*tari_generated.BlockHeaderResponse, error)
+	GetBlockByHeight(ctx context.Context, heights []uint64) ([]*tari_generated.Block, error)
 }
 
 // tariNodeRPCAdapter adapts nodeGRPC's package-level functions to
-// tariNodeRPC.
+// tariNodeRPC. As of go-tari-grpc-lib/v3 v3.3.0, every one of these
+// package-level functions takes a leading context.Context (see
+// NewTariVerifier's doc comment) — this adapter passes straight
+// through whatever ctx its caller (Verify, below) supplies.
 type tariNodeRPCAdapter struct{}
 
-func (tariNodeRPCAdapter) GetHeaderByHash(hash []byte) (*tari_generated.BlockHeaderResponse, error) {
-	return nodeGRPC.GetHeaderByHash(hash)
+func (tariNodeRPCAdapter) GetHeaderByHash(ctx context.Context, hash []byte) (*tari_generated.BlockHeaderResponse, error) {
+	return nodeGRPC.GetHeaderByHash(ctx, hash)
 }
 
-func (tariNodeRPCAdapter) GetBlockByHeight(heights []uint64) ([]*tari_generated.Block, error) {
-	return nodeGRPC.GetBlockByHeight(heights)
+func (tariNodeRPCAdapter) GetBlockByHeight(ctx context.Context, heights []uint64) ([]*tari_generated.Block, error) {
+	return nodeGRPC.GetBlockByHeight(ctx, heights)
 }
 
 // TariVerifier is the production ChainVerifier for ALGO_RXT/ALGO_C29/
@@ -54,9 +57,18 @@ type TariVerifier struct {
 // GRPCNodeClient (internal/leaflib/solo/node.go), only one
 // TariVerifier's worth of nodeGRPC usage should exist per process,
 // since InitNodeGRPC's connection is shared process-wide state.
-func NewTariVerifier(address string) *TariVerifier {
-	nodeGRPC.InitNodeGRPC(address)
-	return &TariVerifier{rpc: tariNodeRPCAdapter{}}
+//
+// As of go-tari-grpc-lib/v3 v3.3.0, InitNodeGRPC itself returns an
+// error (previously void) — a real dial-time failure (e.g. malformed
+// address) is now reported here instead of surfacing later as a
+// confusing failure from the first real RPC call made against an
+// unusable connection. Callers must check err and fail fast rather
+// than proceeding with a half-constructed TariVerifier.
+func NewTariVerifier(address string) (*TariVerifier, error) {
+	if err := nodeGRPC.InitNodeGRPC(address); err != nil {
+		return nil, fmt.Errorf("chain: tari: NewTariVerifier: dialing %s: %w", address, err)
+	}
+	return &TariVerifier{rpc: tariNodeRPCAdapter{}}, nil
 }
 
 // newTariVerifierWithRPC is the test seam: constructs a TariVerifier
@@ -84,33 +96,30 @@ func newTariVerifierWithRPC(rpc tariNodeRPC) *TariVerifier {
 //     distinguish "confirmed and canonical" from "was real, now
 //     orphaned".
 //
-// # ctx handling (PROD_HARDENING_REVIEW.md finding #20)
+// // # ctx handling (PROD_HARDENING_REVIEW.md finding #20)
 //
-// v.rpc (nodeGRPC's package-level GetHeaderByHash/GetBlockByHeight)
-// does NOT accept a context.Context at all — checked against
-// go-tari-grpc-lib/v3's real nodeGRPC package this session: every one
-// of its exported functions builds its own context.Background()
-// internally for the underlying GRPC call, with no variant that
-// takes a caller-supplied context. So ctx genuinely CANNOT be
-// threaded into the GRPC call itself without modifying that external
-// dependency, which is out of scope here.
+// As of go-tari-grpc-lib/v3 v3.3.0, v.rpc (nodeGRPC's package-level
+// GetHeaderByHash/GetBlockByHeight) DOES accept a leading
+// context.Context, and this method passes ctx straight through to
+// both calls (see tariNodeRPCAdapter) — a canceled/timed-out ctx now
+// genuinely cancels the in-flight GRPC call at the transport level,
+// not just this method's own wait on it.
 //
-// What IS feasible without touching go-tari-grpc-lib, and what this
-// method does: run each blocking RPC call in its own goroutine and
-// race it against ctx via callWithContext below, so a canceled/
-// timed-out ctx unblocks THIS METHOD's caller (the unlocker's poll
-// pass) promptly instead of waiting on however long the underlying
-// GRPC call takes to fail or a genuinely hung base node's TCP-level
-// timeout. This bounds the CALLER's wait — the exact problem
-// statement ("a hung base node can stall an entire unlocker pass
-// with no way for the caller to bound it") — even though it cannot
-// cancel the in-flight GRPC call itself: that goroutine keeps running
-// (and its result is simply discarded) until the real call returns on
-// its own. This is a real, if partial, fix: it is a goroutine-per-
-// call-that-times-out leak under sustained base-node unavailability,
-// not a free win, but it is strictly better than the caller being
-// unable to bound its own wait at all, and it requires zero changes
-// to the external dependency.
+// This method ALSO still races each call against ctx in its own
+// goroutine via callWithContext below. That defensive wrapper
+// predates v3.3.0's ctx support (see callWithContext's own doc
+// comment for the full original finding #20 rationale, when nodeGRPC
+// had no ctx parameter at all and this was the ONLY way to bound the
+// caller's wait) and is kept as belt-and-braces: it guarantees this
+// method's caller (the unlocker's poll pass) is unblocked promptly on
+// ctx cancellation even in the hypothetical case where the underlying
+// transport doesn't itself honor ctx cancellation as promptly as
+// expected (e.g. slow DNS resolution ahead of the actual RPC). With a
+// real, ctx-respecting connection this second layer should rarely if
+// ever actually win the race against the real RPC returning on its
+// own — but it costs nothing to keep and removes a way this method
+// could regress back to unbounded blocking if that assumption about
+// the underlying transport is ever wrong.
 func (v *TariVerifier) Verify(ctx context.Context, hashHex string, height int64) (VerifyResult, error) {
 	if height < 0 {
 		return VerifyResult{}, fmt.Errorf("chain: tari: height must be non-negative, got %d", height)
@@ -121,7 +130,7 @@ func (v *TariVerifier) Verify(ctx context.Context, hashHex string, height int64)
 	}
 
 	headerResp, err := callWithContext(ctx, func() (*tari_generated.BlockHeaderResponse, error) {
-		return v.rpc.GetHeaderByHash(hashBytes)
+		return v.rpc.GetHeaderByHash(ctx, hashBytes)
 	})
 	if err != nil {
 		// A ctx cancellation/deadline (see callWithContext) is not a
@@ -144,7 +153,7 @@ func (v *TariVerifier) Verify(ctx context.Context, hashHex string, height int64)
 	}
 
 	canonicalBlocks, err := callWithContext(ctx, func() ([]*tari_generated.Block, error) {
-		return v.rpc.GetBlockByHeight([]uint64{uint64(height)})
+		return v.rpc.GetBlockByHeight(ctx, []uint64{uint64(height)})
 	})
 	if err != nil {
 		return VerifyResult{}, fmt.Errorf("chain: tari: GetBlocks(height=%d): %w", height, err)
@@ -176,16 +185,18 @@ func (v *TariVerifier) Verify(ctx context.Context, hashHex string, height int64)
 	}, nil
 }
 
-// callWithContext runs fn (a blocking call into a client with no
-// context support of its own, e.g. nodeGRPC's package-level
-// functions — see Verify's own doc comment) on a separate goroutine
-// and returns as soon as EITHER fn returns OR ctx is done, whichever
-// comes first. If ctx wins the race, fn's eventual result (if any) is
-// silently discarded — the goroutine is not, and cannot be, killed;
-// it simply keeps running until the real underlying call returns on
-// its own, mirroring exactly what would happen if the caller had
-// instead just given up waiting on a synchronous call with no way to
-// cancel it.
+// callWithContext runs fn (a blocking call, e.g. one of
+// tariNodeRPCAdapter's own methods — see Verify's own doc comment for
+// why this races the call rather than relying solely on fn honoring
+// ctx itself) on a separate goroutine and returns as soon as EITHER
+// fn returns OR ctx is done, whichever comes first. If ctx wins the
+// race, fn's eventual result (if any) is silently discarded — the
+// goroutine is not, and cannot be, killed; it simply keeps running
+// until the real underlying call returns on its own (fn is expected
+// to ALSO have been given ctx itself, so in the common case it
+// returns promptly on its own once the underlying transport observes
+// the same cancellation — this is a defensive upper bound on the
+// caller's wait, not the primary cancellation mechanism).
 func callWithContext[T any](ctx context.Context, fn func() (T, error)) (T, error) {
 	type result struct {
 		val T

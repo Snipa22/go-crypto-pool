@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	git.gammaspectra.live/P2Pool/go-randomx v1.0.0
-	github.com/Snipa22/go-tari-grpc-lib/v3 v3.2.0
+	github.com/Snipa22/go-tari-grpc-lib/v3 v3.4.0
 	github.com/Snipa22/go-tari-lib v1.3.0
 	github.com/Snipa22/go-xmr-lib v0.2.5
 	github.com/go-zeromq/zmq4 v0.17.0

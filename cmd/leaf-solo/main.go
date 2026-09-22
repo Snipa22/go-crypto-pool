@@ -935,7 +935,11 @@ func main() {
 		node = solo.NewMoneroNodeClient(cfg.monerodURL)
 	} else {
 		logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
-		node = solo.NewGRPCNodeClient(cfg.nodeGRPCAddress, coinbaseExtraTag)
+		tariNode, err := solo.NewGRPCNodeClient(cfg.nodeGRPCAddress, coinbaseExtraTag)
+		if err != nil {
+			logger.Fatalf("failed to construct Tari node client for %s: %v", cfg.nodeGRPCAddress, err)
+		}
+		node = tariNode
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
