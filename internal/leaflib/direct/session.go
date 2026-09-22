@@ -862,6 +862,34 @@ func (s *Session) handleSubmit(req solo.Request) {
 				// this method's own skipBackendForward convention
 				// above for the primary leg's unresolved-hash case).
 				mergeMineForwards = matchMergeMineForwards(s.server.mergeMineChains, auxChains)
+
+				// Best-effort NATS relay publish for this
+				// Monero-family found block -- mirrors
+				// Server.submitBlockDirect's own Tari relay-publish
+				// shape/never-block/never-fail contract exactly (see
+				// that method's doc comment), just with raw
+				// TemplateBlob bytes as BlockData instead of a proto
+				// marshal (MoneroCandidate is a plain byte slice, no
+				// proto involved -- see MoneroCandidate's own doc
+				// comment). Gated on !skipBackendForward for the SAME
+				// reason backend forwarding is skipped above: an
+				// unresolved real hash is not safe to key relay dedup
+				// on (relay.Relay.Subscribe's own dedup keys off
+				// BlockMessage.Hash), and a receiving relay-node
+				// instance would have nothing trustworthy to log/
+				// resubmit against.
+				if s.server.relay != nil && !skipBackendForward {
+					msg := relay.BlockMessage{
+						Algo:      s.server.currentAlgoLabel(),
+						Network:   networkLabel(s.server.network),
+						Height:    job.Height,
+						Hash:      blockHashHex,
+						BlockData: moneroCandidate.TemplateBlob,
+					}
+					if err := s.server.relay.Publish(context.Background(), msg); err != nil {
+						s.server.logger.Printf("direct: monero relay publish failed (non-fatal, primary submit unaffected): %v", err)
+					}
+				}
 			}
 		default:
 			block, ok := candidate.(*tari_generated.Block)
@@ -1266,12 +1294,13 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	return payload
 }
 
-// Compile-time reference to relay/proto types this file relies on
-// (avoids an unused-import in edge build configurations while keeping
-// the doc comments above accurate about what this file actually
-// wires).
+// Compile-time reference to proto/transport/log types this file
+// relies on (avoids an unused-import in edge build configurations
+// while keeping the doc comments above accurate about what this file
+// actually wires). relay is no longer listed here: the Monero-family
+// block-find branch above (handleSubmit's ALGO_RXM case) now calls
+// relay.BlockMessage/s.server.relay.Publish for real.
 var (
-	_ = relay.BlockMessage{}
 	_ = proto.Marshal
 	_ = transport.ShareTransport(nil)
 	_ = log.Default

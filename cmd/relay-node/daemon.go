@@ -302,21 +302,16 @@ func (d *Daemon) SubscribeFoundBlocks() (unsubscribe func(), err error) {
 // subscriber must filter for itself) and, only on a match, attempts a
 // real local resubmission via d.Node.SubmitBlock.
 //
-// BlockData wire-format gap (see main.go's doc comment / the PR
-// description for the full writeup this was flagged in, per the
-// brief's own explicit instruction not to silently invent an
-// incompatible format): today, in this whole codebase, ONLY Tari's
-// leaf-direct actually ever calls relay.Publish for a found block
-// (internal/leaflib/direct/server.go's submitBlockDirect, marshaling
-// BlockData as proto.Marshal(*tari_generated.Block) -- see that file's
-// marshalBlockForRelay). NO producer anywhere marshals BlockData for
-// any Monero-family algo yet (confirmed: internal/leaflib/direct/
-// session.go's own ALGO_RXM/ALGO_XMR/etc block-find branch never
-// touches s.relay.Publish at all -- see that file's doc comment on
-// this exact gap). This method therefore only ever attempts a real
-// decode+resubmit for -coin=tari; a matching Monero-family message is
-// logged and explicitly skipped rather than guessing a wire format no
-// real publisher has ever produced.
+// BlockData wire format (see main.go's doc comment / the PR
+// description for the full writeup): internal/leaflib/direct/
+// server.go's submitBlockDirect marshals Tari BlockData as
+// proto.Marshal(*tari_generated.Block) (see that file's
+// marshalBlockForRelay); internal/leaflib/direct/session.go's own
+// ALGO_RXM/ALGO_XMR/etc block-find branch now publishes Monero-family
+// BlockData as the raw, already-nonce-patched
+// solo.MoneroCandidate.TemplateBlob bytes (no proto marshal step --
+// MoneroCandidate is a plain byte slice, no proto involved). Both
+// coin families are handled below via a real decode+resubmit.
 func (d *Daemon) handleFoundBlock(msg relay.BlockMessage) {
 	wantAlgo := leaflib.AlgoWireName(d.Algo)
 	if msg.Algo != wantAlgo || msg.Network != d.Network {
@@ -339,7 +334,14 @@ func (d *Daemon) handleFoundBlock(msg relay.BlockMessage) {
 		}
 		d.Logger.Printf("relay-node: local resubmission SUCCEEDED for relayed block (height=%d hash=%s publisher=%s)", msg.Height, msg.Hash, msg.PublisherID)
 	case coinMonero:
-		d.Logger.Printf("relay-node: received a matching found-block relay message for a monero-family algo (height=%d hash=%s publisher=%s), but NO producer in this codebase currently marshals BlockMessage.BlockData for monero-family blocks (a known, confirmed gap -- see internal/leaflib/direct/session.go's ALGO_RXM/ALGO_XMR block-find handling) -- skipping local resubmission rather than inventing an incompatible wire format", msg.Height, msg.Hash, msg.PublisherID)
+		candidate := &solo.MoneroCandidate{TemplateBlob: msg.BlockData}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := d.Node.SubmitBlock(ctx, candidate); err != nil {
+			d.Logger.Printf("relay-node: local resubmission FAILED for relayed monero-family block (height=%d hash=%s publisher=%s): %v", msg.Height, msg.Hash, msg.PublisherID, err)
+			return
+		}
+		d.Logger.Printf("relay-node: local resubmission SUCCEEDED for relayed monero-family block (height=%d hash=%s publisher=%s)", msg.Height, msg.Hash, msg.PublisherID)
 	default:
 		d.Logger.Printf("relay-node: received a matching found-block relay message but this daemon's own coin %q is unrecognized -- skipping", d.Coin)
 	}
