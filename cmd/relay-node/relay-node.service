@@ -1,0 +1,49 @@
+# relay-node.service
+#
+# NO PRE-EXISTING systemd UNIT CONVENTION WAS FOUND ANYWHERE IN THIS
+# REPOSITORY at the time this was written (checked: no *.service files, no
+# deploy/ directory -- see the PR description for this explicit note). This
+# is therefore a genuinely NEW convention, not a reuse of an established
+# one, and is intentionally simple/conservative rather than guessing at
+# repo-wide systemd conventions that do not yet exist.
+#
+# Install (adjust paths/user for your environment):
+#   sudo install -m0755 relay-node /usr/local/bin/relay-node
+#   sudo install -m0644 relay-node.example.toml /etc/relay-node/relay-node.toml
+#   sudo install -m0644 relay-node.service /etc/systemd/system/relay-node.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now relay-node
+#
+# Deployment shape (see cmd/relay-node/main.go's own doc comment): ONE
+# lightweight instance per physical node. Run multiple instances side by
+# side (each with its own -config/env pointed at a different upstream node)
+# by instantiating this unit under different names, e.g.:
+#   sudo cp relay-node.service /etc/systemd/system/relay-node@sha3x-node1.service
+# and editing each copy's ExecStart -config path accordingly, OR by using a
+# systemd template unit (relay-node@.service) if your deployment tooling
+# prefers that convention -- left as an operator choice, not prescribed
+# here, since no existing convention in this repo dictates one.
+
+[Unit]
+Description=go-crypto-pool relay-node (standalone template-push / found-block relay daemon)
+Documentation=https://github.com/Snipa22/go-crypto-pool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/relay-node -config /etc/relay-node/relay-node.toml
+Restart=on-failure
+RestartSec=5s
+
+# relay-node never shells out and never writes to disk (no os/exec usage,
+# no local state/database) -- a strict, minimal sandbox is safe.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target
