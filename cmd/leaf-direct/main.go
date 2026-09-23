@@ -195,6 +195,46 @@ type config struct {
 	// confirmation.
 	legacyPoolID int
 
+	// legacyCheckinEnabled is LEAF_DIRECT_LEGACY_CHECKIN_ENABLED:
+	// whether the real legacy /poolCheckin heartbeat (see
+	// internal/leaflib/legacytransport/checkin.go) runs at all.
+	// Defaults to true (ENABLED) whenever legacyMode is also true --
+	// this is the OPEN DESIGN QUESTION flagged for Alex's review: the
+	// heartbeat is a genuinely separate concern from core share/block
+	// forwarding (pool-core's own routing/health-check side effect,
+	// not payout correctness), but this codebase's precedent (PR #133,
+	// legacy-mode's own all-or-nothing required-field validation) is
+	// to default to the safer, stricter option and let review be the
+	// safety net -- so this defaults to true rather than false. An
+	// operator who genuinely wants legacy share/block forwarding
+	// WITHOUT the heartbeat (e.g. running the Python sidecar a while
+	// longer during a staged rollout) can still set this to false
+	// explicitly. Ignored entirely when legacyMode is false.
+	legacyCheckinEnabled bool
+
+	// legacyCheckinAPIURL is LEAF_DIRECT_LEGACY_CHECKIN_API_URL: the
+	// legacy backend's real `config_api` base URL (e.g.
+	// "http://100.89.237.127:32322/poolApi/" in production) --
+	// legacytransport.Checkin appends "poolCheckin" itself. REQUIRED
+	// when legacyMode && legacyCheckinEnabled, ignored otherwise.
+	legacyCheckinAPIURL string
+
+	// legacyCheckinAuthToken is LEAF_DIRECT_LEGACY_CHECKIN_AUTH_TOKEN:
+	// the real `api_auth_token` secret, sent as the `x-pool-auth` HTTP
+	// header -- DELIBERATELY SEPARATE from -legacy-auth-key (the
+	// WSData.key checked on /leafApi): these are two distinct real
+	// secrets on the real legacy backend (confirmed from
+	// remoteShare.js's separate auth checks on /leafApi vs
+	// /poolApi/poolCheckin). Never logged. REQUIRED when
+	// legacyMode && legacyCheckinEnabled, ignored otherwise.
+	legacyCheckinAuthToken string
+
+	// legacyCheckinInterval overrides
+	// legacytransport.DefaultCheckinInterval (10s, matching the real
+	// legacy sender's exact cadence). Ignored when the heartbeat is
+	// not running.
+	legacyCheckinInterval time.Duration
+
 	// addressFlagsPollInterval configures the real, manual ban/
 	// forced-minimum-difficulty enforcement described in
 	// internal/leaflib/addressflags's package doc comment. Unlike
@@ -332,6 +372,10 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.legacyAuthKey, "legacy-auth-key", envOr("LEAF_DIRECT_LEGACY_AUTH_KEY", ""), "real legacy WSData.key secret (a plain string field checked server-side, NOT an HTTP header). Never logged. REQUIRED when -legacy-mode=true, ignored otherwise. Env: LEAF_DIRECT_LEGACY_AUTH_KEY")
 	flag.StringVar(&cfg.legacyPoolType, "legacy-pool-type", envOr("LEAF_DIRECT_LEGACY_POOL_TYPE", ""), "legacy backend payout-model value stamped onto every share/block forwarded in legacy mode: pplns|pps|prop|solo. Deliberately SEPARATE from -pool-type -- the legacy backend is a genuinely different deployment that may use a different payout model value. OPEN DESIGN QUESTION: confirm with Alex whether legacy-mode pool-type/pool-id should ever be allowed to just mirror -pool-type/-pool-id, or whether they must always be independently configured like this; defaulting to independent config here as the safer assumption. REQUIRED when -legacy-mode=true, ignored otherwise. Env: LEAF_DIRECT_LEGACY_POOL_TYPE")
 	flag.IntVar(&cfg.legacyPoolID, "legacy-pool-id", envOrInt("LEAF_DIRECT_LEGACY_POOL_ID", 0), "legacy backend pool-server-source identifier stamped onto every share/block forwarded in legacy mode, must be > 0. Deliberately SEPARATE from -pool-id -- same OPEN DESIGN QUESTION/rationale as -legacy-pool-type above; confirm with Alex. REQUIRED when -legacy-mode=true, ignored otherwise. Env: LEAF_DIRECT_LEGACY_POOL_ID")
+	flag.BoolVar(&cfg.legacyCheckinEnabled, "legacy-checkin-enabled", envOr("LEAF_DIRECT_LEGACY_CHECKIN_ENABLED", "true") == "true", "whether the real legacy /poolCheckin heartbeat (internal/leaflib/legacytransport/checkin.go) runs alongside legacy share/block forwarding. Defaults to true (enabled) whenever -legacy-mode=true. Ignored entirely when -legacy-mode=false. Env: LEAF_DIRECT_LEGACY_CHECKIN_ENABLED (\"false\" to disable while still forwarding shares/blocks in legacy mode)")
+	flag.StringVar(&cfg.legacyCheckinAPIURL, "legacy-checkin-api-url", envOr("LEAF_DIRECT_LEGACY_CHECKIN_API_URL", ""), "legacy backend's real config_api base URL for the /poolCheckin heartbeat, e.g. http://100.89.237.127:32322/poolApi/ -- the heartbeat appends poolCheckin itself. REQUIRED when -legacy-mode=true and -legacy-checkin-enabled=true (the default), ignored otherwise. Env: LEAF_DIRECT_LEGACY_CHECKIN_API_URL")
+	flag.StringVar(&cfg.legacyCheckinAuthToken, "legacy-checkin-auth-token", envOr("LEAF_DIRECT_LEGACY_CHECKIN_AUTH_TOKEN", ""), "real legacy api_auth_token secret sent as the x-pool-auth HTTP header on every /poolCheckin POST. DELIBERATELY SEPARATE from -legacy-auth-key (the WSData.key checked on /leafApi) -- these are two distinct real secrets on the real legacy backend. Never logged. REQUIRED when -legacy-mode=true and -legacy-checkin-enabled=true (the default), ignored otherwise. Env: LEAF_DIRECT_LEGACY_CHECKIN_AUTH_TOKEN")
+	flag.DurationVar(&cfg.legacyCheckinInterval, "legacy-checkin-interval", envOrDuration("LEAF_DIRECT_LEGACY_CHECKIN_INTERVAL", legacytransport.DefaultCheckinInterval), "how often the /poolCheckin heartbeat fires -- matches the real legacy sender's exact 10s cadence by default. Env: LEAF_DIRECT_LEGACY_CHECKIN_INTERVAL")
 
 	flag.StringVar(&cfg.submitNodesRaw, "submit-nodes", envOr("LEAF_DIRECT_SUBMIT_NODES", ""), "comma-separated list of ADDITIONAL Tari base node GRPC addresses (beyond -node-grpc-address, which is always included) to submit a genuine block find to, in real parallel. Env: LEAF_DIRECT_SUBMIT_NODES")
 
@@ -425,6 +469,11 @@ type fileConfig struct {
 	LegacyAuthKey    *string `toml:"legacy_auth_key"`
 	LegacyPoolType   *string `toml:"legacy_pool_type"`
 	LegacyPoolID     *int    `toml:"legacy_pool_id"`
+
+	LegacyCheckinEnabled         *bool   `toml:"legacy_checkin_enabled"`
+	LegacyCheckinAPIURL          *string `toml:"legacy_checkin_api_url"`
+	LegacyCheckinAuthToken       *string `toml:"legacy_checkin_auth_token"`
+	LegacyCheckinIntervalSeconds *int    `toml:"legacy_checkin_interval_seconds"`
 
 	SubmitNodesRaw *string `toml:"submit_nodes"`
 
@@ -542,6 +591,14 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.legacyAuthKey, fc.LegacyAuthKey, visited, "legacy-auth-key", "LEAF_DIRECT_LEGACY_AUTH_KEY")
 	cfgfile.ApplyString(&cfg.legacyPoolType, fc.LegacyPoolType, visited, "legacy-pool-type", "LEAF_DIRECT_LEGACY_POOL_TYPE")
 	cfgfile.ApplyInt(&cfg.legacyPoolID, fc.LegacyPoolID, visited, "legacy-pool-id", "LEAF_DIRECT_LEGACY_POOL_ID")
+
+	cfgfile.ApplyBool(&cfg.legacyCheckinEnabled, fc.LegacyCheckinEnabled, visited, "legacy-checkin-enabled", "LEAF_DIRECT_LEGACY_CHECKIN_ENABLED")
+	cfgfile.ApplyString(&cfg.legacyCheckinAPIURL, fc.LegacyCheckinAPIURL, visited, "legacy-checkin-api-url", "LEAF_DIRECT_LEGACY_CHECKIN_API_URL")
+	cfgfile.ApplyString(&cfg.legacyCheckinAuthToken, fc.LegacyCheckinAuthToken, visited, "legacy-checkin-auth-token", "LEAF_DIRECT_LEGACY_CHECKIN_AUTH_TOKEN")
+	if fc.LegacyCheckinIntervalSeconds != nil {
+		d := time.Duration(*fc.LegacyCheckinIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.legacyCheckinInterval, &d, visited, "legacy-checkin-interval", "LEAF_DIRECT_LEGACY_CHECKIN_INTERVAL")
+	}
 
 	cfgfile.ApplyString(&cfg.submitNodesRaw, fc.SubmitNodesRaw, visited, "submit-nodes", "LEAF_DIRECT_SUBMIT_NODES")
 
@@ -892,6 +949,14 @@ func requiredFieldsError(cfg config) error {
 		if cfg.legacyPoolID <= 0 {
 			return fmt.Errorf("LEAF_DIRECT_LEGACY_POOL_ID (or -legacy-pool-id) is required and must be a positive integer when -legacy-mode=true, got %d", cfg.legacyPoolID)
 		}
+		if cfg.legacyCheckinEnabled {
+			if strings.TrimSpace(cfg.legacyCheckinAPIURL) == "" {
+				return errors.New("LEAF_DIRECT_LEGACY_CHECKIN_API_URL (or -legacy-checkin-api-url) is required when -legacy-mode=true and -legacy-checkin-enabled=true (the default)")
+			}
+			if cfg.legacyCheckinAuthToken == "" {
+				return errors.New("LEAF_DIRECT_LEGACY_CHECKIN_AUTH_TOKEN (or -legacy-checkin-auth-token) is required when -legacy-mode=true and -legacy-checkin-enabled=true (the default)")
+			}
+		}
 	}
 	return nil
 }
@@ -952,6 +1017,37 @@ func resolveSubmitNodes(primary, raw string) []string {
 		out = append(out, addr)
 	}
 	return out
+}
+
+// connectionPortCounter implements legacytransport.PortMinerCounter
+// against this leaf's own *leaflib.ConnectionManager, deriving each
+// live connection's port from ManagedConnection.LocalAddr() (the
+// listener/port it was accepted on) rather than needing the
+// ConnectionManager itself to know anything about "ports" as a
+// concept. ports is the full set of configured port numbers (from
+// resolvePorts) so a port with zero current connections still reports
+// 0 rather than being silently absent from the heartbeat's ports map
+// -- matching the real legacy sender's own behavior of always
+// including every configured port.
+type connectionPortCounter struct {
+	cm    *leaflib.ConnectionManager
+	ports []int
+}
+
+// PortMinerCounts implements legacytransport.PortMinerCounter.
+func (c *connectionPortCounter) PortMinerCounts() map[int]int {
+	counts := make(map[int]int, len(c.ports))
+	for _, p := range c.ports {
+		counts[p] = 0
+	}
+	for _, mc := range c.cm.Snapshot() {
+		tcpAddr, ok := mc.LocalAddr().(*net.TCPAddr)
+		if !ok {
+			continue
+		}
+		counts[tcpAddr.Port]++
+	}
+	return counts
 }
 
 func main() {
@@ -1279,6 +1375,38 @@ func main() {
 		addressFlagsCache.Start(ctx)
 		server.EnableAddressFlags(addressFlagsCache)
 		logger.Printf("manual ban/forced-minimum-difficulty enforcement ENABLED, polling %s%s every %s", cfg.backendBaseURL, "/api/v1/leaf/address-flags", cfg.addressFlagsPollInterval)
+	}
+
+	// Real legacy /poolCheckin heartbeat (see
+	// internal/leaflib/legacytransport/checkin.go) -- legacy-mode-only,
+	// gated the exact same way every other legacy-mode feature in this
+	// binary is (cfg.legacyMode), plus its own independent
+	// -legacy-checkin-enabled toggle (default true -- see that flag's
+	// own doc comment for the open design question flagged for Alex).
+	// When either gate is off, this whole block is skipped: zero
+	// goroutines, zero dials, identical behavior to before this
+	// feature existed.
+	if cfg.legacyMode && cfg.legacyCheckinEnabled {
+		portNumbers := make([]int, 0, len(ports))
+		for _, p := range ports {
+			if _, portStr, splitErr := net.SplitHostPort(p.Address); splitErr == nil {
+				if n, convErr := strconv.Atoi(portStr); convErr == nil {
+					portNumbers = append(portNumbers, n)
+				}
+			}
+		}
+		checkin, err := legacytransport.NewCheckin(legacytransport.CheckinConfig{
+			APIURL: cfg.legacyCheckinAPIURL, AuthToken: cfg.legacyCheckinAuthToken,
+			PoolID: int32(cfg.legacyPoolID), Interval: cfg.legacyCheckinInterval,
+		})
+		if err != nil {
+			logger.Fatalf("failed to construct legacy checkin heartbeat: %v", err)
+		}
+		portCounter := &connectionPortCounter{cm: cm, ports: portNumbers}
+		go checkin.Run(ctx, jobManager, portCounter)
+		logger.Printf("LEGACY CHECKIN HEARTBEAT ENABLED: POSTing to %spoolCheckin every %s (legacy pool-id=%d, ports=%v)", cfg.legacyCheckinAPIURL, cfg.legacyCheckinInterval, cfg.legacyPoolID, portNumbers)
+	} else if cfg.legacyMode {
+		logger.Printf("legacy checkin heartbeat DISABLED by operator config (-legacy-checkin-enabled=false) -- legacy share/block forwarding continues normally, but pool-core's own routing/health-check logic may drain traffic from this leaf without it (see this binary's -legacy-checkin-enabled flag doc comment)")
 	}
 
 	if cfg.metricsListenAddress != "" {

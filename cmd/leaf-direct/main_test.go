@@ -540,6 +540,95 @@ func TestLoadConfigPrecedence(t *testing.T) {
 			},
 		},
 
+		// -- bool field: legacy-checkin-enabled (default TRUE, unlike ------
+		// -- legacy-mode itself, which defaults false) ----------------------
+		{
+			name: "legacy-checkin-enabled/default",
+			check: func(t *testing.T, cfg config) {
+				if !cfg.legacyCheckinEnabled {
+					t.Error("legacyCheckinEnabled = false, want hardcoded default true")
+				}
+			},
+		},
+		{
+			name: "legacy-checkin-enabled/flag-disables",
+			args: []string{"-legacy-checkin-enabled=false"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyCheckinEnabled {
+					t.Error("legacyCheckinEnabled = true, want flag value false")
+				}
+			},
+		},
+
+		// -- string field: legacy-checkin-api-url ----------------------------
+		{
+			name: "legacy-checkin-api-url/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyCheckinAPIURL != "" {
+					t.Errorf("legacyCheckinAPIURL = %q, want hardcoded default %q", cfg.legacyCheckinAPIURL, "")
+				}
+			},
+		},
+		{
+			name: "legacy-checkin-api-url/file-only",
+			toml: `legacy_checkin_api_url = "http://legacy.example.com:32322/poolApi/"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyCheckinAPIURL != "http://legacy.example.com:32322/poolApi/" {
+					t.Errorf("legacyCheckinAPIURL = %q, want file value", cfg.legacyCheckinAPIURL)
+				}
+			},
+		},
+		{
+			name: "legacy-checkin-api-url/env-only",
+			env:  map[string]string{"LEAF_DIRECT_LEGACY_CHECKIN_API_URL": "http://env.example.com:32322/poolApi/"},
+			toml: `legacy_checkin_api_url = "http://legacy.example.com:32322/poolApi/"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyCheckinAPIURL != "http://env.example.com:32322/poolApi/" {
+					t.Errorf("legacyCheckinAPIURL = %q, want env value (env must beat file)", cfg.legacyCheckinAPIURL)
+				}
+			},
+		},
+		{
+			name: "legacy-checkin-api-url/flag-only",
+			args: []string{"-legacy-checkin-api-url=http://flag.example.com:32322/poolApi/"},
+			toml: `legacy_checkin_api_url = "http://legacy.example.com:32322/poolApi/"`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyCheckinAPIURL != "http://flag.example.com:32322/poolApi/" {
+					t.Errorf("legacyCheckinAPIURL = %q, want flag value (flag must beat env absence and file)", cfg.legacyCheckinAPIURL)
+				}
+			},
+		},
+
+		// -- string field: legacy-checkin-auth-token -------------------------
+		{
+			name: "legacy-checkin-auth-token/flag-only",
+			args: []string{"-legacy-checkin-auth-token=the-token"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyCheckinAuthToken != "the-token" {
+					t.Errorf("legacyCheckinAuthToken = %q, want flag value", cfg.legacyCheckinAuthToken)
+				}
+			},
+		},
+
+		// -- duration field: legacy-checkin-interval -------------------------
+		{
+			name: "legacy-checkin-interval/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyCheckinInterval != 10*time.Second {
+					t.Errorf("legacyCheckinInterval = %v, want hardcoded default 10s (real legacy cadence)", cfg.legacyCheckinInterval)
+				}
+			},
+		},
+		{
+			name: "legacy-checkin-interval/flag-only",
+			args: []string{"-legacy-checkin-interval=30s"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.legacyCheckinInterval != 30*time.Second {
+					t.Errorf("legacyCheckinInterval = %v, want flag value 30s", cfg.legacyCheckinInterval)
+				}
+			},
+		},
+
 		// -- string field: legacy-pool-type ----------------------------------
 		{
 			name: "legacy-pool-type/default",

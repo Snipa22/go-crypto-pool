@@ -114,6 +114,14 @@ func (mc *ManagedConnection) ID() uint64 { return mc.id }
 // RemoteAddr returns the remote address captured at accept time.
 func (mc *ManagedConnection) RemoteAddr() net.Addr { return mc.remote }
 
+// LocalAddr returns the underlying connection's local (server-side)
+// address -- i.e. which listener/port this connection was accepted on.
+// Used by cmd/leaf-direct's legacy-mode /poolCheckin heartbeat to build
+// a real per-port connected-miner-count breakdown (see
+// internal/leaflib/legacytransport/checkin.go) without this package
+// needing to know anything about "ports" as a concept itself.
+func (mc *ManagedConnection) LocalAddr() net.Addr { return mc.conn.LocalAddr() }
+
 // Context returns the connection's lifetime context. It is cancelled the
 // moment the connection starts closing (for any reason), so caller
 // goroutines (e.g. a per-connection read loop or vardiff timer) can select
