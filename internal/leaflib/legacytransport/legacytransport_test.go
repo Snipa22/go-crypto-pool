@@ -27,11 +27,16 @@ func TestBuildLegacyShare_HappyPath(t *testing.T) {
 		PaymentId:      proto.String("pid-1"),
 		PoolType:       poolpb.PoolType_POOL_TYPE_PPLNS,
 		PoolId:         999, // must NOT be used -- own legacyPoolID used instead
-		BlockDiff:      12345,
-		BlockHeight:    500000,
-		Timestamp:      1700000000,
-		Identifier:     "worker-1",
-		TrustedShare:   true,
+		// BlockDiff (share weight, NOT network difficulty -- see
+		// poolpb.Share.network_diff's doc comment) is deliberately
+		// NOT what legacy's BlockDiff maps from; NetworkDiff is the
+		// real source now (bug fix, 2026-09-23).
+		BlockDiff:    12345,
+		NetworkDiff:  30238431225,
+		BlockHeight:  500000,
+		Timestamp:    1700000000,
+		Identifier:   "worker-1",
+		TrustedShare: true,
 	}
 
 	legacyShare, err := buildLegacyShare(share, legacypb.POOLTYPE_PPLNS, 42)
@@ -62,8 +67,8 @@ func TestBuildLegacyShare_HappyPath(t *testing.T) {
 	if legacyShare.GetPoolID() != 42 {
 		t.Errorf("PoolID = %d, want 42 (the transport's own configured legacy pool ID, not the incoming share's pool_id=999)", legacyShare.GetPoolID())
 	}
-	if legacyShare.GetBlockDiff() != 12345 {
-		t.Errorf("BlockDiff = %d, want 12345", legacyShare.GetBlockDiff())
+	if legacyShare.GetBlockDiff() != 30238431225 {
+		t.Errorf("BlockDiff = %d, want 30238431225 (share.network_diff, NOT share.block_diff=12345 -- bug fix, 2026-09-23)", legacyShare.GetBlockDiff())
 	}
 	if legacyShare.GetBitcoin() != false {
 		t.Errorf("Bitcoin = %v, want false always", legacyShare.GetBitcoin())
@@ -71,8 +76,8 @@ func TestBuildLegacyShare_HappyPath(t *testing.T) {
 	if legacyShare.GetBlockHeight() != 500000 {
 		t.Errorf("BlockHeight = %d, want 500000", legacyShare.GetBlockHeight())
 	}
-	if legacyShare.GetTimestamp() != 1700000000 {
-		t.Errorf("Timestamp = %d, want 1700000000", legacyShare.GetTimestamp())
+	if legacyShare.GetTimestamp() != 1700000000000 {
+		t.Errorf("Timestamp = %d, want 1700000000000 (share.timestamp=1700000000 seconds * 1000 -- legacy expects milliseconds, bug fix 2026-09-23)", legacyShare.GetTimestamp())
 	}
 	if legacyShare.GetIdentifier() != "worker-1" {
 		t.Errorf("Identifier = %q, want %q", legacyShare.GetIdentifier(), "worker-1")
