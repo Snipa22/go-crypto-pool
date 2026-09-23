@@ -234,7 +234,12 @@ relay_subject = ""
 
 # NATS subject for the template (new-tip) relay fast-invalidation broadcast
 # (empty = relay.DefaultTemplateSubject). Reuses the SAME relay_nats_url
-# connection above -- no second NATS URL. (default: "")
+# connection above -- no second NATS URL. Fully active: this leaf-direct's
+# JobManager publishes a TemplateMessage on every genuine local tip increase
+# and subscribes to sibling instances' template messages for immediate
+# per-xn job-cache invalidation (see internal/leaflib/solo/job.go's
+# tipPollLoop/startTemplateRelaySubscription) -- a real latency win across
+# the leaf fleet whenever relay_nats_url is configured. (default: "")
 template_relay_subject = ""
 
 # Optional NATS username for the relay connection above (mirrors
