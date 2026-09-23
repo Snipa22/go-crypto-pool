@@ -175,6 +175,27 @@ message Share {
   // trusted_share carried over from the legacy schema — actively used in
   // production (accounting/payout trust-boundary flag), do not drop.
   bool trusted_share = 16;
+
+  // network_diff is the REAL network/block target difficulty a share's
+  // hash must beat to constitute a genuine block find (populated from
+  // solo.Job.NetworkTargetDifficulty at submit time) -- NOT the same
+  // thing as block_diff (field 9) above, which despite its name is,
+  // today, actually the session's own current vardiff/share-weight
+  // value (identical to `shares`), because internal/backend/db's
+  // address-difficulty-floor enforcement (checkAddressFlags,
+  // migrations/0004_address_flags.up.sql) deliberately reads
+  // Share.block_diff as "the difficulty this share was submitted at"
+  // to enforce an operator-set per-address floor, independent of the
+  // leaf's own vardiff. Renaming/repurposing block_diff itself for
+  // legacy's real network-difficulty need would silently defeat that
+  // floor enforcement for the normal (non-legacy) backend path (real
+  // network difficulty is always vastly larger than any sane floor),
+  // so this is a NEW, additive field instead. legacytransport's
+  // buildLegacyShare is the only current consumer -- it maps this
+  // field onto the legacy Share.block_diff wire field, which the real
+  // legacy nodejs-pool-sxmr backend DOES expect to be genuine network
+  // difficulty (confirmed via live tcpdump capture, 2026-09-23).
+  int64 network_diff = 17;
 }
 
 // Block represents a block found and reported by a leaf.
