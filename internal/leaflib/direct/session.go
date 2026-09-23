@@ -980,9 +980,12 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// s.server.forwardPool exactly like forwardShare above (see
 		// that call site's own doc comment for the full rationale,
 		// including why this uses TrySubmit rather than Submit) --
-		// forwardBlock's own timeout is even longer (10s), so leaving
-		// it inline here would tie up a randomxPool worker for an
-		// even longer span on the (rare, but real) block-find path.
+		// forwardBlock's own outer timeout (s.server.blockForwardTimeout,
+		// 10s by default, but set far longer in legacy mode -- see
+		// ServerConfig.BlockForwardTimeout's doc comment) is even
+		// longer, so leaving it inline here would tie up a randomxPool
+		// worker for an even longer span on the (rare, but real)
+		// block-find path.
 		if skipBackendForward {
 			s.server.logger.Printf("direct: NOT forwarding block find to backend for session %s (job %s, height %d) -- real hash unresolved, see the MONERO BLOCK HASH UNRESOLVED log line above", s.sessionID, job.ID, job.Height)
 		} else if ok := s.server.forwardPool.TrySubmit(func() { s.forwardBlock(share, job, blockHashHex, "") }); !ok {
@@ -1187,7 +1190,7 @@ func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex 
 	if mergeMineChain != "" {
 		pbBlock.MergeMineChain = &mergeMineChain
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.server.blockForwardTimeout)
 	defer cancel()
 	if err := s.server.transport.SubmitBlock(ctx, pbBlock); err != nil {
 		s.server.logger.Printf("direct: failed to report found block to backend for session %s: %v", s.sessionID, err)

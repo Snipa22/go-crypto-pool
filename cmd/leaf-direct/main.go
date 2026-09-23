@@ -235,6 +235,28 @@ type config struct {
 	// not running.
 	legacyCheckinInterval time.Duration
 
+	// legacyBlockRetryBudget is LEAF_DIRECT_LEGACY_BLOCK_RETRY_BUDGET:
+	// the total wall-clock budget legacytransport.LegacyTransport's
+	// SubmitBlock retry-with-backoff loop is allowed before giving up
+	// on a found block that keeps getting a non-2xx response from the
+	// legacy backend (see legacytransport.DefaultBlockSubmitRetryBudget's
+	// doc comment for the full 2026-09-23 production-incident
+	// rationale: a genuine mainnet block find was permanently lost
+	// because the legacy backend's own chain view hadn't synced yet at
+	// the single moment of a one-shot submission). Defaults to
+	// legacytransport.DefaultBlockSubmitRetryBudget (5 MINUTES --
+	// Alex's explicit direction, 2026-09-23) when unset/zero. Ignored
+	// entirely when legacyMode is false (the normal, non-legacy
+	// transport.HTTPProtobufTransport has no retry loop at all).
+	//
+	// IMPORTANT: this value also drives the outer forwardBlock ctx
+	// timeout (direct.ServerConfig.BlockForwardTimeout, set from this
+	// value + slack below) -- the two are deliberately kept in sync so
+	// the retry loop this flag configures actually gets to run its
+	// full intended budget rather than being cut short by its own
+	// caller.
+	legacyBlockRetryBudget time.Duration
+
 	// addressFlagsPollInterval configures the real, manual ban/
 	// forced-minimum-difficulty enforcement described in
 	// internal/leaflib/addressflags's package doc comment. Unlike
@@ -376,6 +398,7 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.legacyCheckinAPIURL, "legacy-checkin-api-url", envOr("LEAF_DIRECT_LEGACY_CHECKIN_API_URL", ""), "legacy backend's real config_api base URL for the /poolCheckin heartbeat, e.g. http://100.89.237.127:32322/poolApi/ -- the heartbeat appends poolCheckin itself. REQUIRED when -legacy-mode=true and -legacy-checkin-enabled=true (the default), ignored otherwise. Env: LEAF_DIRECT_LEGACY_CHECKIN_API_URL")
 	flag.StringVar(&cfg.legacyCheckinAuthToken, "legacy-checkin-auth-token", envOr("LEAF_DIRECT_LEGACY_CHECKIN_AUTH_TOKEN", ""), "real legacy api_auth_token secret sent as the x-pool-auth HTTP header on every /poolCheckin POST. DELIBERATELY SEPARATE from -legacy-auth-key (the WSData.key checked on /leafApi) -- these are two distinct real secrets on the real legacy backend. Never logged. REQUIRED when -legacy-mode=true and -legacy-checkin-enabled=true (the default), ignored otherwise. Env: LEAF_DIRECT_LEGACY_CHECKIN_AUTH_TOKEN")
 	flag.DurationVar(&cfg.legacyCheckinInterval, "legacy-checkin-interval", envOrDuration("LEAF_DIRECT_LEGACY_CHECKIN_INTERVAL", legacytransport.DefaultCheckinInterval), "how often the /poolCheckin heartbeat fires -- matches the real legacy sender's exact 10s cadence by default. Env: LEAF_DIRECT_LEGACY_CHECKIN_INTERVAL")
+	flag.DurationVar(&cfg.legacyBlockRetryBudget, "legacy-block-retry-budget", envOrDuration("LEAF_DIRECT_LEGACY_BLOCK_RETRY_BUDGET", legacytransport.DefaultBlockSubmitRetryBudget), "total wall-clock budget legacytransport's SubmitBlock retry-with-backoff loop keeps retrying a found block against the legacy backend before giving up (real production-incident fix, 2026-09-23: absorbs the legacy backend's own transient chain-sync-lag race that previously permanently lost a genuine mainnet block find). Defaults to 5 minutes (Alex's explicit direction, superseding an earlier 60-120s draft). Ignored when -legacy-mode=false. Env: LEAF_DIRECT_LEGACY_BLOCK_RETRY_BUDGET")
 
 	flag.StringVar(&cfg.submitNodesRaw, "submit-nodes", envOr("LEAF_DIRECT_SUBMIT_NODES", ""), "comma-separated list of ADDITIONAL Tari base node GRPC addresses (beyond -node-grpc-address, which is always included) to submit a genuine block find to, in real parallel. Env: LEAF_DIRECT_SUBMIT_NODES")
 
@@ -470,10 +493,11 @@ type fileConfig struct {
 	LegacyPoolType   *string `toml:"legacy_pool_type"`
 	LegacyPoolID     *int    `toml:"legacy_pool_id"`
 
-	LegacyCheckinEnabled         *bool   `toml:"legacy_checkin_enabled"`
-	LegacyCheckinAPIURL          *string `toml:"legacy_checkin_api_url"`
-	LegacyCheckinAuthToken       *string `toml:"legacy_checkin_auth_token"`
-	LegacyCheckinIntervalSeconds *int    `toml:"legacy_checkin_interval_seconds"`
+	LegacyCheckinEnabled          *bool   `toml:"legacy_checkin_enabled"`
+	LegacyCheckinAPIURL           *string `toml:"legacy_checkin_api_url"`
+	LegacyCheckinAuthToken        *string `toml:"legacy_checkin_auth_token"`
+	LegacyCheckinIntervalSeconds  *int    `toml:"legacy_checkin_interval_seconds"`
+	LegacyBlockRetryBudgetSeconds *int    `toml:"legacy_block_retry_budget_seconds"`
 
 	SubmitNodesRaw *string `toml:"submit_nodes"`
 
@@ -598,6 +622,10 @@ func applyConfigFile(cfg *config) error {
 	if fc.LegacyCheckinIntervalSeconds != nil {
 		d := time.Duration(*fc.LegacyCheckinIntervalSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.legacyCheckinInterval, &d, visited, "legacy-checkin-interval", "LEAF_DIRECT_LEGACY_CHECKIN_INTERVAL")
+	}
+	if fc.LegacyBlockRetryBudgetSeconds != nil {
+		d := time.Duration(*fc.LegacyBlockRetryBudgetSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.legacyBlockRetryBudget, &d, visited, "legacy-block-retry-budget", "LEAF_DIRECT_LEGACY_BLOCK_RETRY_BUDGET")
 	}
 
 	cfgfile.ApplyString(&cfg.submitNodesRaw, fc.SubmitNodesRaw, visited, "submit-nodes", "LEAF_DIRECT_SUBMIT_NODES")
@@ -1239,6 +1267,7 @@ func main() {
 			BackendBaseURL: cfg.legacyBackendURL, AuthKey: cfg.legacyAuthKey,
 			LegacyPoolType: legacyPoolType, LegacyPoolID: int32(cfg.legacyPoolID),
 			ShareTimeout: cfg.backendShareTimeout, BlockTimeout: cfg.backendBlockTimeout,
+			BlockSubmitRetryBudget: cfg.legacyBlockRetryBudget, Logger: logger,
 		})
 		if err != nil {
 			logger.Fatalf("failed to construct legacy backend transport: %v", err)
@@ -1298,14 +1327,34 @@ func main() {
 	if isMoneroFamilyCoin(cfg.coin) {
 		moneroHeaderURL = cfg.monerodURL
 	}
+	// BUG FIX (2026-09-23, real production incident -- see
+	// legacytransport.DefaultBlockSubmitRetryBudget's doc comment):
+	// forwardBlock's own outer ctx timeout (ServerConfig.
+	// BlockForwardTimeout) must comfortably exceed whatever retry
+	// budget the legacy transport is actually configured with, or
+	// the retry loop gets killed early by its own caller. Only
+	// meaningful in legacy mode -- the normal transport.
+	// HTTPProtobufTransport has no retry loop, so this leaves
+	// blockForwardTimeout at direct.NewServer's own 10s default
+	// (zero value here) for every non-legacy-mode deployment,
+	// exactly preserving today's behavior.
+	var blockForwardTimeout time.Duration
+	if cfg.legacyMode {
+		// +30s slack on top of the retry budget: the final retry
+		// attempt still needs its own full per-attempt BlockTimeout
+		// to run to completion (or fail) AFTER the budget's deadline
+		// is checked, plus scheduling/network jitter headroom.
+		blockForwardTimeout = cfg.legacyBlockRetryBudget + cfg.backendBlockTimeout + 30*time.Second
+	}
 	server := direct.NewServer(direct.ServerConfig{
 		ConnectionManager: cm, JobManager: jobManager, Node: node, Validators: validators,
 		Network: networkFromString(cfg.network), Logger: logger, Vardiff: vardiffCfg,
 		Transport: backendTransport, MultiSubmit: multiSubmit, Relay: blockRelay,
 		Algo: resolveAlgo(cfg), PoolType: poolType, PoolID: int32(cfg.poolID),
-		Debug:           debugLogger,
-		MonerodURL:      moneroHeaderURL,
-		MergeMineChains: parseMergeMineChains(cfg.mergeMineChains, logger),
+		Debug:               debugLogger,
+		MonerodURL:          moneroHeaderURL,
+		MergeMineChains:     parseMergeMineChains(cfg.mergeMineChains, logger),
+		BlockForwardTimeout: blockForwardTimeout,
 	})
 	defer server.Shutdown()
 

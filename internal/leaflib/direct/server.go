@@ -185,6 +185,14 @@ type Server struct {
 	// s.server.debugLogger). nil is a complete no-op.
 	debugLogger *leaflib.DebugLogger
 
+	// blockForwardTimeout mirrors ServerConfig.BlockForwardTimeout
+	// exactly -- see that field's doc comment for the full 2026-09-23
+	// rationale. Always a positive duration (NewServer applies the
+	// 10*time.Second default when ServerConfig.BlockForwardTimeout is
+	// zero/negative) -- session.go's forwardBlock reads this directly,
+	// never the zero value.
+	blockForwardTimeout time.Duration
+
 	// moneroHeaderResolver, if non-nil, is this Server's real
 	// monerod get_block_header_by_height client (monero_hash.go),
 	// used ONLY by session.go's handleSubmit to resolve the REAL,
@@ -339,6 +347,32 @@ type ServerConfig struct {
 	// handling then behaves exactly as before this feature existed
 	// (single Monero-leg-only forward).
 	MergeMineChains []MergeMineChainConfig
+
+	// BlockForwardTimeout bounds forwardBlock's own outer ctx wrapping
+	// the ENTIRE transport.ShareTransport.SubmitBlock call (session.go)
+	// -- this is a caller-side bound, separate from and layered on top
+	// of whatever internal per-attempt/retry-budget bounding the
+	// configured Transport implementation applies itself (e.g.
+	// legacytransport.LegacyTransport's own BlockSubmitRetryBudget,
+	// added 2026-09-23 -- see that field's doc comment for the real
+	// production incident this reconciles).
+	//
+	// BUG FIX (2026-09-23, same incident as the retry-budget fix
+	// above): this used to be a hardcoded 10*time.Second in
+	// forwardBlock, which is far shorter than legacytransport's new,
+	// intentionally-generous 5-minute default retry budget -- an
+	// unconfigured/zero value here would silently cancel SubmitBlock's
+	// ctx and kill its retry loop after only 10s, defeating the whole
+	// point of the retry fix for exactly the slow-legacy-backend case
+	// it exists to absorb. Zero/negative falls back to 10*time.Second
+	// (NewServer's own default, preserving the exact pre-fix behavior
+	// for every caller that does not explicitly set this -- i.e. every
+	// existing non-legacy-mode deployment using the normal
+	// transport.HTTPProtobufTransport, which has no retry loop of its
+	// own to protect). cmd/leaf-direct/main.go sets this explicitly
+	// (to comfortably exceed -legacy-block-retry-budget) whenever
+	// -legacy-mode is enabled.
+	BlockForwardTimeout time.Duration
 }
 
 // MergeMineChainConfig names ONE merge-mined chain this Server's
@@ -389,6 +423,14 @@ func NewServer(cfg ServerConfig) *Server {
 		// the full rationale/sizing.
 		forwardPool: solo.NewAsyncValidationPool(defaultForwardPoolWorkers, solo.AsyncValidationQueueSize),
 		debugLogger: cfg.Debug,
+	}
+	// defaultBlockForwardTimeout preserves this field's exact pre-fix
+	// value (2026-09-23) for every caller that does not explicitly set
+	// ServerConfig.BlockForwardTimeout -- see that field's doc comment.
+	const defaultBlockForwardTimeout = 10 * time.Second
+	s.blockForwardTimeout = cfg.BlockForwardTimeout
+	if s.blockForwardTimeout <= 0 {
+		s.blockForwardTimeout = defaultBlockForwardTimeout
 	}
 	if strings.TrimSpace(cfg.MonerodURL) != "" {
 		s.moneroHeaderResolver = NewMoneroBlockHeaderClient(cfg.MonerodURL)

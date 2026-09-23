@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -498,7 +499,15 @@ func TestSubmitBlock_400Response_ReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tr, err := New(Config{BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1})
+	// Short retry budget/interval -- this test intentionally exercises
+	// the "give up cleanly once the budget is exhausted" path (see
+	// TestSubmitBlock_RetriesUntilBudgetExhaustedThenGivesUpCleanly for
+	// the fuller version with attempt-count assertions); it must not
+	// take the real 5-minute default budget to run.
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		BlockSubmitRetryBudget: 50 * time.Millisecond, BlockSubmitRetryInterval: 10 * time.Millisecond,
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -583,5 +592,180 @@ func TestNew_RequiresBackendBaseURL(t *testing.T) {
 func TestNew_RequiresAuthKey(t *testing.T) {
 	if _, err := New(Config{BackendBaseURL: "https://example.com"}); err == nil {
 		t.Fatal("expected error for empty AuthKey, got nil")
+	}
+}
+
+// --- SubmitBlock retry-with-backoff tests (2026-09-23 production fix) ---
+
+// TestSubmitBlock_RetriesThenSucceedsWithinBudget proves the core fix:
+// a backend that returns non-2xx N times then 200 is retried and
+// SubmitBlock eventually returns success, well within the configured
+// budget. This is the exact real-world shape of the 2026-09-23
+// incident (height 351096) -- the legacy backend's own chain view
+// catches up after a few attempts, and this must no longer be a
+// permanent, unrecoverable failure.
+func TestSubmitBlock_RetriesThenSucceedsWithinBudget(t *testing.T) {
+	var attempts int32
+	const failuresBeforeSuccess = 3
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attempts, 1)
+		if n <= failuresBeforeSuccess {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		BlockSubmitRetryBudget: 2 * time.Second, BlockSubmitRetryInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	block := &poolpb.Block{Hash: "0xretry", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS, Height: 351096}
+
+	start := time.Now()
+	if err := tr.SubmitBlock(context.Background(), block); err != nil {
+		t.Fatalf("SubmitBlock: expected eventual success, got error: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if got := atomic.LoadInt32(&attempts); got != failuresBeforeSuccess+1 {
+		t.Errorf("server received %d attempts, want %d (failures + 1 success)", got, failuresBeforeSuccess+1)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("SubmitBlock took %v, want well under the 2s configured budget", elapsed)
+	}
+}
+
+// TestSubmitBlock_GivesUpCleanlyWhenBudgetExhausted proves the "never
+// retry forever" half of the fix: a backend that ALWAYS returns
+// non-2xx must make SubmitBlock return a real, clear error once the
+// configured retry budget is exhausted -- not hang, and not silently
+// succeed.
+func TestSubmitBlock_GivesUpCleanlyWhenBudgetExhausted(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	budget := 150 * time.Millisecond
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		BlockSubmitRetryBudget: budget, BlockSubmitRetryInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	block := &poolpb.Block{Hash: "0xnever", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS}
+
+	start := time.Now()
+	err = tr.SubmitBlock(context.Background(), block)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a real error once the retry budget is exhausted, got nil")
+	}
+	// Bounded: must not hang well past the configured budget (some
+	// slack for the in-flight final attempt/scheduling jitter, but
+	// nowhere near the package's 5-minute DEFAULT budget -- proving
+	// this genuinely respects the configured budget rather than
+	// falling back to the default or retrying forever).
+	if elapsed > 2*time.Second {
+		t.Fatalf("SubmitBlock took %v to give up, want well under 2s given a %v configured budget (must never hang/retry forever)", elapsed, budget)
+	}
+	if got := atomic.LoadInt32(&attempts); got < 2 {
+		t.Errorf("server received %d attempts, want at least 2 (proving it actually retried, not just failed once)", got)
+	}
+}
+
+// TestSubmitBlock_RespectsCallerContextCancellation proves the retry
+// loop does not out-live the caller's own ctx -- e.g. session.go's
+// forwardBlock context.WithTimeout wrapping the whole call (see that
+// method's own fix for this exact scenario).
+func TestSubmitBlock_RespectsCallerContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		// A budget far longer than the ctx below -- the ctx deadline,
+		// not the budget, must be what actually cuts this short.
+		BlockSubmitRetryBudget: time.Minute, BlockSubmitRetryInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	block := &poolpb.Block{Hash: "0xctx", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS}
+
+	start := time.Now()
+	err = tr.SubmitBlock(ctx, block)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error once the caller's ctx is done, got nil")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SubmitBlock took %v, want well under 2s given a 100ms caller ctx timeout (must not out-live the caller's own deadline)", elapsed)
+	}
+}
+
+// TestSubmitShare_NeverRetries proves the retry logic added to
+// SubmitBlock does NOT leak into SubmitShare -- shares are still
+// fire-and-forget/best-effort by original design (see SubmitShare's
+// own doc comment), so a non-2xx response must still fail on the
+// FIRST attempt, with no retry/backoff delay at all.
+func TestSubmitShare_NeverRetries(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	// A generous retry budget/short interval configured on the
+	// transport (as if SubmitBlock's retry were mistakenly shared) --
+	// if SubmitShare respected this at all, this test would be slow
+	// and/or see more than one attempt. It must see neither.
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		BlockSubmitRetryBudget: 5 * time.Second, BlockSubmitRetryInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	share := &poolpb.Share{
+		Shares: 1, PaymentAddress: "addr", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS, Identifier: "w",
+	}
+
+	start := time.Now()
+	if err := tr.SubmitShare(context.Background(), share); err == nil {
+		t.Fatal("expected error for 400 response, got nil")
+	}
+	elapsed := time.Since(start)
+
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("server received %d attempts, want exactly 1 (SubmitShare must never retry)", got)
+	}
+	if elapsed > time.Second {
+		t.Errorf("SubmitShare took %v, want near-instant (no retry/backoff delay)", elapsed)
 	}
 }
