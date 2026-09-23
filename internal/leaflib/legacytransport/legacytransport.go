@@ -54,6 +54,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"time"
@@ -71,6 +72,61 @@ import (
 const (
 	DefaultShareTimeout = 5 * time.Second
 	DefaultBlockTimeout = 5 * time.Second
+
+	// DefaultBlockSubmitRetryBudget/DefaultBlockSubmitRetryInterval
+	// bound SubmitBlock's real retry-with-backoff loop (added
+	// 2026-09-23 -- see this const block's own doc comment below and
+	// SubmitBlock's doc comment for the full incident this fixes).
+	//
+	// REAL PRODUCTION INCIDENT (2026-09-23): a genuine mainnet RXT
+	// block find (height 351096, hash
+	// 0218c4edd0737f4f97f56ae422d71a8fa5f24f02609214dafab0b4def0ef8d86)
+	// was permanently lost from the pool's accounting DB because this
+	// package's single-attempt SubmitBlock treated the legacy
+	// backend's real, transient "my own chain view hasn't synced to
+	// this hash yet" HTTP 400 as a permanent failure and gave up.
+	// Re-querying the exact same hash against the exact same RPC
+	// endpoint minutes later returned a perfectly valid result --
+	// this was a genuine timing race, not a data/hash-format bug.
+	//
+	// The ORIGINAL legacy sender this package replaces
+	// (nodejs-pool-tari-internal's lib/remote_comms.js,
+	// this.storeBlock) retried the SAME POST indefinitely
+	// (`forever: true`, an async.doUntil loop) until it got a 200,
+	// specifically to absorb exactly this class of backend-chain-
+	// sync-lag race. This package deliberately does NOT reproduce
+	// "indefinitely" -- an unbounded retry loop risks hanging this
+	// leaf's forward-pool worker forever on a genuinely bad/
+	// malformed block that will NEVER succeed -- but it does need a
+	// real, generously-sized bounded retry window to absorb the same
+	// real-world propagation lag the original sender was built to
+	// tolerate.
+	//
+	// BUDGET (Alex's explicit direction, 2026-09-23, superseding this
+	// package's own first-draft 60-120s suggestion): 5 MINUTES, not
+	// 60-120 seconds. Real propagation lag on this network is
+	// typically a few seconds to low tens of seconds based on the
+	// 2026-09-23 incident, but Alex's call is to leave substantially
+	// more headroom than that observed range -- a genuinely wedged/
+	// unusually-slow-syncing legacy backend should still get a fair
+	// shot at catching up before this leaf gives up and the find is
+	// lost, and losing one real block's accounting is a far worse
+	// outcome than one extra forwardPool worker being tied up for a
+	// few minutes on the rare block-find path (forwardBlock already
+	// runs on the dedicated, bounded forwardPool -- see
+	// direct/session.go's forwardBlock doc comment -- not on any
+	// hot/latency-sensitive path).
+	//
+	// INTERVAL: fixed 5s -- deliberately NOT exponential. The real
+	// failure mode here is "the backend's local chain view is a few
+	// seconds to low tens of seconds behind", a roughly-fixed-latency
+	// condition, not a load/congestion condition where exponential
+	// backoff's growing-gap behavior would help; a flat 5s interval
+	// gets more attempts into the same total budget while still
+	// being gentle enough not to hammer the backend (60 attempts
+	// over the full 5-minute budget in the worst case).
+	DefaultBlockSubmitRetryBudget   = 5 * time.Minute
+	DefaultBlockSubmitRetryInterval = 5 * time.Second
 
 	// leafAPIPath is the real, fixed nodejs-pool-sxmr endpoint path --
 	// see lib/remoteShare.js's app.post('/leafApi', ...) registration.
@@ -129,6 +185,33 @@ type Config struct {
 	// doubles). If nil, a client with a conservative default Timeout is
 	// constructed.
 	HTTPClient *http.Client
+
+	// BlockSubmitRetryBudget bounds the TOTAL wall-clock time
+	// SubmitBlock's retry loop is allowed to keep retrying a failed
+	// block submission before giving up and returning a real error
+	// (see DefaultBlockSubmitRetryBudget's doc comment for the full
+	// 2026-09-23 production-incident rationale). This is a SEPARATE,
+	// OUTER bound from BlockTimeout above: BlockTimeout still bounds
+	// each individual HTTP call exactly as before; this field bounds
+	// the whole retry loop wrapping potentially many such calls.
+	// Zero/negative falls back to DefaultBlockSubmitRetryBudget.
+	// Never applies to SubmitShare -- see that method's doc comment
+	// for why a share submission has no meaningful retry semantics.
+	BlockSubmitRetryBudget time.Duration
+
+	// BlockSubmitRetryInterval is the fixed delay between retry
+	// attempts within BlockSubmitRetryBudget (see
+	// DefaultBlockSubmitRetryInterval's doc comment for why this is a
+	// flat interval rather than exponential backoff). Zero/negative
+	// falls back to DefaultBlockSubmitRetryInterval.
+	BlockSubmitRetryInterval time.Duration
+
+	// Logger receives an escalating warning line on every failed
+	// SubmitBlock attempt that is about to be retried (never fatal --
+	// the loop itself decides whether to give up, see SubmitBlock's
+	// doc comment). If nil, log.Default() is used. Mirrors
+	// CheckinConfig.Logger's identical convention exactly.
+	Logger *log.Logger
 }
 
 // LegacyTransport is a transport.ShareTransport implementation that
@@ -143,6 +226,14 @@ type LegacyTransport struct {
 	shareTimeout time.Duration
 	blockTimeout time.Duration
 	client       *http.Client
+
+	// blockRetryBudget/blockRetryInterval/logger back
+	// SubmitBlock's retry-with-backoff loop only -- see
+	// Config.BlockSubmitRetryBudget's doc comment. Never consulted
+	// by SubmitShare.
+	blockRetryBudget   time.Duration
+	blockRetryInterval time.Duration
+	logger             *log.Logger
 }
 
 // New constructs a LegacyTransport from cfg. Returns an error if
@@ -173,14 +264,30 @@ func New(cfg Config) (*LegacyTransport, error) {
 		client = &http.Client{Timeout: maxTimeout + 5*time.Second}
 	}
 
+	blockRetryBudget := cfg.BlockSubmitRetryBudget
+	if blockRetryBudget <= 0 {
+		blockRetryBudget = DefaultBlockSubmitRetryBudget
+	}
+	blockRetryInterval := cfg.BlockSubmitRetryInterval
+	if blockRetryInterval <= 0 {
+		blockRetryInterval = DefaultBlockSubmitRetryInterval
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.Default()
+	}
+
 	return &LegacyTransport{
-		baseURL:      trimTrailingSlash(cfg.BackendBaseURL),
-		authKey:      cfg.AuthKey,
-		poolType:     cfg.LegacyPoolType,
-		poolID:       cfg.LegacyPoolID,
-		shareTimeout: shareTimeout,
-		blockTimeout: blockTimeout,
-		client:       client,
+		baseURL:            trimTrailingSlash(cfg.BackendBaseURL),
+		authKey:            cfg.AuthKey,
+		poolType:           cfg.LegacyPoolType,
+		poolID:             cfg.LegacyPoolID,
+		shareTimeout:       shareTimeout,
+		blockTimeout:       blockTimeout,
+		client:             client,
+		blockRetryBudget:   blockRetryBudget,
+		blockRetryInterval: blockRetryInterval,
+		logger:             logger,
 	}, nil
 }
 
@@ -382,6 +489,20 @@ func (t *LegacyTransport) SubmitShare(ctx context.Context, share *poolpb.Share) 
 // `global.database.storeBlock` failure -> HTTP 400). Any non-2xx HTTP
 // response, or a network/transport-level error, is treated as a real
 // error here, faithfully surfacing that real semantic.
+//
+// RETRY-WITH-BACKOFF (added 2026-09-23, real production incident --
+// see DefaultBlockSubmitRetryBudget's doc comment for the full
+// rationale): a non-2xx response is retried against the SAME POST at
+// a fixed interval (blockRetryInterval) until either it succeeds or
+// the total outer budget (blockRetryBudget) is exhausted, at which
+// point this returns a real, clear error -- it never retries
+// unbounded/forever (unlike the original legacy JS sender), and it
+// never blocks past ctx's own deadline/cancellation either. Each
+// individual HTTP attempt is still bounded by blockTimeout exactly as
+// before (t.post's own context.WithTimeout) -- blockRetryBudget is a
+// SEPARATE, larger outer bound wrapping potentially many such calls,
+// not a replacement for it. Every retried attempt (i.e. every
+// attempt after the first) logs an escalating warning via t.logger.
 func (t *LegacyTransport) SubmitBlock(ctx context.Context, block *poolpb.Block) error {
 	legacyBlock, height32, err := buildLegacyBlock(block, t.poolType)
 	if err != nil {
@@ -404,7 +525,42 @@ func (t *LegacyTransport) SubmitBlock(ctx context.Context, block *poolpb.Block) 
 		ExInt: proto.Int32(height32),
 	}
 
-	return t.post(ctx, envelope, t.blockTimeout, "block")
+	deadline := time.Now().Add(t.blockRetryBudget)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		lastErr = t.post(ctx, envelope, t.blockTimeout, "block")
+		if lastErr == nil {
+			return nil
+		}
+
+		// Give up cleanly (real error, never a hang) once either the
+		// caller's own ctx is done, or this attempt's failure already
+		// pushed us past the retry budget's deadline -- checked AFTER
+		// the attempt (not just before sleeping) so a slow-but-still-
+		// failing final attempt cannot itself blow past the budget
+		// unnoticed.
+		if ctx.Err() != nil {
+			return fmt.Errorf("legacytransport: submit block: giving up after %d attempt(s), context done: %w (last attempt error: %v)", attempt, ctx.Err(), lastErr)
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("legacytransport: submit block: exhausted retry budget %s after %d attempt(s), giving up (this find needs manual reconciliation against the real chain at this height): %w", t.blockRetryBudget, attempt, lastErr)
+		}
+
+		wait := t.blockRetryInterval
+		if wait > remaining {
+			wait = remaining
+		}
+		t.logger.Printf("legacytransport: submit block attempt %d failed (retrying in %s, %s left in retry budget): %v", attempt, wait, remaining.Round(time.Second), lastErr)
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("legacytransport: submit block: giving up after %d attempt(s), context done while waiting to retry: %w (last attempt error: %v)", attempt, ctx.Err(), lastErr)
+		}
+	}
 }
 
 // Close implements transport.ShareTransport. LegacyTransport holds no
