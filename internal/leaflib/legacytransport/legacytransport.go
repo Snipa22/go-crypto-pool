@@ -240,16 +240,40 @@ func buildLegacyShare(share *poolpb.Share, legacyPoolType legacypb.POOLTYPE, leg
 		// configured legacy pool ID/type (see Config's doc comment) --
 		// NOT share.GetPoolId()/share.GetPoolType() (go-crypto-pool's own,
 		// separate numbering space).
-		PoolID:    proto.Int32(legacyPoolID),
-		BlockDiff: proto.Int64(share.GetBlockDiff()),
+		PoolID: proto.Int32(legacyPoolID),
+		// BlockDiff: the REAL legacy nodejs-pool-sxmr backend's
+		// remoteShare.js / payout-effort accounting expects this to be
+		// the genuine network/block target difficulty (confirmed via
+		// live tcpdump capture + protobuf decode against production,
+		// 2026-09-23), NOT go-crypto-pool's own Share.block_diff field
+		// (which -- despite its name -- is deliberately the session's
+		// own vardiff/share-weight value here, kept that way because
+		// internal/backend/db's address-difficulty-floor enforcement
+		// depends on it; see poolpb.Share.network_diff's doc comment
+		// and internal/leaflib/direct/session.go's handleSubmit for the
+		// full rationale). share.GetNetworkDiff() is the correct,
+		// additive field for this legacy-only purpose.
+		BlockDiff: proto.Int64(share.GetNetworkDiff()),
 		// Bitcoin is hardcoded false: this repo has no bitcoin-payout
 		// concept at all, and nodejs-pool/lib/pool.js (~line 305) confirms
 		// the real flag is 0/false for any genuine Monero-family payout
 		// address anyway -- see package doc comment.
 		Bitcoin:     proto.Bool(false),
 		BlockHeight: proto.Int32(blockHeight32),
-		Timestamp:   proto.Int64(share.GetTimestamp()),
-		Identifier:  proto.String(share.GetIdentifier()),
+		// Timestamp: the real legacy remoteShare.js does
+		// `Math.floor(shareData.timestamp / 1000)` before storing to
+		// Postgres -- i.e. it ASSUMES the incoming value is Unix
+		// MILLISECONDS (matching the original legacy sender's JS
+		// `+new Date()`). go-crypto-pool's own poolpb.Share.timestamp
+		// is Unix SECONDS (internal/backend/db.Repository.InsertShare
+		// does `time.Unix(s.Timestamp, 0)` -- confirmed real, load-
+		// bearing normal-path semantics that must not change), so this
+		// legacy-only wire path multiplies by 1000 here rather than
+		// changing Share.timestamp's unit at the source (see
+		// internal/leaflib/direct/session.go's handleSubmit for the
+		// same rationale on the BlockDiff/NetworkDiff split above).
+		Timestamp:  proto.Int64(share.GetTimestamp() * 1000),
+		Identifier: proto.String(share.GetIdentifier()),
 	}
 	if share.PaymentId != nil {
 		legacyShare.PaymentID = proto.String(share.GetPaymentId())

@@ -435,7 +435,23 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 		share = &poolpb.Share{
 			Algo: job.Algo, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
+			// BlockDiff/Shares/Timestamp are DELIBERATELY unchanged here
+			// (see the bug-fix note on NetworkDiff just below and on
+			// legacytransport.buildLegacyShare's Timestamp conversion) --
+			// internal/backend/db's address-difficulty-floor enforcement
+			// (checkAddressFlags) and last-share bookkeeping both rely on
+			// BlockDiff/Timestamp keeping their EXISTING, real semantics
+			// (share weight in seconds) for the normal (non-legacy)
+			// backend path.
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			// NetworkDiff carries the REAL network/block target
+			// difficulty (see poolpb.Share.network_diff's doc comment)
+			// -- populated additively alongside BlockDiff so the legacy
+			// wire path (legacytransport.buildLegacyShare) can send the
+			// genuine network difficulty the real legacy backend expects
+			// on its own Share.block_diff field, without disturbing
+			// BlockDiff's existing normal-path meaning above.
+			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
@@ -451,6 +467,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		share = &poolpb.Share{
 			Algo: poolpb.Algo_ALGO_C29, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_C29Proof{C29Proof: &poolpb.C29Proof{
@@ -486,6 +503,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		share = &poolpb.Share{
 			Algo: poolpb.Algo_ALGO_RXT, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
@@ -497,6 +515,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		share = &poolpb.Share{
 			Algo: poolpb.Algo_ALGO_SHA3X, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
+			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
 			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_Sha3XProof{Sha3XProof: &poolpb.SHA3XProof{
