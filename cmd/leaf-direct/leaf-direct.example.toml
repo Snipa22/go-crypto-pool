@@ -306,6 +306,43 @@ legacy_pool_type = ""
 # ignored otherwise. (default: 0)
 legacy_pool_id = 0
 
+# Real legacy /poolCheckin heartbeat (internal/leaflib/legacytransport/
+# checkin.go): every legacy_checkin_interval_seconds, POSTs
+# {current_time, pool_id, block_id, ports} to
+# <legacy_checkin_api_url>poolCheckin with header x-pool-auth set to
+# legacy_checkin_auth_token. Without this, pool-core's own routing/
+# health-check logic silently drains miner traffic away from an
+# otherwise healthy leaf within ~10-20 minutes (see checkin.go's package
+# doc comment) -- this replaces a throwaway Python sidecar stopgap.
+#
+# legacy_checkin_enabled defaults to TRUE whenever legacy_mode is also
+# true (an OPEN DESIGN QUESTION flagged for Alex's review -- the
+# heartbeat is a genuinely separate concern from core share/block
+# forwarding, but defaults to the safer/stricter option). Set to false
+# to forward shares/blocks in legacy mode WITHOUT the heartbeat (e.g.
+# during a staged rollout while the Python sidecar is still running).
+# Ignored entirely when legacy_mode=false. (default: true)
+legacy_checkin_enabled = true
+
+# The legacy backend's real config_api base URL, e.g.
+# "http://100.89.237.127:32322/poolApi/" in production -- the heartbeat
+# appends "poolCheckin" itself. REQUIRED when legacy_mode=true and
+# legacy_checkin_enabled=true (the default), ignored otherwise.
+# (default: "")
+legacy_checkin_api_url = ""
+
+# The real legacy api_auth_token secret, sent as the x-pool-auth HTTP
+# header on every /poolCheckin POST. DELIBERATELY SEPARATE from
+# legacy_auth_key above (the WSData.key checked on /leafApi) -- these
+# are two distinct real secrets on the real legacy backend. Never
+# logged. REQUIRED when legacy_mode=true and legacy_checkin_enabled=true
+# (the default), ignored otherwise. (default: "")
+legacy_checkin_auth_token = ""
+
+# How often the /poolCheckin heartbeat fires, in seconds -- matches the
+# real legacy sender's exact cadence by default. (default: 10)
+legacy_checkin_interval_seconds = 10
+
 # Enable verbose [DEBUG]-tagged logging: share submit params, validation
 # attempt/result, backend HTTP forward attempts (URL/status/response
 # summary), job/template lifecycle, connection lifecycle, and vardiff

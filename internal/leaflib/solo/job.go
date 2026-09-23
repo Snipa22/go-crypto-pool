@@ -460,6 +460,24 @@ func (jm *JobManager) Algo() poolpb.Algo {
 	return jm.cfg.Algo
 }
 
+// LatestHeight returns the most recent chain-tip height this
+// JobManager's tipPollLoop has observed (jm.lastTipHeight), or 0 if no
+// tip has been observed yet (tipObserved is still false -- e.g. called
+// before Start's first successful tip poll). Used by cmd/leaf-direct's
+// legacy-mode /poolCheckin heartbeat (see
+// internal/leaflib/legacytransport/checkin.go) to report the real,
+// live chain-tip height as the heartbeat's block_id field, reusing this
+// JobManager's own existing tip-poll state rather than running a
+// separate poller.
+func (jm *JobManager) LatestHeight() uint64 {
+	jm.mu.RLock()
+	defer jm.mu.RUnlock()
+	if !jm.tipObserved {
+		return 0
+	}
+	return jm.lastTipHeight
+}
+
 // JobForXN returns the current Job for the given per-session xn,
 // generating and caching a brand new, independently-randomized block
 // template the first time this xn is seen (or after the cache has been
