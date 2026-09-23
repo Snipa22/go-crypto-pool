@@ -293,8 +293,8 @@ func loadConfig() (config, error) {
 	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_DIRECT_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a session after too many CONSECUTIVE real RandomX-family (RXT/RXM) validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_DIRECT_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
 	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_DIRECT_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_DIRECT_INVALID_SHARE_DISCONNECT_THRESHOLD")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_DIRECT_ALGO", "sha3x"), "which single mining algorithm this leaf-direct process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_DIRECT_ALGO")
-	flag.StringVar(&cfg.poolType, "pool-type", envOr("LEAF_DIRECT_POOL_TYPE", ""), "real pool payout model stamped onto every share/block forwarded to the backend: pplns|pps|prop|solo. REQUIRED (no safe silent default -- determines real payout accounting semantics). Env: LEAF_DIRECT_POOL_TYPE")
-	flag.IntVar(&cfg.poolID, "pool-id", envOrInt("LEAF_DIRECT_POOL_ID", 0), "real, static, operator-assigned pool-server-source identifier stamped onto every share/block forwarded to the backend (see internal/proto/share.proto's Share.pool_id doc comment). REQUIRED, must be > 0 (no safe silent default -- see this flag's own field doc comment on config.poolID for why 0/unset is not a safe fallback). Env: LEAF_DIRECT_POOL_ID")
+	flag.StringVar(&cfg.poolType, "pool-type", envOr("LEAF_DIRECT_POOL_TYPE", ""), "real pool payout model stamped onto every share/block forwarded to the backend: pplns|pps|prop|solo. REQUIRED UNCONDITIONALLY, even when -legacy-mode=true -- legacytransport derives the actual outgoing legacy PoolType from this value (see requiredFieldsError's doc comment). Env: LEAF_DIRECT_POOL_TYPE")
+	flag.IntVar(&cfg.poolID, "pool-id", envOrInt("LEAF_DIRECT_POOL_ID", 0), "real, static, operator-assigned pool-server-source identifier stamped onto every share/block forwarded to the backend (see internal/proto/share.proto's Share.pool_id doc comment). REQUIRED, must be > 0, when -legacy-mode=false. Not required (and has no effect) when -legacy-mode=true -- legacytransport uses its own separate -legacy-pool-id instead (see requiredFieldsError's doc comment). Env: LEAF_DIRECT_POOL_ID")
 	flag.StringVar(&cfg.randomXServiceURL, "randomx-service-url", envOr("LEAF_DIRECT_RANDOMX_SERVICE_URL", "http://127.0.0.1:39093"), "RandomX-verification HTTP daemon address (only consulted when -algo=rxt). Env: LEAF_DIRECT_RANDOMX_SERVICE_URL")
 	flag.StringVar(&cfg.coinbaseExtraTag, "coinbase-extra-tag", envOr("LEAF_DIRECT_COINBASE_EXTRA_TAG", ""), "coinbase-extra ownership tag appended to every fetched Tari block template (identifies this leaf's found blocks on-chain). Left unset (the default), a per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 / supportxtm-rxt / supportxtm-rxm, based on -algo/-coin -- see resolveCoinbaseExtraTag. When set, this value is used verbatim, overriding the per-algo default. Truncated to solo.MaxCoinbaseExtraTagLen bytes if longer. Env: LEAF_DIRECT_COINBASE_EXTRA_TAG")
 
@@ -320,7 +320,7 @@ func loadConfig() (config, error) {
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_DIRECT_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by metrics (0 = package default). Env: LEAF_DIRECT_MAX_ADDRESS_LABELS")
 	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOr("LEAF_DIRECT_HIDE_REMOTE_ADDRESS", "false") == "true", "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_DIRECT_HIDE_REMOTE_ADDRESS (\"true\" to enable)")
 
-	flag.StringVar(&cfg.backendBaseURL, "backend-base-url", envOr("LEAF_DIRECT_BACKEND_BASE_URL", ""), "real backend base URL every validated share/block is forwarded to over HTTP+Protobuf. REQUIRED. Env: LEAF_DIRECT_BACKEND_BASE_URL")
+	flag.StringVar(&cfg.backendBaseURL, "backend-base-url", envOr("LEAF_DIRECT_BACKEND_BASE_URL", ""), "real backend base URL every validated share/block is forwarded to over HTTP+Protobuf, and that the address-flags ban/forced-min-difficulty poller polls. REQUIRED when -legacy-mode=false. Not required (and unused) when -legacy-mode=true, which forwards via -legacy-backend-url instead and has no address-flags equivalent yet. Env: LEAF_DIRECT_BACKEND_BASE_URL")
 	flag.StringVar(&cfg.backendAuthHeader, "backend-auth-header", envOr("LEAF_DIRECT_BACKEND_AUTH_HEADER", ""), "optional shared-secret/bearer auth header name sent with every backend request. Env: LEAF_DIRECT_BACKEND_AUTH_HEADER")
 	flag.StringVar(&cfg.backendAuthValue, "backend-auth-value", envOr("LEAF_DIRECT_BACKEND_AUTH_VALUE", ""), "value for -backend-auth-header. Env: LEAF_DIRECT_BACKEND_AUTH_VALUE")
 	flag.DurationVar(&cfg.backendShareTimeout, "backend-share-timeout", envOrDuration("LEAF_DIRECT_BACKEND_SHARE_TIMEOUT", 5*time.Second), "per-call timeout forwarding a share to the backend. Env: LEAF_DIRECT_BACKEND_SHARE_TIMEOUT")
@@ -814,6 +814,88 @@ func resolveCoinbaseExtraTag(cfg config) string {
 // Block with an UNSPECIFIED PoolType is exactly the real, confirmed-live
 // bug this flag exists to prevent (the backend correctly rejects it with
 // "pool_type is required").
+// requiredFieldsError returns a non-nil error describing exactly one
+// missing/invalid required field (payout-address is checked by the
+// caller separately, before this is called), or nil if the config is
+// valid to proceed with. It never calls logger.Fatal itself so tests
+// can exercise it directly without forking the binary.
+//
+// -backend-base-url and -pool-id are gated on -legacy-mode; -pool-type
+// is NOT. This split was decided by reading, not assuming, the real
+// downstream consumers of each field (internal/leaflib/direct/
+// session.go and internal/leaflib/legacytransport/legacytransport.go):
+//
+//   - -backend-base-url only ever feeds
+//     transport.NewHTTPProtobufTransport (the NEW go-crypto-pool
+//     backend's HTTP+Protobuf transport, main.go's non-legacy branch
+//     below) and addressFlagsCache's addressflags.NewHTTPSource (this
+//     binary's ban/forced-min-difficulty poller, also below) -- both
+//     are skipped entirely in -legacy-mode=true (see the legacyMode
+//     branches at both call sites). It has NO consumer at all in
+//     legacy mode, so requiring it there blocks a legacy-only
+//     deployment (e.g. jagtech-phx-01) on a flag it genuinely does
+//     not need.
+//
+//   - -pool-id (ServerConfig.PoolID) is stamped onto every
+//     poolpb.Share/poolpb.Block leaf-direct constructs (session.go),
+//     but legacytransport's buildLegacyShare/buildLegacyBlock NEVER
+//     read share.GetPoolId()/block.GetPoolId() -- buildLegacyShare
+//     uses its OWN, separately-configured -legacy-pool-id
+//     (legacytransport.Config.LegacyPoolID) for the outgoing legacy
+//     PoolID field, and legacypb.Block has no PoolID destination at
+//     all ("pool_id similarly have no legacy Block destination and
+//     are dropped" -- buildLegacyBlock's own doc comment). So
+//     -pool-id has ZERO real effect in legacy mode. Relaxed to
+//     optional there (default 0, consumed by nothing).
+//
+//   - -pool-type (ServerConfig.PoolType), by contrast, DOES have a
+//     real, live effect in legacy mode, despite -legacy-pool-type
+//     existing as a seemingly-parallel, separately-configured flag:
+//     buildLegacyShare/buildLegacyBlock derive the actual OUTGOING
+//     legacy PoolType field from share.GetPoolType()/
+//     block.GetPoolType() (i.e. from -pool-type, converted via
+//     legacyPoolTypeFromPB) -- NOT from
+//     legacytransport.Config.LegacyPoolType/-legacy-pool-type, which
+//     is validated as required at startup but then never actually
+//     read by either build function. (This mirrors -legacy-pool-type's
+//     own flag doc comment's "OPEN DESIGN QUESTION" -- confirmed here
+//     by reading the code, not left as a guess. Fixing THAT mismatch
+//     is a separate, real payout-semantics design decision outside
+//     this fix's scope -- flagged in the PR description for Alex, not
+//     silently changed here.) Because -pool-type substantively
+//     controls what PoolType value is actually forwarded to the
+//     legacy backend for every real share/block, it stays REQUIRED
+//     unconditionally -- relaxing it in legacy mode would risk
+//     forwarding POOL_TYPE_UNSPECIFIED-derived legacy shares/blocks,
+//     which is exactly the payout-accounting corruption this
+//     validation exists to prevent.
+func requiredFieldsError(cfg config) error {
+	if !cfg.legacyMode && cfg.backendBaseURL == "" {
+		return errors.New("LEAF_DIRECT_BACKEND_BASE_URL (or -backend-base-url) is required -- leaf-direct's whole purpose is forwarding validated shares/blocks to the real backend (not required when -legacy-mode=true, which forwards via -legacy-backend-url instead)")
+	}
+	if _, ok := poolTypeFromString(cfg.poolType); !ok {
+		return fmt.Errorf("LEAF_DIRECT_POOL_TYPE (or -pool-type) is required and must be one of pplns|pps|prop|solo, got %q -- the backend correctly rejects any share/block whose pool_type is left unset (this is still required even when -legacy-mode=true -- see requiredFieldsError's doc comment)", cfg.poolType)
+	}
+	if !cfg.legacyMode && cfg.poolID <= 0 {
+		return fmt.Errorf("LEAF_DIRECT_POOL_ID (or -pool-id) is required and must be a positive integer, got %d -- an unset/zero pool_id would defeat the entire purpose of pool-source tracking (not required when -legacy-mode=true, which has no consumer for it)", cfg.poolID)
+	}
+	if cfg.legacyMode {
+		if strings.TrimSpace(cfg.legacyBackendURL) == "" {
+			return errors.New("LEAF_DIRECT_LEGACY_BACKEND_URL (or -legacy-backend-url) is required when -legacy-mode=true")
+		}
+		if cfg.legacyAuthKey == "" {
+			return errors.New("LEAF_DIRECT_LEGACY_AUTH_KEY (or -legacy-auth-key) is required when -legacy-mode=true")
+		}
+		if _, ok := legacyPoolTypeFromString(cfg.legacyPoolType); !ok {
+			return fmt.Errorf("LEAF_DIRECT_LEGACY_POOL_TYPE (or -legacy-pool-type) is required and must be one of pplns|pps|prop|solo when -legacy-mode=true, got %q", cfg.legacyPoolType)
+		}
+		if cfg.legacyPoolID <= 0 {
+			return fmt.Errorf("LEAF_DIRECT_LEGACY_POOL_ID (or -legacy-pool-id) is required and must be a positive integer when -legacy-mode=true, got %d", cfg.legacyPoolID)
+		}
+	}
+	return nil
+}
+
 func poolTypeFromString(s string) (poolpb.PoolType, bool) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "pplns":
@@ -916,37 +998,32 @@ func main() {
 	if cfg.payoutAddress == "" {
 		logger.Fatal("LEAF_DIRECT_PAYOUT_ADDRESS (or -payout-address) is required")
 	}
-	if cfg.backendBaseURL == "" {
-		logger.Fatal("LEAF_DIRECT_BACKEND_BASE_URL (or -backend-base-url) is required -- leaf-direct's whole purpose is forwarding validated shares/blocks to the real backend")
+
+	// requiredFieldsError applies leaf-direct's own required-field
+	// startup validation, gating -backend-base-url/-pool-id (but NOT
+	// -pool-type -- see the function's own doc comment for why) on
+	// -legacy-mode. Extracted into its own testable function (see
+	// requiredFieldsError's doc comment and main_test.go's
+	// TestRequiredFieldsError_*) rather than inlined logger.Fatal
+	// calls, specifically so "legacy-mode starts up with
+	// backend-base-url/pool-id unset" and "non-legacy-mode still
+	// requires them" are both provable without forking the binary.
+	if err := requiredFieldsError(cfg); err != nil {
+		logger.Fatalf("%v", err)
 	}
-	poolType, ok := poolTypeFromString(cfg.poolType)
-	if !ok {
-		logger.Fatalf("LEAF_DIRECT_POOL_TYPE (or -pool-type) is required and must be one of pplns|pps|prop|solo, got %q -- the backend correctly rejects any share/block whose pool_type is left unset", cfg.poolType)
-	}
-	if cfg.poolID <= 0 {
-		logger.Fatalf("LEAF_DIRECT_POOL_ID (or -pool-id) is required and must be a positive integer, got %d -- an unset/zero pool_id would defeat the entire purpose of pool-source tracking", cfg.poolID)
-	}
+	// Safe to ignore the bool here: requiredFieldsError already
+	// proved cfg.poolType parses (it is REQUIRED unconditionally,
+	// legacy mode or not -- see that function's doc comment).
+	poolType, _ := poolTypeFromString(cfg.poolType)
 
 	// Legacy-mode validation: when -legacy-mode=false (the default),
 	// all four legacy-* flags/env vars below are ignored entirely -- no
-	// validation, no effect. When true, all four are REQUIRED, erroring
-	// out at startup exactly like the required-flag validation above.
+	// validation, no effect. When true, all four are REQUIRED (folded
+	// into requiredFieldsError above); legacyPoolType is simply
+	// re-derived here for use in backendTransport construction below.
 	var legacyPoolType legacypb.POOLTYPE
 	if cfg.legacyMode {
-		if strings.TrimSpace(cfg.legacyBackendURL) == "" {
-			logger.Fatal("LEAF_DIRECT_LEGACY_BACKEND_URL (or -legacy-backend-url) is required when -legacy-mode=true")
-		}
-		if cfg.legacyAuthKey == "" {
-			logger.Fatal("LEAF_DIRECT_LEGACY_AUTH_KEY (or -legacy-auth-key) is required when -legacy-mode=true")
-		}
-		var lok bool
-		legacyPoolType, lok = legacyPoolTypeFromString(cfg.legacyPoolType)
-		if !lok {
-			logger.Fatalf("LEAF_DIRECT_LEGACY_POOL_TYPE (or -legacy-pool-type) is required and must be one of pplns|pps|prop|solo when -legacy-mode=true, got %q", cfg.legacyPoolType)
-		}
-		if cfg.legacyPoolID <= 0 {
-			logger.Fatalf("LEAF_DIRECT_LEGACY_POOL_ID (or -legacy-pool-id) is required and must be a positive integer when -legacy-mode=true, got %d", cfg.legacyPoolID)
-		}
+		legacyPoolType, _ = legacyPoolTypeFromString(cfg.legacyPoolType)
 	}
 
 	ports, err := resolvePorts(cfg)
@@ -1172,17 +1249,37 @@ func main() {
 	}
 
 	// Real, manual ban/forced-minimum-difficulty enforcement (see
-	// internal/leaflib/addressflags's package doc comment). Unlike
-	// leaf-solo (which has no backend to poll), leaf-direct always
-	// polls the real backend it is already configured to forward
-	// shares/blocks to.
-	addressFlagsCache := addressflags.NewCache(
-		addressflags.NewHTTPSource(cfg.backendBaseURL, cfg.backendAuthHeader, cfg.backendAuthValue),
-		cfg.addressFlagsPollInterval, logger,
-	)
-	addressFlagsCache.Start(ctx)
-	server.EnableAddressFlags(addressFlagsCache)
-	logger.Printf("manual ban/forced-minimum-difficulty enforcement ENABLED, polling %s%s every %s", cfg.backendBaseURL, "/api/v1/leaf/address-flags", cfg.addressFlagsPollInterval)
+	// internal/leaflib/addressflags's package doc comment). Non-legacy
+	// leaf-direct always has the real (NEW go-crypto-pool) backend
+	// configured that it is already forwarding shares/blocks to, so it
+	// polls that backend's own GET /api/v1/leaf/address-flags endpoint.
+	//
+	// -legacy-mode=true has no such backend: cfg.backendBaseURL is not
+	// even required in that mode (see requiredFieldsError), and no
+	// legacy-aware addressflags.Source exists anywhere in this
+	// codebase today (only HTTPSource, above, and leaf-solo's file-
+	// backed FileSource -- neither of which leaf-direct's legacy path
+	// wires up; checked internal/leaflib/legacytransport and
+	// internal/leaflib/addressflags directly, this is not assumed).
+	// Constructing/starting it unconditionally would either poll a
+	// nonexistent NEW-backend endpoint at an EMPTY baseURL (or,
+	// incidentally, the legacy backend's URL if an operator happened
+	// to also set -backend-base-url, which the legacy nodejs-pool-sxmr
+	// backend does not implement either way) -- so it is skipped
+	// entirely in legacy mode, with a clear, unambiguous startup log
+	// line rather than a silent no-op, since this is a real capability
+	// gap operators need to know about.
+	if cfg.legacyMode {
+		logger.Println("manual ban/forced-minimum-difficulty enforcement UNAVAILABLE in -legacy-mode=true: no legacy-backend-aware addressflags.Source exists yet, and the NEW backend's /api/v1/leaf/address-flags is not applicable to a legacy-only deployment -- logins/vardiff proceed with NO ban or forced-min-difficulty enforcement via this path")
+	} else {
+		addressFlagsCache := addressflags.NewCache(
+			addressflags.NewHTTPSource(cfg.backendBaseURL, cfg.backendAuthHeader, cfg.backendAuthValue),
+			cfg.addressFlagsPollInterval, logger,
+		)
+		addressFlagsCache.Start(ctx)
+		server.EnableAddressFlags(addressFlagsCache)
+		logger.Printf("manual ban/forced-minimum-difficulty enforcement ENABLED, polling %s%s every %s", cfg.backendBaseURL, "/api/v1/leaf/address-flags", cfg.addressFlagsPollInterval)
+	}
 
 	if cfg.metricsListenAddress != "" {
 		server.SetHideRemoteAddress(cfg.hideRemoteAddress)

@@ -623,3 +623,130 @@ func TestLoadConfigPrecedence(t *testing.T) {
 		})
 	}
 }
+
+// TestRequiredFieldsError covers the legacy-mode startup-validation
+// gating fixed here: -backend-base-url and -pool-id are required only
+// when -legacy-mode=false; -pool-type stays required unconditionally
+// (see requiredFieldsError's own doc comment for why); the four
+// -legacy-* fields are required only when -legacy-mode=true, exactly
+// as before this fix.
+func TestRequiredFieldsError(t *testing.T) {
+	// baseValid is a config that is valid for a NON-legacy-mode
+	// deployment: every non-legacy required field is set, legacyMode
+	// is false, and none of the legacy-* fields are set.
+	baseValid := func() config {
+		return config{
+			payoutAddress:  "some-address",
+			backendBaseURL: "http://backend.example.com",
+			poolType:       "pplns",
+			poolID:         1,
+			legacyMode:     false,
+		}
+	}
+
+	// baseValidLegacy is a config that is valid for a
+	// -legacy-mode=true deployment per this fix: backend-base-url and
+	// pool-id are deliberately LEFT UNSET (the whole point of this
+	// fix), pool-type is still set (still required), and all four
+	// legacy-* fields are set.
+	baseValidLegacy := func() config {
+		return config{
+			payoutAddress:    "some-address",
+			poolType:         "pplns",
+			legacyMode:       true,
+			legacyBackendURL: "https://legacy.example.com:4443",
+			legacyAuthKey:    "some-key",
+			legacyPoolType:   "pplns",
+			legacyPoolID:     1,
+		}
+	}
+
+	t.Run("non-legacy-mode: valid config passes", func(t *testing.T) {
+		if err := requiredFieldsError(baseValid()); err != nil {
+			t.Errorf("requiredFieldsError() = %v, want nil for a fully-populated non-legacy config", err)
+		}
+	})
+
+	t.Run("non-legacy-mode: missing backend-base-url still fails (unchanged behavior)", func(t *testing.T) {
+		cfg := baseValid()
+		cfg.backendBaseURL = ""
+		if err := requiredFieldsError(cfg); err == nil {
+			t.Error("requiredFieldsError() = nil, want an error: -backend-base-url is still required when -legacy-mode=false")
+		}
+	})
+
+	t.Run("non-legacy-mode: missing pool-type still fails (unchanged behavior)", func(t *testing.T) {
+		cfg := baseValid()
+		cfg.poolType = ""
+		if err := requiredFieldsError(cfg); err == nil {
+			t.Error("requiredFieldsError() = nil, want an error: -pool-type is required regardless of -legacy-mode")
+		}
+	})
+
+	t.Run("non-legacy-mode: missing/zero pool-id still fails (unchanged behavior)", func(t *testing.T) {
+		cfg := baseValid()
+		cfg.poolID = 0
+		if err := requiredFieldsError(cfg); err == nil {
+			t.Error("requiredFieldsError() = nil, want an error: -pool-id is still required when -legacy-mode=false")
+		}
+	})
+
+	t.Run("legacy-mode: valid config with backend-base-url/pool-id UNSET passes (the bug this PR fixes)", func(t *testing.T) {
+		cfg := baseValidLegacy()
+		if cfg.backendBaseURL != "" || cfg.poolID != 0 {
+			t.Fatalf("test premise broken: baseValidLegacy() must leave backend-base-url/pool-id unset, got backendBaseURL=%q poolID=%d", cfg.backendBaseURL, cfg.poolID)
+		}
+		if err := requiredFieldsError(cfg); err != nil {
+			t.Errorf("requiredFieldsError() = %v, want nil -- -backend-base-url/-pool-id must NOT be required when -legacy-mode=true", err)
+		}
+	})
+
+	t.Run("legacy-mode: pool-type is STILL required even though backend-base-url/pool-id are not", func(t *testing.T) {
+		cfg := baseValidLegacy()
+		cfg.poolType = ""
+		if err := requiredFieldsError(cfg); err == nil {
+			t.Error("requiredFieldsError() = nil, want an error: -pool-type must remain required even when -legacy-mode=true (legacytransport derives the real outgoing legacy PoolType from it)")
+		}
+	})
+
+	t.Run("legacy-mode: setting backend-base-url/pool-id anyway is still accepted (optional, not forbidden)", func(t *testing.T) {
+		cfg := baseValidLegacy()
+		cfg.backendBaseURL = "http://backend.example.com"
+		cfg.poolID = 1
+		if err := requiredFieldsError(cfg); err != nil {
+			t.Errorf("requiredFieldsError() = %v, want nil -- setting backend-base-url/pool-id in legacy mode must remain harmless, not an error", err)
+		}
+	})
+
+	t.Run("legacy-mode: missing legacy-backend-url still fails (unchanged behavior)", func(t *testing.T) {
+		cfg := baseValidLegacy()
+		cfg.legacyBackendURL = ""
+		if err := requiredFieldsError(cfg); err == nil {
+			t.Error("requiredFieldsError() = nil, want an error: -legacy-backend-url is required when -legacy-mode=true")
+		}
+	})
+
+	t.Run("legacy-mode: missing legacy-auth-key still fails (unchanged behavior)", func(t *testing.T) {
+		cfg := baseValidLegacy()
+		cfg.legacyAuthKey = ""
+		if err := requiredFieldsError(cfg); err == nil {
+			t.Error("requiredFieldsError() = nil, want an error: -legacy-auth-key is required when -legacy-mode=true")
+		}
+	})
+
+	t.Run("legacy-mode: invalid legacy-pool-type still fails (unchanged behavior)", func(t *testing.T) {
+		cfg := baseValidLegacy()
+		cfg.legacyPoolType = "bogus"
+		if err := requiredFieldsError(cfg); err == nil {
+			t.Error("requiredFieldsError() = nil, want an error: -legacy-pool-type must still be one of pplns|pps|prop|solo when -legacy-mode=true")
+		}
+	})
+
+	t.Run("legacy-mode: zero legacy-pool-id still fails (unchanged behavior)", func(t *testing.T) {
+		cfg := baseValidLegacy()
+		cfg.legacyPoolID = 0
+		if err := requiredFieldsError(cfg); err == nil {
+			t.Error("requiredFieldsError() = nil, want an error: -legacy-pool-id must still be a positive integer when -legacy-mode=true")
+		}
+	})
+}
