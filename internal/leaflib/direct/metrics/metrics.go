@@ -12,14 +12,48 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 )
 
 const (
 	ResultAccepted = "accepted"
 	ResultRejected = "rejected"
+
+	// ResultSuccess/ResultError label relay publish outcomes
+	// (leaf_relay_block_publish_total / leaf_relay_template_publish_total).
+	ResultSuccess = "success"
+	ResultError   = "error"
+
+	// ResultDispatched/ResultDuplicate label relay receive outcomes
+	// (leaf_relay_block_receive_total / leaf_relay_template_receive_total)
+	// -- "dispatched" means relay.Relay's Subscribe/SubscribeTemplate
+	// handler was genuinely invoked for a non-duplicate message from
+	// another instance; "duplicate" means markSeen's recent-hash
+	// cache recognized an already-processed hash and skipped
+	// re-dispatch (see relay.Relay.Subscribe's own doc comment).
+	ResultDispatched = "dispatched"
+	ResultDuplicate  = "duplicate"
+
+	// ResultNoSubmitter labels leaf_direct_relay_resubmit_total for a
+	// relay-triggered resubmission attempt that could not even be
+	// attempted because this instance has no MultiNodeSubmitter
+	// configured (see server.go's handleRelayedBlock) -- distinct
+	// from ResultRejected/ResultAccepted-style success/fail, since no
+	// real submit attempt was made at all.
+	ResultNoSubmitter = "no_submitter"
+
+	// ResultUnmarshalError labels leaf_direct_relay_resubmit_total for
+	// a relay-dispatched found-block message whose BlockData payload
+	// failed to unmarshal (see server.go's handleRelayedBlock /
+	// unmarshalBlockFromRelay) -- resubmission could not even be
+	// attempted, distinct from ResultNoSubmitter (which means no
+	// MultiNodeSubmitter is configured at all).
+	ResultUnmarshalError = "unmarshal_error"
 )
 
 const OtherAddressLabel = "other"
@@ -57,6 +91,16 @@ type AsyncPoolStats struct {
 
 type AsyncPoolStatsFunc func() AsyncPoolStats
 
+// RelayStatsFunc is a callback returning a live snapshot of the
+// leaf's *relay.Relay observability state (relay.Relay.Stats()) --
+// see SetRelaySource. Reusing relay.RelayStats directly (rather than
+// re-declaring an equivalent local struct) means this package never
+// duplicates the relay package's own counting logic, per this
+// feature's explicit design constraint (prefer wiring through
+// existing internal state over adding new counters at the call
+// site).
+type RelayStatsFunc func() relay.RelayStats
+
 // Metrics holds every Prometheus collector leaf-direct registers.
 type Metrics struct {
 	registry *prometheus.Registry
@@ -92,11 +136,26 @@ type Metrics struct {
 	// reconciliation against the real monerod chain.
 	DirectBlockHashUnresolvedTotal prometheus.Counter
 
+	// RelayResubmitTotal counts the real OUTCOME of every
+	// relay-triggered local resubmission attempt (server.go's
+	// handleRelayedBlock, invoked when relay.Relay.Subscribe
+	// dispatches a genuinely new found-block message from another
+	// instance -- see leaf_relay_block_receive_total for the
+	// dispatch-vs-duplicate split at the relay-receive level itself),
+	// labeled by result: ResultAccepted (this instance's own
+	// MultiNodeSubmitter reported at least one node accepted it),
+	// ResultRejected (a real resubmission attempt was made but no
+	// configured node accepted it), or ResultNoSubmitter (no
+	// MultiNodeSubmitter is configured at all -- resubmission could
+	// not even be attempted).
+	RelayResubmitTotal *prometheus.CounterVec
+
 	BuildInfo *prometheus.GaugeVec
 
 	maxAddressLabels int
 	snapshot         SnapshotFunc
 	asyncPoolStats   AsyncPoolStatsFunc
+	relayStats       RelayStatsFunc
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry.
@@ -137,6 +196,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Help: "Total number of real ALGO_RXM (Monero) block finds accepted by submit_block whose real canonical block hash could not be confirmed via get_block_header_by_height afterward -- these are NOT forwarded to the backend (no placeholder hash is ever substituted) and need manual reconciliation.",
 	})
 
+	m.RelayResubmitTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_direct_relay_resubmit_total",
+		Help: "Total number of relay-triggered local block resubmission attempts (a genuinely new found-block message received from another leaf-direct instance via the NATS relay), by outcome (accepted/rejected/no_submitter).",
+	}, []string{"result"})
+
 	m.BuildInfo = registerGaugeVec(reg, prometheus.GaugeOpts{
 		Name: "leaf_direct_build_info",
 		Help: "Always 1; version label carries the running build's version string.",
@@ -158,6 +222,17 @@ func (m *Metrics) SetSnapshotSource(fn SnapshotFunc) {
 // exactly -- see AsyncPoolStats' doc comment.
 func (m *Metrics) SetAsyncPoolSource(fn AsyncPoolStatsFunc) {
 	m.asyncPoolStats = fn
+}
+
+// SetRelaySource wires this leaf's *relay.Relay observability state
+// into the Collect() below -- see RelayStatsFunc's doc comment. A nil
+// fn (never set, e.g. an older caller predating this feature) means
+// Collect emits no relay_* metric samples at all, matching this
+// feature's "zero-cost/zero-registration when relay disabled"
+// contract exactly at the collector level, not just the counter
+// level.
+func (m *Metrics) SetRelaySource(fn RelayStatsFunc) {
+	m.relayStats = fn
 }
 
 func (m *Metrics) Handler() http.Handler {
@@ -211,6 +286,63 @@ var (
 	asyncPoolSubmitBlockedTotalDesc = prometheus.NewDesc(
 		"leaf_async_validation_submit_blocked_total",
 		"Total number of Submit calls to the shared AsyncValidationPool that could not take the fast, non-blocking path (queue full and every worker busy) -- the real saturation signal for Finding 2's bounded-queue/NumCPU-workers fix.",
+		nil, nil,
+	)
+
+	// relay* Desc vars mirror asyncPool*Desc's own "mode-agnostic
+	// leaf_relay_* naming, not leaf_direct_*" convention exactly --
+	// see that block's own doc comment for why: relay.Relay is a
+	// shared component (internal/leaflib/relay, also used by
+	// internal/leaflib/solo's JobManager for the template relay, see
+	// that package's job.go), so its own observability data is named
+	// mode-agnostically even though today only leaf-direct's Server
+	// actually wires SetRelaySource. Values come STRAIGHT from
+	// relay.Relay.Stats() (see RelayStatsFunc) -- this package never
+	// re-counts relay activity itself, only republishes the relay
+	// package's own real counters as Prometheus samples.
+	relayBlockPublishTotalDesc = prometheus.NewDesc(
+		"leaf_relay_block_publish_total",
+		"Total number of found-block messages this instance's relay.Relay has published on the NATS found-block relay subject, by result (success/error). Absent entirely when no relay source is wired (see Metrics.SetRelaySource); always 0 when the relay is disabled/unconfigured (-relay-nats-url empty).",
+		[]string{"result"}, nil,
+	)
+	relayBlockReceiveTotalDesc = prometheus.NewDesc(
+		"leaf_relay_block_receive_total",
+		"Total number of found-block messages this instance's relay.Relay has received from ANOTHER instance on the NATS found-block relay subject (never counts this instance's own publishes -- relay.Relay.Subscribe already filters those out), by result (dispatched = triggered local resubmission / duplicate = already-seen redelivery, skipped). See leaf_direct_relay_resubmit_total for the resubmission attempt's own success/fail outcome.",
+		[]string{"result"}, nil,
+	)
+	relayTemplatePublishTotalDesc = prometheus.NewDesc(
+		"leaf_relay_template_publish_total",
+		"Total number of new-tip template messages this instance's relay.Relay has published on the NATS template-relay subject, by result (success/error).",
+		[]string{"result"}, nil,
+	)
+	relayTemplateReceiveTotalDesc = prometheus.NewDesc(
+		"leaf_relay_template_receive_total",
+		"Total number of new-tip template messages this instance's relay.Relay has received from ANOTHER instance on the NATS template-relay subject (never counts this instance's own publishes), by result (dispatched = triggered a real per-xn job cache invalidation / duplicate = already-seen redelivery, skipped).",
+		[]string{"result"}, nil,
+	)
+	relayConnectedDesc = prometheus.NewDesc(
+		"leaf_relay_connected",
+		"1 if this instance's relay.Relay is CURRENTLY connected to NATS, 0 otherwise -- including whenever the relay is disabled/unconfigured, or mid-reconnect after a transient disconnect. Distinct from whether the relay is merely configured (see relay.Relay.Enabled(), which stays effectively true across a transient reconnect).",
+		nil, nil,
+	)
+	relayLastBlockPublishDesc = prometheus.NewDesc(
+		"leaf_relay_last_block_publish_unixtime",
+		"Unix timestamp (seconds) of this instance's most recent successful found-block relay publish. Absent/0 if this instance has never published one.",
+		nil, nil,
+	)
+	relayLastBlockReceiveDesc = prometheus.NewDesc(
+		"leaf_relay_last_block_receive_unixtime",
+		"Unix timestamp (seconds) of this instance's most recent genuinely-new (non-duplicate) found-block relay receive from another instance. Absent/0 if this instance has never received one.",
+		nil, nil,
+	)
+	relayLastTemplatePublishDesc = prometheus.NewDesc(
+		"leaf_relay_last_template_publish_unixtime",
+		"Unix timestamp (seconds) of this instance's most recent successful template-relay publish. Absent/0 if this instance has never published one.",
+		nil, nil,
+	)
+	relayLastTemplateReceiveDesc = prometheus.NewDesc(
+		"leaf_relay_last_template_receive_unixtime",
+		"Unix timestamp (seconds) of this instance's most recent genuinely-new (non-duplicate) template-relay receive from another instance. Absent/0 if this instance has never received one.",
 		nil, nil,
 	)
 )
@@ -269,6 +401,53 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(asyncPoolInFlightWorkersDesc, prometheus.GaugeValue, float64(stats.InFlightWorkers))
 		ch <- prometheus.MustNewConstMetric(asyncPoolSubmitBlockedTotalDesc, prometheus.CounterValue, float64(stats.SubmitBlockedTotal))
 	}
+
+	// Relay metrics: emitted ONLY when a source has been wired (see
+	// SetRelaySource) -- an unwired Metrics (no relay feature at all,
+	// e.g. an older caller) emits nothing here, not even zero
+	// samples. When wired but the relay itself is disabled
+	// (-relay-nats-url empty), relay.Relay.Stats() is the permanent
+	// zero RelayStats{} (see that method's doc comment), so every
+	// counter below reports 0 and leaf_relay_connected reports 0 --
+	// this is the "stays at zero" half of this feature's
+	// zero-cost-when-disabled contract (see relay_test.go's
+	// TestMetricsRelayDisabledReportsZero).
+	if m.relayStats != nil {
+		rs := m.relayStats()
+		ch <- prometheus.MustNewConstMetric(relayBlockPublishTotalDesc, prometheus.CounterValue, float64(rs.BlockPublishSuccess), ResultSuccess)
+		ch <- prometheus.MustNewConstMetric(relayBlockPublishTotalDesc, prometheus.CounterValue, float64(rs.BlockPublishError), ResultError)
+		ch <- prometheus.MustNewConstMetric(relayBlockReceiveTotalDesc, prometheus.CounterValue, float64(rs.BlockReceiveDispatched), ResultDispatched)
+		ch <- prometheus.MustNewConstMetric(relayBlockReceiveTotalDesc, prometheus.CounterValue, float64(rs.BlockReceiveDuplicate), ResultDuplicate)
+
+		ch <- prometheus.MustNewConstMetric(relayTemplatePublishTotalDesc, prometheus.CounterValue, float64(rs.TemplatePublishSuccess), ResultSuccess)
+		ch <- prometheus.MustNewConstMetric(relayTemplatePublishTotalDesc, prometheus.CounterValue, float64(rs.TemplatePublishError), ResultError)
+		ch <- prometheus.MustNewConstMetric(relayTemplateReceiveTotalDesc, prometheus.CounterValue, float64(rs.TemplateReceiveDispatched), ResultDispatched)
+		ch <- prometheus.MustNewConstMetric(relayTemplateReceiveTotalDesc, prometheus.CounterValue, float64(rs.TemplateReceiveDuplicate), ResultDuplicate)
+
+		connected := 0.0
+		if rs.Connected {
+			connected = 1.0
+		}
+		ch <- prometheus.MustNewConstMetric(relayConnectedDesc, prometheus.GaugeValue, connected)
+
+		ch <- prometheus.MustNewConstMetric(relayLastBlockPublishDesc, prometheus.GaugeValue, unixSecondsOrZero(rs.LastBlockPublish))
+		ch <- prometheus.MustNewConstMetric(relayLastBlockReceiveDesc, prometheus.GaugeValue, unixSecondsOrZero(rs.LastBlockReceive))
+		ch <- prometheus.MustNewConstMetric(relayLastTemplatePublishDesc, prometheus.GaugeValue, unixSecondsOrZero(rs.LastTemplatePublish))
+		ch <- prometheus.MustNewConstMetric(relayLastTemplateReceiveDesc, prometheus.GaugeValue, unixSecondsOrZero(rs.LastTemplateReceive))
+	}
+}
+
+// unixSecondsOrZero returns t's Unix-seconds value, or 0 for the zero
+// time.Time (see relay.RelayStats' own doc comment on why "never"
+// is represented as the zero time rather than the Unix epoch
+// internally -- this is the one place that gets converted back to a
+// bare float64 for the Prometheus gauge sample, where 0 is the
+// correct, conventional "no value yet" representation).
+func unixSecondsOrZero(t time.Time) float64 {
+	if t.IsZero() {
+		return 0
+	}
+	return float64(t.Unix())
 }
 
 // CapAddressCounts mirrors solo/metrics's own CapAddressCounts exactly.

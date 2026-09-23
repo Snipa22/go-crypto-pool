@@ -471,6 +471,18 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetr
 			SubmitBlockedTotal: s.randomxPool.SubmitBlockedTotal(),
 		}
 	})
+	// Relay observability (found-block + template relay, both live on
+	// the 9-host mainnet fleet -- see internal/leaflib/relay's own
+	// Stats() doc comment): reads s.relay's real internal counters
+	// directly, never re-counts relay activity here. s.relay is
+	// always a real, non-nil *relay.Relay (see cmd/leaf-direct/
+	// main.go's wiring -- relay.NewRelay is called unconditionally,
+	// producing a permanent no-op when -relay-nats-url is empty), so
+	// this closure is safe to register unconditionally too; a
+	// disabled relay's Stats() is the permanent zero RelayStats{}.
+	m.SetRelaySource(func() relay.RelayStats {
+		return s.relay.Stats()
+	})
 	s.metrics = m
 	s.maxAddressLabels = maxAddressLabels
 	// Wire the real XNP-reservation-unavailable counter into this
@@ -896,17 +908,34 @@ func networkLabel(n poolpb.Network) string {
 func (s *Server) handleRelayedBlock(msg relay.BlockMessage) {
 	if s.multiSubmit == nil {
 		s.logger.Printf("direct: received relayed block (height=%d hash=%s) but no local MultiNodeSubmitter is configured; cannot resubmit", msg.Height, msg.Hash)
+		s.recordRelayResubmit(directmetrics.ResultNoSubmitter)
 		return
 	}
 	block, err := unmarshalBlockFromRelay(msg.BlockData)
 	if err != nil {
 		s.logger.Printf("direct: failed to unmarshal relayed block payload (height=%d hash=%s): %v", msg.Height, msg.Hash, err)
+		s.recordRelayResubmit(directmetrics.ResultUnmarshalError)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	results, ok := s.multiSubmit.SubmitBlock(ctx, block)
 	s.logger.Printf("direct: relay-triggered local resubmission (height=%d hash=%s publisher=%s): success=%v results=%v", msg.Height, msg.Hash, msg.PublisherID, ok, results)
+	if ok {
+		s.recordRelayResubmit(directmetrics.ResultAccepted)
+	} else {
+		s.recordRelayResubmit(directmetrics.ResultRejected)
+	}
+}
+
+// recordRelayResubmit bumps leaf_direct_relay_resubmit_total, nil-safe
+// like every other record* helper on this type (metrics may not be
+// enabled).
+func (s *Server) recordRelayResubmit(result string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.RelayResubmitTotal.WithLabelValues(result).Inc()
 }
 
 // marshalBlockForRelay serializes block into the coin-agnostic

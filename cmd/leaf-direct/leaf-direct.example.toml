@@ -185,7 +185,13 @@ idle_timeout_seconds = 120
 
 # HTTP listen address for /metrics. Defaults to loopback-only (127.0.0.1); an
 # operator must explicitly set this to a wildcard/public address to expose it
-# publicly. Empty disables it. (default: "127.0.0.1:9601")
+# publicly. Empty disables it. Includes real found-block/template NATS relay
+# observability (leaf_relay_block_publish_total, leaf_relay_block_receive_total,
+# leaf_relay_template_publish_total, leaf_relay_template_receive_total,
+# leaf_relay_connected, leaf_relay_last_{block,template}_{publish,receive}_unixtime,
+# leaf_direct_relay_resubmit_total) whenever relay_nats_url below is
+# configured -- always present, reporting zero, when it is not. (default:
+# "127.0.0.1:9601")
 metrics_listen_address = "127.0.0.1:9601"
 
 # Cap on distinct payment-address labels tracked by metrics (0 = package

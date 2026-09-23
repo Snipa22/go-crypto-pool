@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -262,6 +263,134 @@ type Relay struct {
 	dedupMu   sync.Mutex
 	dedupSeen map[string]time.Time
 	dedupList []string // oldest-first, mirrors dedupSeen's keys, bounds it to dedupCacheSize
+
+	// stats is this Relay's own internal, atomic-counter observability
+	// state (see Stats' doc comment) — the single source of truth for
+	// every relay-level Prometheus metric a caller (e.g.
+	// internal/leaflib/direct's Server.EnableMetrics) wires up, so
+	// publish/receive counting is never duplicated between this
+	// package and a caller's own instrumentation (see this package's
+	// doc comment / this feature's explicit design constraint: prefer
+	// exposing internal state over re-counting at the call site).
+	// Never nil (see NewRelay) — every method below is safe to call on
+	// a disabled Relay too, they simply never get incremented.
+	stats *relayStats
+}
+
+// relayStats holds Relay's real, atomic (lock-free, concurrency-safe)
+// publish/receive/connection-health counters. A single hash string is
+// never enough to distinguish found-block from template traffic (see
+// markSeen's shared dedup cache), so these are tracked as entirely
+// separate counters per message type, mirroring BlockMessage vs
+// TemplateMessage's own separate subjects/methods.
+//
+// All fields are zero-value-safe (a freshly zeroed relayStats reports
+// every counter as 0 and Connected as false) — this is exactly the
+// "zero-cost/zero-registration when relay disabled" contract this
+// feature requires: NewRelay never increments any of these for a
+// disabled Relay (every Publish/PublishTemplate/Subscribe/
+// SubscribeTemplate call is already an early-return no-op for
+// !r.Enabled(), see those methods below), so a disabled Relay's
+// Stats() is always the zero RelayStats{} forever.
+type relayStats struct {
+	blockPublishSuccess atomic.Uint64
+	blockPublishError   atomic.Uint64
+	blockRecvDispatched atomic.Uint64
+	blockRecvDuplicate  atomic.Uint64
+
+	templatePublishSuccess atomic.Uint64
+	templatePublishError   atomic.Uint64
+	templateRecvDispatched atomic.Uint64
+	templateRecvDuplicate  atomic.Uint64
+
+	// connected tracks the CURRENT, live NATS connection state — set
+	// true on a successful initial connect or reconnect, false on
+	// disconnect/close. This is deliberately a separate signal from
+	// Relay.Enabled() (which stays true across a transient
+	// disconnect/reconnect cycle, per NewRelay's own
+	// RetryOnFailedConnect(true) self-healing design): a dashboard
+	// wants to see the real, momentary up/down transitions, not just
+	// "was this feature configured at all".
+	connected atomic.Bool
+
+	// lastBlockPublishUnix/lastBlockReceiveUnix/
+	// lastTemplatePublishUnix/lastTemplateReceiveUnix are Unix-second
+	// timestamps (0 = "never") of this Relay's own most recent
+	// successful publish/dispatched-receive of each message type —
+	// the real staleness/lag signal a per-leaf dashboard needs (see
+	// this feature's task description).
+	lastBlockPublishUnix    atomic.Int64
+	lastBlockReceiveUnix    atomic.Int64
+	lastTemplatePublishUnix atomic.Int64
+	lastTemplateReceiveUnix atomic.Int64
+}
+
+// RelayStats is a point-in-time, immutable snapshot of relayStats,
+// returned by Relay.Stats() — see that method's doc comment. Time
+// fields are the zero time.Time (IsZero() == true) when the
+// corresponding event has never happened (rather than the Unix epoch,
+// which would look like a real, very-stale timestamp on a dashboard).
+type RelayStats struct {
+	Connected bool
+
+	BlockPublishSuccess    uint64
+	BlockPublishError      uint64
+	BlockReceiveDispatched uint64
+	BlockReceiveDuplicate  uint64
+
+	TemplatePublishSuccess    uint64
+	TemplatePublishError      uint64
+	TemplateReceiveDispatched uint64
+	TemplateReceiveDuplicate  uint64
+
+	LastBlockPublish    time.Time
+	LastBlockReceive    time.Time
+	LastTemplatePublish time.Time
+	LastTemplateReceive time.Time
+}
+
+// unixOrZero converts an atomic.Int64 Unix-seconds field (0 = never)
+// into a time.Time, returning the zero time.Time (not the Unix epoch)
+// for "never" — see RelayStats' doc comment on why that distinction
+// matters for a dashboard.
+func unixOrZero(v *atomic.Int64) time.Time {
+	u := v.Load()
+	if u == 0 {
+		return time.Time{}
+	}
+	return time.Unix(u, 0)
+}
+
+// Stats returns a point-in-time snapshot of this Relay's own
+// internal publish/receive/connection-health counters — the single
+// source of truth callers (e.g. internal/leaflib/direct's Prometheus
+// wiring, see that package's metrics.go) should read rather than
+// re-counting relay activity themselves at the call site (this
+// feature's explicit design constraint). Safe to call on a nil or
+// disabled Relay: both report the zero RelayStats{}.
+func (r *Relay) Stats() RelayStats {
+	if r == nil || r.stats == nil {
+		return RelayStats{}
+	}
+	s := r.stats
+	return RelayStats{
+		Connected: s.connected.Load(),
+
+		BlockPublishSuccess:    s.blockPublishSuccess.Load(),
+		BlockPublishError:      s.blockPublishError.Load(),
+		BlockReceiveDispatched: s.blockRecvDispatched.Load(),
+		BlockReceiveDuplicate:  s.blockRecvDuplicate.Load(),
+
+		TemplatePublishSuccess:    s.templatePublishSuccess.Load(),
+		TemplatePublishError:      s.templatePublishError.Load(),
+		TemplateReceiveDispatched: s.templateRecvDispatched.Load(),
+		TemplateReceiveDuplicate:  s.templateRecvDuplicate.Load(),
+
+		LastBlockPublish:    unixOrZero(&s.lastBlockPublishUnix),
+		LastBlockReceive:    unixOrZero(&s.lastBlockReceiveUnix),
+		LastTemplatePublish: unixOrZero(&s.lastTemplatePublishUnix),
+		LastTemplateReceive: unixOrZero(&s.lastTemplateReceiveUnix),
+	}
 }
 
 // NewRelay constructs a Relay from cfg. If cfg.URL is empty, the
@@ -297,6 +426,7 @@ func NewRelay(cfg Config) *Relay {
 		id:              id,
 		logger:          logger,
 		dedupSeen:       make(map[string]time.Time),
+		stats:           &relayStats{},
 	}
 
 	if !r.enabled {
@@ -321,14 +451,17 @@ func NewRelay(cfg Config) *Relay {
 		nats.RetryOnFailedConnect(true),
 		nats.Timeout(5 * time.Second),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			r.stats.connected.Store(false)
 			if err != nil {
 				logger.Printf("relay: NATS disconnected: %v", err)
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
+			r.stats.connected.Store(true)
 			logger.Printf("relay: NATS reconnected to %s", nc.ConnectedUrl())
 		}),
 		nats.ClosedHandler(func(_ *nats.Conn) {
+			r.stats.connected.Store(false)
 			logger.Printf("relay: NATS connection closed")
 		}),
 	})...)
@@ -346,6 +479,7 @@ func NewRelay(cfg Config) *Relay {
 	}
 
 	r.conn = conn
+	r.stats.connected.Store(true)
 	logger.Printf("relay: connected to NATS at %s, subject %q, publisher id %s", cfg.URL, subject, id)
 	return r
 }
@@ -390,13 +524,17 @@ func (r *Relay) Publish(_ context.Context, msg BlockMessage) error {
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
+		r.stats.blockPublishError.Add(1)
 		r.logger.Printf("relay: failed to marshal block message for publish (height %d, hash %s): %v", msg.Height, msg.Hash, err)
 		return fmt.Errorf("relay: marshal: %w", err)
 	}
 	if err := r.conn.Publish(r.subject, data); err != nil {
+		r.stats.blockPublishError.Add(1)
 		r.logger.Printf("relay: publish failed (height %d, hash %s): %v", msg.Height, msg.Hash, err)
 		return fmt.Errorf("relay: publish: %w", err)
 	}
+	r.stats.blockPublishSuccess.Add(1)
+	r.stats.lastBlockPublishUnix.Store(time.Now().Unix())
 	r.logger.Printf("relay: published found block height=%d hash=%s algo=%s network=%s", msg.Height, msg.Hash, msg.Algo, msg.Network)
 	return nil
 }
@@ -437,8 +575,11 @@ func (r *Relay) Subscribe(handler func(BlockMessage)) (unsubscribe func(), err e
 		if !r.markSeen(msg.Hash) {
 			// Already processed this hash recently (duplicate
 			// delivery) — skip re-triggering resubmission.
+			r.stats.blockRecvDuplicate.Add(1)
 			return
 		}
+		r.stats.blockRecvDispatched.Add(1)
+		r.stats.lastBlockReceiveUnix.Store(time.Now().Unix())
 		r.logger.Printf("relay: received found block from another instance (publisher=%s height=%d hash=%s algo=%s network=%s), triggering local resubmission", msg.PublisherID, msg.Height, msg.Hash, msg.Algo, msg.Network)
 		handler(msg)
 	})
@@ -468,13 +609,17 @@ func (r *Relay) PublishTemplate(_ context.Context, msg TemplateMessage) error {
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
+		r.stats.templatePublishError.Add(1)
 		r.logger.Printf("relay: failed to marshal template message for publish (height %d, hash %s): %v", msg.Height, msg.Hash, err)
 		return fmt.Errorf("relay: marshal template: %w", err)
 	}
 	if err := r.conn.Publish(r.templateSubject, data); err != nil {
+		r.stats.templatePublishError.Add(1)
 		r.logger.Printf("relay: template publish failed (height %d, hash %s): %v", msg.Height, msg.Hash, err)
 		return fmt.Errorf("relay: publish template: %w", err)
 	}
+	r.stats.templatePublishSuccess.Add(1)
+	r.stats.lastTemplatePublishUnix.Store(time.Now().Unix())
 	r.logger.Printf("relay: published new-tip template height=%d hash=%s algo=%s network=%s", msg.Height, msg.Hash, msg.Algo, msg.Network)
 	return nil
 }
@@ -508,8 +653,11 @@ func (r *Relay) SubscribeTemplate(handler func(TemplateMessage)) (unsubscribe fu
 		if !r.markSeen(msg.Hash) {
 			// Already processed this hash recently (duplicate
 			// delivery) — skip re-triggering invalidation.
+			r.stats.templateRecvDuplicate.Add(1)
 			return
 		}
+		r.stats.templateRecvDispatched.Add(1)
+		r.stats.lastTemplateReceiveUnix.Store(time.Now().Unix())
 		r.logger.Printf("relay: received new-tip template from another instance (publisher=%s height=%d hash=%s algo=%s network=%s), triggering local invalidation", msg.PublisherID, msg.Height, msg.Hash, msg.Algo, msg.Network)
 		handler(msg)
 	})
