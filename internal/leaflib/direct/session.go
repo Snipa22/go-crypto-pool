@@ -1147,7 +1147,22 @@ func (s *Session) forwardBlock(share *poolpb.Share, job *solo.Job, blockHashHex 
 	}
 	pbBlock := &poolpb.Block{
 		Algo: job.Algo, Network: s.server.network, Hash: blockHashHex,
-		Difficulty: share.GetBlockDiff(), Height: int64(job.Height),
+		// Difficulty: the real legacy nodejs-pool-sxmr backend's
+		// storeBlock always overwrites whatever difficulty value we
+		// send via a live global.coinFuncs.getBlockHeaderByHash
+		// chain lookup before insert (confirmed from the real
+		// lib/temp_comms.js source, 2026-09-23) -- so this field is
+		// currently never actually read server-side, and the prior
+		// share.GetBlockDiff() value here (share-weight, not
+		// network difficulty) caused no live data corruption.
+		// Still fixed to job.NetworkTargetDifficulty for wire-
+		// hygiene/future-proofing: this is the genuine network/
+		// block target difficulty at find time, matching what a
+		// Block.Difficulty field should mean, and no payout-math
+		// path in internal/backend reads Block.Difficulty (only
+		// legacyapi/pool.go's read-only API-response passthrough
+		// does) -- confirmed safe to change.
+		Difficulty: leaflib.SafeInt64(job.NetworkTargetDifficulty), Height: int64(job.Height),
 		Timestamp: time.Now().Unix(), PoolType: s.server.poolType, PoolId: s.server.poolID, Valid: true,
 	}
 	if mergeMineChain != "" {

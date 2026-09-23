@@ -207,8 +207,8 @@ func TestBuildLegacyBlock_HappyPath(t *testing.T) {
 	if legacyBlock.GetShares() != 100 {
 		t.Errorf("Shares = %d, want 100", legacyBlock.GetShares())
 	}
-	if legacyBlock.GetTimestamp() != 1700000001 {
-		t.Errorf("Timestamp = %d, want 1700000001", legacyBlock.GetTimestamp())
+	if legacyBlock.GetTimestamp() != 1700000001000 {
+		t.Errorf("Timestamp = %d, want 1700000001000 (block.timestamp=1700000001 seconds * 1000 -- legacy expects milliseconds, bug fix 2026-09-23)", legacyBlock.GetTimestamp())
 	}
 	if legacyBlock.GetPoolType() != legacypb.POOLTYPE_PROP {
 		t.Errorf("PoolType = %v, want PROP", legacyBlock.GetPoolType())
