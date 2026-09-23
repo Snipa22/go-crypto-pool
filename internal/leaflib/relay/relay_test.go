@@ -814,6 +814,170 @@ func TestBuildNatsOptions_ClientCertAppliedOnlyWhenBothCertAndKeySet(t *testing.
 	})
 }
 
+// TestRelayStats_DisabledIsZero confirms Relay.Stats() reports the
+// permanent zero RelayStats{} for a disabled/unconfigured Relay --
+// this is the relay package's own half of this feature's explicit
+// "zero-cost/zero-registration when relay disabled" contract (see
+// internal/leaflib/direct/metrics's TestRelayMetrics_DisabledRelayStaysZero
+// for the caller-side half).
+func TestRelayStats_DisabledIsZero(t *testing.T) {
+	r := NewRelay(Config{URL: ""})
+	if err := r.Publish(context.Background(), BlockMessage{Height: 1, Hash: "x"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := r.PublishTemplate(context.Background(), TemplateMessage{Height: 1, Hash: "y"}); err != nil {
+		t.Fatalf("PublishTemplate: %v", err)
+	}
+
+	stats := r.Stats()
+	if stats != (RelayStats{}) {
+		t.Errorf("expected zero RelayStats{} for a disabled Relay, got %+v", stats)
+	}
+}
+
+// TestRelayStats_PublishAndReceiveCounted is the required real,
+// wire-level proof that Relay.Stats() genuinely reflects publish/
+// receive activity over a real embedded NATS server: publish
+// success counts, connected reports true, and a subscribing Relay's
+// own Stats() reflects a dispatched (non-duplicate) receive.
+func TestRelayStats_PublishAndReceiveCounted(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServer(t)
+	defer shutdown()
+
+	publisher := NewRelay(Config{URL: url})
+	defer publisher.Close()
+	subscriber := NewRelay(Config{URL: url})
+	defer subscriber.Close()
+
+	if !publisher.Stats().Connected || !subscriber.Stats().Connected {
+		t.Fatalf("expected both relays to report Connected=true after connecting to a real NATS server, publisher=%+v subscriber=%+v", publisher.Stats(), subscriber.Stats())
+	}
+
+	received := make(chan BlockMessage, 1)
+	unsub, err := subscriber.Subscribe(func(msg BlockMessage) { received <- msg })
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer unsub()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := publisher.Publish(context.Background(), BlockMessage{Height: 1, Hash: "stats-block-hash"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the subscriber to receive the published block within 5s")
+	}
+
+	pubStats := publisher.Stats()
+	if pubStats.BlockPublishSuccess != 1 {
+		t.Errorf("publisher BlockPublishSuccess = %d, want 1", pubStats.BlockPublishSuccess)
+	}
+	if pubStats.LastBlockPublish.IsZero() {
+		t.Error("expected publisher LastBlockPublish to be set after a real publish")
+	}
+
+	subStats := subscriber.Stats()
+	if subStats.BlockReceiveDispatched != 1 {
+		t.Errorf("subscriber BlockReceiveDispatched = %d, want 1", subStats.BlockReceiveDispatched)
+	}
+	if subStats.BlockReceiveDuplicate != 0 {
+		t.Errorf("subscriber BlockReceiveDuplicate = %d, want 0 (first delivery, not a duplicate)", subStats.BlockReceiveDuplicate)
+	}
+	if subStats.LastBlockReceive.IsZero() {
+		t.Error("expected subscriber LastBlockReceive to be set after a real receive")
+	}
+	// The subscriber never itself published anything on the block
+	// subject, so its own publish counters must remain at 0 -- proof
+	// publish/receive are tracked as genuinely independent counters,
+	// not accidentally shared/aliased.
+	if subStats.BlockPublishSuccess != 0 {
+		t.Errorf("subscriber BlockPublishSuccess = %d, want 0 (it never published)", subStats.BlockPublishSuccess)
+	}
+
+	// Publish the SAME hash again -- the subscriber's second delivery
+	// must be counted as a duplicate, not a second dispatch.
+	if err := publisher.Publish(context.Background(), BlockMessage{Height: 1, Hash: "stats-block-hash"}); err != nil {
+		t.Fatalf("Publish (duplicate): %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	subStats = subscriber.Stats()
+	if subStats.BlockReceiveDispatched != 1 {
+		t.Errorf("subscriber BlockReceiveDispatched after duplicate = %d, want still 1", subStats.BlockReceiveDispatched)
+	}
+	if subStats.BlockReceiveDuplicate != 1 {
+		t.Errorf("subscriber BlockReceiveDuplicate after duplicate = %d, want 1", subStats.BlockReceiveDuplicate)
+	}
+}
+
+// TestRelayStats_TemplatePublishAndReceiveCounted mirrors
+// TestRelayStats_PublishAndReceiveCounted exactly, for the template
+// relay's own separate counters.
+func TestRelayStats_TemplatePublishAndReceiveCounted(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServer(t)
+	defer shutdown()
+
+	publisher := NewRelay(Config{URL: url})
+	defer publisher.Close()
+	subscriber := NewRelay(Config{URL: url})
+	defer subscriber.Close()
+
+	received := make(chan TemplateMessage, 1)
+	unsub, err := subscriber.SubscribeTemplate(func(msg TemplateMessage) { received <- msg })
+	if err != nil {
+		t.Fatalf("SubscribeTemplate: %v", err)
+	}
+	defer unsub()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := publisher.PublishTemplate(context.Background(), TemplateMessage{Height: 1, Hash: "stats-template-hash"}); err != nil {
+		t.Fatalf("PublishTemplate: %v", err)
+	}
+
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the subscriber to receive the published template within 5s")
+	}
+
+	pubStats := publisher.Stats()
+	if pubStats.TemplatePublishSuccess != 1 {
+		t.Errorf("publisher TemplatePublishSuccess = %d, want 1", pubStats.TemplatePublishSuccess)
+	}
+	subStats := subscriber.Stats()
+	if subStats.TemplateReceiveDispatched != 1 {
+		t.Errorf("subscriber TemplateReceiveDispatched = %d, want 1", subStats.TemplateReceiveDispatched)
+	}
+}
+
+// TestRelayStats_ConnectedFalseAfterClose confirms Stats().Connected
+// flips to false once the underlying NATS connection is deliberately
+// closed (the ClosedHandler wiring in NewRelay) -- a real, observable
+// transition, not just a static true-forever flag.
+func TestRelayStats_ConnectedFalseAfterClose(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServer(t)
+	defer shutdown()
+
+	r := NewRelay(Config{URL: url})
+	if !r.Stats().Connected {
+		t.Fatal("expected Connected=true immediately after a successful connect")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// nats.go's ClosedHandler fires synchronously on Close in
+	// practice, but give it a brief real moment to land before
+	// asserting, matching this test file's existing convention for
+	// async NATS callbacks (see e.g. Subscribe's own 100ms
+	// registration-settle sleeps above).
+	time.Sleep(100 * time.Millisecond)
+	if r.Stats().Connected {
+		t.Error("expected Connected=false after Close()")
+	}
+}
+
 // TestBuildNatsOptions_AllAuthAndTLSFieldsCombined confirms every new
 // Config field can be set together and each corresponding option is
 // applied -- proving the three conditional appends in buildNatsOptions
