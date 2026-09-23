@@ -307,10 +307,31 @@ func buildLegacyBlock(block *poolpb.Block, legacyPoolType legacypb.POOLTYPE) (*l
 		Hash:       proto.String(block.GetHash()),
 		Difficulty: proto.Int64(block.GetDifficulty()),
 		Shares:     proto.Int64(block.GetShares()),
-		Timestamp:  proto.Int64(block.GetTimestamp()),
-		PoolType:   poolType.Enum(),
-		Unlocked:   proto.Bool(block.GetUnlocked()),
-		Valid:      proto.Bool(block.GetValid()),
+		// Timestamp: same bug class as buildLegacyShare's Timestamp
+		// fix above (see that field's doc comment for the full
+		// rationale) -- the real legacy nodejs-pool-sxmr backend's
+		// lib/pool.js storeBlock call does
+		// `global.protos.Block.encode({..., timestamp: Date.now(), ...})`,
+		// i.e. JS Date.now() is Unix MILLISECONDS, and the real
+		// `blocks.block_timestamp` column (confirmed live,
+		// 2026-09-23: every historical row is millisecond-scale) is
+		// a plain bigint with no SQL-side unit coercion. go-crypto-
+		// pool's own poolpb.Block.timestamp is Unix SECONDS
+		// (internal/leaflib/direct/session.go's forwardBlock does
+		// `time.Now().Unix()`, and the normal, non-legacy backend
+		// path -- internal/backend/api's blockToRecord plus
+		// internal/backend/db.Repository.InsertBlock -- forwards
+		// that same value through as an opaque, unconverted int64
+		// with no consumer assuming millisecond semantics, so
+		// changing the SOURCE would be safe there but is still
+		// unnecessary), so this legacy-only wire path multiplies by
+		// 1000 here rather than changing Block.timestamp's unit at
+		// the source -- same convert-only-in-legacytransport
+		// approach as buildLegacyShare's Timestamp fix.
+		Timestamp: proto.Int64(block.GetTimestamp() * 1000),
+		PoolType:  poolType.Enum(),
+		Unlocked:  proto.Bool(block.GetUnlocked()),
+		Valid:     proto.Bool(block.GetValid()),
 	}
 	if block.Value != nil {
 		legacyBlock.Value = proto.Int64(block.GetValue())
