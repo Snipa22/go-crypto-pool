@@ -187,44 +187,12 @@ address_flags_file = ""
 # unset, in seconds. (default: 30)
 address_flags_poll_interval_seconds = 30
 
-# NATS server URL for the template-relay fast-invalidation broadcast (see
-# internal/leaflib/relay). leaf-solo has no found-block broadcast use case of
-# its own -- this is purely for the template relay (a sibling leaf instance's
-# own tip-poll finding a new height can invalidate this instance's per-xn job
-# cache immediately). Empty (default) fully disables the relay -- a complete
-# no-op, never required. (default: "")
-relay_nats_url = ""
-
-# NATS subject for the (unused, by leaf-solo) found-block relay stream (empty
-# = relay package default). (default: "")
-relay_subject = ""
-
-# NATS subject for the template (new-tip) relay fast-invalidation broadcast
-# (empty = relay.DefaultTemplateSubject). Reuses the SAME relay_nats_url
-# connection above -- no second NATS URL. (default: "")
-template_relay_subject = ""
-
-# Optional NATS username for the relay connection above (mirrors
-# nats.UserInfo). Empty (default) connects with no auth. (default: "")
-relay_nats_username = ""
-
-# Optional NATS password paired with relay_nats_username (mirrors
-# nats.UserInfo). Never logged. (default: "")
-relay_nats_password = ""
-
-# Optional CA bundle file to verify the NATS server's TLS certificate
-# against (mirrors nats.RootCAs). Empty (default) appends no TLS CA
-# option. (default: "")
-relay_nats_tls_ca_file = ""
-
-# Optional client certificate file for mutual TLS against the NATS server
-# (mirrors nats.ClientCert; must be set together with relay_nats_tls_key_file).
-# (default: "")
-relay_nats_tls_cert_file = ""
-
-# Optional client private key file paired with relay_nats_tls_cert_file
-# (mirrors nats.ClientCert). (default: "")
-relay_nats_tls_key_file = ""
+# leaf-solo has NO relay code of any kind -- no found-block relay, no
+# template relay, no NATS wiring whatsoever. It is a fully standalone
+# binary with no cross-leaf networking (architecture rule: "The only
+# system that has relays is the relay system itself [relay-node] and
+# the leaf-direct... leaf-solo is just that. Solo."). See leaf-direct
+# for the leaf binary that has both found-block and template relay.
 
 # Real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL,
 # faster block-invalidation trigger on top of the existing tip-poll baseline.
