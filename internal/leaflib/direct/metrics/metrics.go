@@ -54,6 +54,26 @@ const (
 	// attempted, distinct from ResultNoSubmitter (which means no
 	// MultiNodeSubmitter is configured at all).
 	ResultUnmarshalError = "unmarshal_error"
+
+	// ClassificationTrusted/ClassificationValidated/ClassificationInvalid
+	// label leaf_direct_shares_by_classification_total -- a 3-way
+	// split mirroring legacy nodejs-pool-sxmr's (lib/pool.js) own 30s
+	// log line ("Processed ${trustedShares}/${normalShares}/
+	// ${invalidShares}/${totalShares} Trusted/Validated/Invalid/Total
+	// shares in the last 30 seconds"; total is deliberately not
+	// re-derived here since it is always the redundant sum of the
+	// other three). ClassificationTrusted is a RandomX-family
+	// (RXT/RXM) submit that skipped real validation entirely via
+	// session.go's trusted-miner mechanism (solo/trust.go) and was
+	// still accepted; ClassificationValidated is a RandomX-family
+	// submit that WAS fully, cryptographically validated and
+	// accepted; ClassificationInvalid is a RandomX-family submit
+	// that was rejected (either the real validator said no, or it
+	// failed the claimed-difficulty floor check) -- see session.go's
+	// handleSubmit/finishSubmit for the exact three call sites.
+	ClassificationTrusted   = "trusted"
+	ClassificationValidated = "validated"
+	ClassificationInvalid   = "invalid"
 )
 
 const OtherAddressLabel = "other"
@@ -150,6 +170,40 @@ type Metrics struct {
 	// not even be attempted).
 	RelayResubmitTotal *prometheus.CounterVec
 
+	// SharesByClassificationTotal counts every RandomX-family
+	// (RXT/RXM) submit that actually reached real-or-skipped
+	// validation, labeled by classification (trusted/validated/
+	// invalid -- see the Classification* consts above). This is an
+	// ADDITIONAL, independent counter mirroring legacy
+	// nodejs-pool-sxmr's own 3-way share-classification 30s log line
+	// (lib/pool.js) -- it does NOT replace SharesTotal above (that
+	// counter's own accepted/rejected split, across every algo, is
+	// untouched).
+	SharesByClassificationTotal *prometheus.CounterVec
+
+	// TemplateDistributionDuration observes the real wall-clock time
+	// (seconds) Server.invalidateAndRepushJobs spends iterating every
+	// connected session and pushing a freshly regenerated job, labeled
+	// by source ("local" = this leaf's own upstream tip-poll/periodic
+	// refresh found the new template; "relay" = the new template was
+	// learned via the NATS template relay from ANOTHER leaf-direct/
+	// leaf-solo instance and is now being distributed to THIS
+	// instance's own miner sessions) -- mirrors legacy
+	// nodejs-pool-sxmr's own per-new-block-template log line
+	// (lib/pool.js: "Block template distribution took ${...}
+	// miliseconds for ${minerCount} miners for blockID: ${height}").
+	TemplateDistributionDuration *prometheus.HistogramVec
+
+	// TemplateDistributionMiners is the real count of sessions
+	// ACTUALLY pushed a fresh job during that same
+	// invalidateAndRepushJobs pass (not the total connection count --
+	// see leaf_direct_active_connections for that -- and not sessions
+	// skipped via the not-logged-in/regeneration-error/
+	// already-delivered continues), labeled by the same source value
+	// as TemplateDistributionDuration -- mirrors the legacy log
+	// line's own minerCount semantics exactly.
+	TemplateDistributionMiners *prometheus.GaugeVec
+
 	BuildInfo *prometheus.GaugeVec
 
 	maxAddressLabels int
@@ -200,6 +254,32 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Name: "leaf_direct_relay_resubmit_total",
 		Help: "Total number of relay-triggered local block resubmission attempts (a genuinely new found-block message received from another leaf-direct instance via the NATS relay), by outcome (accepted/rejected/no_submitter).",
 	}, []string{"result"})
+
+	m.SharesByClassificationTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_direct_shares_by_classification_total",
+		Help: "Total number of RandomX-family (RXT/RXM) submits that reached real-or-skipped validation, by 3-way classification (trusted/validated/invalid), mirroring legacy nodejs-pool-sxmr's (lib/pool.js) own 30s 'Trusted/Validated/Invalid/Total shares' log line -- total is deliberately not re-derived here since it is always the redundant sum of the other three. This is an additional, independent counter; it does not replace leaf_direct_shares_total's own accepted/rejected split.",
+	}, []string{"classification"})
+
+	// leaf_direct_template_distribution_seconds' bucket boundaries:
+	// prometheus.DefBuckets (5ms..10s) tops out at 10s, which is
+	// coarse for this leaf's typical sub-second-to-few-second
+	// push-loop latencies but still usable -- kept (rather than a
+	// bespoke set) since it is the standard, well-understood
+	// Prometheus default every other histogram-shaped metric an
+	// operator is likely to already be scraping elsewhere uses, and
+	// this metric has no unusual latency profile (no multi-second
+	// tail expected in normal operation) that would justify
+	// diverging from it.
+	m.TemplateDistributionDuration = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "leaf_direct_template_distribution_seconds",
+		Help:    "Real wall-clock seconds Server.invalidateAndRepushJobs spent iterating every connected session and pushing a freshly regenerated job, by source (local = this leaf's own tip-poll/periodic-refresh found the new template; relay = the new template was learned via the NATS template relay from another leaf-direct/leaf-solo instance). Buckets: prometheus.DefBuckets (standard, well-understood default; no unusual latency profile expected). Mirrors legacy nodejs-pool-sxmr's (lib/pool.js) own per-new-block-template 'Block template distribution took ... miliseconds' log line.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"source"})
+
+	m.TemplateDistributionMiners = registerGaugeVec(reg, prometheus.GaugeOpts{
+		Name: "leaf_direct_template_distribution_miners",
+		Help: "Real count of sessions actually pushed a fresh job during the most recent invalidateAndRepushJobs pass (not the total connection count -- see leaf_direct_active_connections -- and not sessions skipped via not-logged-in/regeneration-error/already-delivered), by source (local/relay -- see leaf_direct_template_distribution_seconds). Mirrors legacy nodejs-pool-sxmr's own per-new-block-template log line's minerCount semantics exactly.",
+	}, []string{"source"})
 
 	m.BuildInfo = registerGaugeVec(reg, prometheus.GaugeOpts{
 		Name: "leaf_direct_build_info",
@@ -567,6 +647,23 @@ func registerGaugeVec(reg *prometheus.Registry, opts prometheus.GaugeOpts, label
 		log.Printf("metrics: failed to register gauge vec %s: %v", opts.Name, err)
 	}
 	return gv
+}
+
+// registerHistogramVec mirrors registerCounterVec/registerGaugeVec's
+// exact same AlreadyRegisteredError-tolerant pattern, for a labeled
+// *prometheus.HistogramVec.
+func registerHistogramVec(reg *prometheus.Registry, opts prometheus.HistogramOpts, labels []string) *prometheus.HistogramVec {
+	hv := prometheus.NewHistogramVec(opts, labels)
+	if err := reg.Register(hv); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
+				return existing
+			}
+		}
+		log.Printf("metrics: failed to register histogram vec %s: %v", opts.Name, err)
+	}
+	return hv
 }
 
 // registerCounter mirrors solo/metrics's own identical helper exactly,

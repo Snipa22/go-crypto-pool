@@ -1164,7 +1164,7 @@ func (s *Session) handleSubmit(req Request) {
 		// triggers Server.invalidateAndRepushJobs to regenerate+push fresh
 		// jobs to every connected session) rather than waiting out the
 		// tip-poll interval.
-		go s.server.jobManager.InvalidateAll()
+		go s.server.jobManager.InvalidateAll(TemplateSourceLocal)
 	}
 
 	// DISPATCH_BRIEF (2026-09-10, Alex's explicit direction): leaf-solo

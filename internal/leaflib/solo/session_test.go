@@ -856,7 +856,7 @@ func TestSessionJobHistoryIsBounded(t *testing.T) {
 		// writes block until the peer (this same test) reads them;
 		// calling it inline would self-deadlock against the
 		// recvJobPush call below.
-		go h.jm.InvalidateAll()
+		go h.jm.InvalidateAll(TemplateSourceLocal)
 		push := h.recvJobPush()
 		if push.Params.JobID == "" {
 			t.Fatalf("push %d: expected a non-empty job_id", i)
