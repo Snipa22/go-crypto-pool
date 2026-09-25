@@ -1238,7 +1238,7 @@ func main() {
 	// started above), it is purely an additional, faster trigger
 	// running alongside it.
 	if isMoneroFamilyCoin(cfg.coin) && cfg.moneroZMQURL != "" {
-		zmqClient := monerozmq.NewClient(cfg.moneroZMQURL, jobManager.InvalidateAll, logger)
+		zmqClient := monerozmq.NewClient(cfg.moneroZMQURL, func() { jobManager.InvalidateAll(solo.TemplateSourceLocal) }, logger)
 		go zmqClient.Start(ctx)
 		logger.Printf("real monerod ZMQ fast-invalidation trigger enabled at %s (topic %q)", cfg.moneroZMQURL, monerozmq.TopicNewBlock)
 	} else if cfg.moneroZMQURL != "" {

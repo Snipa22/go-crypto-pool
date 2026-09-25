@@ -180,7 +180,13 @@ func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeC
 		// cmd/leaf-solo's -randomx-workers flag) before Serve begins.
 		randomxPool: NewAsyncValidationPool(0, AsyncValidationQueueSize),
 	}
-	s.unsubscribe = jobManager.Subscribe(s.invalidateAndRepushJobs)
+	// leaf-solo's own invalidateAndRepushJobs has no use for the
+	// source label JobManager.Subscribe's callback now carries (see
+	// job.go's Subscribe/InvalidateAll doc comments) -- only
+	// leaf-direct's template-distribution metrics need it. Wrapped at
+	// this call site rather than changing invalidateAndRepushJobs'
+	// own signature.
+	s.unsubscribe = jobManager.Subscribe(func(_ string) { s.invalidateAndRepushJobs() })
 	return s
 }
 

@@ -182,3 +182,53 @@ func TestRelayMetrics_DisabledRelayStaysZero(t *testing.T) {
 		}
 	}
 }
+
+// TestShareClassificationMetrics proves
+// leaf_direct_shares_by_classification_total emits all 3 real label
+// values (trusted/validated/invalid) correctly -- a real counter,
+// not snapshot-derived, so this mirrors
+// TestRelayMetrics_SnapshotDerived's style of driving it via direct
+// .WithLabelValues(...).Inc() calls then scraping+asserting.
+func TestShareClassificationMetrics(t *testing.T) {
+	m := New("dev", 0)
+	m.SharesByClassificationTotal.WithLabelValues(ClassificationTrusted).Add(2)
+	m.SharesByClassificationTotal.WithLabelValues(ClassificationValidated).Add(5)
+	m.SharesByClassificationTotal.WithLabelValues(ClassificationInvalid).Inc()
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		`leaf_direct_shares_by_classification_total{classification="trusted"} 2`,
+		`leaf_direct_shares_by_classification_total{classification="validated"} 5`,
+		`leaf_direct_shares_by_classification_total{classification="invalid"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+}
+
+// TestTemplateDistributionMetrics proves both
+// leaf_direct_template_distribution_seconds and
+// leaf_direct_template_distribution_miners emit correctly for BOTH
+// source="local" and source="relay" after direct Observe/Set calls.
+func TestTemplateDistributionMetrics(t *testing.T) {
+	m := New("dev", 0)
+	m.TemplateDistributionDuration.WithLabelValues("local").Observe(0.25)
+	m.TemplateDistributionDuration.WithLabelValues("relay").Observe(1.5)
+	m.TemplateDistributionMiners.WithLabelValues("local").Set(12)
+	m.TemplateDistributionMiners.WithLabelValues("relay").Set(7)
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		`leaf_direct_template_distribution_seconds_count{source="local"} 1`,
+		`leaf_direct_template_distribution_seconds_sum{source="local"} 0.25`,
+		`leaf_direct_template_distribution_seconds_count{source="relay"} 1`,
+		`leaf_direct_template_distribution_seconds_sum{source="relay"} 1.5`,
+		`leaf_direct_template_distribution_miners{source="local"} 12`,
+		`leaf_direct_template_distribution_miners{source="relay"} 7`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+}

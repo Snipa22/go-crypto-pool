@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	directmetrics "github.com/Snipa22/go-crypto-pool/internal/leaflib/direct/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/transport"
@@ -595,6 +596,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			disconnect := false
 			if solo.IsRandomXFamily(job.Algo) {
 				s.trust.RecordOutcome(false)
+				s.server.recordShareClassification(directmetrics.ClassificationInvalid)
 				disconnect = s.invalidShareGuard.RecordOutcome(false)
 			}
 			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
@@ -643,6 +645,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		if solo.IsRandomXFamily(job.Algo) && diff < job.StaticDifficulty {
 			disconnect := s.invalidShareGuard.RecordOutcome(false)
 			s.trust.RecordOutcome(false)
+			s.server.recordShareClassification(directmetrics.ClassificationInvalid)
 			s.writeShareResponse(req.ID, false, "share does not meet the job's configured difficulty")
 			if disconnect {
 				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
@@ -653,6 +656,11 @@ func (s *Session) handleSubmit(req solo.Request) {
 		if solo.IsRandomXFamily(job.Algo) {
 			s.trust.RecordOutcome(true)
 			s.invalidShareGuard.RecordOutcome(true)
+			if skipped {
+				s.server.recordShareClassification(directmetrics.ClassificationTrusted)
+			} else {
+				s.server.recordShareClassification(directmetrics.ClassificationValidated)
+			}
 		}
 
 		// GENUINE DIFFERENCE FROM leaf-solo: every validated share (not
@@ -1009,7 +1017,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			}
 		}
 
-		go s.server.jobManager.InvalidateAll()
+		go s.server.jobManager.InvalidateAll(solo.TemplateSourceLocal)
 	}
 
 	// DISPATCH: mirrors solo.Session's own identical dispatch exactly —

@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -507,10 +508,10 @@ func TestDirectInvalidateAndRepushJobsSkipsDuplicatePush(t *testing.T) {
 	h := newDirectTestHarness(t, 1000, 1<<62)
 	_, _ = directLogin(t, h, realTariTestAddress("direct-dedup-addr-1"))
 
-	h.server.invalidateAndRepushJobs()
+	h.server.invalidateAndRepushJobs(solo.TemplateSourceLocal)
 	directExpectNoJobPush(t, h)
 
-	h.server.invalidateAndRepushJobs()
+	h.server.invalidateAndRepushJobs(solo.TemplateSourceLocal)
 	directExpectNoJobPush(t, h)
 }
 
@@ -520,7 +521,7 @@ func TestDirectInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T
 	h := newDirectTestHarness(t, 1000, 1<<62)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("direct-dedup-addr-2"))
 
-	h.server.invalidateAndRepushJobs()
+	h.server.invalidateAndRepushJobs(solo.TemplateSourceLocal)
 	directExpectNoJobPush(t, h)
 
 	baselineJobID := directCurrentJobIDForXN(t, h, xn)
@@ -534,7 +535,7 @@ func TestDirectInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T
 
 	// See solo package's identical test for why this must run in its
 	// own goroutine (net.Pipe's synchronous write/read pairing).
-	go h.server.invalidateAndRepushJobs()
+	go h.server.invalidateAndRepushJobs(solo.TemplateSourceLocal)
 	push := h.recvJobPush()
 
 	if push.Method != "job" {
@@ -548,8 +549,95 @@ func TestDirectInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T
 		t.Fatalf("BUG: a real vardiff-driven target update was dropped -- push.Params.Target = %q, want %q", push.Params.Target, wantTarget)
 	}
 
-	h.server.invalidateAndRepushJobs()
+	h.server.invalidateAndRepushJobs(solo.TemplateSourceLocal)
 	directExpectNoJobPush(t, h)
+}
+
+// TestDirectInvalidateAndRepushJobsRecordsTemplateDistributionMetrics
+// proves invalidateAndRepushJobs' real instrumentation (Part B of
+// this feature): leaf_direct_template_distribution_seconds/
+// leaf_direct_template_distribution_miners are observed/set with the
+// real source label passed through, and the recorded miner count
+// matches how many sessions were ACTUALLY pushed a fresh job (not
+// the total connection count) -- a second, connected-but-never-
+// logged-in session must be skipped and NOT counted, exactly like
+// the real minerCount semantics the legacy nodejs-pool-sxmr log line
+// this metric mirrors ports.
+func TestDirectInvalidateAndRepushJobsRecordsTemplateDistributionMetrics(t *testing.T) {
+	h := newDirectTestHarness(t, 1000, 1<<62)
+	h.server.EnableMetrics("dev", 0)
+
+	sessionID, xn := directLogin(t, h, realTariTestAddress("direct-template-dist-1"))
+
+	// A second connection that never logs in -- invalidateAndRepushJobs
+	// must skip it (sess.loggedIn.Load() == false, the FIRST continue
+	// in that function) and it must NOT be counted toward
+	// TemplateDistributionMiners.
+	serverConn2, clientConn2 := net.Pipe()
+	go h.server.handleConn(context.Background(), serverConn2, 1000)
+	t.Cleanup(func() { _ = clientConn2.Close() })
+	// Give handleConn's goroutine time to register the second session
+	// on h.server before this test's own invalidateAndRepushJobs call
+	// below snapshots h.server.sessions.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.server.mu.RLock()
+		count := len(h.server.sessions)
+		h.server.mu.RUnlock()
+		if count >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second connection never registered as a session on h.server within the test deadline")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Force a genuinely new job for the logged-in session so this
+	// invalidateAndRepushJobs call actually pushes something (mirrors
+	// TestDirectInvalidateAndRepushJobsStillPushesOnDifficultyChange's
+	// own setup -- a bare call right after login is a no-op, see
+	// TestDirectInvalidateAndRepushJobsSkipsDuplicatePush).
+	sess := directSessionByID(t, h, sessionID)
+	newDiff := sess.currentDifficulty.Load() * 2
+	sess.currentDifficulty.Store(newDiff)
+	if _, err := h.jm.RestampDifficulty(context.Background(), xn, newDiff); err != nil {
+		t.Fatalf("RestampDifficulty: %v", err)
+	}
+
+	go h.server.invalidateAndRepushJobs(solo.TemplateSourceRelay)
+	push := h.recvJobPush()
+	if push.Method != "job" {
+		t.Fatalf("push method = %q, want job", push.Method)
+	}
+
+	srv := httptest.NewServer(h.server.MetricsHandler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 65536)
+	n, _ := resp.Body.Read(buf)
+	body := string(buf[:n])
+
+	for _, want := range []string{
+		`leaf_direct_template_distribution_seconds_count{source="relay"} 1`,
+		`leaf_direct_template_distribution_miners{source="relay"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+	for _, absent := range []string{
+		`leaf_direct_template_distribution_seconds_count{source="local"}`,
+		`leaf_direct_template_distribution_miners{source="local"}`,
+	} {
+		if strings.Contains(body, absent) {
+			t.Errorf("expected no %q series (only source=\"relay\" was ever observed in this test), got:\n%s", absent, body)
+		}
+	}
 }
 
 func directXNPrefixedNonceHex(xn string, n uint64) string {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
@@ -305,7 +306,7 @@ func TestJobForXNIsStableForSameXNUntilInvalidated(t *testing.T) {
 
 	// Tip moves -> cache invalidated -> the same xn must now get a
 	// brand new, regenerated Job.
-	jm.InvalidateAll()
+	jm.InvalidateAll(TemplateSourceLocal)
 
 	third, err := jm.JobForXN(context.Background(), "cccc")
 	if err != nil {
@@ -333,20 +334,99 @@ func TestJobManagerNotifiesSubscribersOnInvalidation(t *testing.T) {
 	jm := NewJobManager(JobManagerConfig{Node: node})
 
 	var received atomic.Int64
-	unsub := jm.Subscribe(func() {
+	var lastSource atomic.Value
+	unsub := jm.Subscribe(func(source string) {
 		received.Add(1)
+		lastSource.Store(source)
 	})
 	defer unsub()
 
-	jm.InvalidateAll()
+	jm.InvalidateAll(TemplateSourceLocal)
 	if received.Load() != 1 {
 		t.Errorf("subscriber called %d times, want 1", received.Load())
 	}
+	if got := lastSource.Load(); got != TemplateSourceLocal {
+		t.Errorf("subscriber received source = %v, want %q", got, TemplateSourceLocal)
+	}
 
 	unsub()
-	jm.InvalidateAll()
+	jm.InvalidateAll(TemplateSourceLocal)
 	if received.Load() != 1 {
 		t.Errorf("subscriber should not fire after unsubscribe, got %d calls", received.Load())
+	}
+}
+
+// TestJobManagerSubscribeReceivesRealSource proves Subscribe's
+// callback receives the real, correct TemplateSource* value for
+// EACH of InvalidateAll's distinct real trigger kinds this brief
+// requires coverage for: a tip-poll-triggered/refresh-triggered
+// (both "local") invalidation, and a template-relay-triggered
+// ("relay") invalidation -- driven via the real tipPollLoop/
+// refreshLoop/startTemplateRelaySubscription machinery (Start),
+// not by calling InvalidateAll directly, so this genuinely exercises
+// job.go's own 3 real call sites end-to-end.
+func TestJobManagerSubscribeReceivesRealSource(t *testing.T) {
+	url, shutdown := startEmbeddedNATSServerForJobTest(t)
+	defer shutdown()
+
+	jmRelay := relay.NewRelay(relay.Config{URL: url})
+	defer jmRelay.Close()
+	externalRelay := relay.NewRelay(relay.Config{URL: url})
+	defer externalRelay.Close()
+	if !jmRelay.Enabled() || !externalRelay.Enabled() {
+		t.Fatalf("expected both relays to be Enabled() after connecting to a real NATS server at %s", url)
+	}
+
+	node := &fakeNodeClient{height: 100}
+	jm := NewJobManager(JobManagerConfig{
+		Node: node, PayoutAddress: "solo-test-address",
+		Algo: poolpb.Algo_ALGO_SHA3X, Network: "testnet",
+		RefreshInterval: 24 * time.Hour, // disabled: only tip-poll and the relay subscription drive this test
+		TipPollInterval: 20 * time.Millisecond,
+	})
+	jm.cfg.Relay = jmRelay
+
+	sources := make(chan string, 8)
+	unsub := jm.Subscribe(func(source string) { sources <- source })
+	defer unsub()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	jm.Start(ctx)
+	time.Sleep(150 * time.Millisecond) // let the real NATS subscription land
+
+	// Genuine local tip increase -> "local".
+	node.setHeight(101)
+	select {
+	case source := <-sources:
+		if source != TemplateSourceLocal {
+			t.Errorf("tip-poll-triggered invalidation source = %q, want %q", source, TemplateSourceLocal)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a tip-poll-triggered invalidation within 5s")
+	}
+
+	// Externally-received template relay message -> "relay".
+	if err := externalRelay.PublishTemplate(context.Background(), relay.TemplateMessage{
+		Algo: "sha3x", Network: "testnet", Height: 200, Hash: "external-source-test-hash",
+	}); err != nil {
+		t.Fatalf("PublishTemplate (external): %v", err)
+	}
+	deadline := time.After(5 * time.Second)
+	found := false
+	for !found {
+		select {
+		case source := <-sources:
+			if source == TemplateSourceRelay {
+				found = true
+				break
+			}
+			// A stray "local" from a subsequent tip-poll tick is
+			// possible (TipPollInterval is short); keep waiting for
+			// the relay-triggered one specifically.
+		case <-deadline:
+			t.Fatal("expected a relay-triggered invalidation (source=\"relay\") within 5s")
+		}
 	}
 }
 

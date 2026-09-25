@@ -263,6 +263,29 @@ func (j *Job) MarkNonceUsed(nonce uint64) (firstUse bool) {
 	return true
 }
 
+// TemplateSourceLocal/TemplateSourceRelay label every
+// JobManager.Subscribe(fn func(source string)) callback invocation
+// (see InvalidateAll/notify below) with WHICH of InvalidateAll's 3
+// real call sites triggered this invalidation --
+// internal/leaflib/direct's metrics package (leaf_direct_template_
+// distribution_seconds/leaf_direct_template_distribution_miners)
+// consumes these values as-is for its own "source" label, so these
+// exact string VALUES ("local"/"relay") must never change without
+// updating that consumer too.
+//
+//   - TemplateSourceLocal: tipPollLoop's own genuine tip-height
+//     increase, or refreshLoop's unconditional periodic cache
+//     refresh -- this instance's OWN observation, no relay involved
+//     either way.
+//   - TemplateSourceRelay: startTemplateRelaySubscription's callback
+//     fired because jm.cfg.Relay.SubscribeTemplate delivered a
+//     genuinely new (non-duplicate) template message from ANOTHER
+//     instance.
+const (
+	TemplateSourceLocal = "local"
+	TemplateSourceRelay = "relay"
+)
+
 // maxTrackedNoncesPerJob mirrors internal/leaflib/proxy/job.go's
 // identical constant exactly -- see that constant's own doc comment
 // for the full reasoning (Fix 11, DISPATCH_BRIEF.md 2026-09-10). The
@@ -411,7 +434,7 @@ type JobManager struct {
 	genMu sync.Mutex // serializes concurrent new-template generation
 
 	subMu sync.RWMutex
-	subs  map[uint64]func()
+	subs  map[uint64]func(source string)
 	subID uint64
 
 	logger *log.Logger
@@ -444,7 +467,7 @@ func NewJobManager(cfg JobManagerConfig) *JobManager {
 		cfg:      cfg,
 		perXN:    make(map[string]*Job),
 		jobsByID: make(map[string]*Job),
-		subs:     make(map[uint64]func()),
+		subs:     make(map[uint64]func(source string)),
 		logger:   logger,
 	}
 }
@@ -667,13 +690,20 @@ func (jm *JobManager) JobMaxAge() time.Duration {
 // filtering stale entries out one lookup at a time, the whole
 // generation is invalidated up front so no session can be served a job
 // for a tip that has already moved.
-func (jm *JobManager) InvalidateAll() {
+//
+// source (one of TemplateSourceLocal/TemplateSourceRelay) identifies
+// WHICH real call site triggered this invalidation and is threaded
+// straight through to notify's subscriber callbacks -- see that
+// const block's own doc comment for why (internal/leaflib/direct's
+// template-distribution metrics consume it as their own "source"
+// label).
+func (jm *JobManager) InvalidateAll(source string) {
 	jm.mu.Lock()
 	jm.perXN = make(map[string]*Job)
 	jm.jobsByID = make(map[string]*Job)
 	jm.mu.Unlock()
 	jm.cfg.Debug.Debugf("solo: per-xn job cache invalidated (all cached jobs dropped)")
-	jm.notify()
+	jm.notify(source)
 }
 
 // Probe performs a single, uncached GetBlockTemplate call purely to
@@ -694,11 +724,13 @@ func (jm *JobManager) Probe(ctx context.Context) error {
 }
 
 // Subscribe registers fn to be called every time the per-xn job cache
-// is invalidated (tip movement or periodic refresh). Callers (Server)
+// is invalidated (tip movement or periodic refresh), receiving the
+// real source (TemplateSourceLocal/TemplateSourceRelay) of that
+// invalidation -- see InvalidateAll's doc comment. Callers (Server)
 // use this to push freshly (re-)generated per-xn jobs out to every
 // currently-connected, logged-in session. Returns an unsubscribe
 // function.
-func (jm *JobManager) Subscribe(fn func()) (unsubscribe func()) {
+func (jm *JobManager) Subscribe(fn func(source string)) (unsubscribe func()) {
 	jm.subMu.Lock()
 	id := jm.subID
 	jm.subID++
@@ -711,11 +743,11 @@ func (jm *JobManager) Subscribe(fn func()) (unsubscribe func()) {
 	}
 }
 
-func (jm *JobManager) notify() {
+func (jm *JobManager) notify(source string) {
 	jm.subMu.RLock()
 	defer jm.subMu.RUnlock()
 	for _, fn := range jm.subs {
-		fn()
+		fn(source)
 	}
 }
 
@@ -748,7 +780,7 @@ func (jm *JobManager) Start(ctx context.Context) {
 func (jm *JobManager) startTemplateRelaySubscription(ctx context.Context) {
 	unsub, err := jm.cfg.Relay.SubscribeTemplate(func(msg relay.TemplateMessage) {
 		jm.logger.Printf("solo: received template relay message from another instance (height=%d algo=%s network=%s), invalidating per-xn job cache", msg.Height, msg.Algo, msg.Network)
-		jm.InvalidateAll()
+		jm.InvalidateAll(TemplateSourceRelay)
 	})
 	if err != nil {
 		jm.logger.Printf("solo: template relay subscribe failed (template-relay fast-invalidation disabled, primary tip-poll path unaffected): %v", err)
@@ -769,7 +801,7 @@ func (jm *JobManager) refreshLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			jm.logger.Printf("solo: periodic per-xn job cache invalidation")
-			jm.InvalidateAll()
+			jm.InvalidateAll(TemplateSourceLocal)
 		}
 	}
 }
@@ -807,7 +839,7 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 				jm.mu.Lock()
 				jm.lastTipHeight = height
 				jm.mu.Unlock()
-				jm.InvalidateAll()
+				jm.InvalidateAll(TemplateSourceLocal)
 				jm.publishTemplate(ctx, height)
 			}
 		}

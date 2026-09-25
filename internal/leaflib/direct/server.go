@@ -630,6 +630,21 @@ func (s *Server) recordConnectionError(category string) {
 	s.metrics.ConnectionErrorsTotal.WithLabelValues(category).Inc()
 }
 
+// recordShareClassification bumps the real
+// leaf_direct_shares_by_classification_total counter (see
+// directmetrics.Metrics.SharesByClassificationTotal's doc comment)
+// for classification (one of directmetrics.ClassificationTrusted/
+// ClassificationValidated/ClassificationInvalid) -- called from
+// session.go's finishSubmit closure instead of touching s.metrics
+// directly there, mirroring every other record* helper's nil-checked
+// convention on this type.
+func (s *Server) recordShareClassification(classification string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.SharesByClassificationTotal.WithLabelValues(classification).Inc()
+}
+
 // recordTransportError tracks backend-forwarding failures (share/
 // block), a genuinely new observability axis leaf-solo has no
 // equivalent of (it never forwards anything to a backend). It also
@@ -740,13 +755,53 @@ func (s *Server) recordMoneroBlockHashUnresolved() {
 	s.metrics.DirectBlockHashUnresolvedTotal.Inc()
 }
 
-func (s *Server) invalidateAndRepushJobs() {
+// recordTemplateDistribution observes the real wall-clock duration a
+// single invalidateAndRepushJobs pass took and sets the real count of
+// sessions actually pushed a fresh job during that pass, labeled by
+// source (directmetrics.TemplateDistributionDuration/
+// TemplateDistributionMiners -- see those fields' own doc comments)
+// -- called from invalidateAndRepushJobs instead of touching
+// s.metrics directly there, mirroring every other record* helper's
+// nil-checked convention on this type.
+func (s *Server) recordTemplateDistribution(source string, seconds float64, minerCount int) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.TemplateDistributionDuration.WithLabelValues(source).Observe(seconds)
+	s.metrics.TemplateDistributionMiners.WithLabelValues(source).Set(float64(minerCount))
+}
+
+// invalidateAndRepushJobs is JobManager's Subscribe callback (see
+// server.go's NewServer wiring): fires every time the per-xn job
+// cache is invalidated, iterating every connected, logged-in session
+// and pushing it a freshly (re-)generated job so it never keeps
+// working a job for a tip that has already moved.
+//
+// source (solo.TemplateSourceLocal/solo.TemplateSourceRelay, threaded
+// straight through from JobManager.InvalidateAll -- see that method's
+// and job.go's TemplateSource* consts' own doc comments) identifies
+// WHICH real event triggered this pass: this leaf's own upstream
+// tip-poll/periodic-refresh finding a new template ("local"), or a
+// new template learned via the NATS template relay from ANOTHER
+// leaf-direct/leaf-solo instance now being distributed to THIS
+// instance's own sessions ("relay") -- recorded below via
+// recordTemplateDistribution, mirroring legacy nodejs-pool-sxmr's own
+// per-new-block-template log line (lib/pool.js: "Block template
+// distribution took ${...} miliseconds for ${minerCount} miners for
+// blockID: ${height}"). This metric is meant to expose
+// relay-triggered template-propagation latency/health as more relay
+// nodes get wired into the mesh across the pool-migration effort,
+// distinguishing "my own new tip" from "a relay redelivery"
+// distribution passes.
+func (s *Server) invalidateAndRepushJobs(source string) {
+	start := time.Now()
 	s.mu.RLock()
 	sessions := make([]*Session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
 		sessions = append(sessions, sess)
 	}
 	s.mu.RUnlock()
+	pushed := 0
 	for _, sess := range sessions {
 		if !sess.loggedIn.Load() {
 			continue
@@ -765,7 +820,9 @@ func (s *Server) invalidateAndRepushJobs() {
 			continue
 		}
 		sess.pushJob(job)
+		pushed++
 	}
+	s.recordTemplateDistribution(source, time.Since(start).Seconds(), pushed)
 }
 
 // Serve accepts miner connections on ln, structurally identical to
