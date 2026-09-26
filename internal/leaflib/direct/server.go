@@ -191,18 +191,23 @@ type Server struct {
 	// per-xn job-cache MISS (first time a session's xn is seen, or --
 	// critically -- after chain-tip movement invalidates EVERY
 	// currently-cached xn at once, see solo/job.go's jobForXN doc
-	// comment), that call acquires solo.JobManager's own
-	// server/process-wide genMu sync.Mutex -- which CANNOT be
-	// interrupted by context cancellation under any circumstances --
-	// then makes a real GetBlockTemplate HTTP round-trip (capped at
-	// 30s by MoneroNodeClient's own http.Client.Timeout, but that cap
-	// is per-HTTP-call only; the genMu wait itself is fully
-	// unbounded). Under real load, potentially thousands of the
-	// ~20k live connections can be queued behind that one mutex
-	// simultaneously after a single tip-triggered invalidation, each
-	// one's session stuck unable to call scanner.Scan() again (so
-	// unable to ever notice a peer's FIN) for however long its own
-	// turn takes -- exactly the structural cause of the observed
+	// comment), that call acquires a per-xn generation lock inside
+	// solo.JobManager (originally a single server/process-wide genMu
+	// sync.Mutex shared across EVERY xn; narrowed to per-xn
+	// granularity by a later, related fix -- see solo/job.go's
+	// genLocks field doc comment -- but the property that matters
+	// here is unchanged either way) -- which CANNOT be interrupted by
+	// context cancellation under any circumstances -- then makes a
+	// real GetBlockTemplate HTTP round-trip (capped at 30s by
+	// MoneroNodeClient's own http.Client.Timeout, but that cap is
+	// per-HTTP-call only; the lock wait itself is fully unbounded).
+	// Under real load, potentially thousands of the ~20k live
+	// connections sharing the SAME xn (or, before the per-xn
+	// narrowing above, ANY xn at all) could be queued behind that
+	// lock simultaneously after a single tip-triggered invalidation,
+	// each one's session stuck unable to call scanner.Scan() again
+	// (so unable to ever notice a peer's FIN) for however long its
+	// own turn takes -- exactly the structural cause of the observed
 	// CLOSE-WAIT accumulation: handleConn's cleanup defer is correct
 	// and does fire, but only once Session.Run actually returns, and
 	// Run can't get back to scanner.Scan() until this call does.
@@ -213,15 +218,74 @@ type Server struct {
 	// forwardPool's/randomxPool's exact same "dispatch off the read
 	// loop onto a bounded solo.AsyncValidationPool via TrySubmit"
 	// shape. Deliberately a THIRD, separate pool from both of those
-	// (not reused): the actual contended resource here (genMu, and
-	// transitively the downstream node's template-generation
-	// capacity) is unrelated to either RandomX validation throughput
-	// or backend-transport concurrency, so sharing either existing
+	// (not reused): the actual contended resource here (the
+	// generation lock, and transitively the downstream node's
+	// template-generation capacity) is unrelated to either RandomX
+	// validation throughput or backend-transport concurrency, so
+	// sharing either existing
 	// pool would let a job-fetch stall degrade unrelated throughput
 	// for other sessions, exactly the cross-resource-contention
 	// failure mode forwardPool's own doc comment already describes
 	// avoiding for randomxPool.
 	jobFetchPool *solo.AsyncValidationPool
+
+	// repushPool is the SECOND, related-but-distinct production-
+	// incident fix on top of jobFetchPool above (same leaf,
+	// phx-dump.supportxmr.com; brief2.md): leaf_direct_template_
+	// distribution_seconds/_miners went completely dark (no series at
+	// all) for 15+ minutes despite real mainnet height changes every
+	// ~2 minutes, with zero "new tip detected... invalidating" log
+	// lines in that window (journalctl still showed unrelated
+	// per-session "new block template fetched" lines from job.go's
+	// jobForXN, which fires on ANY cache-miss job generation, not just
+	// tip movement). Root cause chain, all synchronous on ONE
+	// goroutine -- solo/job.go's tipPollLoop (~line 899-967) calls
+	// InvalidateAll (~line 737-744) inline, which calls notify
+	// (~line 783-789) inline while holding jm.subMu.RLock(), which
+	// calls THIS package's own debouncedInvalidateAndRepushJobs
+	// inline, which (on the common, never-debounced genuine-height-
+	// increase path) called invalidateAndRepushJobs inline: a
+	// sequential, one-session-at-a-time loop over every logged-in
+	// session, each one a guaranteed real GetBlockTemplate HTTP round
+	// trip (every session's xn is unique, and InvalidateAll just wiped
+	// the ENTIRE per-xn cache) -- amplified to ~100,000+ sequential
+	// calls by the SAME session-map bloat the sibling CLOSE-WAIT leak
+	// (jobFetchPool, above) causes, but a real structural bug on its
+	// own even at the correct ~20k live-connection count: tipPollLoop
+	// cannot get back around to its own `select { case <-ticker.C }`
+	// -- and therefore cannot detect or log the NEXT tip change, and
+	// this leaf's template-distribution metrics cannot fire again --
+	// until that ENTIRE sequential loop returns. Confirmed via grep: no
+	// recover() anywhere in this call chain (solo/job.go's
+	// tipPollLoop/InvalidateAll/notify, nor this file's
+	// debouncedInvalidateAndRepushJobs/invalidateAndRepushJobs/
+	// firePendingRepush) -- this is NOT a swallowed panic (which would
+	// crash the whole process loudly, and the leaf stayed up serving
+	// connections); it is the sequential loop genuinely still running.
+	//
+	// The fix has two parts (see invalidateAndRepushJobs' own doc
+	// comment for the second): this pool moves the
+	// s.invalidateAndRepushJobs(source) call itself off tipPollLoop's
+	// (or firePendingRepush's timer's) own goroutine, via the exact
+	// same dispatch-onto-a-bounded-solo.AsyncValidationPool-via-
+	// TrySubmit shape jobFetchPool/randomxPool/forwardPool already
+	// use. Deliberately constructed with EXACTLY 1 worker (see
+	// NewServer), NOT solo.DefaultAsyncValidationWorkers()
+	// (runtime.NumCPU()) like every other pool on this Server: unlike
+	// randomxPool/forwardPool/jobFetchPool (which all benefit from
+	// real parallelism across independent sessions/submits),
+	// invalidateAndRepushJobs is a single GLOBAL operation over the
+	// entire session map that must never run twice concurrently --
+	// two overlapping passes could race on/mis-track
+	// s.lastRepushHeight/s.lastRepushAt (repushMu only guards the
+	// debounce bookkeeping in debouncedInvalidateAndRepushJobs, not a
+	// second invalidateAndRepushJobs call already dispatched and
+	// running). This pool exists ONLY to get that one call off
+	// tipPollLoop's critical path, never to parallelize multiple
+	// invocations of it against each other -- the real per-session
+	// fan-out parallelism now lives INSIDE invalidateAndRepushJobs
+	// itself (see that method's own doc comment).
+	repushPool *solo.AsyncValidationPool
 
 	// debugLogger is nil unless ServerConfig.Debug was set (see
 	// cmd/leaf-direct/main.go's -debug/LEAF_DIRECT_DEBUG wiring) --
@@ -535,7 +599,20 @@ func NewServer(cfg ServerConfig) *Server {
 		// genuine burst of near-simultaneous first-dispatch job
 		// fetches across many sessions at once.
 		jobFetchPool: solo.NewAsyncValidationPool(0, solo.AsyncValidationQueueSize),
-		debugLogger:  cfg.Debug,
+		// tipPollLoop-stall fix (brief2.md) -- see repushPool's own
+		// doc comment for the full production-incident rationale and
+		// the explicit "1 worker, not DefaultAsyncValidationWorkers()"
+		// justification (invalidateAndRepushJobs is a single global
+		// operation that must never run twice concurrently -- this
+		// pool exists only to get it off tipPollLoop's own goroutine,
+		// not to parallelize it against itself). queueSize is still
+		// solo.AsyncValidationQueueSize (256) -- generous headroom for
+		// however many notify() calls arrive while one repush pass is
+		// still draining, even though in practice at most one entry
+		// is ever usefully queued at a time (see TrySubmit's own
+		// call sites' doc comments below).
+		repushPool:  solo.NewAsyncValidationPool(1, solo.AsyncValidationQueueSize),
+		debugLogger: cfg.Debug,
 	}
 	// defaultBlockForwardTimeout preserves this field's exact pre-fix
 	// value (2026-09-23) for every caller that does not explicitly set
@@ -920,6 +997,36 @@ func (s *Server) recordTemplateDistribution(source string, seconds float64, mine
 // nodes get wired into the mesh across the pool-migration effort,
 // distinguishing "my own new tip" from "a relay redelivery"
 // distribution passes.
+//
+// PERFORMANCE FIX (brief2.md, SAME production leaf/incident as
+// jobFetchPool above): this used to loop over every logged-in session
+// SEQUENTIALLY, one at a time, on whichever single goroutine called
+// in (originally tipPollLoop's own, via InvalidateAll -> notify ->
+// debouncedInvalidateAndRepushJobs -- see repushPool's own doc comment
+// for that half of the fix, which gets THIS call itself off that
+// goroutine). Because a cache invalidation wipes solo.JobManager's
+// ENTIRE per-xn map and every session has a unique xn,
+// JobForXNAtDifficulty below is a guaranteed cache MISS for every
+// single session -- a real, synchronous GetBlockTemplate HTTP round
+// trip each. Confirmed live: with s.sessions bloated to ~100,000+
+// entries (the sibling CLOSE-WAIT leak's own symptom -- jobFetchPool's
+// doc comment), one sequential pass took long enough that
+// leaf_direct_template_distribution_seconds/_miners went dark for
+// 15+ minutes. Even at the CORRECT, non-leaked ~20k live-connection
+// count this was already a real structural bug (a single goroutine
+// making ~20k sequential synchronous network calls), independent of
+// the leak. Fixed by fanning the per-session work out across up to
+// repushFanoutConcurrency goroutines at once (bounded
+// semaphore-gated sync.WaitGroup, not solo.AsyncValidationPool --
+// see that const's own doc comment for why this shape fits better
+// here), waiting for the WHOLE batch to genuinely finish before
+// recordTemplateDistribution fires -- so the metric this incident is
+// named for actually reflects one real, complete distribution pass,
+// not an early/partial one. EXACT same per-session semantics as
+// before (skip non-logged-in sessions, respect alreadyDelivered,
+// count pushed correctly) -- only the concurrency shape changed;
+// pushed is now an atomic.Int64 since multiple goroutines increment
+// it concurrently.
 func (s *Server) invalidateAndRepushJobs(source string) {
 	start := time.Now()
 	s.mu.RLock()
@@ -928,28 +1035,85 @@ func (s *Server) invalidateAndRepushJobs(source string) {
 		sessions = append(sessions, sess)
 	}
 	s.mu.RUnlock()
-	pushed := 0
+
+	var pushed atomic.Int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, repushFanoutConcurrency)
 	for _, sess := range sessions {
 		if !sess.loggedIn.Load() {
 			continue
 		}
-		job, err := s.jobManager.JobForXNAtDifficulty(context.Background(), sess.xn, sess.currentDifficulty.Load())
-		if err != nil {
-			s.logger.Printf("direct: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.xn, err)
-			continue
-		}
-		// BUG FIX (Alex, live production report: "we're sending
-		// duplicate jobs down the wire to RXT") -- mirrors
-		// solo.Server.invalidateAndRepushJobs' identical fix exactly;
-		// see that function's doc comment and Session.alreadyDelivered
-		// for the real legacy reference this ports.
-		if sess.alreadyDelivered(job) {
-			continue
-		}
-		sess.pushJob(job)
-		pushed++
+		sess := sess
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			job, err := s.jobManager.JobForXNAtDifficulty(context.Background(), sess.xn, sess.currentDifficulty.Load())
+			if err != nil {
+				s.logger.Printf("direct: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.xn, err)
+				return
+			}
+			// BUG FIX (Alex, live production report: "we're sending
+			// duplicate jobs down the wire to RXT") -- mirrors
+			// solo.Server.invalidateAndRepushJobs' identical fix
+			// exactly; see that function's doc comment and
+			// Session.alreadyDelivered for the real legacy reference
+			// this ports.
+			if sess.alreadyDelivered(job) {
+				return
+			}
+			sess.pushJob(job)
+			pushed.Add(1)
+		}()
 	}
-	s.recordTemplateDistribution(source, time.Since(start).Seconds(), pushed)
+	wg.Wait()
+	s.recordTemplateDistribution(source, time.Since(start).Seconds(), int(pushed.Load()))
+}
+
+// repushFanoutConcurrency bounds how many of invalidateAndRepushJobs'
+// own per-session JobForXNAtDifficulty calls (each a real,
+// independent GetBlockTemplate HTTP round trip on a cache miss -- see
+// that method's own doc comment) may be genuinely in flight
+// simultaneously. A plain semaphore-gated sync.WaitGroup is used
+// instead of reusing solo.AsyncValidationPool (unlike jobFetchPool/
+// repushPool/randomxPool/forwardPool) because this is a one-shot fan-
+// out over a single batch whose size varies every call
+// (len(s.sessions)), not a long-lived queue independently fed by many
+// unrelated callers over the server's whole lifetime -- "spawn up to
+// N at once, wait for exactly THIS batch to finish" maps directly
+// onto a semaphore + WaitGroup, whereas coordinating "has this one
+// specific caller's batch fully drained" against AsyncValidationPool's
+// shared, persistent queue would need extra bookkeeping anyway. 64 is
+// a deliberately generous-but-bounded concurrency limit for HTTP
+// calls to the local base node's own GetBlockTemplate endpoint --
+// large enough that even a ~20k-live-connection leaf's full fan-out
+// completes in a small number of sequential "rounds" (bounding this
+// pass to roughly session_count/64 real round-trip latencies, not
+// session_count of them), while still capping worst-case concurrent
+// load against that one local node regardless of how many sessions
+// exist.
+const repushFanoutConcurrency = 64
+
+// dispatchRepush hands a real invalidateAndRepushJobs pass off to
+// s.repushPool (see that field's own doc comment for the full
+// production-incident rationale) instead of running it inline on the
+// caller's own goroutine. Every call site that used to call
+// s.invalidateAndRepushJobs(source) directly -- debouncedInvalidate
+// AndRepushJobs' three branches (the defensive CurrentBest-not-set
+// fallback, the genuine-height-increase path, and the debounce-
+// window-elapsed path) and firePendingRepush's own timer callback --
+// now goes through this helper instead, so NONE of them can ever
+// block tipPollLoop's (or, for firePendingRepush, time.AfterFunc's
+// own) goroutine on invalidateAndRepushJobs' full duration again.
+// Uses TrySubmit (never blocks the caller) -- on the very unlikely
+// case the pool's single worker is already busy AND its queue is
+// also genuinely full, this logs clearly rather than silently
+// dropping the invalidation notice with no trace at all.
+func (s *Server) dispatchRepush(source string) {
+	if ok := s.repushPool.TrySubmit(func() { s.invalidateAndRepushJobs(source) }); !ok {
+		s.logger.Printf("direct: repushPool saturated or shutting down -- dropped a %q template-cache-invalidation repush notice (tip detection and other sessions are unaffected, but connected miners will not receive an updated job from this particular notification)", source)
+	}
 }
 
 // debouncedInvalidateAndRepushJobs is the ACTUAL callback registered
@@ -981,6 +1145,17 @@ func (s *Server) invalidateAndRepushJobs(source string) {
 // publishTemplateForJob call) at all -- those keep firing exactly as
 // already merged, unconditionally and immediately, regardless of any
 // state tracked here.
+//
+// DECOUPLING FIX (brief2.md): this function itself runs synchronously
+// on whichever goroutine solo.JobManager.notify called it from --
+// tipPollLoop's own, for the common genuine-height-increase case (see
+// repushPool's own doc comment for the full incident). Every branch
+// below that used to call s.invalidateAndRepushJobs(source) directly
+// now calls s.dispatchRepush(source) instead, which hands the real
+// (and, as of this fix, internally-parallelized -- see that method's
+// own doc comment) repush pass off to s.repushPool and returns
+// immediately, so THIS function -- and therefore tipPollLoop itself --
+// is never blocked on how long a repush pass actually takes.
 func (s *Server) debouncedInvalidateAndRepushJobs(source string) {
 	height, _, ok := s.jobManager.CurrentBest()
 	if !ok {
@@ -988,7 +1163,7 @@ func (s *Server) debouncedInvalidateAndRepushJobs(source string) {
 		// (setBest is always called before notify -- see job.go's
 		// InvalidateAll/adoptRelayedJob), but don't block a real
 		// repush on this being true.
-		s.invalidateAndRepushJobs(source)
+		s.dispatchRepush(source)
 		return
 	}
 
@@ -1008,7 +1183,7 @@ func (s *Server) debouncedInvalidateAndRepushJobs(source string) {
 		s.lastRepushAt = time.Now()
 		s.lastRepushSet = true
 		s.repushMu.Unlock()
-		s.invalidateAndRepushJobs(source)
+		s.dispatchRepush(source)
 		return
 	}
 
@@ -1024,7 +1199,7 @@ func (s *Server) debouncedInvalidateAndRepushJobs(source string) {
 	if time.Since(s.lastRepushAt) >= equalHeightRepushDebounce {
 		s.lastRepushAt = time.Now()
 		s.repushMu.Unlock()
-		s.invalidateAndRepushJobs(source)
+		s.dispatchRepush(source)
 		return
 	}
 
@@ -1048,7 +1223,12 @@ func (s *Server) debouncedInvalidateAndRepushJobs(source string) {
 // debounce window has elapsed since the last actual repush. Re-checks
 // pendingRepush under repushMu (it may have already been cleared/
 // superseded by a genuine height increase that ran ahead of this
-// timer firing) before calling the real invalidateAndRepushJobs.
+// timer firing) before dispatching the real invalidateAndRepushJobs
+// via s.dispatchRepush (brief2.md: this runs on time.AfterFunc's own
+// goroutine, not tipPollLoop's -- less urgent than the other call
+// sites for that reason, but a slow repush here would still delay
+// the same template-distribution metric, so it gets the identical
+// off-goroutine treatment for consistency).
 func (s *Server) firePendingRepush() {
 	s.repushMu.Lock()
 	s.pendingRepushTimer = nil
@@ -1061,7 +1241,7 @@ func (s *Server) firePendingRepush() {
 	s.pendingRepushSource = ""
 	s.lastRepushAt = time.Now()
 	s.repushMu.Unlock()
-	s.invalidateAndRepushJobs(source)
+	s.dispatchRepush(source)
 }
 
 // Serve accepts miner connections on ln, structurally identical to
@@ -1257,9 +1437,9 @@ func unmarshalBlockFromRelay(data []byte) (*tari_generated.Block, error) {
 
 // Shutdown unsubscribes from job updates and the relay, closes the
 // multi-node submitter's connections, and stops this Server's RandomX-
-// family async validation worker pool, forwardPool, and jobFetchPool
-// (see solo.AsyncValidationPool.Stop -- blocks until every in-flight
-// job on each pool finishes). It does not close the
+// family async validation worker pool, forwardPool, jobFetchPool, and
+// repushPool (see solo.AsyncValidationPool.Stop -- blocks until every
+// in-flight job on each pool finishes). It does not close the
 // ConnectionManager, listener, or transport — callers own those
 // lifecycles.
 func (s *Server) Shutdown() {
@@ -1287,5 +1467,8 @@ func (s *Server) Shutdown() {
 	}
 	if s.jobFetchPool != nil {
 		s.jobFetchPool.Stop()
+	}
+	if s.repushPool != nil {
+		s.repushPool.Stop()
 	}
 }

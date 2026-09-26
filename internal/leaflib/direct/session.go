@@ -196,7 +196,8 @@ func (s *Session) handleLine(line string) {
 // in server.go for the full root-cause explanation: a per-xn
 // cache-miss job fetch (solo.JobManager.jobForXN, job.go ~line
 // 553-622) can block for an effectively unbounded time on a
-// process-wide, context-cancellation-immune sync.Mutex (jm.genMu)
+// process-wide (as of a later, related fix: per-xn -- see solo/job.go's
+// genLocks field doc comment), context-cancellation-immune sync.Mutex
 // before ever reaching its own 30s-capped GetBlockTemplate HTTP
 // call). Everything up through the point where a job is actually
 // needed (address validation, ban/forced-floor enforcement,
@@ -304,16 +305,19 @@ func (s *Session) fetchAndDeliverLoginJob(reqID int) {
 	// BELT-AND-SUSPENDERS (server.go's jobFetchPool doc comment; does
 	// NOT by itself fix the read-loop-blocking bug -- that is fixed by
 	// handleLogin's TrySubmit dispatch above): a bare sync.Mutex.Lock()
-	// (jm.genMu, inside solo.JobManager's jobForXN) cannot be
-	// interrupted by context cancellation under any circumstances, so
-	// this 5s timeout (matching forwardShare's own existing 5s
-	// convention -- see that method's doc comment) only bounds the
-	// GetBlockTemplate HTTP-call portion of the work ONCE genMu is
-	// eventually acquired; it does nothing at all while a call is
-	// still queued waiting on genMu itself. Bounding it anyway keeps
-	// any ONE dispatched jobFetchPool worker from occupying its pool
-	// slot indefinitely once past the mutex, on top of (not instead
-	// of) MoneroNodeClient's own 30s http.Client-level timeout.
+	// (the per-xn generation lock inside solo.JobManager's jobForXN --
+	// originally a single process-wide genMu, narrowed to per-xn by a
+	// later, related fix; see solo/job.go's genLocks doc comment)
+	// cannot be interrupted by context cancellation under any
+	// circumstances, so this 5s timeout (matching forwardShare's own
+	// existing 5s convention -- see that method's doc comment) only
+	// bounds the GetBlockTemplate HTTP-call portion of the work ONCE
+	// that lock is eventually acquired; it does nothing at all while a
+	// call is still queued waiting on the lock itself. Bounding it
+	// anyway keeps any ONE dispatched jobFetchPool worker from
+	// occupying its pool slot indefinitely once past the lock, on top
+	// of (not instead of) MoneroNodeClient's own 30s http.Client-level
+	// timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.xn, s.currentDifficulty.Load())
