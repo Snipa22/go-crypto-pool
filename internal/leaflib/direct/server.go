@@ -177,6 +177,52 @@ type Server struct {
 	// what is structurally the identical shape.
 	forwardPool *solo.AsyncValidationPool
 
+	// jobFetchPool is the CLOSE-WAIT-accumulation production-incident
+	// fix (phx-dump.supportxmr.com, leaf-direct -legacy-mode, ~20k+
+	// real connected Monero miners; 17,855 CLOSE-WAIT vs 8,636 ESTAB
+	// observed via `ss -tn`, leaf_direct_active_connections gauge
+	// tracking process fd count ~1:1): session.go's
+	// handleLogin/handleGetJob used to call
+	// s.server.jobManager.JobForXNAtDifficulty DIRECTLY on
+	// Session.Run's own read-loop goroutine, with NO worker-pool
+	// dispatch at all -- unlike forwardShare/forwardBlock
+	// (forwardPool, above) and RandomX-family finishSubmit
+	// (randomxPool, above), which already got this exact fix. On a
+	// per-xn job-cache MISS (first time a session's xn is seen, or --
+	// critically -- after chain-tip movement invalidates EVERY
+	// currently-cached xn at once, see solo/job.go's jobForXN doc
+	// comment), that call acquires solo.JobManager's own
+	// server/process-wide genMu sync.Mutex -- which CANNOT be
+	// interrupted by context cancellation under any circumstances --
+	// then makes a real GetBlockTemplate HTTP round-trip (capped at
+	// 30s by MoneroNodeClient's own http.Client.Timeout, but that cap
+	// is per-HTTP-call only; the genMu wait itself is fully
+	// unbounded). Under real load, potentially thousands of the
+	// ~20k live connections can be queued behind that one mutex
+	// simultaneously after a single tip-triggered invalidation, each
+	// one's session stuck unable to call scanner.Scan() again (so
+	// unable to ever notice a peer's FIN) for however long its own
+	// turn takes -- exactly the structural cause of the observed
+	// CLOSE-WAIT accumulation: handleConn's cleanup defer is correct
+	// and does fire, but only once Session.Run actually returns, and
+	// Run can't get back to scanner.Scan() until this call does.
+	// jobFetchPool moves that call (and everything that depends on
+	// its result -- building/writing the login/getjob response) onto
+	// its own dedicated, bounded worker pool instead, so it can never
+	// again block any session's own read-loop goroutine -- mirroring
+	// forwardPool's/randomxPool's exact same "dispatch off the read
+	// loop onto a bounded solo.AsyncValidationPool via TrySubmit"
+	// shape. Deliberately a THIRD, separate pool from both of those
+	// (not reused): the actual contended resource here (genMu, and
+	// transitively the downstream node's template-generation
+	// capacity) is unrelated to either RandomX validation throughput
+	// or backend-transport concurrency, so sharing either existing
+	// pool would let a job-fetch stall degrade unrelated throughput
+	// for other sessions, exactly the cross-resource-contention
+	// failure mode forwardPool's own doc comment already describes
+	// avoiding for randomxPool.
+	jobFetchPool *solo.AsyncValidationPool
+
 	// debugLogger is nil unless ServerConfig.Debug was set (see
 	// cmd/leaf-direct/main.go's -debug/LEAF_DIRECT_DEBUG wiring) --
 	// the real, opt-in verbose logging sink (internal/leaflib/
@@ -473,7 +519,23 @@ func NewServer(cfg ServerConfig) *Server {
 		// doc comment and defaultForwardPoolWorkers' doc comment for
 		// the full rationale/sizing.
 		forwardPool: solo.NewAsyncValidationPool(defaultForwardPoolWorkers, solo.AsyncValidationQueueSize),
-		debugLogger: cfg.Debug,
+		// CLOSE-WAIT fix -- see jobFetchPool's own doc comment above
+		// for the full production-incident rationale. workers=0 lets
+		// NewAsyncValidationPool apply DefaultAsyncValidationWorkers()
+		// (runtime.NumCPU()), matching randomxPool's own convention
+		// exactly (same rationale: scale with the actual host this
+		// process runs on rather than an arbitrary fixed literal). An
+		// operator wanting a different fixed count can override via
+		// SetJobFetchPoolSize (see cmd/leaf-direct's -job-fetch-workers
+		// flag) before Serve begins. AsyncValidationQueueSize (256) is
+		// reused unchanged for the queue bound, matching that
+		// constant's own "generous headroom for a burst, real
+		// backpressure once genuinely full" convention -- exactly the
+		// bound needed here: a tip-triggered invalidation can queue a
+		// genuine burst of near-simultaneous first-dispatch job
+		// fetches across many sessions at once.
+		jobFetchPool: solo.NewAsyncValidationPool(0, solo.AsyncValidationQueueSize),
+		debugLogger:  cfg.Debug,
 	}
 	// defaultBlockForwardTimeout preserves this field's exact pre-fix
 	// value (2026-09-23) for every caller that does not explicitly set
@@ -573,6 +635,20 @@ func (s *Server) SetRandomXWorkerPoolSize(workers, queueSize int) {
 func (s *Server) SetForwardPoolSize(workers, queueSize int) {
 	s.forwardPool.Stop()
 	s.forwardPool = solo.NewAsyncValidationPool(workers, queueSize)
+}
+
+// SetJobFetchPoolSize replaces this Server's jobFetchPool (CLOSE-WAIT
+// production-incident fix, see that field's own doc comment) with a
+// freshly constructed one sized to workers/queueSize -- mirrors
+// SetRandomXWorkerPoolSize's/SetForwardPoolSize's exact same "stop
+// the old one, construct a fresh one" pattern and pre-Serve-only
+// calling convention. workers<=0 falls back to
+// solo.DefaultAsyncValidationWorkers() (runtime.NumCPU()) via
+// NewAsyncValidationPool's own fallback, matching jobFetchPool's
+// default construction in NewServer.
+func (s *Server) SetJobFetchPoolSize(workers, queueSize int) {
+	s.jobFetchPool.Stop()
+	s.jobFetchPool = solo.NewAsyncValidationPool(workers, queueSize)
 }
 
 // SetInvalidShareGuardConfig mirrors solo.Server's own identical
@@ -1181,8 +1257,9 @@ func unmarshalBlockFromRelay(data []byte) (*tari_generated.Block, error) {
 
 // Shutdown unsubscribes from job updates and the relay, closes the
 // multi-node submitter's connections, and stops this Server's RandomX-
-// family async validation worker pool (see solo.AsyncValidationPool.Stop --
-// blocks until every in-flight validation finishes). It does not close the
+// family async validation worker pool, forwardPool, and jobFetchPool
+// (see solo.AsyncValidationPool.Stop -- blocks until every in-flight
+// job on each pool finishes). It does not close the
 // ConnectionManager, listener, or transport — callers own those
 // lifecycles.
 func (s *Server) Shutdown() {
@@ -1207,5 +1284,8 @@ func (s *Server) Shutdown() {
 	}
 	if s.forwardPool != nil {
 		s.forwardPool.Stop()
+	}
+	if s.jobFetchPool != nil {
+		s.jobFetchPool.Stop()
 	}
 }

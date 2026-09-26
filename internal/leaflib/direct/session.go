@@ -190,6 +190,22 @@ func (s *Session) handleLine(line string) {
 	}
 }
 
+// handleLogin's job-template fetch is dispatched off Session.Run's own
+// read-loop goroutine -- CLOSE-WAIT production-incident fix
+// (phx-dump.supportxmr.com; see Server.jobFetchPool's own doc comment
+// in server.go for the full root-cause explanation: a per-xn
+// cache-miss job fetch (solo.JobManager.jobForXN, job.go ~line
+// 553-622) can block for an effectively unbounded time on a
+// process-wide, context-cancellation-immune sync.Mutex (jm.genMu)
+// before ever reaching its own 30s-capped GetBlockTemplate HTTP
+// call). Everything up through the point where a job is actually
+// needed (address validation, ban/forced-floor enforcement,
+// s.loggedIn/s.address/s.worker/s.agent bookkeeping) stays exactly as
+// synchronous as before -- ONLY the JobForXNAtDifficulty call and the
+// response it produces move onto s.server.jobFetchPool, via the same
+// TrySubmit-non-blocking-dispatch pattern already used for
+// forwardShare (s.server.forwardPool) and RandomX-family
+// finishSubmit (s.server.randomxPool) -- see fetchAndDeliverLoginJob.
 func (s *Session) handleLogin(req solo.Request) {
 	var login solo.LoginRequest
 	if len(req.Params) > 0 {
@@ -261,29 +277,84 @@ func (s *Session) handleLogin(req solo.Request) {
 		}
 	}
 
-	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
+	// CLOSE-WAIT FIX: dispatch the job fetch (and the login response
+	// it produces) onto s.server.jobFetchPool instead of running it
+	// inline here -- see this method's own doc comment and
+	// Server.jobFetchPool's doc comment (server.go) for the full
+	// root-cause explanation. TrySubmit (never the blocking Submit)
+	// so a genuinely saturated/shutting-down pool rejects only THIS
+	// session's dispatch rather than blocking Session.Run's read loop
+	// waiting for queue room -- exactly forwardShare's/finishSubmit's
+	// existing convention. On successful dispatch, return immediately
+	// WITHOUT writing a response yet: fetchAndDeliverLoginJob writes
+	// the real login response (success or failure) once the job fetch
+	// resolves, from its own jobFetchPool worker goroutine.
+	if ok := s.server.jobFetchPool.TrySubmit(func() { s.fetchAndDeliverLoginJob(req.ID) }); !ok {
+		s.writeGeneralResponse(req.ID, "job fetch pool is saturated or shutting down, please retry", "")
+	}
+}
+
+// fetchAndDeliverLoginJob runs ON s.server.jobFetchPool's own worker
+// goroutine (see handleLogin's dispatch above), NEVER on Session.Run's
+// own read-loop goroutine. The actual JobForXNAtDifficulty call and
+// the response it produces are otherwise UNCHANGED from handleLogin's
+// pre-fix inline body -- this is a pure "move this code onto a
+// different goroutine via TrySubmit" refactor, not a logic rewrite.
+func (s *Session) fetchAndDeliverLoginJob(reqID int) {
+	// BELT-AND-SUSPENDERS (server.go's jobFetchPool doc comment; does
+	// NOT by itself fix the read-loop-blocking bug -- that is fixed by
+	// handleLogin's TrySubmit dispatch above): a bare sync.Mutex.Lock()
+	// (jm.genMu, inside solo.JobManager's jobForXN) cannot be
+	// interrupted by context cancellation under any circumstances, so
+	// this 5s timeout (matching forwardShare's own existing 5s
+	// convention -- see that method's doc comment) only bounds the
+	// GetBlockTemplate HTTP-call portion of the work ONCE genMu is
+	// eventually acquired; it does nothing at all while a call is
+	// still queued waiting on genMu itself. Bounding it anyway keeps
+	// any ONE dispatched jobFetchPool worker from occupying its pool
+	// slot indefinitely once past the mutex, on top of (not instead
+	// of) MoneroNodeClient's own 30s http.Client-level timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.xn, s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("direct: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
-		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
+		s.writeGeneralResponse(reqID, "no job template available yet, retry shortly", "")
 		return
 	}
 	resp := solo.LoginResponse{
-		ID: req.ID, JsonRPC: "2.0",
+		ID: reqID, JsonRPC: "2.0",
 		Result: solo.LoginResult{ID: s.sessionID, Job: s.jobPayload(job), Status: "OK"},
 		Status: "OK",
 	}
 	s.writeJSON(resp)
 }
 
+// handleGetJob's job-template fetch is dispatched off Session.Run's
+// own read-loop goroutine exactly like handleLogin's above -- see that
+// method's doc comment and Server.jobFetchPool's doc comment
+// (server.go) for the full root-cause explanation and
+// fetchAndDeliverGetJob for the dispatched closure.
 func (s *Session) handleGetJob(req solo.Request) {
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before getjob", "")
 		return
 	}
-	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
+	if ok := s.server.jobFetchPool.TrySubmit(func() { s.fetchAndDeliverGetJob(req.ID) }); !ok {
+		s.writeGeneralResponse(req.ID, "job fetch pool is saturated or shutting down, please retry", "")
+	}
+}
+
+// fetchAndDeliverGetJob mirrors fetchAndDeliverLoginJob exactly (see
+// that method's doc comment) -- runs ON s.server.jobFetchPool's own
+// worker goroutine, never on Session.Run's read-loop goroutine.
+func (s *Session) fetchAndDeliverGetJob(reqID int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.xn, s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("direct: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
-		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
+		s.writeGeneralResponse(reqID, "no job template available yet, retry shortly", "")
 		return
 	}
 	s.pushJob(job)

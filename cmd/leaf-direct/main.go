@@ -79,6 +79,13 @@ type config struct {
 	invalidShareDisconnectEnabled   bool
 	invalidShareDisconnectThreshold int
 
+	// jobFetchWorkers is CLOSE-WAIT-production-incident fix's own
+	// -job-fetch-workers -- mirrors -randomx-workers's exact same
+	// "0/unset uses the documented default" convention (see
+	// internal/leaflib/direct.Server.jobFetchPool's doc comment for
+	// the full rationale).
+	jobFetchWorkers int
+
 	// poolID is LEAF_DIRECT_POOL_ID / -pool-id: the real, static,
 	// operator-assigned integer identifying this leaf-direct
 	// process's pool-server source (see internal/proto/share.proto's
@@ -352,6 +359,7 @@ func loadConfig() (config, error) {
 	flag.IntVar(&cfg.trustChange, "trust-change", envOrInt("LEAF_DIRECT_TRUST_CHANGE", 0), "real per-accepted-share probability decrement -- 0/unset uses the documented default (1). Env: LEAF_DIRECT_TRUST_CHANGE")
 	flag.IntVar(&cfg.trustMin, "trust-min", envOrInt("LEAF_DIRECT_TRUST_MIN", 0), "real probability floor -- 0/unset uses the documented default (20). Env: LEAF_DIRECT_TRUST_MIN")
 	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_DIRECT_RANDOMX_WORKERS", 0), "RandomX-family (RXT/RXM) async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_DIRECT_RANDOMX_WORKERS")
+	flag.IntVar(&cfg.jobFetchWorkers, "job-fetch-workers", envOrInt("LEAF_DIRECT_JOB_FETCH_WORKERS", 0), "job-template-fetch (login/getjob) async worker pool size (see internal/leaflib/direct.Server.jobFetchPool's doc comment for the CLOSE-WAIT production-incident fix this pool exists for). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_DIRECT_JOB_FETCH_WORKERS")
 	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_DIRECT_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a session after too many CONSECUTIVE real RandomX-family (RXT/RXM) validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_DIRECT_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
 	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_DIRECT_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_DIRECT_INVALID_SHARE_DISCONNECT_THRESHOLD")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_DIRECT_ALGO", "sha3x"), "which single mining algorithm this leaf-direct process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_DIRECT_ALGO")
@@ -451,6 +459,10 @@ type fileConfig struct {
 	InvalidShareDisconnectEnabled   *bool `toml:"invalid_share_disconnect_enabled"`
 	InvalidShareDisconnectThreshold *int  `toml:"invalid_share_disconnect_threshold"`
 
+	// JobFetchWorkers mirrors RandomXWorkers's exact same convention
+	// -- see cfg.jobFetchWorkers's doc comment.
+	JobFetchWorkers *int `toml:"job_fetch_workers"`
+
 	Algo              *string `toml:"algo"`
 	PoolType          *string `toml:"pool_type"`
 	PoolID            *int    `toml:"pool_id"`
@@ -546,6 +558,7 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyInt(&cfg.trustChange, fc.TrustChange, visited, "trust-change", "LEAF_DIRECT_TRUST_CHANGE")
 	cfgfile.ApplyInt(&cfg.trustMin, fc.TrustMin, visited, "trust-min", "LEAF_DIRECT_TRUST_MIN")
 	cfgfile.ApplyInt(&cfg.randomxWorkers, fc.RandomXWorkers, visited, "randomx-workers", "LEAF_DIRECT_RANDOMX_WORKERS")
+	cfgfile.ApplyInt(&cfg.jobFetchWorkers, fc.JobFetchWorkers, visited, "job-fetch-workers", "LEAF_DIRECT_JOB_FETCH_WORKERS")
 	cfgfile.ApplyBool(&cfg.invalidShareDisconnectEnabled, fc.InvalidShareDisconnectEnabled, visited, "invalid-share-disconnect-enabled", "LEAF_DIRECT_INVALID_SHARE_DISCONNECT_ENABLED")
 	cfgfile.ApplyInt(&cfg.invalidShareDisconnectThreshold, fc.InvalidShareDisconnectThreshold, visited, "invalid-share-disconnect-threshold", "LEAF_DIRECT_INVALID_SHARE_DISCONNECT_THRESHOLD")
 
@@ -1378,6 +1391,16 @@ func main() {
 	if cfg.randomxWorkers > 0 {
 		server.SetRandomXWorkerPoolSize(cfg.randomxWorkers, 0)
 		logger.Printf("RandomX-family async validation worker pool size overridden to %d (default would have been runtime.NumCPU()=%d)", cfg.randomxWorkers, runtime.NumCPU())
+	}
+
+	// CLOSE-WAIT production-incident fix: worker count is
+	// runtime.NumCPU() by DEFAULT (direct.NewServer's own
+	// construction already applies this), not a hardcoded literal;
+	// an operator who wants a different fixed count can still get one
+	// via -job-fetch-workers.
+	if cfg.jobFetchWorkers > 0 {
+		server.SetJobFetchPoolSize(cfg.jobFetchWorkers, 0)
+		logger.Printf("job-fetch (login/getjob) async worker pool size overridden to %d (default would have been runtime.NumCPU()=%d)", cfg.jobFetchWorkers, runtime.NumCPU())
 	}
 
 	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b): disconnect
