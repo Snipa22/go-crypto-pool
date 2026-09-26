@@ -450,7 +450,23 @@ type JobManager struct {
 	bestSize   int
 	bestSet    bool
 
-	genMu sync.Mutex // serializes concurrent new-template generation
+	// genLocks holds one lazily-created *sync.Mutex per xn
+	// (map[string]*sync.Mutex, via sync.Map so lookups/creations don't
+	// need a separate lock of their own), serializing concurrent
+	// new-template generation ONLY for the SAME xn -- see jobForXN's
+	// own doc comment for the full rationale and the incident
+	// (brief2.md, second finding on the phx-dump.supportxmr.com
+	// leaf) that required narrowing this from a single global
+	// sync.Mutex (the original genMu) to per-xn granularity.
+	// Deliberately never pruned/removed as xns age out (InvalidateAll
+	// wipes perXN/jobsByID but leaves genLocks alone) -- a stray
+	// *sync.Mutex per distinct xn ever seen over this process's
+	// lifetime is a few dozen bytes each, the same order of magnitude
+	// this package already accepts for jobsByID's own unbounded-by-ID
+	// growth, and pruning it safely (without racing a lock currently
+	// held by another goroutine) would need real reference-counting
+	// for no measurable benefit at realistic connection counts.
+	genLocks sync.Map
 
 	subMu sync.RWMutex
 	subs  map[uint64]func(source string)
@@ -555,12 +571,38 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 		return job, nil
 	}
 
-	// Serialize generation so concurrent first-requests for the same
-	// (or different) xn don't race to fetch redundant templates; a
-	// double-check after acquiring genMu keeps this cheap in the common
-	// case where the xn is already cached.
-	jm.genMu.Lock()
-	defer jm.genMu.Unlock()
+	// NARROWED LOCK GRANULARITY (brief2.md, second finding, discovered
+	// while implementing that fix's own required regression test):
+	// this used to acquire a single, process-wide jm.genMu
+	// sync.Mutex here, serializing EVERY concurrent first-request
+	// across EVERY xn, not just concurrent first-requests for the
+	// SAME xn -- confirmed via a live experiment (20 concurrent
+	// JobForXNAtDifficulty calls for 20 DISTINCT xns against a mock
+	// GetBlockTemplate with an artificial 30ms delay took ~607ms
+	// total, i.e. fully serialized, not the ~30ms true concurrent
+	// execution would take). That mattered beyond raw throughput:
+	// internal/leaflib/direct.Server.invalidateAndRepushJobs' own
+	// brief2.md fix bounds/parallelizes its per-session fan-out
+	// specifically so a mass cache invalidation (every session's xn
+	// missing at once) completes in time proportional to
+	// session_count/concurrency rather than session_count -- which
+	// the old single global genMu would have silently defeated
+	// entirely, since every one of those concurrent callers would
+	// still have funneled through the exact same single mutex one at
+	// a time regardless of how many goroutines Server dispatched.
+	// jm.genLocks (see that field's own doc comment) replaces genMu
+	// with one lazily-created *sync.Mutex PER xn instead, preserving
+	// the original, still-needed guarantee (concurrent first-
+	// requests for the SAME xn collapse to a single real fetch, all
+	// sharing its result -- see
+	// TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate)
+	// while letting genuinely different xns' real GetBlockTemplate
+	// calls run fully concurrently, exactly as
+	// direct.Server.invalidateAndRepushJobs' own fan-out now expects.
+	genLockAny, _ := jm.genLocks.LoadOrStore(xn, &sync.Mutex{})
+	genLock := genLockAny.(*sync.Mutex)
+	genLock.Lock()
+	defer genLock.Unlock()
 
 	if job, ok := jm.lookupXN(xn); ok {
 		return job, nil

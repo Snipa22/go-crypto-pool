@@ -170,6 +170,43 @@ func repushCount(server *Server) int {
 	return total
 }
 
+// waitForRepushCount polls repushCount(server) until it reaches want
+// or timeout elapses, then returns the final observed value.
+//
+// NEEDED AS OF brief2.md's tipPollLoop-stall fix: debouncedInvalidate
+// AndRepushJobs' every dispatch (see Server.dispatchRepush) now hands
+// the real invalidateAndRepushJobs pass off to Server.repushPool
+// asynchronously (TrySubmit, never blocking the caller) instead of
+// running it inline -- exactly the point of that fix (decoupling
+// tipPollLoop's own goroutine from however long a repush pass takes).
+// This package's pre-existing debounce tests (BRIEF.md,
+// feat/equal-height-push-debounce) were written when
+// jm.InvalidateAll -> notify -> debouncedInvalidateAndRepushJobs ->
+// invalidateAndRepushJobs was a single synchronous call chain, so
+// repushCount(server) was already correct by the time InvalidateAll
+// returned. With repushPool's single worker now genuinely running
+// that pass on its own goroutine, these tests must poll for the
+// expected count within a bounded deadline instead of asserting it
+// immediately -- this changes ONLY these tests' own synchronization,
+// not what they're actually verifying (still the real, eventual
+// side effect of exactly one invalidateAndRepushJobs call per
+// expected repush).
+func waitForRepushCount(t *testing.T, server *Server, want int, timeout time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var got int
+	for {
+		got = repushCount(server)
+		if got >= want {
+			return got
+		}
+		if time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // seedBest performs one real fetch (via a fresh, never-before-seen
 // xn, so JobForXN can't just return a cache hit) at height/size,
 // installing it as jm's own tracked best (solo.JobManager.CurrentBest)
@@ -196,15 +233,20 @@ func TestDebounceTwoSameHeightFiringsWithinWindowYieldOneRepush(t *testing.T) {
 
 	// First notification at height 5: this is the very first repush
 	// ever (lastRepushSet is still false) -- always immediate,
-	// regardless of debounce.
+	// regardless of debounce. dispatchRepush hands it off to
+	// repushPool asynchronously now (brief2.md), so wait for it
+	// rather than asserting synchronously.
 	jm.InvalidateAll(solo.TemplateSourceLocal)
-	if got := repushCount(server); got != 1 {
+	if got := waitForRepushCount(t, server, 1, 2*time.Second); got != 1 {
 		t.Fatalf("after first same-height notification: repush count = %d, want 1", got)
 	}
 
 	// Second notification at the SAME height, firing immediately
 	// afterward (well within the 20s window) -- must be buffered, not
-	// repushed again yet.
+	// repushed again yet. No async wait needed here: the debounced
+	// (buffered) path never calls dispatchRepush at all, so there is
+	// nothing in flight to wait for -- an immediate check correctly
+	// proves it was buffered, not just "not yet delivered".
 	jm.InvalidateAll(solo.TemplateSourceLocal)
 	if got := repushCount(server); got != 1 {
 		t.Fatalf("after second same-height notification (within debounce window): repush count = %d, want still 1 (buffered, not repushed again)", got)
@@ -229,7 +271,7 @@ func TestDebounceSameHeightAfterWindowElapsedRepushesImmediately(t *testing.T) {
 	seedBest(t, jm, node, "xn-1", 7, 100)
 
 	jm.InvalidateAll(solo.TemplateSourceLocal)
-	if got := repushCount(server); got != 1 {
+	if got := waitForRepushCount(t, server, 1, 2*time.Second); got != 1 {
 		t.Fatalf("after first notification: repush count = %d, want 1", got)
 	}
 
@@ -241,7 +283,7 @@ func TestDebounceSameHeightAfterWindowElapsedRepushesImmediately(t *testing.T) {
 	server.repushMu.Unlock()
 
 	jm.InvalidateAll(solo.TemplateSourceLocal)
-	if got := repushCount(server); got != 2 {
+	if got := waitForRepushCount(t, server, 2, 2*time.Second); got != 2 {
 		t.Fatalf("after same-height notification once the debounce window had elapsed: repush count = %d, want 2 (immediate, no buffering wait)", got)
 	}
 
@@ -264,7 +306,7 @@ func TestDebounceHeightIncreaseAppliesImmediatelyAndDiscardsPending(t *testing.T
 
 	seedBest(t, jm, node, "xn-1", 10, 100)
 	jm.InvalidateAll(solo.TemplateSourceLocal) // first ever: immediate
-	if got := repushCount(server); got != 1 {
+	if got := waitForRepushCount(t, server, 1, 2*time.Second); got != 1 {
 		t.Fatalf("after first notification: repush count = %d, want 1", got)
 	}
 
@@ -285,7 +327,7 @@ func TestDebounceHeightIncreaseAppliesImmediatelyAndDiscardsPending(t *testing.T
 	seedBest(t, jm, node, "xn-2", 11, 100)
 	jm.InvalidateAll(solo.TemplateSourceLocal)
 
-	if got := repushCount(server); got != 2 {
+	if got := waitForRepushCount(t, server, 2, 2*time.Second); got != 2 {
 		t.Fatalf("after height-increase notification: repush count = %d, want 2 (applied immediately)", got)
 	}
 
@@ -322,7 +364,7 @@ func TestDebounceSoloJobManagerStateUnaffectedByServerBuffering(t *testing.T) {
 
 	seedBest(t, jm, node, "xn-1", 20, 100)
 	jm.InvalidateAll(solo.TemplateSourceLocal) // first ever: immediate repush
-	if got := repushCount(server); got != 1 {
+	if got := waitForRepushCount(t, server, 1, 2*time.Second); got != 1 {
 		t.Fatalf("after first notification: repush count = %d, want 1", got)
 	}
 
@@ -452,7 +494,7 @@ func TestDebounceRelayPublishUnaffectedByServerDebounceState(t *testing.T) {
 	// ~20s) at height 100.
 	seedBest(t, jm, node, "xn-seed", 100, 10)
 	jm.InvalidateAll(solo.TemplateSourceLocal)
-	if got := repushCount(server); got != 1 {
+	if got := waitForRepushCount(t, server, 1, 2*time.Second); got != 1 {
 		t.Fatalf("after seed notification: repush count = %d, want 1", got)
 	}
 	jm.InvalidateAll(solo.TemplateSourceLocal)

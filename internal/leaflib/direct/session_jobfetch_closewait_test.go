@@ -22,8 +22,12 @@ import (
 // session.go's handleLogin/fetchAndDeliverLoginJob doc comments for the
 // full root-cause explanation: solo.JobManager.jobForXN's per-xn
 // cache-miss path (job.go ~line 553-622) can block for an effectively
-// unbounded time on a process-wide, context-cancellation-immune
-// sync.Mutex (jm.genMu) before ever reaching its own bounded
+// unbounded time on a context-cancellation-immune sync.Mutex (a
+// per-xn generation lock; originally a single process-wide genMu,
+// narrowed to per-xn granularity by a later, related fix -- see
+// solo/job.go's genLocks doc comment -- the property this test relies
+// on, an uninterruptible Lock() before the bounded GetBlockTemplate
+// call, holds either way) before ever reaching its own bounded
 // GetBlockTemplate HTTP call -- running that inline on Session.Run's own
 // read-loop goroutine (the pre-fix behavior) means the read loop can
 // never call scanner.Scan() again (the only place that would notice a
@@ -34,7 +38,8 @@ import (
 // blockingDirectNodeClient wraps *fakeDirectNodeClient, overriding only
 // GetBlockTemplate to block until either the test-controlled release
 // channel is closed or the caller's own ctx is done -- lets this test
-// deterministically simulate exactly the "stuck behind jm.genMu, then a
+// deterministically simulate exactly the "stuck behind the per-xn
+// generation lock, then a
 // slow downstream GetBlockTemplate call" condition the production
 // incident hit, without needing a real monerod/base-node.
 type blockingDirectNodeClient struct {
@@ -126,17 +131,18 @@ func TestDirectSession_LoginJobFetchBlocked_ClientDisconnectStillCleansUpPromptl
 	}
 
 	// A fresh session's xn has never been seen before -- this login
-	// unconditionally hits jobForXN's cache-miss path (jm.genMu.Lock()
-	// then the blocked GetBlockTemplate call below), exactly the
-	// production incident's own trigger condition.
+	// unconditionally hits jobForXN's cache-miss path (the per-xn
+	// generation lock, then the blocked GetBlockTemplate call below),
+	// exactly the production incident's own trigger condition.
 	h.send(solo.Request{ID: 1, Method: "login", Params: mustDirectJSON(t, solo.LoginRequest{
 		Login: realTariTestAddress("closewait-jobfetch-blocked"), Pass: "x", Agent: "XMRig/6.25.0", Algo: []string{"sha3x"},
 	})})
 
 	// Wait until the mock GetBlockTemplate call has genuinely been
-	// entered (i.e. jm.genMu was acquired and the blocked HTTP-call
-	// stand-in is now in flight) before proceeding -- otherwise this
-	// test could race ahead of the dispatch and prove nothing.
+	// entered (i.e. the per-xn generation lock was acquired and the
+	// blocked HTTP-call stand-in is now in flight) before proceeding
+	// -- otherwise this test could race ahead of the dispatch and
+	// prove nothing.
 	deadline := time.Now().Add(2 * time.Second)
 	for node.callCount() < 1 {
 		if time.Now().After(deadline) {
