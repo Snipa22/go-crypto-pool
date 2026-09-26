@@ -211,7 +211,58 @@ type Server struct {
 	// ALGO_RXM block-find handling. Empty (nil) for -coin=tari and
 	// every pre-existing caller.
 	mergeMineChains []MergeMineChainConfig
+
+	// repushMu/lastRepush*/pendingRepush* implement the equal-height
+	// miner-visible-repush debounce described in this feature's own
+	// brief (feat/equal-height-push-debounce) -- see
+	// debouncedInvalidateAndRepushJobs' doc comment for the full
+	// design. Deliberately a SEPARATE mutex from s.mu (which guards
+	// s.sessions) to avoid any lock-ordering entanglement between
+	// this bookkeeping and session-map access performed by the real
+	// repush (invalidateAndRepushJobs) itself.
+	repushMu sync.Mutex
+
+	// lastRepushHeight/lastRepushSet/lastRepushAt record the
+	// (height, time) of the last miner-visible repush THIS Server
+	// actually performed -- NOT solo.JobManager's own tracked best
+	// (see solo.JobManager.CurrentBest), which updates immediately/
+	// unconditionally on every genuinely-better candidate regardless
+	// of whether Server has chosen to defer the repush yet.
+	lastRepushHeight uint64
+	lastRepushSet    bool
+	lastRepushAt     time.Time
+
+	// pendingRepush/pendingRepushSource track whether a same-height
+	// repush is currently owed/buffered during the debounce window --
+	// deliberately no buffered SIZE here (see
+	// debouncedInvalidateAndRepushJobs' doc comment: the eventual
+	// repush re-reads JobManager.CurrentBest() fresh rather than
+	// trusting a stale captured value).
+	pendingRepush       bool
+	pendingRepushSource string
+
+	// pendingRepushTimer is the live time.AfterFunc timer (if any)
+	// scheduled to fire the buffered same-height repush once the
+	// debounce window elapses -- stopped by Shutdown so a torn-down
+	// Server never fires a stale repush after shutdown.
+	pendingRepushTimer *time.Timer
 }
+
+// equalHeightRepushDebounce bounds how often a same-height
+// "improvement" (the currently-tracked-best template getting a
+// larger size at the SAME height as what was last actually repushed
+// to connected miners) is allowed to trigger a real miner-visible
+// repush (see debouncedInvalidateAndRepushJobs). Confirmed live on
+// production: multiple sibling leaf-direct instances independently
+// observing the SAME new chain-tip height can each publish their own
+// mempool-snapshot template in quick succession, and without this
+// bound each one triggers a separate repush to every connected miner,
+// wasting miner hashing effort. A genuine chain-height increase over
+// what was last repushed is NEVER subject to this debounce -- see
+// that method's doc comment; this constant governs ONLY the
+// same-height case. Fixed for this pass (not configurable via flag --
+// see feat/equal-height-push-debounce's own brief).
+const equalHeightRepushDebounce = 20 * time.Second
 
 // defaultForwardPoolWorkers/defaultForwardPoolQueueSize size Fix 12's
 // forwardPool (DISPATCH_BRIEF.md 2026-09-10). Unlike randomxPool
@@ -438,7 +489,7 @@ func NewServer(cfg ServerConfig) *Server {
 	s.mergeMineChains = cfg.MergeMineChains
 	s.transportOKSoFar.Store(true)
 	if cfg.JobManager != nil {
-		s.unsubscribe = cfg.JobManager.Subscribe(s.invalidateAndRepushJobs)
+		s.unsubscribe = cfg.JobManager.Subscribe(s.debouncedInvalidateAndRepushJobs)
 	}
 	if s.relay != nil {
 		unsub, err := s.relay.Subscribe(s.handleRelayedBlock)
@@ -825,6 +876,118 @@ func (s *Server) invalidateAndRepushJobs(source string) {
 	s.recordTemplateDistribution(source, time.Since(start).Seconds(), pushed)
 }
 
+// debouncedInvalidateAndRepushJobs is the ACTUAL callback registered
+// with solo.JobManager.Subscribe (see NewServer) -- it decides
+// whether/when to call the real, miner-visible
+// invalidateAndRepushJobs, per this feature's own brief
+// (feat/equal-height-push-debounce):
+//
+//  1. A genuine chain-height increase over what this Server has most
+//     recently actually repushed to connected miners always applies
+//     immediately -- no debounce, ever. An old-height job is actively
+//     stale, not just suboptimal.
+//  2. A same-height "improvement" (the currently-tracked-best
+//     template, per solo.JobManager.CurrentBest, getting a larger
+//     size at the SAME height as what was last actually repushed) is
+//     debounced to at most once every equalHeightRepushDebounce.
+//     Further same-height notifications arriving inside that window
+//     are buffered/coalesced (this only remembers that a repush is
+//     owed, not any particular size -- see pendingRepush's own doc
+//     comment) and a single repush fires once the window elapses,
+//     using whatever solo.JobManager's ACTUAL current state is at
+//     that moment (CurrentBest is re-read fresh when the timer
+//     fires, never a stale snapshot from when buffering started).
+//
+// This debounce governs ONLY whether/when Server calls its own real
+// invalidateAndRepushJobs (the miner-visible repush). It never
+// touches solo.JobManager's own per-xn cache content/timing and never
+// affects the relay broadcast path (solo.JobManager.tipPollLoop's
+// publishTemplateForJob call) at all -- those keep firing exactly as
+// already merged, unconditionally and immediately, regardless of any
+// state tracked here.
+func (s *Server) debouncedInvalidateAndRepushJobs(source string) {
+	height, _, ok := s.jobManager.CurrentBest()
+	if !ok {
+		// Defensive: should not happen once a subscription has fired
+		// (setBest is always called before notify -- see job.go's
+		// InvalidateAll/adoptRelayedJob), but don't block a real
+		// repush on this being true.
+		s.invalidateAndRepushJobs(source)
+		return
+	}
+
+	s.repushMu.Lock()
+
+	if !s.lastRepushSet || height > s.lastRepushHeight {
+		// Genuine height increase (or the very first repush ever) --
+		// a stale same-height buffer at the OLD height is moot now;
+		// discard it.
+		if s.pendingRepushTimer != nil {
+			s.pendingRepushTimer.Stop()
+			s.pendingRepushTimer = nil
+		}
+		s.pendingRepush = false
+		s.pendingRepushSource = ""
+		s.lastRepushHeight = height
+		s.lastRepushAt = time.Now()
+		s.lastRepushSet = true
+		s.repushMu.Unlock()
+		s.invalidateAndRepushJobs(source)
+		return
+	}
+
+	if height < s.lastRepushHeight {
+		// Should not reach here at all -- the shared isBetterCandidate
+		// in solo already gates what becomes the tracked best before
+		// this subscription ever fires. Log defensively and fall
+		// through to the equal-height handling below rather than
+		// crash or silently drop the notification.
+		s.logger.Printf("direct: debouncedInvalidateAndRepushJobs: unexpected lower height notification (current best=%d, last repush=%d, source=%s) -- treating as same-height for debounce purposes", height, s.lastRepushHeight, source)
+	}
+
+	if time.Since(s.lastRepushAt) >= equalHeightRepushDebounce {
+		s.lastRepushAt = time.Now()
+		s.repushMu.Unlock()
+		s.invalidateAndRepushJobs(source)
+		return
+	}
+
+	// Inside the debounce window: buffer/coalesce. There is
+	// deliberately no size tracked here (see pendingRepush's own doc
+	// comment) -- only the latest source is remembered, overwriting
+	// any earlier-buffered one.
+	s.pendingRepush = true
+	s.pendingRepushSource = source
+	if s.pendingRepushTimer == nil {
+		remaining := equalHeightRepushDebounce - time.Since(s.lastRepushAt)
+		if remaining < 0 {
+			remaining = 0
+		}
+		s.pendingRepushTimer = time.AfterFunc(remaining, s.firePendingRepush)
+	}
+	s.repushMu.Unlock()
+}
+
+// firePendingRepush is pendingRepushTimer's callback -- fires once the
+// debounce window has elapsed since the last actual repush. Re-checks
+// pendingRepush under repushMu (it may have already been cleared/
+// superseded by a genuine height increase that ran ahead of this
+// timer firing) before calling the real invalidateAndRepushJobs.
+func (s *Server) firePendingRepush() {
+	s.repushMu.Lock()
+	s.pendingRepushTimer = nil
+	if !s.pendingRepush {
+		s.repushMu.Unlock()
+		return
+	}
+	source := s.pendingRepushSource
+	s.pendingRepush = false
+	s.pendingRepushSource = ""
+	s.lastRepushAt = time.Now()
+	s.repushMu.Unlock()
+	s.invalidateAndRepushJobs(source)
+}
+
 // Serve accepts miner connections on ln, structurally identical to
 // solo.Server.Serve.
 func (s *Server) Serve(ctx context.Context, ln net.Listener, port solo.PortConfig) error {
@@ -1026,6 +1189,13 @@ func (s *Server) Shutdown() {
 	if s.unsubscribe != nil {
 		s.unsubscribe()
 	}
+	s.repushMu.Lock()
+	if s.pendingRepushTimer != nil {
+		s.pendingRepushTimer.Stop()
+		s.pendingRepushTimer = nil
+	}
+	s.pendingRepush = false
+	s.repushMu.Unlock()
 	if s.relayUnsub != nil {
 		s.relayUnsub()
 	}
