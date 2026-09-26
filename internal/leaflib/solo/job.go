@@ -1013,6 +1013,18 @@ func (jm *JobManager) currentBestSnapshot() bestTemplate {
 	return bestTemplate{height: jm.bestHeight, size: jm.bestSize, set: jm.bestSet}
 }
 
+// CurrentBest returns a point-in-time snapshot of this JobManager's own
+// tracked best (height, size) template record -- the same state
+// isBetterCandidate/setBest already maintain internally, exposed
+// read-only for a caller (leaf-direct's Server) that needs to know the
+// current best height/size WITHOUT duplicating that tracking itself.
+// ok is false if no template has been observed yet (mirrors
+// bestTemplate.set).
+func (jm *JobManager) CurrentBest() (height uint64, size int, ok bool) {
+	b := jm.currentBestSnapshot()
+	return b.height, b.size, b.set
+}
+
 // setBest records (height, size) as JobManager's new tracked best
 // template -- called whenever a job is (re)installed as the served
 // baseline by ANY path (local fetch in jobForXN/tipPollLoop, or a
