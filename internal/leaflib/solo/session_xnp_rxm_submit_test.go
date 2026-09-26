@@ -92,6 +92,19 @@ func (f *fakeMoneroXNPNodeClient) SubmitBlock(_ context.Context, _ any) error {
 	return errUnexpectedSubmitBlockCall
 }
 
+// TemplateBytesForRelay/JobFromTemplateBytes: this is a Monero-family
+// test double -- relay-template-adoption is explicitly scoped to
+// leaf-direct's Tari NodeClient only, so simple "not supported" stubs
+// satisfy the NodeClient interface here, mirroring
+// MoneroNodeClient's own real "not supported" stub.
+func (f *fakeMoneroXNPNodeClient) TemplateBytesForRelay(_ *Job) ([]byte, error) {
+	return nil, errors.New("fakeMoneroXNPNodeClient: TemplateBytesForRelay not supported")
+}
+
+func (f *fakeMoneroXNPNodeClient) JobFromTemplateBytes(_ []byte, _ poolpb.Algo) (*Job, error) {
+	return nil, errors.New("fakeMoneroXNPNodeClient: JobFromTemplateBytes not supported")
+}
+
 var errUnexpectedSubmitBlockCall = errors.New("fakeMoneroXNPNodeClient: SubmitBlock unexpectedly called")
 
 // newRXMXNPTestHarness is newRXMTestHarness's real-Monero-shaped

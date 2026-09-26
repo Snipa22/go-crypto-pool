@@ -17,6 +17,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -120,6 +121,38 @@ type NodeClient interface {
 	// SubmitBlock submits a completed candidate block (as produced by
 	// this SAME NodeClient's own BuildCandidateBlock) to the real node.
 	SubmitBlock(ctx context.Context, candidate any) error
+
+	// JobFromTemplateBytes reconstructs a *Job from raw bytes
+	// previously produced by this SAME NodeClient implementation's
+	// own template-serialization (see TemplateBytesForRelay), for
+	// the given algo. Used by JobManager (job.go's
+	// startTemplateRelaySubscription) to adopt a relayed template
+	// without a local GetBlockTemplate round-trip against this
+	// instance's own possibly-lagging node — see this feature's
+	// design doc (relay-template-adoption brief): relay is
+	// authoritative over the local node whenever it disagrees.
+	//
+	// Implementations that don't support this (e.g. GRPCNodeClient,
+	// MoneroNodeClient — leaf-solo never wires a non-nil Relay into
+	// JobManagerConfig in practice, so this is never exercised there)
+	// should return a clear, distinct error rather than attempting a
+	// shadow implementation.
+	JobFromTemplateBytes(data []byte, algo poolpb.Algo) (*Job, error)
+
+	// TemplateBytesForRelay serializes job's real underlying template
+	// content (job.TemplateData) into the wire bytes
+	// JobFromTemplateBytes can reconstruct from, for relay
+	// publishing/comparison (job.go's publishTemplateForJob and
+	// jobForXN's own tracked-best bookkeeping both call this).
+	// Returns (nil, nil) — never an error — if this specific job
+	// cannot be serialized for relay for a benign/expected reason;
+	// callers must never treat a failure here as a reason to fail
+	// the primary local-fetch/serve path. Implementations that don't
+	// support this feature at all (see JobFromTemplateBytes) may
+	// return a distinct, clearly-labeled error instead — callers
+	// already treat any non-nil error here identically to a nil
+	// result (see job.go's templateSizeForRelay).
+	TemplateBytesForRelay(job *Job) ([]byte, error)
 }
 
 // TariPowDataFromJob is the explicitly-named escape hatch for RXT's
@@ -727,4 +760,33 @@ func (c *GRPCNodeClient) SubmitBlock(ctx context.Context, candidate any) error {
 	}
 	_, err := nodeGRPC.SubmitBlock(ctx, block)
 	return err
+}
+
+// errRelayTemplateAdoptionNotSupported is returned by
+// GRPCNodeClient/MoneroNodeClient's JobFromTemplateBytes/
+// TemplateBytesForRelay stubs below. Relay-template adoption
+// (relay-template-adoption brief) is explicitly scoped to
+// leaf-direct's own NodeClient implementation only (see
+// internal/leaflib/direct/node.go) — every leaf-direct instance of a
+// given pool/algo shares the SAME fleet-wide payout_address, so a
+// relayed template already pays the correct destination, unlike
+// leaf-solo (per-operator payout addresses) where adopting a
+// sibling's relayed template would misdirect the coinbase. leaf-solo
+// never wires a non-nil Relay into JobManagerConfig in practice (see
+// cmd/leaf-solo/main.go), so this path is never actually exercised
+// there — but solo.NodeClient's interface still requires both
+// methods to exist so GRPCNodeClient/MoneroNodeClient keep
+// satisfying it.
+var errRelayTemplateAdoptionNotSupported = errors.New("solo: relay template adoption not supported for leaf-solo")
+
+// JobFromTemplateBytes implements NodeClient. Not supported for
+// leaf-solo — see errRelayTemplateAdoptionNotSupported's doc comment.
+func (c *GRPCNodeClient) JobFromTemplateBytes(_ []byte, _ poolpb.Algo) (*Job, error) {
+	return nil, errRelayTemplateAdoptionNotSupported
+}
+
+// TemplateBytesForRelay implements NodeClient. Not supported for
+// leaf-solo — see errRelayTemplateAdoptionNotSupported's doc comment.
+func (c *GRPCNodeClient) TemplateBytesForRelay(_ *Job) ([]byte, error) {
+	return nil, errRelayTemplateAdoptionNotSupported
 }

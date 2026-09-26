@@ -110,6 +110,20 @@ func (m *mockNodeClient) SubmitBlock(_ context.Context, candidate any) error {
 	return m.submitErr
 }
 
+// JobFromTemplateBytes/TemplateBytesForRelay implement solo.NodeClient
+// -- relay-node itself never calls either (it only PUBLISHES template
+// bytes via templateDataForJob/proto.Marshal directly in daemon.go,
+// it never ADOPTS a relayed template the way leaf-direct's JobManager
+// does), so these are simple, clearly-unused stubs, mirroring
+// solo.GRPCNodeClient's own "not supported" stub convention.
+func (m *mockNodeClient) JobFromTemplateBytes(_ []byte, _ poolpb.Algo) (*solo.Job, error) {
+	return nil, errors.New("mockNodeClient: JobFromTemplateBytes not used by relay-node")
+}
+
+func (m *mockNodeClient) TemplateBytesForRelay(_ *solo.Job) ([]byte, error) {
+	return nil, errors.New("mockNodeClient: TemplateBytesForRelay not used by relay-node")
+}
+
 func (m *mockNodeClient) callCounts() (tip, template, submit int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

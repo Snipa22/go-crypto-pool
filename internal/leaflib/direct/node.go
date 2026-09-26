@@ -9,6 +9,7 @@ import (
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
 	tarilib "github.com/Snipa22/go-tari-lib/nodeGRPC"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
@@ -226,6 +227,60 @@ func (c *NodeClient) SubmitBlock(_ context.Context, candidate any) error {
 	}
 	_, err := c.client.SubmitBlock(block)
 	return err
+}
+
+// TemplateBytesForRelay implements solo.NodeClient — the real,
+// production implementation for leaf-direct's relay-template-adoption
+// feature (see this feature's own brief: leaf-direct is the ONLY
+// NodeClient implementation this is wired for; every leaf-direct
+// instance of a given pool/algo shares the SAME fleet-wide
+// payout_address, so a sibling's relayed template already pays the
+// correct destination -- no coinbase-mismatch concern to design
+// around here, unlike leaf-solo's per-operator addresses).
+//
+// job.TemplateData already holds the real, complete
+// *tari_generated.GetNewBlockResult this job was built from (see
+// tariJobFromResult below) -- proto.Marshal of that exact value is
+// the complete real upstream payload (Block/Header/Pow chain and
+// all), genuinely sufficient for JobFromTemplateBytes (on ANY
+// receiving leaf-direct instance, since they all run this SAME code)
+// to reconstruct an equivalent *solo.Job from scratch via the SAME
+// tariJobFromResult helper GetBlockTemplate itself uses -- so job
+// construction logic is never duplicated between the local-fetch and
+// relay-adopt paths.
+//
+// Returns (nil, nil) -- never an error -- if job.TemplateData does
+// not hold the expected real Tari type (e.g. a nil/zero-value Job, or
+// one from some other coin's NodeClient): this must never be treated
+// as a reason to fail the primary tip-poll/publish path (see
+// solo.NodeClient.TemplateBytesForRelay's own interface doc comment).
+func (c *NodeClient) TemplateBytesForRelay(job *solo.Job) ([]byte, error) {
+	if job == nil {
+		return nil, nil
+	}
+	result, ok := job.TemplateData.(*tari_generated.GetNewBlockResult)
+	if !ok || result == nil {
+		return nil, nil
+	}
+	data, err := proto.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("direct: TemplateBytesForRelay: marshaling GetNewBlockResult: %w", err)
+	}
+	return data, nil
+}
+
+// JobFromTemplateBytes implements solo.NodeClient — the real,
+// production counterpart to TemplateBytesForRelay above: unmarshal
+// data back into a *tari_generated.GetNewBlockResult and hand it to
+// the EXACT SAME tariJobFromResult helper GetBlockTemplate itself
+// calls, so a relay-adopted job is built via identical logic to a
+// locally-fetched one, never a shadow reimplementation.
+func (c *NodeClient) JobFromTemplateBytes(data []byte, algo poolpb.Algo) (*solo.Job, error) {
+	var result tari_generated.GetNewBlockResult
+	if err := proto.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("direct: JobFromTemplateBytes: unmarshaling GetNewBlockResult: %w", err)
+	}
+	return tariJobFromResult(&result, algo)
 }
 
 // Close releases the underlying GRPC connection.
