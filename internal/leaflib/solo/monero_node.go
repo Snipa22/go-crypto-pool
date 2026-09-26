@@ -574,6 +574,22 @@ func (c *MoneroNodeClient) SubmitBlock(ctx context.Context, candidate any) error
 	return err
 }
 
+// JobFromTemplateBytes implements NodeClient. Not supported for
+// Monero/RXM's own leaf-solo/leaf-direct path — the relay-template-
+// adoption feature (see node.go's errRelayTemplateAdoptionNotSupported
+// doc comment) is explicitly scoped to leaf-direct's Tari NodeClient
+// only for this pass; MoneroNodeClient still needs both interface
+// methods to exist so it keeps satisfying solo.NodeClient.
+func (c *MoneroNodeClient) JobFromTemplateBytes(_ []byte, _ poolpb.Algo) (*Job, error) {
+	return nil, errRelayTemplateAdoptionNotSupported
+}
+
+// TemplateBytesForRelay implements NodeClient. Not supported -- see
+// JobFromTemplateBytes's doc comment above.
+func (c *MoneroNodeClient) TemplateBytesForRelay(_ *Job) ([]byte, error) {
+	return nil, errRelayTemplateAdoptionNotSupported
+}
+
 // SubmitBlockWithID performs the exact SAME real submit_block call as
 // SubmitBlock, additionally returning the daemon's own real block_id
 // string for the submitted candidate (see moneroSubmitBlockAuxResult's

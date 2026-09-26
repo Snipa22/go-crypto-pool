@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -158,6 +160,31 @@ func (f *fakeNodeClient) setHeight(h uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.height = h
+}
+
+// TemplateBytesForRelay/JobFromTemplateBytes implement solo.NodeClient
+// for this test double using the SAME real, production reconstruction
+// path direct.NodeClient uses (proto.Marshal/Unmarshal of the real
+// *tari_generated.GetNewBlockResult + this package's own
+// tariJobFromResult) -- so job_relay_test.go's adoption tests exercise
+// genuine (de)serialization, not a shadow/simplified stand-in.
+func (f *fakeNodeClient) TemplateBytesForRelay(job *Job) ([]byte, error) {
+	if job == nil {
+		return nil, nil
+	}
+	result, ok := job.TemplateData.(*tari_generated.GetNewBlockResult)
+	if !ok || result == nil {
+		return nil, nil
+	}
+	return proto.Marshal(result)
+}
+
+func (f *fakeNodeClient) JobFromTemplateBytes(data []byte, algo poolpb.Algo) (*Job, error) {
+	var result tari_generated.GetNewBlockResult
+	if err := proto.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("fakeNodeClient: JobFromTemplateBytes: unmarshal: %w", err)
+	}
+	return tariJobFromResult(&result, algo)
 }
 
 func TestJobForXNBuildsJobFromTemplate(t *testing.T) {
@@ -613,5 +640,77 @@ func TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate(t *testing.T) {
 	}
 	if node.templateCalls.Load() != 1 {
 		t.Errorf("expected exactly 1 template call despite %d concurrent first-requesters, got %d", n, node.templateCalls.Load())
+	}
+}
+
+// TestIsBetterCandidate covers isBetterCandidate's full documented
+// priority order (relay-template-adoption brief, section 4's required
+// coverage): higher height wins regardless of size; equal height +
+// larger size wins; equal height + equal/smaller size does not adopt;
+// lower height never wins regardless of size.
+func TestIsBetterCandidate(t *testing.T) {
+	tests := []struct {
+		name                           string
+		currentHeight, candidateHeight uint64
+		currentSize, candidateSize     int
+		want                           bool
+	}{
+		{
+			name:          "higher height wins with smaller size",
+			currentHeight: 100, candidateHeight: 101,
+			currentSize: 10000, candidateSize: 1,
+			want: true,
+		},
+		{
+			name:          "higher height wins with larger size",
+			currentHeight: 100, candidateHeight: 101,
+			currentSize: 1, candidateSize: 10000,
+			want: true,
+		},
+		{
+			name:          "higher height wins with equal size",
+			currentHeight: 100, candidateHeight: 101,
+			currentSize: 500, candidateSize: 500,
+			want: true,
+		},
+		{
+			name:          "equal height, larger size wins",
+			currentHeight: 100, candidateHeight: 100,
+			currentSize: 500, candidateSize: 501,
+			want: true,
+		},
+		{
+			name:          "equal height, equal size does not adopt",
+			currentHeight: 100, candidateHeight: 100,
+			currentSize: 500, candidateSize: 500,
+			want: false,
+		},
+		{
+			name:          "equal height, smaller size does not adopt",
+			currentHeight: 100, candidateHeight: 100,
+			currentSize: 500, candidateSize: 499,
+			want: false,
+		},
+		{
+			name:          "lower height never wins despite much larger size",
+			currentHeight: 100, candidateHeight: 99,
+			currentSize: 1, candidateSize: 999999,
+			want: false,
+		},
+		{
+			name:          "lower height never wins with equal size",
+			currentHeight: 100, candidateHeight: 50,
+			currentSize: 500, candidateSize: 500,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isBetterCandidate(tt.currentHeight, tt.candidateHeight, tt.currentSize, tt.candidateSize)
+			if got != tt.want {
+				t.Errorf("isBetterCandidate(currentHeight=%d, candidateHeight=%d, currentSize=%d, candidateSize=%d) = %v, want %v",
+					tt.currentHeight, tt.candidateHeight, tt.currentSize, tt.candidateSize, got, tt.want)
+			}
+		})
 	}
 }

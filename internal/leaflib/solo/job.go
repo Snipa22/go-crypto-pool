@@ -431,6 +431,25 @@ type JobManager struct {
 	lastTipHeight uint64
 	tipObserved   bool // false until tipPollLoop's first successful GetTipInfo, so that first poll seeds a baseline instead of being misread as tip movement from a zero-value default
 
+	// bestHeight/bestSize/bestSet track the (height, serialized-byte-
+	// size) of the best template this JobManager has adopted/served
+	// so far from ANY source (local fetch or relay) -- see
+	// isBetterCandidate's doc comment for the exact priority order
+	// this gates. bestSet is false until the very first job (local or
+	// relay) has ever been installed; see currentBestSnapshot/setBest.
+	// This is deliberately separate from lastTipHeight (which tracks
+	// THIS instance's own node's tip, regardless of what's actually
+	// being served) and from any individual cached Job (perXN/
+	// jobsByID entries reflect what miners are actually being handed
+	// right now; bestHeight/bestSize reflect the best this JobManager
+	// has ever confirmed, which relay adoption may keep ahead of a
+	// lagging local node indefinitely -- per this feature's settled
+	// design, relay is authoritative over local whenever it
+	// disagrees, with no time-boxing/hysteresis/fallback).
+	bestHeight uint64
+	bestSize   int
+	bestSet    bool
+
 	genMu sync.Mutex // serializes concurrent new-template generation
 
 	subMu sync.RWMutex
@@ -572,6 +591,24 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 	job.StaticDifficulty = difficulty
 	if job.CreatedAt.IsZero() {
 		job.CreatedAt = time.Now()
+	}
+
+	// Tracked-best bookkeeping (relay-template-adoption brief,
+	// section 3): this fetch's own (height, size) is only recorded as
+	// the new tracked best if there is no baseline yet (true cold
+	// start -- always adopt, exactly like today) OR it is genuinely
+	// better than what's already tracked (which may be relay-sourced
+	// and ahead of what THIS particular fetch just observed). This
+	// job is still cached/served for xn unconditionally either way —
+	// per-xn independent template fetching (this package's core
+	// design, see Job's own doc comment) is never short-circuited by
+	// this bookkeeping; only the shared best-tracker's own value is
+	// protected from regressing below a genuinely superior relayed
+	// template.
+	size := jm.templateSizeForRelay(job)
+	best := jm.currentBestSnapshot()
+	if !best.set || isBetterCandidate(best.height, job.Height, best.size, size) {
+		jm.setBest(job.Height, size)
 	}
 
 	jm.mu.Lock()
@@ -766,24 +803,58 @@ func (jm *JobManager) Start(ctx context.Context) {
 }
 
 // startTemplateRelaySubscription subscribes to jm.cfg.Relay's
-// template broadcasts, invalidating the ENTIRE per-xn job cache
-// (jm.InvalidateAll) on every genuinely new (non-self, non-duplicate
-// — already guaranteed by relay.Relay.SubscribeTemplate's own
-// contract) template message received. Safe to call unconditionally
-// even when jm.cfg.Relay is nil or disabled/unconfigured:
-// SubscribeTemplate itself is nil/disabled-Relay-safe (see
-// relay.Relay.Enabled()'s `r != nil` check), returning a no-op
-// unsubscribe func and a nil error in that case. The returned
+// template broadcasts. Per this feature's settled design (relay is
+// authoritative over the local node whenever it disagrees — no
+// time-boxing/hysteresis/fallback), every genuinely new (non-self,
+// non-duplicate — already guaranteed by relay.Relay.SubscribeTemplate's
+// own contract) template message is compared against this
+// JobManager's own currently tracked best (height, size) via
+// isBetterCandidate BEFORE anything is invalidated/adopted:
+//
+//   - Not better: logged at Debug level and otherwise ignored --
+//     no cache wipe, no wasted local re-fetch (this is the exact bug
+//     this feature fixes: the old behavior unconditionally wiped and
+//     let the next JobForXN call re-invoke GetBlockTemplate against
+//     THIS instance's own possibly-lagging node on ANY relay message
+//     at all, regardless of whether it was actually better).
+//   - Better, and the real template content reconstructs successfully
+//     (NodeClient.JobFromTemplateBytes): adopted directly via
+//     adoptRelayedJob -- every currently-known xn is immediately
+//     reseeded with the reconstructed job, with NO local
+//     GetBlockTemplate round-trip.
+//   - Better, but reconstruction fails (e.g. an empty/malformed
+//     TemplateData, or a pre-adoption-feature bare-height-only
+//     publisher): falls back to a plain InvalidateAll, matching this
+//     feature's pre-existing behavior exactly (the next per-xn
+//     request re-fetches locally).
+//
+// Safe to call unconditionally even when jm.cfg.Relay is nil or
+// disabled/unconfigured: SubscribeTemplate itself is nil/disabled-
+// Relay-safe (see relay.Relay.Enabled()'s `r != nil` check), returning
+// a no-op unsubscribe func and a nil error in that case. The returned
 // unsubscribe func is invoked once ctx is cancelled, tying this
 // subscription's lifetime to the SAME ctx refreshLoop/tipPollLoop
 // already use.
 func (jm *JobManager) startTemplateRelaySubscription(ctx context.Context) {
 	unsub, err := jm.cfg.Relay.SubscribeTemplate(func(msg relay.TemplateMessage) {
-		jm.logger.Printf("solo: received template relay message from another instance (height=%d algo=%s network=%s), invalidating per-xn job cache", msg.Height, msg.Algo, msg.Network)
-		jm.InvalidateAll(TemplateSourceRelay)
+		best := jm.currentBestSnapshot()
+		if best.set && !isBetterCandidate(best.height, msg.Height, best.size, msg.Size) {
+			jm.cfg.Debug.Debugf("solo: received template relay message from another instance (height=%d size=%d algo=%s network=%s) -- not better than tracked best (height=%d size=%d), ignoring (no cache wipe, no local re-fetch)", msg.Height, msg.Size, msg.Algo, msg.Network, best.height, best.size)
+			return
+		}
+		job, jerr := jm.cfg.Node.JobFromTemplateBytes(msg.TemplateData, jm.cfg.Algo)
+		if jerr != nil || job == nil {
+			jm.logger.Printf("solo: received a superior template relay message from another instance (height=%d size=%d algo=%s network=%s) but could not reconstruct a job from its bytes (%v) -- falling back to a plain per-xn job cache invalidation", msg.Height, msg.Size, msg.Algo, msg.Network, jerr)
+			jm.setBest(msg.Height, msg.Size)
+			jm.InvalidateAll(TemplateSourceRelay)
+			return
+		}
+		jm.logger.Printf("solo: adopting superior relayed template from another instance (height=%d size=%d algo=%s network=%s), reseeding per-xn job cache without a local re-fetch", msg.Height, msg.Size, msg.Algo, msg.Network)
+		jm.setBest(job.Height, msg.Size)
+		jm.adoptRelayedJob(job)
 	})
 	if err != nil {
-		jm.logger.Printf("solo: template relay subscribe failed (template-relay fast-invalidation disabled, primary tip-poll path unaffected): %v", err)
+		jm.logger.Printf("solo: template relay subscribe failed (template-relay fast-invalidation/adoption disabled, primary tip-poll path unaffected): %v", err)
 		return
 	}
 	go func() {
@@ -806,6 +877,25 @@ func (jm *JobManager) refreshLoop(ctx context.Context) {
 	}
 }
 
+// tipPollLoop polls the local node's chain tip and, on a genuine
+// height increase, decides whether to invalidate/replace the served
+// per-xn job cache. When jm.cfg.Relay is disabled/unconfigured, this
+// preserves the exact original, pre-adoption-feature behavior: an
+// unconditional wipe on any genuine local tip increase, no extra
+// fetch/compare/publish overhead -- there is nothing to compare
+// against or publish to.
+//
+// When a Relay IS configured, a genuine local tip increase now fetches
+// a real candidate template (needed to compute its real serialized
+// size and to have real content to publish -- see publishTemplateForJob)
+// and compares it, via the SAME isBetterCandidate priority order the
+// relay-adoption path uses, against this JobManager's own tracked
+// best (which may already be ahead of this instance's own local view,
+// having been set by a previously-adopted relayed template). Only a
+// genuinely better local candidate invalidates the cache and gets
+// published; an inferior one (this instance's own node lagging behind
+// a sibling's already-adopted relayed template) leaves the
+// currently-served cache untouched and publishes nothing.
 func (jm *JobManager) tipPollLoop(ctx context.Context) {
 	ticker := time.NewTicker(jm.cfg.TipPollInterval)
 	defer ticker.Stop()
@@ -834,36 +924,175 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 				jm.mu.Unlock()
 				continue
 			}
-			if height > last {
-				jm.logger.Printf("solo: new tip detected (height %d -> %d), invalidating per-xn job cache", last, height)
-				jm.mu.Lock()
-				jm.lastTipHeight = height
-				jm.mu.Unlock()
-				jm.InvalidateAll(TemplateSourceLocal)
-				jm.publishTemplate(ctx, height)
+			if height <= last {
+				continue
 			}
+
+			jm.mu.Lock()
+			jm.lastTipHeight = height
+			jm.mu.Unlock()
+
+			if !jm.cfg.Relay.Enabled() {
+				// No relay in play (leaf-solo's own default, or
+				// leaf-direct without one configured) -- nothing to
+				// compare against or publish to, so preserve the
+				// exact original behavior unchanged.
+				jm.logger.Printf("solo: new tip detected (height %d -> %d), invalidating per-xn job cache", last, height)
+				jm.InvalidateAll(TemplateSourceLocal)
+				continue
+			}
+
+			job, ferr := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress, jm.cfg.Algo)
+			if ferr != nil || job == nil {
+				jm.logger.Printf("solo: tip-poll candidate template fetch failed (height %d): %v", height, ferr)
+				continue
+			}
+			data, tbErr := jm.cfg.Node.TemplateBytesForRelay(job)
+			if tbErr != nil {
+				data = nil
+			}
+			size := len(data)
+			best := jm.currentBestSnapshot()
+			if best.set && !isBetterCandidate(best.height, job.Height, best.size, size) {
+				jm.cfg.Debug.Debugf("solo: local candidate template (height=%d size=%d) not better than tracked best (height=%d size=%d) -- keeping existing per-xn job cache, no publish", job.Height, size, best.height, best.size)
+				continue
+			}
+
+			jm.logger.Printf("solo: new tip detected (height %d -> %d), invalidating per-xn job cache", last, height)
+			jm.setBest(job.Height, size)
+			jm.InvalidateAll(TemplateSourceLocal)
+			jm.publishTemplateForJob(ctx, job, data)
 		}
 	}
 }
 
-// publishTemplate best-effort-broadcasts a relay.TemplateMessage for
-// this JobManager's own genuine local tip increase (see tipPollLoop's
-// `height > last` branch, which is the ONLY call site — never called
-// on the first tip observation/baseline seed, and never called when
-// height is unchanged) over jm.cfg.Relay, so a sibling leaf instance's
-// own JobManager can invalidate its per-xn job cache immediately
-// instead of waiting for its own next tip-poll tick. Never blocks or
-// fails the primary tip-poll path: PublishTemplate itself is already
-// a complete no-op on a nil/disabled Relay (see
-// relay.Relay.Enabled()), and any real publish error is only logged.
-func (jm *JobManager) publishTemplate(ctx context.Context, height uint64) {
+// isBetterCandidate reports whether a candidate (height, size)
+// template should replace the current one, per the maintainer's
+// settled priority (relay-template-adoption brief, "design decision
+// already settled with the maintainer"):
+//
+//  1. Strictly higher Height always wins -- a newer block height is
+//     unconditionally better than any same-or-lower height template,
+//     regardless of size.
+//  2. At EQUAL height, strictly larger serialized template byte size
+//     wins ("larger bytes = larger fee due to the way the templates
+//     are built" -- taken as ground truth, not re-derived here).
+//  3. Anything else (lower height, or equal height + equal-or-smaller
+//     size) is NOT better -- the candidate must not be adopted.
+//
+// This is the SINGLE shared comparison both the relay-adoption path
+// (startTemplateRelaySubscription) and the local-fetch path (jobForXN,
+// tipPollLoop) call -- see this feature's brief: "The comparison
+// function should be a single shared piece of logic both paths call,
+// not duplicated."
+func isBetterCandidate(currentHeight, candidateHeight uint64, currentSize, candidateSize int) bool {
+	if candidateHeight > currentHeight {
+		return true
+	}
+	if candidateHeight == currentHeight && candidateSize > currentSize {
+		return true
+	}
+	return false
+}
+
+// bestTemplate is a point-in-time snapshot of JobManager's own
+// tracked bestHeight/bestSize/bestSet fields -- see those fields' own
+// doc comment. Returned by currentBestSnapshot so callers never read
+// jm.bestHeight/bestSize/bestSet directly without jm.mu held.
+type bestTemplate struct {
+	height uint64
+	size   int
+	set    bool
+}
+
+// currentBestSnapshot returns a point-in-time copy of jm's tracked
+// best (height, size) template record -- safe to call concurrently.
+func (jm *JobManager) currentBestSnapshot() bestTemplate {
+	jm.mu.RLock()
+	defer jm.mu.RUnlock()
+	return bestTemplate{height: jm.bestHeight, size: jm.bestSize, set: jm.bestSet}
+}
+
+// setBest records (height, size) as JobManager's new tracked best
+// template -- called whenever a job is (re)installed as the served
+// baseline by ANY path (local fetch in jobForXN/tipPollLoop, or a
+// successfully-adopted relay template in
+// startTemplateRelaySubscription).
+func (jm *JobManager) setBest(height uint64, size int) {
+	jm.mu.Lock()
+	jm.bestHeight = height
+	jm.bestSize = size
+	jm.bestSet = true
+	jm.mu.Unlock()
+}
+
+// templateSizeForRelay returns the real serialized byte size of job
+// via jm.cfg.Node.TemplateBytesForRelay, for isBetterCandidate
+// comparisons -- 0 (never an error) if job is nil, jm.cfg.Node is
+// nil, or TemplateBytesForRelay itself errors/returns no data (e.g.
+// GRPCNodeClient/MoneroNodeClient's "not supported" stubs). A 0 size
+// here never blocks the primary local-fetch path; it only means this
+// particular job can't outrank an existing equal-height best on size
+// alone (it can still win outright via a strictly higher height).
+func (jm *JobManager) templateSizeForRelay(job *Job) int {
+	if job == nil || jm.cfg.Node == nil {
+		return 0
+	}
+	data, err := jm.cfg.Node.TemplateBytesForRelay(job)
+	if err != nil || data == nil {
+		return 0
+	}
+	return len(data)
+}
+
+// adoptRelayedJob installs job (reconstructed from a superior relayed
+// template -- see startTemplateRelaySubscription) as the new baseline
+// for EVERY currently-known xn, replacing the whole perXN/jobsByID
+// cache -- the same "wipe" shape InvalidateAll already uses, but
+// seeded directly from the relayed content instead of clearing to
+// empty and waiting for the next per-xn GetBlockTemplate call (which
+// would just hit this instance's own, already-confirmed-lagging,
+// local node again -- defeating the entire point of adopting a
+// relayed template in the first place). Every xn ends up sharing this
+// SAME *Job until the next genuine invalidation/adoption event —
+// leaf-direct-specific tradeoff, acceptable per this feature's own
+// brief (leaf-direct's shared fleet-wide payout_address already means
+// there's no coinbase-mismatch concern across sibling instances).
+func (jm *JobManager) adoptRelayedJob(job *Job) {
+	jm.mu.Lock()
+	newPerXN := make(map[string]*Job, len(jm.perXN))
+	for xn := range jm.perXN {
+		newPerXN[xn] = job
+	}
+	jm.perXN = newPerXN
+	jm.jobsByID = map[string]*Job{job.ID: job}
+	jm.mu.Unlock()
+	jm.cfg.Debug.Debugf("solo: per-xn job cache reseeded from adopted relay template (job_id=%s height=%d)", job.ID, job.Height)
+	jm.notify(TemplateSourceRelay)
+}
+
+// publishTemplateForJob best-effort-broadcasts a relay.TemplateMessage
+// carrying job's real serialized template content (data, already
+// fetched via NodeClient.TemplateBytesForRelay by the caller — see
+// tipPollLoop) so a sibling leaf instance's own JobManager can adopt
+// it directly (see startTemplateRelaySubscription) rather than merely
+// being told to re-poll its own possibly-lagging node. data may be
+// nil/empty (e.g. TemplateBytesForRelay errored or this NodeClient
+// doesn't support it) -- that degrades gracefully to a bare tip
+// notification, exactly like this function's pre-adoption-feature
+// behavior. Never blocks/fails the primary tip-poll path: PublishTemplate
+// itself is already a complete no-op on a nil/disabled Relay, and any
+// real publish error is only logged.
+func (jm *JobManager) publishTemplateForJob(ctx context.Context, job *Job, data []byte) {
 	algo := algoWireName(jm.cfg.Algo)
 	network := jm.cfg.Network
 	msg := relay.TemplateMessage{
-		Algo:    algo,
-		Network: network,
-		Height:  height,
-		Hash:    syntheticTipDedupHash(algo, network, height),
+		Algo:         algo,
+		Network:      network,
+		Height:       job.Height,
+		TemplateData: data,
+		Size:         len(data),
+		Hash:         syntheticTipDedupHash(algo, network, job.Height),
 	}
 	if err := jm.cfg.Relay.PublishTemplate(ctx, msg); err != nil {
 		jm.logger.Printf("solo: template relay publish failed (non-fatal, primary tip-poll path unaffected): %v", err)

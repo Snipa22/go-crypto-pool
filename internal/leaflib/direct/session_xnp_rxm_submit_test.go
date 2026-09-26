@@ -81,6 +81,19 @@ func (f *fakeDirectMoneroXNPNodeClient) SubmitBlock(_ context.Context, _ any) er
 	return errUnexpectedDirectXNPSubmitBlockCall
 }
 
+// TemplateBytesForRelay/JobFromTemplateBytes: this is a Monero-family
+// test double -- relay-template-adoption is explicitly scoped to
+// leaf-direct's Tari NodeClient only (see node.go's real
+// implementation), so simple "not supported" stubs satisfy
+// solo.NodeClient here.
+func (f *fakeDirectMoneroXNPNodeClient) TemplateBytesForRelay(_ *solo.Job) ([]byte, error) {
+	return nil, errors.New("fakeDirectMoneroXNPNodeClient: TemplateBytesForRelay not supported")
+}
+
+func (f *fakeDirectMoneroXNPNodeClient) JobFromTemplateBytes(_ []byte, _ poolpb.Algo) (*solo.Job, error) {
+	return nil, errors.New("fakeDirectMoneroXNPNodeClient: JobFromTemplateBytes not supported")
+}
+
 var (
 	errUnexpectedDirectXNPCandidateCall   = errors.New("fakeDirectMoneroXNPNodeClient: BuildCandidateBlock unexpectedly called")
 	errUnexpectedDirectXNPSubmitBlockCall = errors.New("fakeDirectMoneroXNPNodeClient: SubmitBlock unexpectedly called")

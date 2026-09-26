@@ -60,6 +60,20 @@ func (f *fakeDirectNodeClient) SubmitBlock(_ context.Context, _ any) error {
 	return nil
 }
 
+// TemplateBytesForRelay/JobFromTemplateBytes: this minimal fake has no
+// real Tari template content to (de)serialize (its GetBlockTemplate
+// above returns a bare *solo.Job with no TemplateData) -- these tests
+// only exercise GetTipInfo/GetBlockTemplate/relay wiring plumbing, not
+// adoption itself, so simple "not supported" stubs are sufficient to
+// satisfy solo.NodeClient.
+func (f *fakeDirectNodeClient) TemplateBytesForRelay(_ *solo.Job) ([]byte, error) {
+	return nil, nil
+}
+
+func (f *fakeDirectNodeClient) JobFromTemplateBytes(_ []byte, _ poolpb.Algo) (*solo.Job, error) {
+	return nil, fmt.Errorf("fakeDirectNodeClient: JobFromTemplateBytes not supported by this minimal test double")
+}
+
 // startEmbeddedNATSServerForRelayWiringTest mirrors
 // internal/leaflib/relay/relay_test.go's own startEmbeddedNATSServer
 // exactly (a REAL, in-process, embedded NATS server bound to an

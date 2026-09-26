@@ -138,11 +138,30 @@ type TemplateMessage struct {
 
 	// TemplateData is whatever tip/template-identifying bytes the
 	// receiving leaf's own JobManager needs (e.g. a tip hash or
-	// serialized header) — this package does not itself know or care
-	// what's inside, exactly like BlockMessage.BlockData. May be
-	// empty; a bare Height is already enough for the real, current
-	// consumer (JobManager.InvalidateAll on receipt).
+	// serialized header) — this package does not itself know or
+	// care what's inside, exactly like BlockMessage.BlockData. May be
+	// empty; a bare Height is already enough for the original,
+	// pre-adoption consumer behavior (JobManager.InvalidateAll on
+	// receipt). As of the leaf-direct relay-template-adoption
+	// feature (internal/leaflib/solo's JobManager), this now
+	// genuinely carries the real, serialized template payload (via
+	// solo.NodeClient.TemplateBytesForRelay) so a receiving
+	// JobManager can reconstruct a full *solo.Job
+	// (solo.NodeClient.JobFromTemplateBytes) without a local
+	// GetBlockTemplate round-trip against its own possibly-lagging
+	// node. Still coin-agnostic and opaque to this package.
 	TemplateData []byte `json:"template_data"`
+
+	// Size is len(TemplateData) at publish time -- a cheap,
+	// deserialize-free signal a receiving JobManager can compare
+	// against its own currently tracked best template size (see
+	// solo/job.go's isBetterCandidate) without needing to unmarshal
+	// TemplateData first just to measure it. Always populated
+	// alongside TemplateData by PublishTemplate's real callers (see
+	// solo/job.go's publishTemplateForJob) -- 0 for any
+	// TemplateData-less message (e.g. a bare tip notification, or a
+	// pre-adoption-feature publisher).
+	Size int `json:"size"`
 
 	// Hash is a hex-encoded identifying value for this observed tip,
 	// used for dedup (see Relay.SubscribeTemplate, which reuses the

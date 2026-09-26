@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
@@ -125,6 +127,30 @@ func (f *fakeDirectNodeClient) SubmitBlock(_ context.Context, candidate any) err
 	f.lastSubmittedBlock = block
 	f.mu.Unlock()
 	return nil
+}
+
+// TemplateBytesForRelay/JobFromTemplateBytes mirror NodeClient's own
+// real implementation (node.go) exactly -- this fake's GetBlockTemplate
+// already builds a real *tari_generated.GetNewBlockResult via
+// tariJobFromResult, so it can reuse the exact same real
+// proto.Marshal/Unmarshal round-trip the production NodeClient uses.
+func (f *fakeDirectNodeClient) TemplateBytesForRelay(job *solo.Job) ([]byte, error) {
+	if job == nil {
+		return nil, nil
+	}
+	result, ok := job.TemplateData.(*tari_generated.GetNewBlockResult)
+	if !ok || result == nil {
+		return nil, nil
+	}
+	return proto.Marshal(result)
+}
+
+func (f *fakeDirectNodeClient) JobFromTemplateBytes(data []byte, algo poolpb.Algo) (*solo.Job, error) {
+	var result tari_generated.GetNewBlockResult
+	if err := proto.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("fakeDirectNodeClient: JobFromTemplateBytes: unmarshal: %w", err)
+	}
+	return tariJobFromResult(&result, algo)
 }
 
 var _ solo.NodeClient = (*fakeDirectNodeClient)(nil)
