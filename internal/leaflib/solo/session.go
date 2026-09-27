@@ -1796,8 +1796,49 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	// and are omitted from the wire (omitempty) — see
 	// protocol_xnp_test.go for a real marshaled-JSON byte-diff
 	// proving this holds both for SHA3X/C29 jobs and for RXM/RXT
-	// jobs served to a non-proxy agent.
+	// jobs served to a non-proxy agent. The same holds for the three
+	// difficulty fields set at the top of the block below
+	// (Difficulty/TargetDiff/TargetDiffHex): a non-proxy agent never
+	// reaches them at all.
 	if IsXNPProxyAgent(s.agent.Load().(string)) {
+		// DIFFICULTY HALF of the real proxy-class job shape — the fix
+		// for a confirmed production incident: a MoneroOcean-fork
+		// xmr-node-proxy user reported "getting a job difficulty of
+		// 1" from this leaf. The legacy reference's proxy-class
+		// cachedJob (lib/pool.js Miner.getJob ~654-736) carries NO
+		// bare "target" key at all; it sends `difficulty`,
+		// `target_diff: this.difficulty` and `target_diff_hex:
+		// this.diffHex` instead, and every xmr-node-proxy-family
+		// client (the original Snipa22/xmr-node-proxy's lib/xmr.js,
+		// the affected user's MoneroOcean fork's coins/template.js,
+		// and this repo's OWN leaf-proxy — proxy/protocol.go's
+		// UpstreamJobPayload) reads exactly those keys. With none of
+		// them ever emitted, the fork's normalizeDifficulty(
+		// template.target_diff, this.difficulty) chain got undefined
+		// twice over and fell through to its hardcoded `return 1`.
+		// See protocol.go's Difficulty/TargetDiff/TargetDiffHex doc
+		// comment for the verbatim source citations.
+		//
+		// Deliberately set BEFORE (and independent of) the per-algo
+		// switch below: difficulty is a property of THIS session's own
+		// stamped job, not of monerod's reserved_offset, so it is not
+		// gated on job.ReservedOffsetUsable — an XNP-proxy client
+		// whose template happens to fail that bounds check still must
+		// not be told its difficulty is 1.
+		//
+		// Both numeric fields carry the identical value
+		// (job.StaticDifficulty — the same value Target above is
+		// derived from via diffToTargetHex), exactly as legacy itself
+		// sends one plain numeric difficulty under two key names, and
+		// TargetDiffHex reuses payload.Target byte-for-byte rather
+		// than recomputing a different width/endianness encoding
+		// (legacy's this.diffHex IS what its `target` would carry).
+		difficulty := job.StaticDifficulty
+		targetDiff := difficulty
+		targetDiffHex := payload.Target
+		payload.Difficulty = &difficulty
+		payload.TargetDiff = &targetDiff
+		payload.TargetDiffHex = &targetDiffHex
 		switch job.Algo {
 		case poolpb.Algo_ALGO_RXM, poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, poolpb.Algo_ALGO_XEQ,
 			poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL:

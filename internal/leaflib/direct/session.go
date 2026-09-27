@@ -1612,8 +1612,35 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	// stay nil and are omitted from the wire (omitempty) — see
 	// protocol_xnp_test.go (solo package) and this package's own
 	// session_xnp_test.go for real marshaled-JSON byte-diffs proving
-	// this.
+	// this. The same holds for the three difficulty fields set at the
+	// top of the block below.
 	if solo.IsXNPProxyAgent(s.agent.Load().(string)) {
+		// DIFFICULTY HALF of the real proxy-class job shape — mirrors
+		// solo.Session.jobPayload's identical addition exactly; see
+		// that function and solo/protocol.go's Difficulty/TargetDiff/
+		// TargetDiffHex doc comment for the verbatim legacy source
+		// citations (lib/pool.js Miner.getJob's proxy cachedJob sends
+		// `difficulty`/`target_diff`/`target_diff_hex` and NO bare
+		// `target`) and for the confirmed production incident this
+		// fixes (a MoneroOcean-fork xmr-node-proxy client falling
+		// through its own normalizeDifficulty chain to a hardcoded
+		// difficulty of 1 because none of those keys was ever
+		// emitted).
+		//
+		// Set BEFORE (and independent of) the per-algo switch below:
+		// difficulty is a property of THIS session's own stamped job,
+		// not of monerod's reserved_offset, so it is deliberately not
+		// gated on job.ReservedOffsetUsable. Both numeric fields carry
+		// the identical job.StaticDifficulty value (the same value
+		// Target is derived from), and TargetDiffHex reuses
+		// payload.Target byte-for-byte rather than recomputing a
+		// different encoding.
+		difficulty := job.StaticDifficulty
+		targetDiff := difficulty
+		targetDiffHex := payload.Target
+		payload.Difficulty = &difficulty
+		payload.TargetDiff = &targetDiff
+		payload.TargetDiffHex = &targetDiffHex
 		switch job.Algo {
 		case poolpb.Algo_ALGO_RXM, poolpb.Algo_ALGO_XMR, poolpb.Algo_ALGO_ARQ, poolpb.Algo_ALGO_XEQ,
 			poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL:
