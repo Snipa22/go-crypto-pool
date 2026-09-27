@@ -4,8 +4,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	shared "github.com/Snipa22/go-crypto-pool/internal/leaflib/metrics"
 )
 
 func scrape(t *testing.T, m *Metrics) string {
@@ -246,5 +251,149 @@ func TestAsyncPoolMetrics_NoSourceIsAbsent(t *testing.T) {
 	body := scrape(t, m)
 	if strings.Contains(body, "leaf_async_validation_queue_depth") {
 		t.Errorf("expected no leaf_async_validation_queue_depth series without a source, got:\n%s", body)
+	}
+}
+
+// fakeClock is a manually-advanced time source for deterministic
+// rate-tracker integration testing -- mirrors
+// internal/leaflib/metrics's own identical test helper exactly (see
+// that package's ratetracker_test.go), duplicated here rather than
+// exported from the shared package since it exists purely to drive
+// shared.NewLabeledRateTrackersForTest's clock parameter in THIS
+// package's own tests.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newFakeClock(start time.Time) *fakeClock {
+	return &fakeClock{now: start}
+}
+
+func (f *fakeClock) Now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.now
+}
+
+func (f *fakeClock) Advance(d time.Duration) {
+	f.mu.Lock()
+	f.now = f.now.Add(d)
+	f.mu.Unlock()
+}
+
+// metricValue finds the first scrape-output line for name with the
+// given label pairs (label, value, label, value, ...) and parses its
+// trailing float64 sample value, failing the test if no such line
+// exists.
+func metricValue(t *testing.T, body, name string, labelPairs ...string) float64 {
+	t.Helper()
+	labelStr := ""
+	if len(labelPairs) > 0 {
+		parts := make([]string, 0, len(labelPairs)/2)
+		for i := 0; i < len(labelPairs); i += 2 {
+			parts = append(parts, fmt.Sprintf(`%s="%s"`, labelPairs[i], labelPairs[i+1]))
+		}
+		labelStr = "{" + strings.Join(parts, ",") + "}"
+	}
+	prefix := name + labelStr + " "
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 64)
+			if err != nil {
+				t.Fatalf("parse metric value for %q: %v (line: %q)", prefix, err, line)
+			}
+			return v
+		}
+	}
+	t.Fatalf("metric %q not found in scrape output:\n%s", prefix, body)
+	return 0
+}
+
+// TestPerSecondRateMetrics_IntegrationAcrossSimulatedTicks is the
+// required per-second-rate integration test: increments
+// SharesTotal/BlocksTotal (via IncShareResult/IncBlockResult, the
+// real call sites server.go's recordShare/recordBlock now use) a
+// known number of times across SIMULATED ticks (never a real
+// ticker/real sleep -- see
+// shared.NewLabeledRateTrackersForTest/LabeledRateTrackers.Tick),
+// then scrapes via the real Handler() and asserts:
+//   - the existing _total counters report their EXACT, unchanged
+//     cumulative values.
+//   - the new _per_second gauges report the exact known constant
+//     rate each label combination was driven at (a fixed per-tick
+//     increment over a fixed number of 1-simulated-second ticks
+//     converges to an EXACT, not just in-tolerance, rate -- see
+//     internal/leaflib/metrics/ratetracker_test.go's identical
+//     convergence tests for why this is deterministic).
+//
+// Mirrors internal/leaflib/direct/metrics's identical test exactly.
+func TestPerSecondRateMetrics_IntegrationAcrossSimulatedTicks(t *testing.T) {
+	m := New("dev", 0)
+
+	// Swap in manually-driven, non-autostart rate-tracker groups
+	// (same package as Metrics, so the unexported fields are
+	// directly reachable) so this test controls sampling cadence
+	// deterministically instead of relying on the production
+	// 1-real-second background ticker.
+	fc := newFakeClock(time.Unix(0, 0))
+	m.sharesRate = shared.NewLabeledRateTrackersForTest(fc.Now, 60, time.Second)
+	m.blocksRate = shared.NewLabeledRateTrackersForTest(fc.Now, 60, time.Second)
+
+	const ticks = 10
+	for i := 0; i < ticks; i++ {
+		fc.Advance(time.Second)
+
+		m.IncShareResult(ResultAccepted)
+		m.IncShareResult(ResultAccepted)
+		m.IncShareResult(ResultAccepted)
+		m.IncShareResult(ResultRejected)
+
+		m.IncBlockResult(ResultAccepted)
+
+		m.sharesRate.Tick()
+		m.blocksRate.Tick()
+	}
+
+	body := scrape(t, m)
+
+	// _total counters: exact, unchanged cumulative values.
+	for _, tc := range []struct {
+		name   string
+		labels []string
+		want   float64
+	}{
+		{"leaf_shares_total", []string{"result", "accepted"}, 30},
+		{"leaf_shares_total", []string{"result", "rejected"}, 10},
+		{"leaf_blocks_total", []string{"result", "accepted"}, 10},
+	} {
+		if got := metricValue(t, body, tc.name, tc.labels...); got != tc.want {
+			t.Errorf("%s{%s=%q} = %v, want %v", tc.name, tc.labels[0], tc.labels[1], got, tc.want)
+		}
+	}
+	// result="rejected" was never incremented on BlocksTotal, so
+	// that label combination's series is genuinely absent.
+	if strings.Contains(body, `leaf_blocks_total{result="rejected"}`) {
+		t.Errorf("expected no leaf_blocks_total series for result=rejected (never incremented), got:\n%s", body)
+	}
+
+	// _per_second gauges: a constant per-tick increment over
+	// 1-simulated-second ticks converges to an EXACT rate equal to
+	// that per-tick increment.
+	for _, tc := range []struct {
+		name   string
+		labels []string
+		want   float64
+	}{
+		{"leaf_shares_per_second", []string{"result", "accepted"}, 3},
+		{"leaf_shares_per_second", []string{"result", "rejected"}, 1},
+		{"leaf_blocks_per_second", []string{"result", "accepted"}, 1},
+		// Never incremented -- must report exactly 0, not merely
+		// "in tolerance" of 0.
+		{"leaf_blocks_per_second", []string{"result", "rejected"}, 0},
+	} {
+		if got := metricValue(t, body, tc.name, tc.labels...); got != tc.want {
+			t.Errorf("%s{%s=%q} = %v, want %v", tc.name, tc.labels[0], tc.labels[1], got, tc.want)
+		}
 	}
 }

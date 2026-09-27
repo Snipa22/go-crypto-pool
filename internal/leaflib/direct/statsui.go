@@ -200,6 +200,18 @@ func sortAddressCounts(counts []AddressCount) {
 	}
 }
 
+// DefaultStatsPageMaxSessions is the default -stats-page-max-sessions/
+// LEAF_DIRECT_STATS_PAGE_MAX_SESSIONS cap on how many SessionStat
+// rows the stats HTML page's "Connected sessions" table renders by
+// default -- picked as a reasonable midpoint of Alex's requested
+// 100-200 range (real production scale, e.g. 13,500+ concurrent
+// sessions on sxmr-phx-dump, made the previous uncapped
+// one-row-per-session table "way too much to see" as a default
+// view). Does NOT affect Stats() itself, and does NOT affect
+// Stats.ActiveSessions (the separate, already-correct, uncapped
+// total count) -- see capSessionsForDisplay's own doc comment.
+const DefaultStatsPageMaxSessions = 150
+
 // sortSessionsByConnectedAt sorts sessions ascending by ConnectedAt —
 // mirrors internal/leaflib/proxy/server.go's sortSessionsByConnectedAt
 // exactly.
@@ -238,6 +250,39 @@ func minMaxMedian(vals []uint64) (min, max, median uint64) {
 		median = (sorted[mid-1] + sorted[mid]) / 2
 	}
 	return min, max, median
+}
+
+// capSessionsForDisplay truncates sessions (already sorted ascending
+// by ConnectedAt, per Stats()'s own sortSessionsByConnectedAt call --
+// oldest-connected session first) to at most max entries for
+// rendering on the stats HTML page ONLY -- called exclusively from
+// StatsHTMLHandler, right before building statsPageData. Stats()
+// itself is deliberately left completely unchanged/uncapped: it is
+// also used by tests and potentially other internal callers that may
+// legitimately want the full list, so the cap must never leak into
+// that method's own contract.
+//
+// max <= 0 means "no cap, render everything" (the explicit escape
+// hatch for anyone who wants the old, uncapped behavior), mirroring
+// this codebase's existing zero-disables convention (e.g.
+// cfg.idleTimeout/cfg.noShareTimeout).
+//
+// When max > 0 and there are more sessions than max, the FIRST max
+// entries of the existing ascending-ConnectedAt order are kept --
+// i.e. the longest-connected ("oldest") sessions are shown, not the
+// most-recently-connected ones. This keeps the existing, already-
+// documented sort order exactly as-is rather than inventing a new
+// one: a capped view showing the sessions that have been around the
+// longest (and are therefore the most likely to be long-term/steady
+// miners worth seeing at a glance) is a reasonable default, and
+// avoids the alternative of the visible set constantly reshuffling
+// as brand-new connections continually bump older ones off the
+// bottom of a "newest first" table.
+func capSessionsForDisplay(sessions []SessionStat, max int) (shown []SessionStat, truncated bool) {
+	if max <= 0 || len(sessions) <= max {
+		return sessions, false
+	}
+	return sessions[:max], true
 }
 
 // statsPageTemplate is the basic, single-page stats UI for
@@ -328,11 +373,11 @@ const statsPageHTML = `<!DOCTYPE html>
   <p class="empty">No logged-in sessions yet.</p>
   {{end}}
 
-  <h2>Connected sessions</h2>
-  {{if .Stats.Sessions}}
+  <h2>Connected sessions{{if .SessionsCapped}} (showing {{len .ShownSessions}} of {{.Stats.ActiveSessions}}, capped to {{.StatsPageMaxSessions}}){{end}}</h2>
+  {{if .ShownSessions}}
   <table>
     <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Agent</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Blocks</th></tr>
-    {{range .Stats.Sessions}}
+    {{range .ShownSessions}}
     <tr>
       <td>{{.SessionID}}</td>
       <td>{{if .Address}}{{.Address}}{{else}}<span class="empty">(not logged in)</span>{{end}}</td>
@@ -364,6 +409,24 @@ type statsPageData struct {
 	// HideRemoteAddress mirrors internal/leaflib/solo/statsui.go's
 	// identical field exactly — see that doc comment.
 	HideRemoteAddress bool
+
+	// ShownSessions is the (possibly truncated) subset of
+	// Stats.Sessions actually rendered in the "Connected sessions"
+	// table -- see capSessionsForDisplay's doc comment. Deliberately
+	// a separate field from Stats.Sessions rather than mutating it:
+	// Stats is the exact, unmodified return value of Stats(), kept
+	// that way so nothing about this template's data construction
+	// could ever be mistaken for changing Stats()'s own contract.
+	ShownSessions []SessionStat
+	// StatsPageMaxSessions is the configured -stats-page-max-sessions
+	// cap (mirrors MaxAddressLabels's naming/role for the address
+	// cap above).
+	StatsPageMaxSessions int
+	// SessionsCapped is true only when Stats.Sessions actually had
+	// to be truncated to produce ShownSessions -- mirrors
+	// AddressCapped's own "false when not actually capped" contract
+	// exactly.
+	SessionsCapped bool
 }
 
 // formatHashrate mirrors solo/statsui.go's own formatHashrate exactly.
@@ -387,12 +450,16 @@ func formatHashrate(hz float64) string {
 func (s *Server) StatsHTMLHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		st := s.Stats()
+		shown, truncated := capSessionsForDisplay(st.Sessions, s.statsPageMaxSessions)
 		data := statsPageData{
-			GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
-			Stats:             st,
-			MaxAddressLabels:  s.maxAddressLabels,
-			AddressCapped:     len(st.MinersByAddress) > 0 && st.MinersByAddress[len(st.MinersByAddress)-1].Address == "other",
-			HideRemoteAddress: s.hideRemoteAddress.Load(),
+			GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
+			Stats:                st,
+			MaxAddressLabels:     s.maxAddressLabels,
+			AddressCapped:        len(st.MinersByAddress) > 0 && st.MinersByAddress[len(st.MinersByAddress)-1].Address == "other",
+			HideRemoteAddress:    s.hideRemoteAddress.Load(),
+			ShownSessions:        shown,
+			StatsPageMaxSessions: s.statsPageMaxSessions,
+			SessionsCapped:       truncated,
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := statsPageTemplate.Execute(w, data); err != nil {

@@ -4,6 +4,7 @@ package solo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -98,6 +99,16 @@ type Server struct {
 	// EnableMetrics when called with a positive value.
 	maxAddressLabels int
 
+	// statsPageMaxSessions caps how many SessionStat rows
+	// StatsHTMLHandler actually renders in its "Connected sessions"
+	// table -- NOT the same as ActiveSessions (which stays uncapped)
+	// and NOT applied inside Stats() itself (see
+	// capSessionsForDisplay's own doc comment in statsui.go).
+	// Defaults to DefaultStatsPageMaxSessions. 0/negative disables
+	// the cap entirely (render everything). Set via
+	// SetStatsPageMaxSessions.
+	statsPageMaxSessions int
+
 	// hideRemoteAddress, when true, tells StatsHTMLHandler to omit
 	// the "Remote address" column (both header and value) from the
 	// rendered stats page entirely -- see SetHideRemoteAddress.
@@ -142,7 +153,45 @@ type Server struct {
 	// *leaflib.DebugLogger's own Debugf/Enabled methods are safe to
 	// call on a nil receiver.
 	debugLogger *leaflib.DebugLogger
+
+	// noShareTimeout is set by SetNoShareTimeout (see that method's
+	// doc comment): a connected session that has NEVER produced a
+	// genuinely accepted share (shareCount.Load() == 0) within this
+	// long of connecting gets disconnected by the periodic sweep
+	// below (runNoShareSweep). Zero/negative (the default -- this
+	// field is never set unless SetNoShareTimeout is called)
+	// disables the feature entirely, mirroring
+	// ManagedConnection.armReadDeadline's own <=0-disables
+	// convention -- see SetNoShareTimeout/startNoShareSweep, which
+	// never even starts the sweep goroutine in that case.
+	noShareTimeout time.Duration
+
+	// noShareSweepStop/noShareSweepDone are the sweep goroutine's own
+	// stop signal/completion signal (started by startNoShareSweep,
+	// closed/waited-on by stopNoShareSweep from Shutdown). Both stay
+	// nil for a Server that never calls SetNoShareTimeout with a
+	// positive value -- see startNoShareSweep's doc comment.
+	noShareSweepStop chan struct{}
+	noShareSweepDone chan struct{}
+
+	// noShareSweepNow is a test-only clock seam (mirrors
+	// MoneroNodeClient's own nowFunc convention exactly): nil in
+	// production, so sweepNoShareSessions always calls time.Now();
+	// overridden by this package's own no-share-timeout tests so
+	// they never sleep-based-test a real multi-minute window.
+	noShareSweepNow func() time.Time
 }
+
+// defaultNoShareSweepInterval is how often runNoShareSweep scans the
+// live session map for sessions that have exceeded noShareTimeout
+// without ever producing an accepted share -- see that method's own
+// doc comment. Deliberately short relative to any realistic
+// noShareTimeout (Alex's stated "2-3 minutes" -- see
+// cmd/leaf-solo's -no-share-timeout flag doc comment) so the
+// timeout is enforced within a few seconds of actually elapsing,
+// without hot-looping a full session-map scan far more often than
+// that. Not operator-configurable -- only noShareTimeout itself is.
+const defaultNoShareSweepInterval = 15 * time.Second
 
 // NewServer constructs a Server. cm must already be configured with the
 // desired MaxConnections/IdleTimeout (ManagerConfig) by the caller —
@@ -170,15 +219,23 @@ func NewServer(cm *leaflib.ConnectionManager, jobManager *JobManager, node NodeC
 		vardiff:                 vardiff.Normalized(),
 		sessions:                make(map[uint64]*Session),
 		maxAddressLabels:        metrics.DefaultMaxAddressLabels,
+		statsPageMaxSessions:    DefaultStatsPageMaxSessions,
 		invalidShareGuardConfig: leaflib.DefaultInvalidShareGuardConfig(),
-		// workers=0 lets NewAsyncValidationPool apply its own default
-		// (DefaultAsyncValidationWorkers() == runtime.NumCPU(), NOT a
-		// hardcoded literal -- see asyncvalidation.go's doc comment
-		// and Alex's explicit direction in DISPATCH_BRIEF.md,
-		// 2026-09-10). An operator wanting a different fixed count
-		// can override via SetRandomXWorkerPoolSize (see
-		// cmd/leaf-solo's -randomx-workers flag) before Serve begins.
-		randomxPool: NewAsyncValidationPool(0, AsyncValidationQueueSize),
+		// workers=0/queueSize=0 lets NewAsyncValidationPool apply its
+		// own defaults (DefaultAsyncValidationWorkers() ==
+		// runtime.NumCPU() for workers, NOT a hardcoded literal --
+		// see asyncvalidation.go's doc comment and Alex's explicit
+		// direction in DISPATCH_BRIEF.md, 2026-09-10; and
+		// DefaultAsyncValidationQueueSize(workers) for queueSize --
+		// max(AsyncValidationQueueSize, workers*
+		// DefaultAsyncValidationQueueMultiplier), scaling with the
+		// real worker count instead of staying the old flat 256
+		// literal regardless of host size). An operator wanting a
+		// different fixed worker count and/or queue size can override
+		// via SetRandomXWorkerPoolSize (see cmd/leaf-solo's
+		// -randomx-workers/-randomx-queue-size flags) before Serve
+		// begins.
+		randomxPool: NewAsyncValidationPool(0, 0),
 	}
 	// leaf-solo's own invalidateAndRepushJobs has no use for the
 	// source label JobManager.Subscribe's callback now carries (see
@@ -272,6 +329,16 @@ func (s *Server) SetHideRemoteAddress(hide bool) {
 	s.hideRemoteAddress.Store(hide)
 }
 
+// SetStatsPageMaxSessions sets the -stats-page-max-sessions/
+// LEAF_SOLO_STATS_PAGE_MAX_SESSIONS cap StatsHTMLHandler enforces on
+// its "Connected sessions" table row count -- see
+// statsPageMaxSessions's own doc comment and capSessionsForDisplay
+// in statsui.go for the full rationale. 0/negative disables the cap
+// entirely (render everything).
+func (s *Server) SetStatsPageMaxSessions(max int) {
+	s.statsPageMaxSessions = max
+}
+
 // SetDebugLogger opts this Server (and every Session it creates) into
 // verbose [DEBUG]-tagged logging -- see internal/leaflib/debuglog.go's
 // doc comment and cmd/leaf-solo/main.go's -debug/LEAF_SOLO_DEBUG
@@ -282,6 +349,44 @@ func (s *Server) SetHideRemoteAddress(hide bool) {
 // every other opt-in Set*/Enable* method's convention on this type.
 func (s *Server) SetDebugLogger(d *leaflib.DebugLogger) {
 	s.debugLogger = d
+}
+
+// SetNoShareTimeout opts this Server into the connection-hygiene
+// disconnect this feature's own brief describes: a session that
+// connects and never produces a single genuinely accepted share
+// (see Session.shareCount) within timeout of connecting gets
+// disconnected by a periodic sweep (runNoShareSweep) -- a huge
+// number of miners at real production scale connect and only ever
+// send periodic keepalived messages, never a real submit, wasting a
+// connection slot indefinitely without ever tripping the existing,
+// generic "any contact resets the clock" idle timeout
+// (ManagedConnection.armReadDeadline). This is a genuinely different
+// condition from that idle timeout: the connection is NOT idle (it
+// is actively sending non-share traffic) -- see
+// metrics.ConnErrorIdleTimeout's own doc comment for that
+// distinction and this feature's own metrics.ConnErrorNoShareTimeout
+// category (recorded by sweepNoShareSessions).
+//
+// A non-positive timeout disables this feature entirely (mirrors
+// armReadDeadline's own <=0-disables convention): the sweep
+// goroutine is never even started in that case (see
+// startNoShareSweep), so a Server that never calls this method (or
+// calls it with a non-positive value) costs not even one extra
+// goroutine. Set from cmd/leaf-solo's own -no-share-timeout/
+// LEAF_SOLO_NO_SHARE_TIMEOUT flag (default 3m, matching Alex's
+// stated "2-3 minutes" upper bound). Must be called before Serve
+// begins accepting connections, mirroring every other opt-in
+// Set*/Enable* method's convention on this type.
+//
+// A session that submits its first accepted share is PERMANENTLY
+// exempt from this specific disconnect for the rest of its life
+// (shareCount only ever increases, never resets) -- it never
+// re-triggers later just because a session goes quiet AFTER its
+// first share; that's what the existing, separate idle timeout
+// already covers.
+func (s *Server) SetNoShareTimeout(timeout time.Duration) {
+	s.noShareTimeout = timeout
+	s.startNoShareSweep()
 }
 
 // EnableAddressFlags opts this server into the real, manual ban/
@@ -341,14 +446,14 @@ func (s *Server) recordShare(accepted bool) {
 	if s.metrics == nil {
 		return
 	}
-	s.metrics.SharesTotal.WithLabelValues(resultLabel(accepted)).Inc()
+	s.metrics.IncShareResult(resultLabel(accepted))
 }
 
 func (s *Server) recordBlock(accepted bool) {
 	if s.metrics == nil {
 		return
 	}
-	s.metrics.BlocksTotal.WithLabelValues(resultLabel(accepted)).Inc()
+	s.metrics.IncBlockResult(resultLabel(accepted))
 }
 
 func (s *Server) recordConnectionError(category string) {
@@ -356,6 +461,136 @@ func (s *Server) recordConnectionError(category string) {
 		return
 	}
 	s.metrics.ConnectionErrorsTotal.WithLabelValues(category).Inc()
+}
+
+// startNoShareSweep launches the single, Server-scoped periodic
+// no-share-timeout sweep goroutine (runNoShareSweep) if
+// s.noShareTimeout is positive -- deliberately ONE ticker for the
+// whole Server, never one timer/goroutine per session. At the real
+// production scale this feature exists for (13,500+ concurrent
+// connections, per this feature's own brief), a per-session timer on
+// top of everything else already running per-session would repeat
+// the exact class of session-map-bloat production incidents this
+// codebase's direct.Server (jobFetchPool/repushPool) doc comments
+// describe fixing elsewhere. This sweep instead scans the SAME
+// s.sessions map every other per-connection bookkeeping path on this
+// Server already maintains (see sessionSnapshots/handleConn) -- no
+// second, parallel registry.
+//
+// A non-positive s.noShareTimeout is this feature's documented
+// no-op: no goroutine is started at all (the stronger guarantee,
+// preferred here over "start it but have it never disconnect
+// anyone" -- see this package's own no-share-timeout tests, which
+// confirm a disabled Server leaks no extra goroutine). Called from
+// SetNoShareTimeout.
+func (s *Server) startNoShareSweep() {
+	if s.noShareTimeout <= 0 {
+		return
+	}
+	s.noShareSweepStop = make(chan struct{})
+	s.noShareSweepDone = make(chan struct{})
+	go s.runNoShareSweep()
+}
+
+func (s *Server) runNoShareSweep() {
+	defer close(s.noShareSweepDone)
+	ticker := time.NewTicker(defaultNoShareSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.noShareSweepStop:
+			return
+		case <-ticker.C:
+			s.sweepNoShareSessions()
+		}
+	}
+}
+
+// sweepNoShareSessions is a single pass of the no-share-timeout
+// sweep: it takes a real, complete snapshot of every currently-live
+// session (RLock'd, mirroring sessionSnapshots' own convention
+// exactly) and, for each one that has NEVER produced a genuinely
+// accepted share (Session.shareCount.Load() == 0, incremented only
+// in finishSubmit AFTER real validation passes -- never for a
+// rejected/invalid submit) and has been connected longer than
+// s.noShareTimeout, closes it via the exact same mc.Close(...)
+// mechanism the existing invalid-share-guard disconnect uses (see
+// finishSubmit's own disconnect call), with a clear, distinct reason
+// string and connection-error category
+// (metrics.ConnErrorNoShareTimeout) so it is never conflated with
+// the generic metrics.ConnErrorIdleTimeout category -- that
+// connection was NOT idle, it was actively sending non-share
+// traffic.
+//
+// A session that has produced at least one accepted share is
+// PERMANENTLY exempt from this specific disconnect for the rest of
+// its life, even if it goes on to submit nothing else ever again --
+// shareCount only ever increases, so this check can never re-trigger
+// for a session once it has passed it once (that's what the
+// existing, separate, generic idle timeout already covers).
+func (s *Server) sweepNoShareSessions() {
+	// Defensive no-op mirroring startNoShareSweep's own <=0-disables
+	// convention: in normal operation this can never actually be
+	// reached with a non-positive noShareTimeout (startNoShareSweep
+	// never starts the goroutine that calls this in that case), but
+	// keeping the same guard here too means a caller that invokes
+	// this directly (e.g. this package's own tests) never has to
+	// worry about it double-checking noShareTimeout itself.
+	if s.noShareTimeout <= 0 {
+		return
+	}
+	now := time.Now
+	if s.noShareSweepNow != nil {
+		now = s.noShareSweepNow
+	}
+	nowT := now()
+
+	s.mu.RLock()
+	var stale []*Session
+	for _, sess := range s.sessions {
+		if sess.shareCount.Load() == 0 && nowT.Sub(sess.connectedAt) > s.noShareTimeout {
+			stale = append(stale, sess)
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, sess := range stale {
+		addr, _ := sess.address.Load().(string)
+		s.logger.Printf("solo: disconnecting session %s (address %s): no share submitted within %s of connecting", sess.sessionID, addr, s.noShareTimeout)
+		_ = sess.mc.Close(fmt.Sprintf("no share submitted within %s of connecting", s.noShareTimeout))
+		s.recordConnectionError(metrics.ConnErrorNoShareTimeout)
+	}
+}
+
+// stopNoShareSweep stops the sweep goroutine started by
+// startNoShareSweep, if one was ever started -- a Server that never
+// called SetNoShareTimeout with a positive value never started one
+// (see that method's own doc comment), so this is a safe no-op there
+// too. Called from Shutdown(), mirroring every other background
+// worker's explicit stop-on-Shutdown convention on this type
+// (randomxPool.Stop(), etc.).
+func (s *Server) stopNoShareSweep() {
+	if s.noShareSweepStop == nil {
+		return
+	}
+	close(s.noShareSweepStop)
+	<-s.noShareSweepDone
+}
+
+// recordShareRejectionReason bumps the real
+// leaf_share_rejection_reason_total counter (see
+// metrics.Metrics.ShareRejectionReasonTotal's doc comment) for reason
+// (one of metrics.RejectionReason*) -- called from session.go's
+// rejectShare helper at every real reject call site handleSubmit
+// reaches, mirroring recordShare/recordBlock/recordConnectionError's
+// identical nil-checked convention above. ADDITIVE to (never a
+// replacement for) writeShareResponse's own existing recordShare(false)
+// bookkeeping -- see rejectShare's own doc comment.
+func (s *Server) recordShareRejectionReason(reason string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.IncShareRejectionReason(reason)
 }
 
 func resultLabel(accepted bool) string {
@@ -506,16 +741,24 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, startingDifficul
 	session.Run(mc.Context())
 }
 
-// Shutdown unsubscribes from job updates and stops this Server's
+// Shutdown unsubscribes from job updates, stops this Server's
 // RandomX-family async validation worker pool (asyncValidationPool.Stop --
-// blocks until every in-flight validation finishes). It does not close the
-// ConnectionManager or listener — callers own those lifecycles.
+// blocks until every in-flight validation finishes), the
+// no-share-timeout sweep goroutine (see stopNoShareSweep, a no-op if
+// it was never started), and -- if metrics are enabled -- the
+// per-second rate trackers' background goroutines (see
+// metrics.Metrics.Stop). It does not close the ConnectionManager or
+// listener — callers own those lifecycles.
 func (s *Server) Shutdown() {
 	if s.unsubscribe != nil {
 		s.unsubscribe()
 	}
+	s.stopNoShareSweep()
 	if s.randomxPool != nil {
 		s.randomxPool.Stop()
+	}
+	if s.metrics != nil {
+		s.metrics.Stop()
 	}
 }
 

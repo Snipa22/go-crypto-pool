@@ -3,6 +3,7 @@ package solo
 
 import (
 	"context"
+	mathrand "math/rand"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
@@ -34,6 +35,26 @@ func computeRetarget(curDiff, hashes uint64, connSeconds, targetTime int, minDif
 	return leaflib.ComputeRetarget(curDiff, hashes, connSeconds, targetTime, minDiff, maxDiff)
 }
 
+// vardiffJitterFunc is a test-injectable seam over the one-time
+// initial retarget-ticker jitter delay's random source below --
+// mirrors this repo's existing test-injectable-randomness convention
+// (see internal/backend/legacyapi's `nowUnix` package-level func-var
+// seam) rather than inventing a new one. Production code always
+// calls through this var; tests may substitute an instrumented/
+// deterministic replacement.
+//
+// Uses math/rand, deliberately NOT crypto/rand: this jitter exists
+// purely to desynchronize (load-shed) a thundering herd of
+// simultaneous retargets, not to produce a security-sensitive value,
+// so the faster, non-cryptographic PRNG is the correct tool here --
+// do not "fix" this into an unnecessary crypto/rand dependency. Go
+// 1.20+ auto-seeds math/rand's global source (this module's go.mod
+// declares `go 1.25.0`, well past that threshold), so no explicit
+// process-startup seeding call is required.
+var vardiffJitterFunc = func(interval time.Duration) time.Duration {
+	return time.Duration(mathrand.Int63n(int64(interval)))
+}
+
 // runVardiffLoop is this session's own per-connection retarget timer,
 // ported from go-tari-sha3x-solo-stratum's cron registration
 // (`config.SystemCrons.AddCronJob("*/60 * * * * *", m.NewDiff)`) —
@@ -52,11 +73,33 @@ func computeRetarget(curDiff, hashes uint64, connSeconds, targetTime int, minDif
 // so reading it here from this goroutine is safe without further
 // synchronization (Go's memory model guarantees a happens-before edge
 // across goroutine creation).
+//
+// Before starting the ticker, this waits out a random ONE-TIME
+// initial jitter delay uniformly distributed across the FULL interval
+// window (vardiffJitterFunc above) -- this permanently desynchronizes
+// this session's retarget PHASE from every other session that
+// happened to start at the same instant (e.g. thousands of miners
+// reconnecting within the same few seconds during a cutover), fixing
+// the resulting thundering-herd retarget wave forever, not just for
+// the first retarget: a time.Ticker's subsequent ticks stay offset by
+// whatever phase its first tick landed on, so only this one-time
+// delay is needed. Every SUBSEQUENT retarget still respects the exact
+// configured interval unchanged -- only the ABSOLUTE WALL-CLOCK
+// MOMENT this session's cycle lands on is randomized, not its real
+// per-session cadence.
 func (s *Session) runVardiffLoop(ctx context.Context) {
 	interval := s.server.vardiff.RetargetInterval
 	if interval <= 0 {
 		interval = defaultVardiffConfig().RetargetInterval
 	}
+
+	jitter := vardiffJitterFunc(interval)
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(jitter):
+	}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -69,7 +112,9 @@ func (s *Session) runVardiffLoop(ctx context.Context) {
 	}
 }
 
-// maybeRetarget is the per-tick body of runVardiffLoop: it gates on
+// maybeRetarget is the per-tick body of runVardiffLoop: it returns
+// immediately for a fixed-difficulty session (Session.fixedDiff -- see
+// that field's doc comment), otherwise gates on
 // connection age (legacy's `getConnSeconds() < 60` check, generalized
 // to the configured RetargetInterval), runs computeRetarget against
 // this session's OWN currentDifficulty/hashesAccumulated/connectedAt
@@ -80,6 +125,17 @@ func (s *Session) runVardiffLoop(ctx context.Context) {
 // closing `m.SendNewJob(false)` call), never broadcasting to any other
 // connected session.
 func (s *Session) maybeRetarget() {
+	// A session that requested (or was assigned) a FIXED difficulty at
+	// login is NEVER retargeted, for the lifetime of the connection --
+	// see Session.fixedDiff's own doc comment (session.go) for the
+	// verbatim legacy retargetMiners citation (nodejs-pool-sxmr
+	// lib/pool.js lines 227-236) this gate ports. Checked first,
+	// before the connection-age gate and before any computeRetarget
+	// work, so a fixed-difficulty session costs nothing per tick.
+	if s.fixedDiff.Load() {
+		return
+	}
+
 	cfg := s.server.vardiff
 	connSeconds := int(time.Since(s.connectedAt).Seconds())
 	if connSeconds < int(cfg.RetargetInterval.Seconds()) {

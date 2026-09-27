@@ -67,6 +67,34 @@ type Session struct {
 	// diagnostic-only.
 	agent atomic.Value // string
 
+	// paymentID mirrors solo.Session's own identical field: the
+	// genuine Monero payment ID the miner supplied as a
+	// 64-lowercase-hex second dot-segment of its login field
+	// (solo.ParseLoginFields / solo.LoginFields.PaymentID),
+	// Monero-family algos only.
+	//
+	// UNLIKE leaf-solo (which has no share table/backend/payout
+	// accounting at all, and documents that as a known gap on its own
+	// copy of this field), leaf-direct forwards EVERY validated share
+	// to the real backend -- so this field is genuinely wired through
+	// to payout accounting here, stamped onto poolpb.Share.PaymentId
+	// (see sharePaymentID below and handleSubmit's four real Share
+	// constructions). That is pre-existing, complete, real plumbing,
+	// not new machinery invented for this fix:
+	// internal/backend/api's own ingestion handler already reads
+	// Share.PaymentId into db.Share.PaymentID (api.go), which
+	// internal/backend/db keys both the `balance` and
+	// `miner_identifiers` rows on (COALESCE(payment_id, '')), and
+	// internal/leaflib/legacytransport already maps it onto the legacy
+	// SXMR wire share too (legacytransport.go).
+	paymentID atomic.Value // string
+
+	// fixedDiff mirrors solo.Session's own identical field exactly --
+	// see that field's doc comment for the full rationale and the
+	// verbatim legacy retargetMiners citation it ports. Read by
+	// vardiff.go's maybeRetarget, which returns immediately when set.
+	fixedDiff atomic.Bool
+
 	// trust is nil unless server.trustConfig.Enabled at newSession
 	// time — see solo.MinerTrust and solo/trust.go's doc comment.
 	trust *solo.MinerTrust
@@ -106,6 +134,23 @@ type Session struct {
 	lastDeliveredDifficulty atomic.Uint64
 }
 
+// sharePaymentID renders this session's own captured Monero payment ID
+// (see the paymentID field's doc comment) as the optional
+// poolpb.Share.PaymentId this leaf stamps on every forwarded share:
+// nil when the miner supplied none (the overwhelmingly common case,
+// and byte-for-byte identical to this field not existing -- the
+// backend's own ingestion handler already treats a nil PaymentId as
+// "no payment ID", and internal/backend/db keys its balance/
+// miner_identifiers rows on COALESCE(payment_id, ”)), or a pointer to
+// the real 64-hex value the miner actually sent.
+func (s *Session) sharePaymentID() *string {
+	pid, _ := s.paymentID.Load().(string)
+	if pid == "" {
+		return nil
+	}
+	return &pid
+}
+
 // alreadyDelivered mirrors solo.Session's own identical method exactly
 // -- see that method's doc comment.
 func (s *Session) alreadyDelivered(job *solo.Job) bool {
@@ -130,6 +175,7 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	s.address.Store("")
 	s.worker.Store("")
 	s.agent.Store("")
+	s.paymentID.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
 	if server.trustConfig.Enabled {
 		s.trust = solo.NewMinerTrust(server.trustConfig)
@@ -220,6 +266,35 @@ func (s *Session) handleLogin(req solo.Request) {
 		return
 	}
 
+	// BUG FIX: real login-field parse (address /
+	// "+"-fixed-difficulty / ".paymentID" / ".identifier") BEFORE any
+	// address validation. This handler used to pass login.Login -- the
+	// RAW, UNSTRIPPED string the miner sent -- straight into
+	// solo.ValidateAddressForAlgo below, so a miner using the
+	// completely standard "<address>+<fixed_diff>" /
+	// "<address>.<workername_or_paymentid>" Monero-family stratum
+	// convention failed address validation and was refused a login
+	// outright. solo.ParseLoginFields is a faithful port of the real
+	// legacy nodejs-pool-sxmr parse -- see its doc comment for the
+	// verbatim source citation and for every scoping decision.
+	//
+	// Clamp bounds are this leaf's OWN already-configured
+	// -min-difficulty/-max-difficulty, reached through the (already
+	// Normalized, see NewServer) VardiffConfig every retarget on this
+	// session is clamped to as well.
+	loginFields, err := solo.ParseLoginFields(
+		s.server.algo,
+		login.Login,
+		login.Agent,
+		s.currentDifficulty.Load(),
+		s.server.vardiff.MinDifficulty,
+		s.server.vardiff.MaxDifficulty,
+	)
+	if err != nil {
+		s.writeGeneralResponse(req.ID, err.Error(), "")
+		return
+	}
+
 	// Real, coin-aware payment-address validation, mirroring
 	// solo.Session's own handleLogin exactly (see that method's doc
 	// comment) — leaf-direct already carries its own configured
@@ -227,7 +302,13 @@ func (s *Session) handleLogin(req solo.Request) {
 	// algo every job this leaf produces is stamped with, so no
 	// JobManager.Algo() indirection is needed here the way solo's
 	// own handleLogin needs it.
-	if err := solo.ValidateAddressForAlgo(s.server.algo, login.Login); err != nil {
+	//
+	// NOTE (the actual fix): loginFields.Address -- the STRIPPED
+	// address -- is what goes in here, never the raw login.Login, and
+	// every downstream use of the miner's address in this handler
+	// (ban/forced-floor lookup, s.address storage) uses that same
+	// stripped value.
+	if err := solo.ValidateAddressForAlgo(s.server.algo, loginFields.Address); err != nil {
 		s.writeGeneralResponse(req.ID, err.Error(), "")
 		return
 	}
@@ -244,9 +325,9 @@ func (s *Session) handleLogin(req solo.Request) {
 	// address is treated as unflagged.
 	var forcedFloor uint64
 	if s.server.addressFlags != nil {
-		flags := s.server.addressFlags.Get(login.Login)
+		flags := s.server.addressFlags.Get(loginFields.Address)
 		if flags.Banned {
-			s.server.logger.Printf("direct: rejecting login for banned address %s (session %s)", login.Login, s.sessionID)
+			s.server.logger.Printf("direct: rejecting login for banned address %s (session %s)", loginFields.Address, s.sessionID)
 			s.writeGeneralResponse(req.ID, "this address is banned from this pool", "")
 			return
 		}
@@ -260,11 +341,32 @@ func (s *Session) handleLogin(req solo.Request) {
 	if worker == "" {
 		worker = "x"
 	}
+	// Legacy identifier precedence, mirroring solo.Session's own
+	// handleLogin exactly -- see that method's own comment at this
+	// same point for the full citation (pool.js lines 419-423) and for
+	// the two decisions made here: the dot-segment identifier feeds
+	// the SAME worker/s.worker field, and legacy's `pass.split(":")`
+	// is deliberately NOT ported.
+	if loginFields.Identifier != "" && worker == "x" {
+		worker = loginFields.Identifier
+	}
 
-	s.address.Store(login.Login)
+	s.address.Store(loginFields.Address)
 	s.worker.Store(worker)
 	s.agent.Store(login.Agent)
+	s.paymentID.Store(loginFields.PaymentID)
 	s.loggedIn.Store(true)
+
+	// A miner-requested (or NiceHash-assigned) FIXED difficulty
+	// becomes this session's STARTING difficulty and pins it for the
+	// lifetime of the connection -- mirrors solo.Session's own
+	// handleLogin exactly (see that method's own comment at this same
+	// point, and Session.fixedDiff's doc comment, for the verbatim
+	// legacy citations).
+	if loginFields.FixedDiff {
+		s.fixedDiff.Store(true)
+		s.currentDifficulty.Store(loginFields.Difficulty)
+	}
 
 	// A forced minimum difficulty always wins over the port tier's
 	// own configured starting difficulty -- mirrors solo.Session's
@@ -364,6 +466,97 @@ func (s *Session) fetchAndDeliverGetJob(reqID int) {
 	s.pushJob(job)
 }
 
+// pushFreshJobOnStaleSubmit is handleSubmit's own dedicated fix for
+// the real, live-confirmed production rejection-reason breakdown
+// (brief_push_job_on_stale.md: stale_or_unknown_job was 715/1550,
+// ~46%, of leaf-direct-prod's total rejects in a recent sample):
+// a submit rejected for a reason that means "the job you are hashing
+// on is no longer the one this server considers current for you"
+// leaves the miner able to regenerate the exact same rejection
+// indefinitely, with nothing pushed to correct it until the next
+// scheduled refresh (periodic 30s job refresh, 60s vardiff retarget,
+// or a real tip change). Called ONLY from the rejection branches
+// enumerated below, in ADDITION to (never instead of) the existing
+// rejectShare/writeShareResponse call already made for this submit --
+// it does NOT change the wire-visible rejection response for THIS
+// submit at all, it only arranges for a SEPARATE, additional "job"
+// push to reach this session right after.
+//
+// EXACTLY FOUR rejection reasons, no more (widened from the original
+// two) -- see solo.Session's own identical method's doc comment for
+// the full per-reason reasoning, which is identical here:
+//   - RejectionReasonStaleOrUnknownJob
+//   - RejectionReasonJobExpired
+//   - RejectionReasonDifficultyFloorMiss (BOTH of this leaf's real
+//     call sites for that reason: the cheap pre-dispatch
+//     claimed-difficulty floor check, and finishSubmit's own
+//     post-validation REAL-derived-difficulty floor check -- they
+//     report the same reason for the same underlying "your target is
+//     from an older, lower-difficulty job" cause, so gating on the
+//     reason means gating on both)
+//   - RejectionReasonDuplicateNonce
+//
+// Every OTHER rejection reason (claimed_difficulty_or_crypto_invalid,
+// banned_address, malformed_nonce, invalid_xnonce, invalid_pow_shape,
+// missing_claimed_result, malformed_submit_request,
+// block_submit_failed, pool_saturated, internal_error) deliberately
+// does NOT push.
+//
+// Dispatched onto s.server.jobFetchPool (the same CLOSE-WAIT-incident
+// worker pool handleLogin/handleGetJob's own fetchAndDeliverLoginJob/
+// fetchAndDeliverGetJob already use -- see jobFetchPool's own doc
+// comment in server.go) rather than calling JobForXNAtDifficulty
+// inline here, so a slow/blocked job-template fetch can never stall
+// handleSubmit's own caller, Session.Run's read loop, for this or any
+// other in-flight message from this session. That dispatch is also
+// what makes the new finishSubmit call site safe: finishSubmit may
+// already be running on a randomxPool worker goroutine rather than
+// the read loop, and TrySubmit is callable from either.
+func (s *Session) pushFreshJobOnStaleSubmit() {
+	if ok := s.server.jobFetchPool.TrySubmit(func() { s.fetchAndPushFreshJobOnStaleSubmit() }); !ok {
+		s.server.logger.Printf("direct: job fetch pool saturated or shutting down, could not push fresh job to session %s after a stale-job-class submit rejection", s.sessionID)
+	}
+}
+
+// fetchAndPushFreshJobOnStaleSubmit runs ON s.server.jobFetchPool's
+// own worker goroutine (see pushFreshJobOnStaleSubmit's dispatch
+// above), never on Session.Run's own read-loop goroutine. Fetches a
+// fresh job at this session's OWN current difficulty
+// (s.currentDifficulty.Load() -- never any other value), exactly the
+// same JobForXNAtDifficulty call fetchAndDeliverGetJob/
+// fetchAndDeliverLoginJob already make for this same session.
+//
+// Gated through s.alreadyDelivered (see that method's doc comment):
+// if the freshly fetched job is byte-for-byte identical (same job.ID
+// AND same difficulty) to what this session's own lastDeliveredJobID/
+// lastDeliveredDifficulty bookkeeping says was already sent to it,
+// this is a deliberate no-op, matching invalidateAndRepushJobs' own
+// identical dedup gate (server.go) and the live production bug
+// (Alex's "we're sending duplicate jobs down the wire" report) that
+// gate was originally added to fix -- pushing the literal same job
+// bytes again would not help this miner catch up to a job it may
+// simply not have switched to client-side yet, and would violate the
+// one invariant this codebase has already fixed a real incident to
+// establish. s.pushJob(job) below is the SAME existing helper
+// handleGetJob/handleLogin's own job pushes already use -- it already
+// calls s.recordJob(job) (via jobPayload) so this freshly pushed job
+// becomes immediately submittable against by this session, and
+// already gates on s.loggedIn itself, so there is no separate
+// logged-in check needed here.
+func (s *Session) fetchAndPushFreshJobOnStaleSubmit() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.xn, s.currentDifficulty.Load())
+	if err != nil {
+		s.server.logger.Printf("direct: failed to fetch fresh job for session %s (xn %s) after a stale-job-class submit rejection: %v", s.sessionID, s.xn, err)
+		return
+	}
+	if s.alreadyDelivered(job) {
+		return
+	}
+	s.pushJob(job)
+}
+
 // handleSubmit is leaf-direct's own version of solo.Session's
 // handleSubmit: the wire parsing / xn-prefix / session-ownership /
 // job-expiry / validator-dispatch / difficulty-derivation logic is
@@ -384,11 +577,11 @@ func (s *Session) handleSubmit(req solo.Request) {
 	}
 	var submit solo.SubmitRequest
 	if len(req.Params) == 0 {
-		s.writeShareResponse(req.ID, false, "submit requires params")
+		s.rejectShare(req.ID, directmetrics.RejectionReasonMalformedSubmitRequest, "submit requires params")
 		return
 	}
 	if err := json.Unmarshal(req.Params, &submit); err != nil {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid submit params: %v", err))
+		s.rejectShare(req.ID, directmetrics.RejectionReasonMalformedSubmitRequest, fmt.Sprintf("invalid submit params: %v", err))
 		return
 	}
 
@@ -396,13 +589,15 @@ func (s *Session) handleSubmit(req solo.Request) {
 
 	job, ok := s.ownJob(submit.JobID)
 	if !ok {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("unknown or stale job_id: %s", submit.JobID))
+		s.rejectShare(req.ID, directmetrics.RejectionReasonStaleOrUnknownJob, fmt.Sprintf("unknown or stale job_id: %s", submit.JobID))
+		s.pushFreshJobOnStaleSubmit()
 		return
 	}
 
 	if maxAge := s.server.jobManager.JobMaxAge(); maxAge > 0 {
 		if age := time.Since(job.CreatedAt); age > maxAge {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("job expired: job_id %s was issued %s ago (max age %s)", submit.JobID, age.Round(time.Second), maxAge))
+			s.rejectShare(req.ID, directmetrics.RejectionReasonJobExpired, fmt.Sprintf("job expired: job_id %s was issued %s ago (max age %s)", submit.JobID, age.Round(time.Second), maxAge))
+			s.pushFreshJobOnStaleSubmit()
 			return
 		}
 	}
@@ -415,7 +610,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 	if s.server.addressFlags != nil {
 		if flags := s.server.addressFlags.Get(s.address.Load().(string)); flags.Banned {
 			s.server.logger.Printf("direct: rejecting submit for now-banned address %s (session %s)", s.address.Load(), s.sessionID)
-			s.writeShareResponse(req.ID, false, "this address is banned from this pool")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonBannedAddress, "this address is banned from this pool")
 			return
 		}
 	}
@@ -433,7 +628,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// as one opaque value it controls end-to-end.
 	if !solo.IsRandomXFamily(job.Algo) {
 		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
+			s.rejectShare(req.ID, directmetrics.RejectionReasonInvalidXNonce, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 			return
 		}
 	}
@@ -451,12 +646,12 @@ func (s *Session) handleSubmit(req solo.Request) {
 	nonceBytes, err := hex.DecodeString(submit.Nonce)
 	if solo.IsRandomXFamily(job.Algo) {
 		if err != nil || (len(nonceBytes) != 4 && len(nonceBytes) != 8) {
-			s.writeShareResponse(req.ID, false, "nonce must be 4 bytes for RandomX-family (rx/0) jobs, hex-encoded uint32")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonMalformedNonce, "nonce must be 4 bytes for RandomX-family (rx/0) jobs, hex-encoded uint32")
 			return
 		}
 	} else {
 		if err != nil || len(nonceBytes) != 8 {
-			s.writeShareResponse(req.ID, false, "nonce must be 8 bytes, hex-encoded uint64")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonMalformedNonce, "nonce must be 8 bytes, hex-encoded uint64")
 			return
 		}
 	}
@@ -481,7 +676,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			nonce = binary.LittleEndian.Uint64(nonceBytes)
 		}
 		if submit.Result == "" {
-			s.writeShareResponse(req.ID, false, "monero (rxm) submit requires a claimed result hash in \"result\"")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonMissingClaimedResult, "monero (rxm) submit requires a claimed result hash in \"result\"")
 			return
 		}
 		// XNP-PROXY SUBMIT FIX: mirrors solo.Session's own identical
@@ -506,7 +701,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			blob, blobErr = solo.MoneroHashingBlobForSubmit(job, nonce)
 		}
 		if blobErr != nil {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("failed to build monero randomx verification blob: %v", blobErr))
+			s.rejectShare(req.ID, directmetrics.RejectionReasonInternalError, fmt.Sprintf("failed to build monero randomx verification blob: %v", blobErr))
 			return
 		}
 		share = &poolpb.Share{
@@ -528,7 +723,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			// on its own Share.block_diff field, without disturbing
 			// BlockDiff's existing normal-path meaning above.
 			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
-			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
+			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string), PaymentId: s.sharePaymentID(),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
 				Blob: blob, SeedHash: job.VmKey, ResultHex: submit.Result,
@@ -536,7 +731,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 	case poolpb.Algo_ALGO_C29:
 		if len(submit.POW) != c29SubmitCycleSize {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("pow must carry exactly %d edges for a C29 cycle, got %d", c29SubmitCycleSize, len(submit.POW)))
+			s.rejectShare(req.ID, directmetrics.RejectionReasonInvalidPowShape, fmt.Sprintf("pow must carry exactly %d edges for a C29 cycle, got %d", c29SubmitCycleSize, len(submit.POW)))
 			return
 		}
 		nonce = binary.BigEndian.Uint64(nonceBytes)
@@ -544,7 +739,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_C29, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
-			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
+			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string), PaymentId: s.sharePaymentID(),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_C29Proof{C29Proof: &poolpb.C29Proof{
 				EdgeBits: c29SubmitEdgeBits, Cycle: submit.POW, Header: job.Header, Nonce: nonce,
@@ -568,7 +763,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			nonce = binary.BigEndian.Uint64(nonceBytes)
 		}
 		if submit.Result == "" {
-			s.writeShareResponse(req.ID, false, "rxt submit requires a claimed result hash in \"result\"")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonMissingClaimedResult, "rxt submit requires a claimed result hash in \"result\"")
 			return
 		}
 		var powData []byte
@@ -580,7 +775,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_RXT, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
-			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
+			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string), PaymentId: s.sharePaymentID(),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
 				Blob: blob, SeedHash: job.VmKey, ResultHex: submit.Result,
@@ -592,7 +787,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_SHA3X, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
-			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string),
+			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string), PaymentId: s.sharePaymentID(),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_Sha3XProof{Sha3XProof: &poolpb.SHA3XProof{
 				Header: job.Header, Nonce: nonce,
@@ -601,7 +796,8 @@ func (s *Session) handleSubmit(req solo.Request) {
 	}
 
 	if !job.MarkNonceUsed(nonce) {
-		s.writeShareResponse(req.ID, false, fmt.Sprintf("duplicate nonce: %s", submit.Nonce))
+		s.rejectShare(req.ID, directmetrics.RejectionReasonDuplicateNonce, fmt.Sprintf("duplicate nonce: %s", submit.Nonce))
+		s.pushFreshJobOnStaleSubmit()
 		return
 	}
 
@@ -628,7 +824,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 	finishSubmit := func() {
 		v, err := s.server.validators.Get(job.Algo)
 		if err != nil {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("no validator configured for this leaf's algo %v: %v", job.Algo, err))
+			s.rejectShare(req.ID, directmetrics.RejectionReasonInternalError, fmt.Sprintf("no validator configured for this leaf's algo %v: %v", job.Algo, err))
 			return
 		}
 
@@ -650,7 +846,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			valid, err = v.Validate(context.Background(), share)
 			s.server.debugLogger.Debugf("direct: validation attempt: session=%s job_id=%s algo=%v valid=%v err=%v", s.sessionID, job.ID, job.Algo, valid, err)
 			if err != nil && err != validator.ErrWrongProofType {
-				s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
+				s.rejectShare(req.ID, directmetrics.RejectionReasonInternalError, fmt.Sprintf("validation error: %v", err))
 				return
 			}
 		}
@@ -674,7 +870,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 				s.server.recordShareClassification(directmetrics.ClassificationInvalid)
 				disconnect = s.invalidShareGuard.RecordOutcome(false)
 			}
-			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonClaimedDifficultyOrCryptoInvalid, "share does not meet configured difficulty or is cryptographically invalid")
 			if disconnect {
 				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
 				s.mc.Close("exceeded consecutive invalid-share threshold")
@@ -686,7 +882,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 
 		diff, candidate, err := s.server.node.BuildCandidateBlock(job, nonce, solo.SubmitProof{Cycle: submit.POW, ResultHex: submit.Result})
 		if err != nil {
-			s.writeShareResponse(req.ID, false, fmt.Sprintf("difficulty derivation error: %v", err))
+			s.rejectShare(req.ID, directmetrics.RejectionReasonInternalError, fmt.Sprintf("difficulty derivation error: %v", err))
 			return
 		}
 
@@ -721,7 +917,8 @@ func (s *Session) handleSubmit(req solo.Request) {
 			disconnect := s.invalidShareGuard.RecordOutcome(false)
 			s.trust.RecordOutcome(false)
 			s.server.recordShareClassification(directmetrics.ClassificationInvalid)
-			s.writeShareResponse(req.ID, false, "share does not meet the job's configured difficulty")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonDifficultyFloorMiss, "share does not meet the job's configured difficulty")
+			s.pushFreshJobOnStaleSubmit()
 			if disconnect {
 				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
 				s.mc.Close("exceeded consecutive invalid-share threshold")
@@ -881,7 +1078,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			poolpb.Algo_ALGO_GRFT, poolpb.Algo_ALGO_SFX, poolpb.Algo_ALGO_ZEPH, poolpb.Algo_ALGO_SAL:
 			moneroCandidate, ok := candidate.(*solo.MoneroCandidate)
 			if !ok || moneroCandidate == nil {
-				s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
+				s.rejectShare(req.ID, directmetrics.RejectionReasonInternalError, fmt.Sprintf("internal error: unexpected monero candidate type %T", candidate))
 				return
 			}
 			// THE REAL FIX (see this repo's git history for the full
@@ -996,7 +1193,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		default:
 			block, ok := candidate.(*tari_generated.Block)
 			if !ok {
-				s.writeShareResponse(req.ID, false, fmt.Sprintf("internal error: unexpected candidate type %T", candidate))
+				s.rejectShare(req.ID, directmetrics.RejectionReasonInternalError, fmt.Sprintf("internal error: unexpected candidate type %T", candidate))
 				return
 			}
 			var results []NodeSubmitResult
@@ -1005,7 +1202,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 				s.hashesAccumulated.Add(job.StaticDifficulty)
 				s.server.logger.Printf("direct: BLOCK SUBMIT FAILED at every configured node for session %s (job %s, height %d): %v", s.sessionID, job.ID, job.Height, results)
 				s.server.recordBlock(false)
-				s.writeShareResponse(req.ID, false, fmt.Sprintf("invalid block: rejected/failed at every configured node (%d configured)", len(results)))
+				s.rejectShare(req.ID, directmetrics.RejectionReasonBlockSubmitFailed, fmt.Sprintf("invalid block: rejected/failed at every configured node (%d configured)", len(results)))
 				return
 			}
 		}
@@ -1013,7 +1210,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		if !submitOK {
 			s.hashesAccumulated.Add(job.StaticDifficulty)
 			s.server.recordBlock(false)
-			s.writeShareResponse(req.ID, false, "invalid block: rejected/failed at the configured node")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonBlockSubmitFailed, "invalid block: rejected/failed at the configured node")
 			return
 		}
 
@@ -1136,11 +1333,12 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// money risk this leaf's validation exists to prevent.
 		claimedDiff, err := solo.ClaimedRandomXFamilyDifficulty(job.Algo, submit.Result)
 		if err != nil {
-			s.writeShareResponse(req.ID, false, "share does not meet configured difficulty or is cryptographically invalid")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonClaimedDifficultyOrCryptoInvalid, "share does not meet configured difficulty or is cryptographically invalid")
 			return
 		}
 		if claimedDiff < job.StaticDifficulty {
-			s.writeShareResponse(req.ID, false, "share does not meet the job's configured difficulty")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonDifficultyFloorMiss, "share does not meet the job's configured difficulty")
+			s.pushFreshJobOnStaleSubmit()
 			return
 		}
 
@@ -1156,7 +1354,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		// already used this exact TrySubmit-and-reject pattern for the
 		// same reason).
 		if ok := s.server.randomxPool.TrySubmit(finishSubmit); !ok {
-			s.writeShareResponse(req.ID, false, "validation pool is saturated or shutting down, please retry")
+			s.rejectShare(req.ID, directmetrics.RejectionReasonPoolSaturated, "validation pool is saturated or shutting down, please retry")
 		}
 		return
 	}
@@ -1311,6 +1509,25 @@ func (s *Session) writeShareResponse(id int, accepted bool, errMsg string) {
 	s.server.recordShare(accepted)
 	s.server.debugLogger.Debugf("direct: submit result: session=%s accepted=%v reason=%q", s.sessionID, accepted, errMsg)
 	leaflib.WriteShareResponse(s.writeJSON, leaflib.IsLegacyWireAlgo(s.server.algo), id, accepted, errMsg)
+}
+
+// rejectShare is handleSubmit's own single real reject call site
+// wrapper (see brief_rejection_reasons.md): it bumps the new, real
+// leaf_direct_share_rejection_reason_total counter for category (one
+// of directmetrics.RejectionReason*) via
+// s.server.recordShareRejectionReason, THEN calls the existing,
+// unmodified writeShareResponse(id, false, errMsg) -- ADDITIVE
+// observability only, never a replacement for writeShareResponse's
+// own existing recordShare(false) bookkeeping or the wire-visible
+// errMsg a real miner/operator already sees. Every
+// writeShareResponse(id, false, ...) call site in handleSubmit below
+// goes through this helper instead of calling writeShareResponse
+// directly, so a real reject can never be added to handleSubmit in
+// the future without also being forced to pick one of the closed
+// RejectionReason* categories.
+func (s *Session) rejectShare(id int, category, errMsg string) {
+	s.server.recordShareRejectionReason(category)
+	s.writeShareResponse(id, false, errMsg)
 }
 
 func (s *Session) writeJSON(v any) {

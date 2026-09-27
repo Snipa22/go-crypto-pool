@@ -166,6 +166,28 @@ func TestServer_EnableMetrics_BanRejectionsTotal_LoginAndSubmitPhases(t *testing
 // dispatch through the pool and observing the exported gauges change
 // accordingly, then clearing and observing them return to a resting
 // state.
+// TestServer_SetRandomXWorkerPoolSize_QueueSizeReachesPool mirrors
+// solo/direct packages' identical test exactly -- see solo package's
+// own doc comment for the full rationale: this confirms
+// cmd/leaf-proxy's new -randomx-queue-size flag's plumbing target
+// (server.SetRandomXWorkerPoolSize(cfg.randomxWorkers,
+// cfg.randomxQueueSize)) genuinely reaches the constructed pool's
+// real QueueCapacity(), not just Workers().
+func TestServer_SetRandomXWorkerPoolSize_QueueSizeReachesPool(t *testing.T) {
+	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
+
+	const explicitWorkers = 2
+	const explicitQueueSize = 777
+	h.server.SetRandomXWorkerPoolSize(explicitWorkers, explicitQueueSize)
+
+	if got := h.server.randomxPool.QueueCapacity(); got != explicitQueueSize {
+		t.Fatalf("randomxPool.QueueCapacity() = %d, want %d (the explicit queueSize passed to SetRandomXWorkerPoolSize)", got, explicitQueueSize)
+	}
+	if got := h.server.randomxPool.Workers(); got != explicitWorkers {
+		t.Fatalf("randomxPool.Workers() = %d, want %d (the explicit workers passed to SetRandomXWorkerPoolSize)", got, explicitWorkers)
+	}
+}
+
 func TestServer_EnableMetrics_AsyncPoolStatsWiredToRealPool(t *testing.T) {
 	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Hour}, 0)
 	h.server.EnableMetrics("test", 0)

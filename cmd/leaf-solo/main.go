@@ -125,6 +125,18 @@ type config struct {
 	// override at all.
 	randomxWorkers int
 
+	// randomxQueueSize overrides the RandomX-family (RXT/RXM) async
+	// validation pool's bounded queue capacity (see
+	// internal/leaflib/solo/asyncvalidation.go's
+	// NewAsyncValidationPool doc comment). 0 (the default) means "use
+	// DefaultAsyncValidationQueueSize(workers)"
+	// (max(AsyncValidationQueueSize, workers*
+	// DefaultAsyncValidationQueueMultiplier)) -- see that function's
+	// own doc comment: this used to be a hardcoded flat literal 256
+	// with no operator override at all, and no relationship to the
+	// pool's own worker count.
+	randomxQueueSize int
+
 	// invalidShareDisconnectEnabled/invalidShareDisconnectThreshold
 	// configure leaflib.InvalidShareGuard (see that type's doc
 	// comment for the full DISPATCH_BRIEF.md 2026-09-10 Fix 2b
@@ -201,8 +213,24 @@ type config struct {
 	maxConnections int
 	idleTimeout    time.Duration
 
+	// noShareTimeout is this feature's own -no-share-timeout/
+	// LEAF_SOLO_NO_SHARE_TIMEOUT flag (see its flag.DurationVar
+	// registration below and solo.Server.SetNoShareTimeout's doc
+	// comment for the full rationale). Zero/negative disables the
+	// feature entirely, mirroring idleTimeout's own -idle-timeout
+	// convention.
+	noShareTimeout time.Duration
+
 	metricsListenAddress string
 	maxAddressLabels     int
+
+	// statsPageMaxSessions is this feature's own
+	// -stats-page-max-sessions/LEAF_SOLO_STATS_PAGE_MAX_SESSIONS flag
+	// (see its flag.IntVar registration below and
+	// solo.Server.SetStatsPageMaxSessions's doc comment for the full
+	// rationale). 0/negative disables the cap entirely, mirroring
+	// idleTimeout/noShareTimeout's own zero-disables convention.
+	statsPageMaxSessions int
 
 	// hideRemoteAddress, when true, tells the stats HTML page to
 	// omit the "Remote address" column entirely (see
@@ -259,6 +287,7 @@ func loadConfig() (config, error) {
 	flag.BoolVar(&cfg.standalone, "standalone", envOr("LEAF_SOLO_STANDALONE", "false") == "true", "only meaningful for -coin=xmr/monero: when true, runs standalone (non-merge-mined) XMR (poolpb.Algo_ALGO_XMR) against -monerod-url instead of the default Tari-merge-mined ALGO_RXM behavior. No effect for -coin=tari or any other registered coin ticker (already always standalone). Env: LEAF_SOLO_STANDALONE (\"true\" to enable)")
 	flag.StringVar(&cfg.monerodURL, "monerod-url", envOr("LEAF_SOLO_MONEROD_URL", ""), "real monerod-JSON-RPC-compatible base URL (e.g. http://148.163.90.157:28081), no trailing slash or /json_rpc suffix required. REQUIRED when -coin resolves to any monerod-family coin; ignored for -coin=tari. For -coin=monero (or -coin=xmr without -standalone), point this at your local minotari_merge_mining_proxy listener, NOT raw monerod -- pointing at raw monerod will mine Monero-only with no Tari merge-mine revenue. Env: LEAF_SOLO_MONEROD_URL")
 	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_SOLO_RANDOMX_WORKERS", 0), "RandomX-family (RXT/RXM) async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_SOLO_RANDOMX_WORKERS")
+	flag.IntVar(&cfg.randomxQueueSize, "randomx-queue-size", envOrInt("LEAF_SOLO_RANDOMX_QUEUE_SIZE", 0), "RandomX-family (RXT/RXM) async validation pool's bounded queue capacity (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, max(256, randomx-workers*16) -- NOT a hardcoded flat literal. Env: LEAF_SOLO_RANDOMX_QUEUE_SIZE")
 	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a session after too many CONSECUTIVE real RandomX-family (RXT/RXM) block-find-level validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
 	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD")
 	flag.StringVar(&cfg.algo, "algo", envOr("LEAF_SOLO_ALGO", "sha3x"), "which single mining algorithm this leaf-solo process serves: sha3x (default), c29, or rxt -- for -coin=tari only. Ignored (always ALGO_RXM/plain RandomX) when -coin=monero. Env: LEAF_SOLO_ALGO")
@@ -294,9 +323,11 @@ func loadConfig() (config, error) {
 
 	flag.IntVar(&cfg.maxConnections, "max-connections", envOrInt("LEAF_SOLO_MAX_CONNECTIONS", leaflib.DefaultLeafMaxConnections), "max concurrent miner connections, 0 = unlimited. Env: LEAF_SOLO_MAX_CONNECTIONS")
 	flag.DurationVar(&cfg.idleTimeout, "idle-timeout", envOrDuration("LEAF_SOLO_IDLE_TIMEOUT", 2*time.Minute), "rolling per-connection idle timeout. Env: LEAF_SOLO_IDLE_TIMEOUT")
+	flag.DurationVar(&cfg.noShareTimeout, "no-share-timeout", envOrDuration("LEAF_SOLO_NO_SHARE_TIMEOUT", 3*time.Minute), "disconnect a session that has never submitted a single accepted share within this long of connecting (a huge number of miners connect and only ever send keepalived, never a real submit, wasting a connection slot indefinitely -- this is separate from -idle-timeout, which only resets on total silence). 0 or negative disables this check entirely. Env: LEAF_SOLO_NO_SHARE_TIMEOUT")
 
 	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_SOLO_METRICS_LISTEN_ADDRESS", "127.0.0.1:9600"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the miner-facing stratum port). Defaults to loopback-only (127.0.0.1) -- an operator must explicitly set this to a wildcard/public address (e.g. :9600 or 0.0.0.0:9600) to expose stats/metrics publicly. Set to empty string to disable. Env: LEAF_SOLO_METRICS_LISTEN_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_SOLO_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_SOLO_MAX_ADDRESS_LABELS")
+	flag.IntVar(&cfg.statsPageMaxSessions, "stats-page-max-sessions", envOrInt("LEAF_SOLO_STATS_PAGE_MAX_SESSIONS", solo.DefaultStatsPageMaxSessions), "cap on how many session rows the stats HTML page's \"Connected sessions\" table renders (the separate \"Active connections\" summary count is always accurate/uncapped). 0 or negative disables the cap entirely (render every session). Env: LEAF_SOLO_STATS_PAGE_MAX_SESSIONS")
 	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOr("LEAF_SOLO_HIDE_REMOTE_ADDRESS", "false") == "true", "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments so remote miner IPs are never exposed on a page anyone can load. Disabled by default (existing behavior unchanged). Env: LEAF_SOLO_HIDE_REMOTE_ADDRESS (\"true\" to enable)")
 
 	flag.StringVar(&cfg.addressFlagsFile, "address-flags-file", envOr("LEAF_SOLO_ADDRESS_FLAGS_FILE", ""), "path to a local, operator-maintained JSON file of manually banned/forced-minimum-difficulty payment addresses (see internal/leaflib/addressflags.FileSource's doc comment for the file format). Empty (default) disables the feature entirely -- leaf-solo has no backend to poll instead. Env: LEAF_SOLO_ADDRESS_FLAGS_FILE")
@@ -333,6 +364,7 @@ type fileConfig struct {
 	MonerodURL      *string `toml:"monerod_url"`
 
 	RandomXWorkers                  *int  `toml:"randomx_workers"`
+	RandomXQueueSize                *int  `toml:"randomx_queue_size"`
 	InvalidShareDisconnectEnabled   *bool `toml:"invalid_share_disconnect_enabled"`
 	InvalidShareDisconnectThreshold *int  `toml:"invalid_share_disconnect_threshold"`
 
@@ -355,11 +387,13 @@ type fileConfig struct {
 	TipPollIntervalSeconds *int `toml:"tip_poll_interval_seconds"`
 	JobMaxAgeSeconds       *int `toml:"job_max_age_seconds"`
 
-	MaxConnections     *int `toml:"max_connections"`
-	IdleTimeoutSeconds *int `toml:"idle_timeout_seconds"`
+	MaxConnections        *int `toml:"max_connections"`
+	IdleTimeoutSeconds    *int `toml:"idle_timeout_seconds"`
+	NoShareTimeoutSeconds *int `toml:"no_share_timeout_seconds"`
 
 	MetricsListenAddress *string `toml:"metrics_listen_address"`
 	MaxAddressLabels     *int    `toml:"max_address_labels"`
+	StatsPageMaxSessions *int    `toml:"stats_page_max_sessions"`
 	HideRemoteAddress    *bool   `toml:"hide_remote_address"`
 
 	AddressFlagsFile                *string `toml:"address_flags_file"`
@@ -394,6 +428,7 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyString(&cfg.monerodURL, fc.MonerodURL, visited, "monerod-url", "LEAF_SOLO_MONEROD_URL")
 
 	cfgfile.ApplyInt(&cfg.randomxWorkers, fc.RandomXWorkers, visited, "randomx-workers", "LEAF_SOLO_RANDOMX_WORKERS")
+	cfgfile.ApplyInt(&cfg.randomxQueueSize, fc.RandomXQueueSize, visited, "randomx-queue-size", "LEAF_SOLO_RANDOMX_QUEUE_SIZE")
 	cfgfile.ApplyBool(&cfg.invalidShareDisconnectEnabled, fc.InvalidShareDisconnectEnabled, visited, "invalid-share-disconnect-enabled", "LEAF_SOLO_INVALID_SHARE_DISCONNECT_ENABLED")
 	cfgfile.ApplyInt(&cfg.invalidShareDisconnectThreshold, fc.InvalidShareDisconnectThreshold, visited, "invalid-share-disconnect-threshold", "LEAF_SOLO_INVALID_SHARE_DISCONNECT_THRESHOLD")
 
@@ -445,9 +480,14 @@ func applyConfigFile(cfg *config) error {
 		d := time.Duration(*fc.IdleTimeoutSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.idleTimeout, &d, visited, "idle-timeout", "LEAF_SOLO_IDLE_TIMEOUT")
 	}
+	if fc.NoShareTimeoutSeconds != nil {
+		d := time.Duration(*fc.NoShareTimeoutSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.noShareTimeout, &d, visited, "no-share-timeout", "LEAF_SOLO_NO_SHARE_TIMEOUT")
+	}
 
 	cfgfile.ApplyString(&cfg.metricsListenAddress, fc.MetricsListenAddress, visited, "metrics-listen-address", "LEAF_SOLO_METRICS_LISTEN_ADDRESS")
 	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_SOLO_MAX_ADDRESS_LABELS")
+	cfgfile.ApplyInt(&cfg.statsPageMaxSessions, fc.StatsPageMaxSessions, visited, "stats-page-max-sessions", "LEAF_SOLO_STATS_PAGE_MAX_SESSIONS")
 	cfgfile.ApplyBool(&cfg.hideRemoteAddress, fc.HideRemoteAddress, visited, "hide-remote-address", "LEAF_SOLO_HIDE_REMOTE_ADDRESS")
 
 	cfgfile.ApplyString(&cfg.addressFlagsFile, fc.AddressFlagsFile, visited, "address-flags-file", "LEAF_SOLO_ADDRESS_FLAGS_FILE")
@@ -951,15 +991,21 @@ func main() {
 	defer server.Shutdown()
 
 	server.SetDebugLogger(debugLogger)
+	server.SetNoShareTimeout(cfg.noShareTimeout)
 
 	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2a): worker
 	// count is runtime.NumCPU() by DEFAULT (server.NewServer's own
 	// construction already applies this -- see solo/asyncvalidation.go's
 	// doc comment), not a hardcoded literal 8; an operator who wants a
 	// different fixed count can still get one via -randomx-workers.
-	if cfg.randomxWorkers > 0 {
-		server.SetRandomXWorkerPoolSize(cfg.randomxWorkers, 0)
-		logger.Printf("RandomX-family async validation worker pool size overridden to %d (default would have been runtime.NumCPU()=%d)", cfg.randomxWorkers, runtime.NumCPU())
+	// Queue size DEFAULTS to solo.DefaultAsyncValidationQueueSize(workers)
+	// (max(256, workers*16)) -- scales with the pool's own real worker
+	// count instead of the old flat 256 literal; an operator who wants a
+	// different fixed queue size can still get one via
+	// -randomx-queue-size.
+	if cfg.randomxWorkers > 0 || cfg.randomxQueueSize > 0 {
+		server.SetRandomXWorkerPoolSize(cfg.randomxWorkers, cfg.randomxQueueSize)
+		logger.Printf("RandomX-family async validation worker pool size overridden to %d (default would have been runtime.NumCPU()=%d), queue size overridden to %d (0 means the documented default, max(256, workers*16), is in effect)", cfg.randomxWorkers, runtime.NumCPU(), cfg.randomxQueueSize)
 	}
 
 	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b): disconnect
@@ -993,6 +1039,7 @@ func main() {
 
 	if cfg.metricsListenAddress != "" {
 		server.SetHideRemoteAddress(cfg.hideRemoteAddress)
+		server.SetStatsPageMaxSessions(cfg.statsPageMaxSessions)
 		server.EnableMetrics(version, cfg.maxAddressLabels)
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", server.MetricsHandler())

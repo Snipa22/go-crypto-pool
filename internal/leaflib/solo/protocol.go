@@ -59,11 +59,17 @@ import (
 //     ported from go-tari-sha3x-solo-stratum's miner.go SubmitJob
 //     (`strings.HasPrefix(strings.ToLower(submittedWork.Nonce), m.xn)`).
 //
-// Deliberately still NOT ported: "." / "+" login-address suffix parsing
-// for payment-ID/custom-difficulty (go-crypto-pool's solo leaf uses one
-// static, leaf-configured difficulty for everyone — see
-// JobManagerConfig.StaticDifficulty in job.go) — the address is taken
-// as-is.
+// Now PORTED: "." / "+" login-field suffix parsing for payment-ID /
+// worker identifier / miner-requested fixed difficulty -- see
+// loginfields.go's ParseLoginFields for the verbatim legacy source
+// citation and for every scoping decision (the "+" difficulty split is
+// algo-agnostic; the "." payment-ID/identifier split is Monero-family
+// only, matching the legacy reference's own Monero-only scope). The
+// previous note here ("deliberately still NOT ported ... the address
+// is taken as-is") described a real bug: the RAW, unstripped login
+// string was handed to the byte-exact address validators, which
+// correctly rejected it, so every miner using that completely standard
+// convention was locked out of this leaf entirely.
 //
 // Ported and REQUIRED (see task description): per-job used-nonce
 // tracking, so a miner can't replay the same nonce twice for credit —

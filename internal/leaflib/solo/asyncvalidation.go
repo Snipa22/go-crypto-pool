@@ -111,6 +111,55 @@ import (
 // loop should use TrySubmit instead.
 const AsyncValidationQueueSize = 256
 
+// DefaultAsyncValidationQueueMultiplier is the QUEUE-SIZE ANALOGUE of
+// Fix 2a's own worker-count correction above: this pool's DEFAULT
+// queue capacity (when its caller passes queueSize <= 0) used to be
+// the flat AsyncValidationQueueSize (256) literal above regardless of
+// how many workers the pool was actually built with -- fine for a
+// small/moderate worker count, but proportionally thin on a big box.
+// Alex's own words on this (RANDOMX_QUEUE_SIZE dispatch,
+// confirmed against a real 128-CPU host, sxmr-phx-dump): "a couple
+// hundred at once is reasonable, but it's also low, this is a small
+// server for us" -- i.e. a fixed 256 might be entirely fine on a tiny
+// box but is proportionally thin on a large one; the default should
+// scale with the box's own real worker count (itself already
+// runtime.NumCPU()-derived, i.e. genuinely dynamic per-host -- see
+// DefaultAsyncValidationWorkers above) rather than staying a
+// hand-picked flat number.
+//
+// WORKED EXAMPLE (the real sxmr-phx-dump case this was written for):
+// 128 workers * 16 == 2048 -- a meaningfully larger, more-than-"a
+// couple hundred" buffer than the old flat 256 on that real 128-CPU
+// host, while a hypothetical tiny 4-worker dev/test box still gets
+// max(256, 4*16) == max(256, 64) == 256, the UNCHANGED floor from
+// today (see DefaultAsyncValidationQueueSize below for where that
+// floor is actually applied) -- so a small box does not regress to a
+// smaller queue than it already had.
+const DefaultAsyncValidationQueueMultiplier = 16
+
+// DefaultAsyncValidationQueueSize returns the DEFAULT queue capacity
+// NewAsyncValidationPool falls back to when its caller passes
+// queueSize <= 0: max(AsyncValidationQueueSize, workers *
+// DefaultAsyncValidationQueueMultiplier) -- see that const's own doc
+// comment above for the full rationale (Alex's quote, and the real
+// 128-worker/2048-queue sxmr-phx-dump example) and the explicit
+// floor's purpose (never let a small worker count regress below
+// today's flat 256). workers<=0 is normalized to
+// DefaultAsyncValidationWorkers() (runtime.NumCPU()) first, exactly
+// like NewAsyncValidationPool's own workers<=0 fallback, so a caller
+// can query "what queue size would a from-scratch default pool get"
+// independent of whether it has already resolved its own worker
+// count.
+func DefaultAsyncValidationQueueSize(workers int) int {
+	if workers <= 0 {
+		workers = DefaultAsyncValidationWorkers()
+	}
+	if scaled := workers * DefaultAsyncValidationQueueMultiplier; scaled > AsyncValidationQueueSize {
+		return scaled
+	}
+	return AsyncValidationQueueSize
+}
+
 // DefaultAsyncValidationWorkers returns the DEFAULT worker count
 // NewAsyncValidationPool falls back to when its caller passes
 // workers <= 0 -- runtime.NumCPU(), per this file's own doc comment
@@ -171,18 +220,25 @@ type AsyncValidationPool struct {
 // NewAsyncValidationPool starts workers goroutines immediately, each ready
 // to pull closures off a queue bounded to queueSize entries. A non-positive
 // workers falls back to DefaultAsyncValidationWorkers() (runtime.NumCPU())
-// and a non-positive queueSize falls back to AsyncValidationQueueSize, so a
-// caller can pass zero values (e.g. a Server built without deliberately
-// overriding either) and still get the documented, justified default bound
-// rather than an unbounded or zero-capacity pool -- and an operator who
-// DOES want a specific fixed worker count can still get one by passing a
-// positive value (see Server.SetRandomXWorkerPoolSize).
+// and a non-positive queueSize falls back to
+// DefaultAsyncValidationQueueSize(workers) -- max(AsyncValidationQueueSize,
+// workers*DefaultAsyncValidationQueueMultiplier), see that function's own
+// doc comment for the full rationale (this used to be the flat
+// AsyncValidationQueueSize literal regardless of worker count; it now
+// scales with the pool's own real worker count instead, with an explicit
+// floor so a small worker count never regresses below the old flat
+// default) -- so a caller can pass zero values (e.g. a Server built
+// without deliberately overriding either) and still get the documented,
+// justified default bound rather than an unbounded or zero-capacity pool
+// -- and an operator who DOES want a specific fixed worker count and/or
+// queue size can still get one by passing a positive value (see
+// Server.SetRandomXWorkerPoolSize).
 func NewAsyncValidationPool(workers, queueSize int) *AsyncValidationPool {
 	if workers <= 0 {
 		workers = DefaultAsyncValidationWorkers()
 	}
 	if queueSize <= 0 {
-		queueSize = AsyncValidationQueueSize
+		queueSize = DefaultAsyncValidationQueueSize(workers)
 	}
 	p := &AsyncValidationPool{
 		jobs:    make(chan func(), queueSize),

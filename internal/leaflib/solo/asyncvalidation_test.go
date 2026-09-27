@@ -59,6 +59,78 @@ func TestNewAsyncValidationPoolHonorsExplicitWorkerCount(t *testing.T) {
 	}
 }
 
+// TestNewAsyncValidationPoolDefaultQueueSize_TinyWorkerCount_FloorApplies
+// is a REQUIRED test (RandomX validation queue size fix): a tiny worker
+// count (1) must still get the unchanged floor of
+// AsyncValidationQueueSize (256), not a proportionally tiny queue --
+// 1*DefaultAsyncValidationQueueMultiplier (16) is well below the floor.
+func TestNewAsyncValidationPoolDefaultQueueSize_TinyWorkerCount_FloorApplies(t *testing.T) {
+	p := NewAsyncValidationPool(1, 0)
+	defer p.Stop()
+	if got, want := p.QueueCapacity(), 256; got != want {
+		t.Fatalf("NewAsyncValidationPool(1, 0).QueueCapacity() = %d, want %d (the unchanged floor)", got, want)
+	}
+}
+
+// TestNewAsyncValidationPoolDefaultQueueSize_128Workers_RealSxmrPhxDumpCase
+// is a REQUIRED test (RandomX validation queue size fix): the real
+// sxmr-phx-dump case -- 128 workers -- must get a scaled default queue
+// of 128*16 = 2048, not the old flat 256.
+func TestNewAsyncValidationPoolDefaultQueueSize_128Workers_RealSxmrPhxDumpCase(t *testing.T) {
+	p := NewAsyncValidationPool(128, 0)
+	defer p.Stop()
+	if got, want := p.QueueCapacity(), 2048; got != want {
+		t.Fatalf("NewAsyncValidationPool(128, 0).QueueCapacity() = %d, want %d (128*16, the real sxmr-phx-dump case)", got, want)
+	}
+}
+
+// TestNewAsyncValidationPoolDefaultQueueSize_4Workers_FloorApplies is a
+// REQUIRED test (RandomX validation queue size fix): 4*16 = 64 is below
+// the 256 floor, so the floor must still apply.
+func TestNewAsyncValidationPoolDefaultQueueSize_4Workers_FloorApplies(t *testing.T) {
+	p := NewAsyncValidationPool(4, 0)
+	defer p.Stop()
+	if got, want := p.QueueCapacity(), 256; got != want {
+		t.Fatalf("NewAsyncValidationPool(4, 0).QueueCapacity() = %d, want %d (4*16=64 < 256, the floor)", got, want)
+	}
+}
+
+// TestNewAsyncValidationPoolExplicitQueueSizeHonoredVerbatim is a
+// REQUIRED test (RandomX validation queue size fix), regression-proofing
+// the existing override path: an explicit positive queueSize must be
+// honored exactly, untouched by the new scaling default.
+func TestNewAsyncValidationPoolExplicitQueueSizeHonoredVerbatim(t *testing.T) {
+	p := NewAsyncValidationPool(50, 500)
+	defer p.Stop()
+	if got, want := p.QueueCapacity(), 500; got != want {
+		t.Fatalf("NewAsyncValidationPool(50, 500).QueueCapacity() = %d, want %d (explicit queueSize must be honored verbatim)", got, want)
+	}
+}
+
+// TestDefaultAsyncValidationQueueSize is the direct, standalone-helper
+// regression guard mirroring TestDefaultAsyncValidationWorkersIsNumCPU's
+// own style: DefaultAsyncValidationQueueSize(workers) itself (not just
+// the pool's own QueueCapacity()) must implement the documented
+// max(AsyncValidationQueueSize, workers*
+// DefaultAsyncValidationQueueMultiplier) formula.
+func TestDefaultAsyncValidationQueueSize(t *testing.T) {
+	cases := []struct {
+		workers int
+		want    int
+	}{
+		{workers: 1, want: 256},
+		{workers: 4, want: 256},
+		{workers: 16, want: 256},   // 16*16=256, exactly at the floor.
+		{workers: 17, want: 272},   // 17*16=272, just above the floor.
+		{workers: 128, want: 2048}, // the real sxmr-phx-dump case.
+	}
+	for _, tc := range cases {
+		if got := DefaultAsyncValidationQueueSize(tc.workers); got != tc.want {
+			t.Errorf("DefaultAsyncValidationQueueSize(%d) = %d, want %d", tc.workers, got, tc.want)
+		}
+	}
+}
+
 // TestAsyncValidationPool_InFlightWorkers_TracksRunningClosures is
 // the required Fix 9 test (DISPATCH_BRIEF.md 2026-09-10):
 // InFlightWorkers() must actually reflect how many dispatched
