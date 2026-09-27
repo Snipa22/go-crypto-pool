@@ -593,6 +593,20 @@ func (s *Server) recordShareRejectionReason(reason string) {
 	s.metrics.IncShareRejectionReason(reason)
 }
 
+// recordLoginRejection bumps the real leaf_solo_login_rejections_total
+// counter (see metrics.Metrics.LoginRejectionsTotal's doc comment) for
+// reason (one of metrics.LoginRejectionReason*) -- called from
+// session.go's handleLogin at every real rejection return point,
+// mirroring recordShare/recordBlock/recordConnectionError/
+// recordShareRejectionReason's identical nil-checked convention above
+// (DISPATCH_BRIEF.md "login-rejection-reason metrics").
+func (s *Server) recordLoginRejection(reason string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.IncLoginRejectionReason(reason)
+}
+
 func resultLabel(accepted bool) string {
 	if accepted {
 		return metrics.ResultAccepted

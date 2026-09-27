@@ -542,6 +542,20 @@ func (s *Server) recordBanRejection(phase string) {
 	s.metrics.BanRejectionsTotal.WithLabelValues(phase).Inc()
 }
 
+// recordLoginRejection bumps the real
+// leaf_proxy_login_rejections_total counter (see
+// metrics.Metrics.LoginRejectionsTotal's doc comment) for reason (one
+// of metrics.LoginRejectionReason*) -- called from session.go's
+// handleLogin at every real rejection return point, mirroring
+// recordBanRejection's identical nil-checked convention above
+// (DISPATCH_BRIEF.md "login-rejection-reason metrics").
+func (s *Server) recordLoginRejection(reason string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.LoginRejectionsTotal.WithLabelValues(reason).Inc()
+}
+
 // resultLabel mirrors solo.Server's own identical helper exactly.
 func resultLabel(accepted bool) string {
 	if accepted {

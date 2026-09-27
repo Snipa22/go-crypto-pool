@@ -1097,6 +1097,21 @@ func (s *Server) recordShareRejectionReason(reason string) {
 	s.metrics.IncShareRejectionReason(reason)
 }
 
+// recordLoginRejection bumps the real
+// leaf_direct_login_rejections_total counter (see
+// directmetrics.Metrics.LoginRejectionsTotal's doc comment) for
+// reason (one of directmetrics.LoginRejectionReason*) -- called from
+// session.go's handleLogin/fetchAndDeliverLoginJob at every real
+// login rejection return point, mirroring recordShareRejectionReason's
+// identical nil-checked convention above (DISPATCH_BRIEF.md
+// "login-rejection-reason metrics").
+func (s *Server) recordLoginRejection(reason string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.IncLoginRejectionReason(reason)
+}
+
 // recordTransportError tracks backend-forwarding failures (share/
 // block), a genuinely new observability axis leaf-solo has no
 // equivalent of (it never forwards anything to a backend). It also

@@ -412,11 +412,13 @@ func (s *Session) handleLogin(req Request) {
 	var login LoginRequest
 	if len(req.Params) > 0 {
 		if err := json.Unmarshal(req.Params, &login); err != nil {
+			s.server.recordLoginRejection(metrics.LoginRejectionReasonInvalidParams)
 			s.writeGeneralResponse(req.ID, fmt.Sprintf("invalid login params: %v", err), "")
 			return
 		}
 	}
 	if login.Login == "" {
+		s.server.recordLoginRejection(metrics.LoginRejectionReasonEmptyAddress)
 		s.writeGeneralResponse(req.ID, "invalid address provided, please use a valid address", "")
 		return
 	}
@@ -440,6 +442,7 @@ func (s *Session) handleLogin(req Request) {
 	// response rather than ever touching a map/label/cache.
 	if len(login.Login) > maxProxyLoginLen {
 		s.server.logger.Printf("proxy: rejecting login with an oversized login string (%d bytes, max %d) from session %s", len(login.Login), maxProxyLoginLen, s.sessionID)
+		s.server.recordLoginRejection(metrics.LoginRejectionReasonOversizedLogin)
 		s.writeGeneralResponse(req.ID, "invalid address provided: too long", "")
 		return
 	}
@@ -468,6 +471,7 @@ func (s *Session) handleLogin(req Request) {
 		if flags.Banned {
 			s.server.logger.Printf("proxy: rejecting login for banned address %s (session %s)", login.Login, s.sessionID)
 			s.server.recordBanRejection(metrics.BanRejectionPhaseLogin)
+			s.server.recordLoginRejection(metrics.LoginRejectionReasonBanned)
 			s.writeGeneralResponse(req.ID, "this address is banned from this pool", "")
 			return
 		}
@@ -536,6 +540,7 @@ func (s *Session) handleLogin(req Request) {
 	job, err := s.currentJob(s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("proxy: failed to get job for session %s: %v", s.sessionID, err)
+		s.server.recordLoginRejection(metrics.LoginRejectionReasonNoJobTemplate)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
 	}

@@ -73,6 +73,62 @@ const (
 	BanRejectionPhaseSubmit = "submit"
 )
 
+// LoginRejectionReason* label leaf_proxy_login_rejections_total
+// (DISPATCH_BRIEF.md "login-rejection-reason metrics", Alex: "Can you
+// add a metric for rejected logins to see why we're rejecting? I'm
+// curious how many of these are just bans we reject.") -- a small,
+// FIXED, closed enum covering every real rejection return point in
+// session.go's handleLogin, in the order they're checked. Mirrors
+// internal/leaflib/solo/metrics's identical LoginRejectionReason*
+// convention, with leaf-proxy's own real divergence: it has no
+// equivalent of solo/direct's ValidateAddressForAlgo check (it
+// forwards the login string as-is to its upstream, never decoding it
+// as a Tari/Monero address -- see maxProxyLoginLen's own doc comment
+// in session.go), so LoginRejectionReasonOversizedLogin takes
+// LoginRejectionReasonInvalidAddressFormat's place in this label set:
+//   - LoginRejectionReasonInvalidParams: json.Unmarshal(req.Params,
+//     &login) failed.
+//   - LoginRejectionReasonEmptyAddress: login.Login == "".
+//   - LoginRejectionReasonOversizedLogin: len(login.Login) >
+//     maxProxyLoginLen.
+//   - LoginRejectionReasonBanned: s.server.addressFlags.Get(...)
+//     .Banned is true at LOGIN time only -- matching solo/direct's
+//     own login-time-only scope for this reason value exactly. This
+//     is DISTINCT from BanRejectionPhaseLogin above:
+//     leaf_proxy_login_rejections_total{reason="banned"} and
+//     leaf_proxy_ban_rejections_total{phase="login"} report the SAME
+//     count by construction (both fire from this exact same call
+//     site) -- that overlap is deliberate and expected, per
+//     DISPATCH_BRIEF.md's own explicit instruction not to eliminate
+//     or merge the two metrics. BanRejectionsTotal additionally
+//     covers handleSubmit's mid-session ban re-check
+//     (BanRejectionPhaseSubmit), which this login-only metric does
+//     NOT and never will.
+//   - LoginRejectionReasonNoJobTemplate:
+//     s.currentJob(...)/s.server.jobs.NextJob failed (no upstream
+//     template available yet).
+//
+// Each site calls Metrics.IncLoginRejectionReason with exactly one of
+// these, via server.go's recordLoginRejection helper.
+const (
+	LoginRejectionReasonInvalidParams  = "invalid_params"
+	LoginRejectionReasonEmptyAddress   = "empty_address"
+	LoginRejectionReasonOversizedLogin = "oversized_login"
+	LoginRejectionReasonBanned         = "banned"
+	LoginRejectionReasonNoJobTemplate  = "no_job_template"
+)
+
+// AllLoginRejectionReasons is the full, closed enumeration of every
+// LoginRejectionReason* const above, in the order declared -- used by
+// tests to confirm only the expected reason's counter moved.
+var AllLoginRejectionReasons = []string{
+	LoginRejectionReasonInvalidParams,
+	LoginRejectionReasonEmptyAddress,
+	LoginRejectionReasonOversizedLogin,
+	LoginRejectionReasonBanned,
+	LoginRejectionReasonNoJobTemplate,
+}
+
 // Connection-error categories for ConnectionErrorsTotal -- the same
 // fixed, bounded category set internal/leaflib/solo/metrics defines,
 // duplicated here as small string constants (not the surrounding
@@ -193,6 +249,17 @@ type Metrics struct {
 	// BanRejectionPhaseLogin/BanRejectionPhaseSubmit's doc comment.
 	BanRejectionsTotal *prometheus.CounterVec
 
+	// LoginRejectionsTotal is the real, per-category breakdown of
+	// every login-time rejection in session.go's handleLogin (see
+	// the LoginRejectionReason* consts above) -- DISPATCH_BRIEF.md
+	// "login-rejection-reason metrics". Previously EVERY one of
+	// these rejection points was log-only, with no counter of any
+	// kind, EXCEPT the banned check, which already incremented
+	// BanRejectionsTotal above -- see LoginRejectionReasonBanned's
+	// own doc comment for why both counters coexist and are expected
+	// to report the same count for that one reason value.
+	LoginRejectionsTotal *prometheus.CounterVec
+
 	// UpstreamConnected is 1 when the single upstream pool
 	// connection is currently up, 0 when it is down/reconnecting.
 	UpstreamConnected prometheus.Gauge
@@ -263,6 +330,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Name: "leaf_proxy_ban_rejections_total",
 		Help: "Total number of downstream login/submit attempts rejected because the address-flags cache reports the address as banned, by phase (login/submit).",
 	}, []string{"phase"})
+
+	m.LoginRejectionsTotal = shared.RegisterCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_proxy_login_rejections_total",
+		Help: "Real, per-category breakdown of every login-time rejection in session.go's handleLogin (see this package's LoginRejectionReason* consts for the full, closed enum and the exact call site each one maps to) -- previously every one of these rejection points was log-only, with no counter of any kind (except the banned reason, which also increments the pre-existing leaf_proxy_ban_rejections_total{phase=\"login\"} -- both are expected to report the same count for that one reason value; see LoginRejectionReasonBanned's doc comment).",
+	}, []string{"reason"})
 
 	m.UpstreamConnected = shared.RegisterGauge(reg, prometheus.GaugeOpts{
 		Name: "leaf_proxy_upstream_connected",

@@ -416,11 +416,13 @@ func (s *Session) handleLogin(req Request) {
 	var login LoginRequest
 	if len(req.Params) > 0 {
 		if err := json.Unmarshal(req.Params, &login); err != nil {
+			s.server.recordLoginRejection(metrics.LoginRejectionReasonInvalidParams)
 			s.writeGeneralResponse(req.ID, fmt.Sprintf("invalid login params: %v", err), "")
 			return
 		}
 	}
 	if login.Login == "" {
+		s.server.recordLoginRejection(metrics.LoginRejectionReasonEmptyAddress)
 		s.writeGeneralResponse(req.ID, "invalid address provided, please use a valid address", "")
 		return
 	}
@@ -459,6 +461,7 @@ func (s *Session) handleLogin(req Request) {
 	// address in this handler (ban/forced-floor lookup, s.address
 	// storage) uses that same stripped value.
 	if err := ValidateAddressForAlgo(s.server.jobManager.Algo(), loginFields.Address); err != nil {
+		s.server.recordLoginRejection(metrics.LoginRejectionReasonInvalidAddressFormat)
 		s.writeGeneralResponse(req.ID, err.Error(), "")
 		return
 	}
@@ -481,6 +484,7 @@ func (s *Session) handleLogin(req Request) {
 		flags := s.server.addressFlags.Get(loginFields.Address)
 		if flags.Banned {
 			s.server.logger.Printf("solo: rejecting login for banned address %s (session %s)", loginFields.Address, s.sessionID)
+			s.server.recordLoginRejection(metrics.LoginRejectionReasonBanned)
 			s.writeGeneralResponse(req.ID, "this address is banned from this pool", "")
 			return
 		}
@@ -587,6 +591,7 @@ func (s *Session) handleLogin(req Request) {
 	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
+		s.server.recordLoginRejection(metrics.LoginRejectionReasonNoJobTemplate)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
 	}

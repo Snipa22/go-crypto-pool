@@ -199,6 +199,58 @@ var AllRejectionReasons = []string{
 
 const OtherAddressLabel = "other"
 
+// LoginRejectionReason* label leaf_direct_login_rejections_total
+// (DISPATCH_BRIEF.md "login-rejection-reason metrics", Alex: "Can you
+// add a metric for rejected logins to see why we're rejecting? I'm
+// curious how many of these are just bans we reject.") -- a small,
+// FIXED, closed enum covering every real rejection return point in
+// session.go's handleLogin/fetchAndDeliverLoginJob, in the order
+// they're checked. Mirrors internal/leaflib/solo/metrics's identical
+// LoginRejectionReason* consts exactly (see that package's doc
+// comment for the full per-value rationale, which applies identically
+// here):
+//   - LoginRejectionReasonInvalidParams: json.Unmarshal(req.Params,
+//     &login) failed.
+//   - LoginRejectionReasonEmptyAddress: login.Login == "".
+//   - LoginRejectionReasonInvalidAddressFormat:
+//     solo.ValidateAddressForAlgo rejects the (already
+//     loginfields-parsed) address as malformed for this leaf's
+//     configured algo.
+//   - LoginRejectionReasonBanned: s.server.addressFlags.Get(...)
+//     .Banned is true.
+//   - LoginRejectionReasonNoJobTemplate:
+//     s.server.jobManager.JobForXNAtDifficulty failed -- reached from
+//     fetchAndDeliverLoginJob (the jobFetchPool-dispatched closure
+//     handleLogin's own TrySubmit call defers this same real login
+//     rejection to), not handleLogin's own body directly -- see that
+//     function's doc comment for why the job fetch runs off
+//     Session.Run's read-loop goroutine.
+//
+// Each site calls Metrics.IncLoginRejectionReason with exactly one of
+// these, via server.go's recordLoginRejection helper. Deliberately NOT
+// covering solo.ParseLoginFields' own error return, mirroring
+// solo/metrics's identical exclusion exactly (see that package's doc
+// comment for the rationale).
+const (
+	LoginRejectionReasonInvalidParams        = "invalid_params"
+	LoginRejectionReasonEmptyAddress         = "empty_address"
+	LoginRejectionReasonInvalidAddressFormat = "invalid_address_format"
+	LoginRejectionReasonBanned               = "banned"
+	LoginRejectionReasonNoJobTemplate        = "no_job_template"
+)
+
+// AllLoginRejectionReasons is the full, closed enumeration of every
+// LoginRejectionReason* const above, in the order declared -- mirrors
+// AllRejectionReasons' identical convention, used by tests to confirm
+// only the expected reason's counter moved.
+var AllLoginRejectionReasons = []string{
+	LoginRejectionReasonInvalidParams,
+	LoginRejectionReasonEmptyAddress,
+	LoginRejectionReasonInvalidAddressFormat,
+	LoginRejectionReasonBanned,
+	LoginRejectionReasonNoJobTemplate,
+}
+
 const DefaultMaxAddressLabels = 50
 
 // SessionSnapshot mirrors solo/metrics's own SessionSnapshot exactly.
@@ -315,6 +367,15 @@ type Metrics struct {
 	// unchanged.
 	ShareRejectionReasonTotal *prometheus.CounterVec
 
+	// LoginRejectionsTotal is the real, per-category breakdown of
+	// every login-time rejection in session.go's
+	// handleLogin/fetchAndDeliverLoginJob (see the
+	// LoginRejectionReason* consts above) -- DISPATCH_BRIEF.md
+	// "login-rejection-reason metrics". Previously EVERY one of
+	// these rejection points was log-only, with no counter of any
+	// kind.
+	LoginRejectionsTotal *prometheus.CounterVec
+
 	// TemplateDistributionDuration observes the real wall-clock time
 	// (seconds) Server.invalidateAndRepushJobs spends iterating every
 	// connected session and pushing a freshly regenerated job, labeled
@@ -418,6 +479,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Help: "Real, per-category breakdown of the 'rejected' side of leaf_direct_shares_total, by reason (see the direct/metrics package's RejectionReason* consts for the full, closed enum and the exact handleSubmit call site each one maps to). Additive to leaf_direct_shares_total's own accepted/rejected split, which remains completely unchanged.",
 	}, []string{"reason"})
 
+	m.LoginRejectionsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_direct_login_rejections_total",
+		Help: "Real, per-category breakdown of every login-time rejection in session.go's handleLogin/fetchAndDeliverLoginJob (see this package's LoginRejectionReason* consts for the full, closed enum and the exact call site each one maps to) -- previously every one of these rejection points was log-only, with no counter of any kind.",
+	}, []string{"reason"})
+
 	// leaf_direct_template_distribution_seconds' bucket boundaries:
 	// prometheus.DefBuckets (5ms..10s) tops out at 10s, which is
 	// coarse for this leaf's typical sub-second-to-few-second
@@ -519,6 +585,17 @@ func (m *Metrics) IncShareClassification(classification string) {
 func (m *Metrics) IncShareRejectionReason(reason string) {
 	m.ShareRejectionReasonTotal.WithLabelValues(reason).Inc()
 	m.rejectionReasonRate.Inc(reason)
+}
+
+// IncLoginRejectionReason bumps LoginRejectionsTotal for reason (one
+// of LoginRejectionReason* above) -- callers (server.go's
+// recordLoginRejection) must call this INSTEAD OF touching
+// LoginRejectionsTotal directly. Mirrors
+// internal/leaflib/solo/metrics's identical IncLoginRejectionReason
+// exactly -- no accompanying per-second rate gauge, deliberately
+// (see that package's doc comment for the rationale).
+func (m *Metrics) IncLoginRejectionReason(reason string) {
+	m.LoginRejectionsTotal.WithLabelValues(reason).Inc()
 }
 
 // Stop releases the background ticker goroutines backing

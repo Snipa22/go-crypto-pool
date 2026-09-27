@@ -76,10 +76,21 @@ type fakeDirectNodeClient struct {
 	templateCalls atomic.Int64
 	submitCalls   atomic.Int64
 
+	// getBlockTemplateErr, when non-nil, is returned by
+	// GetBlockTemplate below instead of a real synthetic template --
+	// mirrors solo/job_test.go's own fakeNodeClient.getBlockTemplateErr
+	// field exactly, added for the login-rejection-metrics
+	// no_job_template test case (DISPATCH_BRIEF.md "login-rejection-
+	// reason metrics").
+	getBlockTemplateErr error
+
 	lastSubmittedBlock *tari_generated.Block
 }
 
 func (f *fakeDirectNodeClient) GetBlockTemplate(_ context.Context, _ string, algo poolpb.Algo) (*solo.Job, error) {
+	if f.getBlockTemplateErr != nil {
+		return nil, f.getBlockTemplateErr
+	}
 	call := f.templateCalls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
