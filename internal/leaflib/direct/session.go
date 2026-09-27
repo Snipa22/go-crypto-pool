@@ -90,8 +90,12 @@ type Session struct {
 	paymentID atomic.Value // string
 
 	// fixedDiff mirrors solo.Session's own identical field exactly --
-	// see that field's doc comment for the full rationale and the
-	// verbatim legacy retargetMiners citation it ports. Read by
+	// see that field's doc comment for the full rationale, the
+	// verbatim legacy retargetMiners citation it ports, and the
+	// XNP-proxy escape hatch that legacy's own `proxyAddressList`
+	// clause now DOES have an equivalent of here
+	// (solo.LoginFields.XNPProxyExemptFromFixedDiffPin, applied
+	// identically by this package's own handleLogin below). Read by
 	// vardiff.go's maybeRetarget, which returns immediately when set.
 	fixedDiff atomic.Bool
 
@@ -362,9 +366,22 @@ func (s *Session) handleLogin(req solo.Request) {
 	// lifetime of the connection -- mirrors solo.Session's own
 	// handleLogin exactly (see that method's own comment at this same
 	// point, and Session.fixedDiff's doc comment, for the verbatim
-	// legacy citations).
+	// legacy citations), INCLUDING the XNP-proxy escape hatch: an
+	// XNP-proxy-detected session whose fixed difficulty came from the
+	// login field's own "+<difficulty>" suffix gets that value as its
+	// starting difficulty but is NOT pinned, so normal vardiff
+	// retargeting keeps tracking its changing downstream-aggregate
+	// hashrate. That is this leaf's equivalent of legacy's
+	// `proxyAddressList` clause in retargetMiners -- see
+	// solo.LoginFields.XNPProxyExemptFromFixedDiffPin
+	// (solo/loginfields.go) for the verbatim citation, the mechanism
+	// divergence (agent-string detection here vs. legacy's
+	// operator-maintained payout-address allowlist), and why the
+	// NiceHash-agent pin is deliberately left untouched.
 	if loginFields.FixedDiff {
-		s.fixedDiff.Store(true)
+		if !loginFields.XNPProxyExemptFromFixedDiffPin(login.Agent) {
+			s.fixedDiff.Store(true)
+		}
 		s.currentDifficulty.Store(loginFields.Difficulty)
 	}
 

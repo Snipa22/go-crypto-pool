@@ -117,6 +117,23 @@ type LoginFields struct {
 	// both leaf modes).
 	FixedDiff bool
 
+	// FixedDiffFromLoginSuffix reports WHICH of the two real legacy
+	// mechanisms set FixedDiff above: true when it came from the login
+	// field's own "+<difficulty>" suffix (pool.js lines 402-411),
+	// false when FixedDiff came ONLY from a NiceHash agent string
+	// (pool.js lines 392-395). Always false when FixedDiff is false.
+	//
+	// The two are deliberately distinguishable because exactly one of
+	// them is exempted for XNP-proxy sessions -- see
+	// XNPProxyExemptFromFixedDiffPin below for the full rationale and
+	// the cited legacy `proxyAddressList` escape hatch it implements.
+	// A login carrying BOTH (a NiceHash agent AND a "+" suffix) counts
+	// as suffix-driven, because the suffix's value is what actually
+	// won: legacy's own ordering has the "+" split overwrite the
+	// NiceHash default (see the switch below, ordering preserved
+	// verbatim), so the resulting pin is the suffix's pin.
+	FixedDiffFromLoginSuffix bool
+
 	// Difficulty is the session's resulting STARTING difficulty. It is
 	// the startingDiff passed in unless FixedDiff is true, in which
 	// case it is the requested fixed value (clamped to
@@ -243,6 +260,7 @@ func ParseLoginFields(algo poolpb.Algo, login, agent string, startingDiff, minDi
 			return LoginFields{}, err
 		}
 		out.FixedDiff = true
+		out.FixedDiffFromLoginSuffix = true
 		out.Difficulty = clampDifficulty(requested, minDiff, maxDiff)
 	case len(diffSplit) > 2:
 		return LoginFields{}, ErrTooManyLoginOptions
@@ -268,6 +286,61 @@ func ParseLoginFields(algo poolpb.Algo, login, agent string, startingDiff, minDi
 	}
 
 	return out, nil
+}
+
+// XNPProxyExemptFromFixedDiffPin reports whether this login's
+// fixed-difficulty request must be honored as a STARTING difficulty
+// only, WITHOUT permanently pinning the session out of vardiff
+// retargeting for the lifetime of the connection (Session.fixedDiff in
+// both leaf-direct and leaf-solo -- see that field's own doc comment).
+//
+// This is this leaf's implementation of the real legacy
+// `proxyAddressList` escape hatch, which until now had no equivalent
+// here at all (/workspace/nodejs-pool-sxmr/lib/pool.js, retargetMiners,
+// lines ~227-236, quoted verbatim):
+//
+//	function retargetMiners() {
+//	    for (let minerId in activeMiners) {
+//	        let miner = activeMiners[minerId];
+//	        if (!miner.fixed_diff || (miner.fixed_diff && proxyAddressList.indexOf(miner.payout) !== -1)) {
+//	            miner.updateDifficulty();
+//	        }
+//	    }
+//	}
+//
+// Legacy's own right-hand clause exists because an xmr-node-proxy
+// aggregator legitimately logs in with a fixed difficulty (a pool
+// OPERATOR configures the proxy's upstream username with a
+// "+<difficulty>" suffix specifically to skip past the vardiff ramp-up
+// curve for a connection that starts at a huge AGGREGATE hashrate from
+// its very first share) and yet STILL needs ongoing retargeting,
+// because that aggregate hashrate -- the sum of every sub-miner behind
+// it -- changes over the life of the connection. Honoring the suffix as
+// a permanent pin instead of a starting point leaves such a proxy stuck
+// at whatever value its operator configured once, forever, no matter
+// how its real downstream hashrate moves.
+//
+// MECHANISM DIVERGENCE, stated explicitly: legacy detects a proxy by an
+// OPERATOR-MAINTAINED allowlist of known proxy payout addresses
+// (`proxyAddressList`, populated from its pool config). This leaf has
+// no proxy-address registry of any kind, so the equivalence is
+// implemented using this leaf's OWN already-existing, already-tested
+// XNP detection instead: the connecting client's self-reported agent
+// string (IsXNPProxyAgent, protocol.go -- the same single
+// implementation session.go's jobPayload already gates the XNP
+// raw-template-blob/reservation-offset job fields on, deliberately
+// reused rather than re-implemented). Semantically this is the
+// STRONGER of the two: it identifies the actual aggregating client
+// rather than trusting an address list to stay in sync with reality.
+//
+// SCOPE, deliberately narrow: only the login-string
+// "+<difficulty>"-suffix-driven pin is exempted
+// (FixedDiffFromLoginSuffix). The NiceHash-agent-string pin is NOT
+// touched -- NiceHash is a genuine per-rental fixed-difficulty
+// hashpower market maker, not an aggregating proxy needing ongoing
+// retargeting, and legacy pins it the same way.
+func (f LoginFields) XNPProxyExemptFromFixedDiffPin(agent string) bool {
+	return f.FixedDiff && f.FixedDiffFromLoginSuffix && IsXNPProxyAgent(agent)
 }
 
 // isLegacyPaymentID mirrors pool.js line 416's exact test for "this
