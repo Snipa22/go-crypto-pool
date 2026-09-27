@@ -132,6 +132,14 @@ func (s *Session) maybeRetarget() {
 	// lib/pool.js lines 227-236) this gate ports. Checked first,
 	// before the connection-age gate and before any computeRetarget
 	// work, so a fixed-difficulty session costs nothing per tick.
+	//
+	// An XNP-proxy-detected session that requested a "+<difficulty>"
+	// suffix deliberately never reaches this gate as "fixed": it is
+	// exempted from the pin at login time instead (handleLogin, via
+	// LoginFields.XNPProxyExemptFromFixedDiffPin -- legacy's own
+	// `proxyAddressList` clause of the very same retargetMiners
+	// check), so it flows through the full retarget below like any
+	// ordinary session.
 	if s.fixedDiff.Load() {
 		return
 	}

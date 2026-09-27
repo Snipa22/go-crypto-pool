@@ -108,9 +108,21 @@ type Session struct {
 	//
 	// The legacy `proxyAddressList` escape hatch (an xmr-node-proxy
 	// aggregator logs in with a fixed diff but still needs its
-	// downstream-aggregate difficulty retargeted) has NO equivalent in
-	// this leaf -- there is no proxy-address registry here at all --
-	// so the gate ported here is the plain `!fixed_diff` half.
+	// downstream-aggregate difficulty retargeted) DOES now have an
+	// equivalent here, implemented in terms of this leaf's own
+	// agent-string XNP detection rather than legacy's
+	// operator-maintained proxy-payout-address allowlist (this leaf has
+	// no such registry at all) -- see
+	// LoginFields.XNPProxyExemptFromFixedDiffPin (loginfields.go) for
+	// the full citation and mechanism-divergence rationale, and
+	// handleLogin below for the single call site that applies it. For
+	// an XNP-proxy-detected session, the operator's requested
+	// "+<difficulty>" value is still used as this session's STARTING
+	// difficulty -- only the permanent PIN is withheld, so normal
+	// vardiff retargeting proceeds from there exactly as it would for
+	// any ordinary non-fixed-difficulty session. Every other session,
+	// XNP-undetected, is pinned exactly as the plain `!fixed_diff`
+	// half of the legacy gate above prescribes.
 	fixedDiff atomic.Bool
 
 	// --- SECURITY FIX: per-session job ownership (jobList/jobLog) ---
@@ -534,8 +546,24 @@ func (s *Session) handleLogin(req Request) {
 	// fixed-difficulty session (an explicit operator ban/floor
 	// outranks a miner's own request), exactly as it already outranks
 	// the port tier's default.
+	//
+	// XNP-PROXY ESCAPE HATCH: an XNP-proxy-detected session whose
+	// fixed difficulty came from the login field's own
+	// "+<difficulty>" suffix gets that value as its STARTING
+	// difficulty but is NOT pinned -- normal vardiff retargeting
+	// proceeds from there, so an aggregating proxy's difficulty keeps
+	// tracking its real (and changing) downstream-aggregate hashrate.
+	// This is this leaf's equivalent of legacy's own
+	// `proxyAddressList` clause in retargetMiners; see
+	// LoginFields.XNPProxyExemptFromFixedDiffPin (loginfields.go) for
+	// the verbatim citation, the mechanism divergence (agent-string
+	// detection here vs. legacy's operator-maintained payout-address
+	// allowlist, which has no equivalent in this leaf), and why the
+	// NiceHash-agent pin is deliberately left untouched.
 	if loginFields.FixedDiff {
-		s.fixedDiff.Store(true)
+		if !loginFields.XNPProxyExemptFromFixedDiffPin(login.Agent) {
+			s.fixedDiff.Store(true)
+		}
 		s.currentDifficulty.Store(loginFields.Difficulty)
 	}
 

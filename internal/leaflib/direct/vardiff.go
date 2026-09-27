@@ -77,7 +77,9 @@ func (s *Session) runVardiffLoop(ctx context.Context) {
 // maybeRetarget mirrors solo.Session's own maybeRetarget exactly,
 // including its fixed-difficulty gate (Session.fixedDiff -- see
 // solo.Session's own copy of that field for the verbatim legacy
-// retargetMiners citation).
+// retargetMiners citation, and for the XNP-proxy escape hatch that
+// keeps an aggregating proxy's "+<difficulty>"-suffixed session out of
+// this gate entirely, applied at login time rather than here).
 func (s *Session) maybeRetarget() {
 	if s.fixedDiff.Load() {
 		return
