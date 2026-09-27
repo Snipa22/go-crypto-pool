@@ -131,6 +131,12 @@ upstream_request_timeout_seconds = 15
 # default, runtime.NumCPU() -- NOT a hardcoded literal. (default: 0)
 randomx_workers = 0
 
+# RandomX async validation pool's bounded queue capacity (see
+# internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented
+# default, max(256, randomx_workers*16) -- NOT a hardcoded flat literal.
+# (default: 0)
+randomx_queue_size = 0
+
 # Disconnect a downstream session after too many CONSECUTIVE real RandomX
 # validation failures (see internal/leaflib.InvalidShareGuard) -- a
 # security-hardening default, enabled unless explicitly turned off.
@@ -161,6 +167,12 @@ metrics_listen_address = "127.0.0.1:9601"
 # Cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address
 # and the stats page's per-address breakdown (0 = package default). (default: 0)
 max_address_labels = 0
+
+# Cap on how many session rows the stats HTML page's "Connected sessions"
+# table renders (the separate "Active connections" summary count is always
+# accurate/uncapped). 0 or negative disables the cap entirely (render every
+# session). (default: 150)
+stats_page_max_sessions = 150
 
 # Omit the "Remote address" column from the stats HTML page entirely --
 # recommended for public-facing deployments. (default: false)

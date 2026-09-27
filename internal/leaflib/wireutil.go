@@ -122,16 +122,71 @@ func AlgoWireName(algo poolpb.Algo) string {
 	}
 }
 
-// DiffToTargetHex ports go-tari-sha3x-solo-stratum's
-// minerTracking.MinerJob.diffToTarget + GetJobJSON's subsequent
-// encoding exactly: target = uint64(2^64-1) / difficulty, then that
-// resulting uint64 is written out as 8 raw bytes in LITTLE-ENDIAN
-// order, then hex-encoded as a string. A difficulty of 0 is treated
-// as 1 purely to avoid a runtime division-by-zero panic on a
-// misconfiguration, rather than changing the real formula.
+// DiffToTargetHex encodes a session difficulty into the wire "target"
+// field, in two stages.
+//
+// STAGE 1 (difficulty <= math.MaxUint32, i.e. 0xFFFFFFFF — the
+// default, and the only path any difficulty this pool can currently
+// issue takes): the REAL legacy sxmr encoding, ported from
+// nodejs-pool-sxmr's `lib/pool.js` Miner.getTargetHex +
+// `lib/coins/xmr.js` baseDiff:
+//
+//	let padded = new Buffer(32); padded.fill(0);
+//	let diffBuff = baseDiff.div(this.difficulty).toBuffer();  // baseDiff = 2^256-1
+//	diffBuff.copy(padded, 32 - diffBuff.length);              // right-align into 32 bytes
+//	let buff = padded.slice(0, 4);                            // TOP 4 bytes
+//	let buffArray = buff.toByteArray().reverse();             // -> little-endian
+//	return new Buffer(buffArray).toString("hex");             // 8 hex chars
+//
+// That legacy code has NO other branch and no protoVersion gate: it is
+// unconditionally 4-byte for every session at every difficulty. This
+// 32-bit little-endian target is the standard, universally-compatible
+// CryptoNight/RandomX stratum convention that xmrig, xmr-stak et al.
+// parse correctly by default; the 8-byte "extended" form below is NOT
+// what an unmodified miner client assumes, and a client that computes
+// its local target from a 16-hex-char value as if it were 8 hex chars
+// submits shares it believes valid that the pool then correctly
+// rejects as difficulty_floor_miss.
+//
+// The legacy bignum expression above is exactly equal to
+// uint32(math.MaxUint32 / difficulty) in native uint32 arithmetic, for
+// EVERY difficulty >= 1 — no arbitrary-precision arithmetic needed.
+// Proof: taking the top 4 bytes of the 32-byte right-aligned
+// big-endian quotient is floor(floor((2^256-1)/d) / 2^224), which by
+// the nested-floor identity is floor((2^256-1) / (d * 2^224)). Write
+// M = 2^32-1 and note (2^256-1) = M*2^224 + (2^224-1) exactly. With
+// M = d*k + r (0 <= r < d), the numerator is d*k*2^224 +
+// (r+1)*2^224 - 1, so the quotient is k + ((r+1)*2^224 - 1)/(d*2^224),
+// whose floor is k iff (r+1)*2^224 - 1 < d*2^224, i.e. iff
+// r + 1 <= d — always true because r < d. Hence the result is exactly
+// k = floor((2^32-1)/d). TestDiffToTargetHexMatchesRealLegacyFormula
+// verifies this against a real math/big implementation of the legacy
+// algorithm across the full boundary set, so this is a proven
+// equivalence and not an assertion.
+//
+// STAGE 2 (difficulty > math.MaxUint32): the pre-existing 8-byte
+// behavior, UNCHANGED — ported from go-tari-sha3x-solo-stratum's
+// minerTracking.MinerJob.diffToTarget + GetJobJSON encoding:
+// target = uint64(2^64-1) / difficulty, written out as 8 raw
+// LITTLE-ENDIAN bytes, hex-encoded (16 hex chars). 0xFFFFFFFF is the
+// objective precision floor for a 4-byte target — at or below it
+// (2^32-1)/difficulty is still a meaningful, non-degenerate integer
+// (>= 1); above it a 4-byte target would round toward 0 and lose real
+// precision, so the wider encoding is retained as a fallback for any
+// future difficulty config that exceeds that ceiling.
+//
+// A difficulty of 0 is treated as 1 purely to avoid a runtime
+// division-by-zero panic on a misconfiguration, rather than changing
+// either real formula.
 func DiffToTargetHex(difficulty uint64) string {
 	if difficulty == 0 {
 		difficulty = 1
+	}
+	if difficulty <= math.MaxUint32 {
+		target32 := uint32(math.MaxUint32 / difficulty)
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, target32)
+		return hex.EncodeToString(buf)
 	}
 	target := uint64(math.MaxUint64) / difficulty
 	buf := make([]byte, 8)

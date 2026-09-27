@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	shared "github.com/Snipa22/go-crypto-pool/internal/leaflib/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 )
 
@@ -74,7 +75,127 @@ const (
 	ClassificationTrusted   = "trusted"
 	ClassificationValidated = "validated"
 	ClassificationInvalid   = "invalid"
+
+	// RejectionReason* label leaf_direct_share_rejection_reason_total
+	// -- a small, FIXED, closed enum (never the raw free-text
+	// s.writeShareResponse error string -- that would be unbounded
+	// Prometheus label cardinality) covering every real
+	// pre-validation-and-beyond reject call site in
+	// session.go's handleSubmit, found by reading that method in
+	// full (see brief_rejection_reasons.md's live incident: prior to
+	// this, ZERO of these had any per-reason visibility at all --
+	// only the aggregate leaf_direct_shares_total{result="rejected"}
+	// counter, which cannot distinguish "12% pre-validation rejects"
+	// from "0.06% genuine crypto/difficulty failures"). Each site
+	// calls Metrics.IncShareRejectionReason with exactly one of
+	// these, via session.go's rejectShare helper -- ADDITIVE to (never
+	// replacing) the existing s.writeShareResponse(id, false, ...)
+	// call and the recordShare(false) bookkeeping it already does
+	// internally.
+	//
+	//   - RejectionReasonStaleOrUnknownJob: submit.JobID isn't in
+	//     this session's own bounded JobHistory (s.ownJob) -- either
+	//     genuinely unknown, or aged out of the ring buffer
+	//     (defaultSessionJobHistorySize).
+	//   - RejectionReasonJobExpired: job.CreatedAt exceeds the
+	//     JobManager's configured JobMaxAge, independent of the ring
+	//     buffer.
+	//   - RejectionReasonBannedAddress: the submit-time address-flags
+	//     re-check (independent of the login-time check, which never
+	//     reaches writeShareResponse at all -- see
+	//     RejectionReasonOther's doc comment below) found this
+	//     session's address newly banned.
+	//   - RejectionReasonInvalidXNonce: a SHA3X/C29 submit's nonce
+	//     does not start with this session's assigned xn prefix.
+	//   - RejectionReasonMalformedNonce: the submit's nonce hex
+	//     failed to decode, or decoded to the wrong byte length for
+	//     its algo (4/8 bytes RandomX-family, 8 bytes otherwise).
+	//   - RejectionReasonInvalidPowShape: a C29 submit's "pow" field
+	//     did not carry exactly c29SubmitCycleSize edges.
+	//   - RejectionReasonDuplicateNonce: job.MarkNonceUsed reported a
+	//     replayed/colliding nonce.
+	//   - RejectionReasonMissingClaimedResult: an ALGO_RXM/ALGO_RXT
+	//     submit omitted the required claimed "result" hash field.
+	//   - RejectionReasonDifficultyFloorMiss: the submit's difficulty
+	//     (either the miner's own cheap pre-dispatch CLAIMED value,
+	//     or -- RXT/RXM only, leaf-direct-specific, see handleSubmit's
+	//     "GENUINE DIFFERENCE FROM leaf-solo" comment -- the REAL,
+	//     daemon-confirmed derived value) is below this job's own
+	//     configured StaticDifficulty floor.
+	//   - RejectionReasonClaimedDifficultyOrCryptoInvalid: either the
+	//     cheap pre-dispatch claimed-difficulty/malformed-hex filter
+	//     (solo.ClaimedRandomXFamilyDifficulty) rejected the submit
+	//     outright, or the real validator ran and reported the share
+	//     cryptographically invalid.
+	//   - RejectionReasonMalformedSubmitRequest: the submit's wire
+	//     params were missing or failed to JSON-unmarshal at all.
+	//   - RejectionReasonBlockSubmitFailed: a share that genuinely
+	//     cleared network/block difficulty was rejected/failed at
+	//     every node this leaf attempted to submit it to.
+	//   - RejectionReasonPoolSaturated: the shared randomxPool async
+	//     validation pool's bounded queue was full (or the pool was
+	//     shutting down) when this RXT/RXM submit tried to dispatch.
+	//   - RejectionReasonInternalError: an infrastructure-only
+	//     failure unrelated to the miner's own submission validity
+	//     (no validator configured for this leaf's algo, a
+	//     validator.Validate call itself erroring rather than
+	//     returning invalid=false, a difficulty-derivation error, a
+	//     Monero verification-blob build error, or an unexpected
+	//     internal candidate type).
+	//   - RejectionReasonOther: reserved fallback bucket for any
+	//     future reject call site added to handleSubmit without an
+	//     immediately-obvious existing category -- never emitted by
+	//     any call site as of this feature's introduction. NOT used
+	//     for "login required before submit": that check runs before
+	//     submit params are even parsed and rejects via
+	//     writeGeneralResponse (not writeShareResponse), so it never
+	//     touches leaf_direct_shares_total{result="rejected"} at all
+	//     -- out of scope for a "rejected share" breakdown by
+	//     construction (verified by reading handleSubmit; see this
+	//     feature's PR description for the full note on this
+	//     deliberate deviation from brief_rejection_reasons.md's
+	//     initial "not_logged_in" suggestion).
+	RejectionReasonStaleOrUnknownJob                = "stale_or_unknown_job"
+	RejectionReasonJobExpired                       = "job_expired"
+	RejectionReasonBannedAddress                    = "banned_address"
+	RejectionReasonInvalidXNonce                    = "invalid_xnonce"
+	RejectionReasonMalformedNonce                   = "malformed_nonce"
+	RejectionReasonInvalidPowShape                  = "invalid_pow_shape"
+	RejectionReasonDuplicateNonce                   = "duplicate_nonce"
+	RejectionReasonMissingClaimedResult             = "missing_claimed_result"
+	RejectionReasonDifficultyFloorMiss              = "difficulty_floor_miss"
+	RejectionReasonClaimedDifficultyOrCryptoInvalid = "claimed_difficulty_or_crypto_invalid"
+	RejectionReasonMalformedSubmitRequest           = "malformed_submit_request"
+	RejectionReasonBlockSubmitFailed                = "block_submit_failed"
+	RejectionReasonPoolSaturated                    = "pool_saturated"
+	RejectionReasonInternalError                    = "internal_error"
+	RejectionReasonOther                            = "other"
 )
+
+// AllRejectionReasons is the full, closed enumeration of every
+// RejectionReason* const above, in the order declared -- used by
+// Collect to emit a leaf_direct_share_rejection_reason_per_second
+// sample for every reason on every scrape (matching how
+// classificationPerSecondDesc's three fixed labels are emitted
+// unconditionally above), and by this package's own tests to assert
+// no other, unexpected reason value is ever produced.
+var AllRejectionReasons = []string{
+	RejectionReasonStaleOrUnknownJob,
+	RejectionReasonJobExpired,
+	RejectionReasonBannedAddress,
+	RejectionReasonInvalidXNonce,
+	RejectionReasonMalformedNonce,
+	RejectionReasonInvalidPowShape,
+	RejectionReasonDuplicateNonce,
+	RejectionReasonMissingClaimedResult,
+	RejectionReasonDifficultyFloorMiss,
+	RejectionReasonClaimedDifficultyOrCryptoInvalid,
+	RejectionReasonMalformedSubmitRequest,
+	RejectionReasonBlockSubmitFailed,
+	RejectionReasonPoolSaturated,
+	RejectionReasonInternalError,
+	RejectionReasonOther,
+}
 
 const OtherAddressLabel = "other"
 
@@ -181,6 +302,19 @@ type Metrics struct {
 	// untouched).
 	SharesByClassificationTotal *prometheus.CounterVec
 
+	// ShareRejectionReasonTotal is the real, per-category breakdown
+	// of the "rejected" side of SharesTotal (leaf_direct_shares_total
+	// {result="rejected"}) -- labeled by reason (see the
+	// RejectionReason* consts above). This is the direct fix for
+	// brief_rejection_reasons.md's live incident: SharesTotal alone
+	// cannot distinguish "a genuine cryptographic/difficulty
+	// validation failure" from "a submit that never reached real
+	// validation at all" (unknown job_id, expired job, malformed
+	// nonce, etc.) -- ADDITIVE to (never replacing) SharesTotal's own
+	// existing accepted/rejected split, which is completely
+	// unchanged.
+	ShareRejectionReasonTotal *prometheus.CounterVec
+
 	// TemplateDistributionDuration observes the real wall-clock time
 	// (seconds) Server.invalidateAndRepushJobs spends iterating every
 	// connected session and pushing a freshly regenerated job, labeled
@@ -205,6 +339,25 @@ type Metrics struct {
 	TemplateDistributionMiners *prometheus.GaugeVec
 
 	BuildInfo *prometheus.GaugeVec
+
+	// sharesRate/blocksRate/classificationRate/rejectionReasonRate
+	// back leaf_direct_shares_per_second/leaf_direct_blocks_per_second/
+	// leaf_direct_shares_by_classification_per_second/
+	// leaf_direct_share_rejection_reason_per_second (see Collect) --
+	// a 60s-rolling-window per-second rate of SharesTotal/
+	// BlocksTotal/SharesByClassificationTotal/
+	// ShareRejectionReasonTotal, additive to those counters (which
+	// remain completely unchanged). One shared.RateTracker per label
+	// combination, created lazily by
+	// IncShareResult/IncBlockResult/IncShareClassification/
+	// IncShareRejectionReason below at the exact same real
+	// accept/reject/classification/rejection-reason branch points
+	// server.go's recordShare/recordBlock/recordShareClassification/
+	// recordShareRejectionReason already call.
+	sharesRate          *shared.LabeledRateTrackers
+	blocksRate          *shared.LabeledRateTrackers
+	classificationRate  *shared.LabeledRateTrackers
+	rejectionReasonRate *shared.LabeledRateTrackers
 
 	maxAddressLabels int
 	snapshot         SnapshotFunc
@@ -260,6 +413,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Help: "Total number of RandomX-family (RXT/RXM) submits that reached real-or-skipped validation, by 3-way classification (trusted/validated/invalid), mirroring legacy nodejs-pool-sxmr's (lib/pool.js) own 30s 'Trusted/Validated/Invalid/Total shares' log line -- total is deliberately not re-derived here since it is always the redundant sum of the other three. This is an additional, independent counter; it does not replace leaf_direct_shares_total's own accepted/rejected split.",
 	}, []string{"classification"})
 
+	m.ShareRejectionReasonTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_direct_share_rejection_reason_total",
+		Help: "Real, per-category breakdown of the 'rejected' side of leaf_direct_shares_total, by reason (see the direct/metrics package's RejectionReason* consts for the full, closed enum and the exact handleSubmit call site each one maps to). Additive to leaf_direct_shares_total's own accepted/rejected split, which remains completely unchanged.",
+	}, []string{"reason"})
+
 	// leaf_direct_template_distribution_seconds' bucket boundaries:
 	// prometheus.DefBuckets (5ms..10s) tops out at 10s, which is
 	// coarse for this leaf's typical sub-second-to-few-second
@@ -286,6 +444,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Help: "Always 1; version label carries the running build's version string.",
 	}, []string{"version"})
 	m.BuildInfo.WithLabelValues(version).Set(1)
+
+	m.sharesRate = shared.NewLabeledRateTrackers()
+	m.blocksRate = shared.NewLabeledRateTrackers()
+	m.classificationRate = shared.NewLabeledRateTrackers()
+	m.rejectionReasonRate = shared.NewLabeledRateTrackers()
 
 	if err := reg.Register(m); err != nil {
 		log.Printf("metrics: failed to register leaf-direct snapshot collector: %v", err)
@@ -317,6 +480,64 @@ func (m *Metrics) SetRelaySource(fn RelayStatsFunc) {
 
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// IncShareResult increments SharesTotal for result (see ResultLabel)
+// AND records the same increment for that result's rolling-window
+// per-second rate (leaf_direct_shares_per_second, see Collect) --
+// callers (server.go's recordShare) must call this INSTEAD OF
+// touching SharesTotal directly, so the two never drift out of
+// lockstep.
+func (m *Metrics) IncShareResult(result string) {
+	m.SharesTotal.WithLabelValues(result).Inc()
+	m.sharesRate.Inc(result)
+}
+
+// IncBlockResult is IncShareResult's BlocksTotal/
+// leaf_direct_blocks_per_second analogue.
+func (m *Metrics) IncBlockResult(result string) {
+	m.BlocksTotal.WithLabelValues(result).Inc()
+	m.blocksRate.Inc(result)
+}
+
+// IncShareClassification is IncShareResult's
+// SharesByClassificationTotal/
+// leaf_direct_shares_by_classification_per_second analogue.
+func (m *Metrics) IncShareClassification(classification string) {
+	m.SharesByClassificationTotal.WithLabelValues(classification).Inc()
+	m.classificationRate.Inc(classification)
+}
+
+// IncShareRejectionReason is IncShareResult's ShareRejectionReasonTotal/
+// leaf_direct_share_rejection_reason_per_second analogue -- callers
+// (server.go's recordShareRejectionReason, itself called from
+// session.go's rejectShare helper at every real pre-validation-and-
+// beyond reject call site) must call this INSTEAD OF touching
+// ShareRejectionReasonTotal directly, so the two never drift out of
+// lockstep. See the RejectionReason* consts' doc comment for the
+// full, closed enum this reason must be one of.
+func (m *Metrics) IncShareRejectionReason(reason string) {
+	m.ShareRejectionReasonTotal.WithLabelValues(reason).Inc()
+	m.rejectionReasonRate.Inc(reason)
+}
+
+// Stop releases the background ticker goroutines backing
+// sharesRate/blocksRate/classificationRate/rejectionReasonRate's
+// lazily-created shared.RateTracker instances (see
+// shared.RateTracker.Stop's own doc comment -- safe to call even if
+// some/all label combinations were never incremented, since Stop
+// only iterates trackers that actually got lazily created). Callers
+// (server.go's Shutdown) should call this from the owning Server's
+// own shutdown path; a Metrics never explicitly Stop()'d simply
+// keeps its trackers' goroutines alive for the process lifetime,
+// which is fine for the normal one-Metrics-per-process production
+// case (mirrors solo.AsyncValidationPool.Stop's identical "optional
+// for a process-lifetime singleton" convention).
+func (m *Metrics) Stop() {
+	m.sharesRate.Stop()
+	m.blocksRate.Stop()
+	m.classificationRate.Stop()
+	m.rejectionReasonRate.Stop()
 }
 
 var (
@@ -425,6 +646,33 @@ var (
 		"Unix timestamp (seconds) of this instance's most recent genuinely-new (non-duplicate) template-relay receive from another instance. Absent/0 if this instance has never received one.",
 		nil, nil,
 	)
+
+	// *PerSecondDesc: additive 60s-rolling-window per-second rate
+	// gauges (see shared.RateTracker) mirroring their corresponding
+	// _total counter's exact label set -- the existing _total
+	// counters (SharesTotal/BlocksTotal/SharesByClassificationTotal)
+	// remain completely unchanged; some dashboards/alerting may
+	// already correctly apply rate()/irate() against them.
+	sharesPerSecondDesc = prometheus.NewDesc(
+		"leaf_direct_shares_per_second",
+		"Real, leaf-computed 60-second-rolling-window per-second rate of leaf_direct_shares_total, by result (accepted/rejected) -- computed directly by this leaf (see shared.RateTracker) rather than relying on a dashboard panel applying rate()/irate() against the _total counter itself.",
+		[]string{"result"}, nil,
+	)
+	blocksPerSecondDesc = prometheus.NewDesc(
+		"leaf_direct_blocks_per_second",
+		"Real, leaf-computed 60-second-rolling-window per-second rate of leaf_direct_blocks_total, by result (accepted/rejected).",
+		[]string{"result"}, nil,
+	)
+	classificationPerSecondDesc = prometheus.NewDesc(
+		"leaf_direct_shares_by_classification_per_second",
+		"Real, leaf-computed 60-second-rolling-window per-second rate of leaf_direct_shares_by_classification_total, by classification (trusted/validated/invalid).",
+		[]string{"classification"}, nil,
+	)
+	rejectionReasonPerSecondDesc = prometheus.NewDesc(
+		"leaf_direct_share_rejection_reason_per_second",
+		"Real, leaf-computed 60-second-rolling-window per-second rate of leaf_direct_share_rejection_reason_total, by reason (see the RejectionReason* consts for the full, closed enum).",
+		[]string{"reason"}, nil,
+	)
 )
 
 func ResultLabel(accepted bool) string {
@@ -514,6 +762,20 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(relayLastBlockReceiveDesc, prometheus.GaugeValue, unixSecondsOrZero(rs.LastBlockReceive))
 		ch <- prometheus.MustNewConstMetric(relayLastTemplatePublishDesc, prometheus.GaugeValue, unixSecondsOrZero(rs.LastTemplatePublish))
 		ch <- prometheus.MustNewConstMetric(relayLastTemplateReceiveDesc, prometheus.GaugeValue, unixSecondsOrZero(rs.LastTemplateReceive))
+	}
+
+	ch <- prometheus.MustNewConstMetric(sharesPerSecondDesc, prometheus.GaugeValue, m.sharesRate.Rate(ResultAccepted), ResultAccepted)
+	ch <- prometheus.MustNewConstMetric(sharesPerSecondDesc, prometheus.GaugeValue, m.sharesRate.Rate(ResultRejected), ResultRejected)
+
+	ch <- prometheus.MustNewConstMetric(blocksPerSecondDesc, prometheus.GaugeValue, m.blocksRate.Rate(ResultAccepted), ResultAccepted)
+	ch <- prometheus.MustNewConstMetric(blocksPerSecondDesc, prometheus.GaugeValue, m.blocksRate.Rate(ResultRejected), ResultRejected)
+
+	ch <- prometheus.MustNewConstMetric(classificationPerSecondDesc, prometheus.GaugeValue, m.classificationRate.Rate(ClassificationTrusted), ClassificationTrusted)
+	ch <- prometheus.MustNewConstMetric(classificationPerSecondDesc, prometheus.GaugeValue, m.classificationRate.Rate(ClassificationValidated), ClassificationValidated)
+	ch <- prometheus.MustNewConstMetric(classificationPerSecondDesc, prometheus.GaugeValue, m.classificationRate.Rate(ClassificationInvalid), ClassificationInvalid)
+
+	for _, reason := range AllRejectionReasons {
+		ch <- prometheus.MustNewConstMetric(rejectionReasonPerSecondDesc, prometheus.GaugeValue, m.rejectionReasonRate.Rate(reason), reason)
 	}
 }
 

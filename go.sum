@@ -6,8 +6,8 @@ github.com/Snipa22/go-tari-grpc-lib/v3 v3.4.0 h1:+F0xYMMRLCNwqC/jtR+bCRou5M32JVm
 github.com/Snipa22/go-tari-grpc-lib/v3 v3.4.0/go.mod h1:PhFhxISrJsqnix9QDy16YuxpbpPEcQzFkixNtJftSx8=
 github.com/Snipa22/go-tari-lib v1.3.0 h1:qcp4adD/aFiRLukPGO1C8S+Z5bEaOG4wyhatP5dQEHo=
 github.com/Snipa22/go-tari-lib v1.3.0/go.mod h1:x9BnwC1bf2dnAVHMHeuR/ieMjVFKdAkohCc6LH2M2N8=
-github.com/Snipa22/go-xmr-lib v0.2.5 h1:yIwRAt09rNwUqcVdn2RlG9cuwt9Pqa1y34XFCSayBFY=
-github.com/Snipa22/go-xmr-lib v0.2.5/go.mod h1:8U2SctyDXHNSt16fwBEKH/vykzBn51ek9dywRYZpe9M=
+github.com/Snipa22/go-xmr-lib v1.0.0 h1:MEptt0PcJIeo9gsGLzLx9XnIWO09VEXmB/pu47/a25s=
+github.com/Snipa22/go-xmr-lib v1.0.0/go.mod h1:8U2SctyDXHNSt16fwBEKH/vykzBn51ek9dywRYZpe9M=
 github.com/antithesishq/antithesis-sdk-go v0.7.2-default-no-op h1:p2zFsAzvhIpFya8AIOHIbWf7NGvO34QpLGclyf7nXj8=
 github.com/antithesishq/antithesis-sdk-go v0.7.2-default-no-op/go.mod h1:FQyySiasQQM8735Ddel3MRojmy4dA1IqCeyJ5jmPMbI=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=

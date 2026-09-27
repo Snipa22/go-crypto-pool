@@ -120,6 +120,16 @@ type Server struct {
 	// identically — same convention as leaf-solo's Server.
 	maxAddressLabels int
 
+	// statsPageMaxSessions caps how many SessionStat rows
+	// StatsHTMLHandler actually renders in its "Connected sessions"
+	// table -- NOT the same as ActiveSessions (which stays uncapped)
+	// and NOT applied inside Stats() itself (see
+	// capSessionsForDisplay's own doc comment in statsui.go).
+	// Defaults to DefaultStatsPageMaxSessions. 0/negative disables
+	// the cap entirely (render everything). Set via
+	// SetStatsPageMaxSessions.
+	statsPageMaxSessions int
+
 	// lastReconnectCount tracks the most recent UpstreamHealth.
 	// ReconnectCount() value observed at scrape time, so
 	// sessionSnapshots can Add() the real delta onto the monotonic
@@ -237,17 +247,24 @@ func NewServer(cm *leaflib.ConnectionManager, jobs *JobManager, validator ShareV
 		jobMaxAge:               jobMaxAge,
 		sessions:                make(map[uint64]*Session),
 		maxAddressLabels:        metrics.DefaultMaxAddressLabels,
+		statsPageMaxSessions:    DefaultStatsPageMaxSessions,
 		invalidShareGuardConfig: leaflib.DefaultInvalidShareGuardConfig(),
 		poolDiffCapEnabled:      true,
-		// workers=0 lets NewAsyncValidationPool apply its own default
-		// (DefaultAsyncValidationWorkers() == runtime.NumCPU(), NOT a
-		// hardcoded literal -- see solo/asyncvalidation.go's doc
-		// comment and Alex's explicit direction in
-		// DISPATCH_BRIEF.md, 2026-09-10). An operator wanting a
-		// different fixed count can override via
-		// SetRandomXWorkerPoolSize (see cmd/leaf-proxy's
-		// -randomx-workers flag) before Serve begins.
-		randomxPool: solo.NewAsyncValidationPool(0, solo.AsyncValidationQueueSize),
+		// workers=0/queueSize=0 lets NewAsyncValidationPool apply its
+		// own defaults (DefaultAsyncValidationWorkers() ==
+		// runtime.NumCPU() for workers, NOT a hardcoded literal --
+		// see solo/asyncvalidation.go's doc comment and Alex's
+		// explicit direction in DISPATCH_BRIEF.md, 2026-09-10; and
+		// DefaultAsyncValidationQueueSize(workers) for queueSize --
+		// max(AsyncValidationQueueSize, workers*
+		// DefaultAsyncValidationQueueMultiplier), scaling with the
+		// real worker count instead of staying the old flat 256
+		// literal regardless of host size). An operator wanting a
+		// different fixed worker count and/or queue size can override
+		// via SetRandomXWorkerPoolSize (see cmd/leaf-proxy's
+		// -randomx-workers/-randomx-queue-size flags) before Serve
+		// begins.
+		randomxPool: solo.NewAsyncValidationPool(0, 0),
 	}
 	s.unsubscribe = jobs.Subscribe(s.repushAllSessions)
 	return s
@@ -307,6 +324,16 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *metrics.Me
 // identical method exactly — see that doc comment.
 func (s *Server) SetHideRemoteAddress(hide bool) {
 	s.hideRemoteAddress.Store(hide)
+}
+
+// SetStatsPageMaxSessions sets the -stats-page-max-sessions/
+// LEAF_PROXY_STATS_PAGE_MAX_SESSIONS cap StatsHTMLHandler enforces on
+// its "Connected sessions" table row count -- see
+// statsPageMaxSessions's own doc comment and capSessionsForDisplay
+// in statsui.go for the full rationale. 0/negative disables the cap
+// entirely (render everything).
+func (s *Server) SetStatsPageMaxSessions(max int) {
+	s.statsPageMaxSessions = max
 }
 
 // SetDebugLogger opts this Server (and every Session it creates) into

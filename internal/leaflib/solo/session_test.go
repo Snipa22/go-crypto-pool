@@ -393,17 +393,28 @@ func TestSessionLoginPushesInitialJob(t *testing.T) {
 	if _, err := hex.DecodeString(resp.Result.Job.XN); err != nil {
 		t.Errorf("xn %q is not valid hex: %v", resp.Result.Job.XN, err)
 	}
-	// Real wire encoding check: target must decode to exactly 8 raw
-	// bytes (a little-endian uint64), matching
-	// go-tari-sha3x-solo-stratum's diffToTarget encoding exactly.
+	// Real wire encoding check: at this test's difficulty (1000 —
+	// far below the 0xFFFFFFFF 4-byte precision floor) the target
+	// must decode to exactly 4 raw bytes (a little-endian uint32),
+	// matching the REAL legacy sxmr wire encoding
+	// (nodejs-pool-sxmr lib/pool.js Miner.getTargetHex:
+	// top 4 bytes of the 32-byte right-aligned (2^256-1)/difficulty,
+	// byte-reversed) that every stock RandomX-family miner client
+	// parses by default. See leaflib.DiffToTargetHex's doc comment
+	// and internal/leaflib/wireutil_target_test.go for the real
+	// bignum-verified equivalence proof; the pre-existing 8-byte
+	// (16-hex-char) encoding now applies only ABOVE that floor.
 	targetBytes, err := hex.DecodeString(resp.Result.Job.Target)
-	if err != nil || len(targetBytes) != 8 {
-		t.Fatalf("target %q must be 8 hex-encoded bytes, got %d bytes, err=%v", resp.Result.Job.Target, len(targetBytes), err)
+	if err != nil || len(targetBytes) != 4 {
+		t.Fatalf("target %q must be 4 hex-encoded bytes, got %d bytes, err=%v", resp.Result.Job.Target, len(targetBytes), err)
 	}
-	gotTarget := binary.LittleEndian.Uint64(targetBytes)
-	wantTarget := uint64(math.MaxUint64) / 1000
+	gotTarget := binary.LittleEndian.Uint32(targetBytes)
+	wantTarget := uint32(math.MaxUint32 / 1000)
 	if gotTarget != wantTarget {
-		t.Errorf("decoded target = %d, want %d (2^64-1 / difficulty=1000)", gotTarget, wantTarget)
+		t.Errorf("decoded target = %d, want %d (2^32-1 / difficulty=1000)", gotTarget, wantTarget)
+	}
+	if got, want := resp.Result.Job.Target, leaflib.DiffToTargetHex(1000); got != want {
+		t.Errorf("target = %q, want %q (DiffToTargetHex(1000))", got, want)
 	}
 	// job_id must be exactly 16 hex characters (first 16 hex chars of
 	// the block hash), matching go-tari-sha3x-solo-stratum exactly.

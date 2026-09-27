@@ -21,6 +21,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	shared "github.com/Snipa22/go-crypto-pool/internal/leaflib/metrics"
 )
 
 // Result label values for shares_total/blocks_total, mirroring the
@@ -54,13 +56,98 @@ const (
 //     TCP reset) — kept as a single bounded fallback bucket rather
 //     than inventing new fixed categories that don't correspond to a
 //     real code path.
+//   - ConnErrorNoShareTimeout: server.go's runNoShareSweep closed the
+//     connection because it never produced a single genuinely
+//     accepted share within the configured -no-share-timeout of
+//     connecting (see Server.SetNoShareTimeout's doc comment).
+//     Deliberately distinct from ConnErrorIdleTimeout: that category
+//     means the connection went fully silent; this one means the
+//     connection stayed genuinely active (e.g. repeated keepalived)
+//     but never once produced a real accepted share. This reuses the
+//     existing ConnectionErrorsTotal metric with a new category
+//     label value rather than adding a new metric — this const
+//     block documents a "small fixed category set" purely as a
+//     documentation/callers convention, not a Prometheus-level closed
+//     enum (the label itself is a plain, open-ended string), so
+//     adding a new value here is not a breaking change for any
+//     existing dashboard.
 const (
 	ConnErrorIdleTimeout    = "idle-timeout"
 	ConnErrorRemoteEOF      = "remote-eof"
 	ConnErrorProtocolError  = "protocol-error"
 	ConnErrorRejectedByGate = "rejected-by-gate"
+	ConnErrorNoShareTimeout = "no-share-timeout"
 	ConnErrorOther          = "other"
 )
+
+// RejectionReason* label leaf_share_rejection_reason_total -- a small,
+// FIXED, closed enum (never the raw free-text s.writeShareResponse
+// error string -- that would be unbounded Prometheus label
+// cardinality) covering every real reject call site in
+// session.go's handleSubmit, found by reading that method in full
+// (see brief_rejection_reasons.md, which motivated this metric from a
+// leaf-direct production incident -- leaf-solo mirrors the fix here
+// since session.go's handleSubmit has the exact same pattern of reject
+// call sites with no per-reason visibility). Each site calls
+// Metrics.IncShareRejectionReason with exactly one of these, via
+// session.go's rejectShare helper -- ADDITIVE to (never replacing) the
+// existing s.writeShareResponse(id, false, ...) call and the
+// recordShare(false) bookkeeping it already does internally. These
+// are the exact same category values internal/leaflib/direct/metrics
+// defines (see that package's own doc comment on each for the full
+// per-category rationale) -- kept identical across both leaf modes so
+// a mixed-fleet dashboard/alert can use one consistent reason label
+// set regardless of which leaf mode reported it. leaf-solo's
+// handleSubmit has no equivalent of leaf-direct's ADDITIONAL
+// real-derived-difficulty-floor recheck (leaf-solo never forwards an
+// ordinary share to a backend at all, so that extra check doesn't
+// exist here -- see solo/session.go's handleSubmit doc comment), but
+// every category below still maps to at least one real leaf-solo call
+// site (RejectionReasonDifficultyFloorMiss covers leaf-solo's own
+// claimed-difficulty floor check instead). Just like leaf-direct,
+// "login required before submit" is deliberately NOT one of these
+// categories: that check rejects via writeGeneralResponse (not
+// writeShareResponse) before submit params are even parsed, so it
+// never touches leaf_shares_total{result="rejected"} at all.
+const (
+	RejectionReasonStaleOrUnknownJob                = "stale_or_unknown_job"
+	RejectionReasonJobExpired                       = "job_expired"
+	RejectionReasonBannedAddress                    = "banned_address"
+	RejectionReasonInvalidXNonce                    = "invalid_xnonce"
+	RejectionReasonMalformedNonce                   = "malformed_nonce"
+	RejectionReasonInvalidPowShape                  = "invalid_pow_shape"
+	RejectionReasonDuplicateNonce                   = "duplicate_nonce"
+	RejectionReasonMissingClaimedResult             = "missing_claimed_result"
+	RejectionReasonDifficultyFloorMiss              = "difficulty_floor_miss"
+	RejectionReasonClaimedDifficultyOrCryptoInvalid = "claimed_difficulty_or_crypto_invalid"
+	RejectionReasonMalformedSubmitRequest           = "malformed_submit_request"
+	RejectionReasonBlockSubmitFailed                = "block_submit_failed"
+	RejectionReasonPoolSaturated                    = "pool_saturated"
+	RejectionReasonInternalError                    = "internal_error"
+	RejectionReasonOther                            = "other"
+)
+
+// AllRejectionReasons is the full, closed enumeration of every
+// RejectionReason* const above, in the order declared -- mirrors
+// internal/leaflib/direct/metrics's identical AllRejectionReasons
+// exactly (see that package's own doc comment).
+var AllRejectionReasons = []string{
+	RejectionReasonStaleOrUnknownJob,
+	RejectionReasonJobExpired,
+	RejectionReasonBannedAddress,
+	RejectionReasonInvalidXNonce,
+	RejectionReasonMalformedNonce,
+	RejectionReasonInvalidPowShape,
+	RejectionReasonDuplicateNonce,
+	RejectionReasonMissingClaimedResult,
+	RejectionReasonDifficultyFloorMiss,
+	RejectionReasonClaimedDifficultyOrCryptoInvalid,
+	RejectionReasonMalformedSubmitRequest,
+	RejectionReasonBlockSubmitFailed,
+	RejectionReasonPoolSaturated,
+	RejectionReasonInternalError,
+	RejectionReasonOther,
+}
 
 // OtherAddressLabel is the bucket every address beyond the configured
 // cardinality cap (see CapAddressCounts) is aggregated into, on both
@@ -173,7 +260,33 @@ type Metrics struct {
 	// degraded to omitted rather than potentially-corrupt.
 	XNPReservationUnavailableTotal prometheus.Counter
 
+	// ShareRejectionReasonTotal is the real, per-category breakdown
+	// of the "rejected" side of SharesTotal (leaf_shares_total
+	// {result="rejected"}) -- labeled by reason (see the
+	// RejectionReason* consts above). Mirrors
+	// internal/leaflib/direct/metrics's identical
+	// ShareRejectionReasonTotal exactly -- ADDITIVE to (never
+	// replacing) SharesTotal's own existing accepted/rejected split,
+	// which is completely unchanged.
+	ShareRejectionReasonTotal *prometheus.CounterVec
+
 	BuildInfo *prometheus.GaugeVec
+
+	// sharesRate/blocksRate/rejectionReasonRate back
+	// leaf_shares_per_second/leaf_blocks_per_second/
+	// leaf_share_rejection_reason_per_second (see Collect) -- a
+	// 60s-rolling-window per-second rate of SharesTotal/BlocksTotal/
+	// ShareRejectionReasonTotal, additive to those counters (which
+	// remain completely unchanged). One shared.RateTracker per label
+	// combination, created lazily by
+	// IncShareResult/IncBlockResult/IncShareRejectionReason below at
+	// the exact same real accept/reject/rejection-reason branch
+	// points server.go's recordShare/recordBlock/
+	// recordShareRejectionReason already call. Mirrors
+	// internal/leaflib/direct/metrics's identical fields exactly.
+	sharesRate          *shared.LabeledRateTrackers
+	blocksRate          *shared.LabeledRateTrackers
+	rejectionReasonRate *shared.LabeledRateTrackers
 
 	maxAddressLabels int
 	snapshot         SnapshotFunc
@@ -213,11 +326,20 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Help: "Total number of Monero get_block_template responses whose real reserved_offset did not fit within the returned blocktemplate_blob, causing the XNP-proxy-shape job fields (reserved_offset/client_nonce_offset/client_pool_offset/blocktemplate_blob) to be omitted for that job rather than published out-of-bounds.",
 	})
 
+	m.ShareRejectionReasonTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "leaf_share_rejection_reason_total",
+		Help: "Real, per-category breakdown of the 'rejected' side of leaf_shares_total, by reason (see this package's RejectionReason* consts for the full, closed enum and the exact handleSubmit call site each one maps to). Additive to leaf_shares_total's own accepted/rejected split, which remains completely unchanged.",
+	}, []string{"reason"})
+
 	m.BuildInfo = registerGaugeVec(reg, prometheus.GaugeOpts{
 		Name: "leaf_solo_build_info",
 		Help: "Always 1; version label carries the running build's version string.",
 	}, []string{"version"})
 	m.BuildInfo.WithLabelValues(version).Set(1)
+
+	m.sharesRate = shared.NewLabeledRateTrackers()
+	m.blocksRate = shared.NewLabeledRateTrackers()
+	m.rejectionReasonRate = shared.NewLabeledRateTrackers()
 
 	// m itself implements prometheus.Collector for the
 	// snapshot-derived metrics (active connections, unique remote
@@ -256,6 +378,54 @@ func (m *Metrics) SetAsyncPoolSource(fn AsyncPoolStatsFunc) {
 // scoped to this Metrics' private registry.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// IncShareResult increments SharesTotal for result (see
+// resultLabel-style accepted/rejected values) AND records the same
+// increment for that result's rolling-window per-second rate
+// (leaf_shares_per_second, see Collect) -- callers (server.go's
+// recordShare) must call this INSTEAD OF touching SharesTotal
+// directly, so the two never drift out of lockstep. Mirrors
+// internal/leaflib/direct/metrics's identical method exactly.
+func (m *Metrics) IncShareResult(result string) {
+	m.SharesTotal.WithLabelValues(result).Inc()
+	m.sharesRate.Inc(result)
+}
+
+// IncBlockResult is IncShareResult's BlocksTotal/
+// leaf_blocks_per_second analogue.
+func (m *Metrics) IncBlockResult(result string) {
+	m.BlocksTotal.WithLabelValues(result).Inc()
+	m.blocksRate.Inc(result)
+}
+
+// IncShareRejectionReason is IncShareResult's ShareRejectionReasonTotal/
+// leaf_share_rejection_reason_per_second analogue -- callers
+// (server.go's recordShareRejectionReason, itself called from
+// session.go's rejectShare helper at every real reject call site)
+// must call this INSTEAD OF touching ShareRejectionReasonTotal
+// directly, so the two never drift out of lockstep. Mirrors
+// internal/leaflib/direct/metrics's identical method exactly.
+func (m *Metrics) IncShareRejectionReason(reason string) {
+	m.ShareRejectionReasonTotal.WithLabelValues(reason).Inc()
+	m.rejectionReasonRate.Inc(reason)
+}
+
+// Stop releases the background ticker goroutines backing
+// sharesRate/blocksRate/rejectionReasonRate's lazily-created
+// shared.RateTracker instances (see shared.RateTracker.Stop's own
+// doc comment -- safe to call even if some/all label combinations
+// were never incremented). Callers (server.go's Shutdown) should
+// call this from the owning Server's own shutdown path; a Metrics
+// never explicitly Stop()'d simply keeps its trackers' goroutines
+// alive for the process lifetime, which is fine for the normal
+// one-Metrics-per-process production case (mirrors
+// solo.AsyncValidationPool.Stop's identical "optional for a
+// process-lifetime singleton" convention).
+func (m *Metrics) Stop() {
+	m.sharesRate.Stop()
+	m.blocksRate.Stop()
+	m.rejectionReasonRate.Stop()
 }
 
 // --- snapshot-derived metrics (recomputed on every scrape) ---
@@ -344,6 +514,31 @@ var (
 		"Total number of Submit calls to the shared AsyncValidationPool that could not take the fast, non-blocking path (queue full and every worker busy) -- the real saturation signal for Finding 2's bounded-queue/NumCPU-workers fix.",
 		nil, nil,
 	)
+
+	// *PerSecondDesc: additive 60s-rolling-window per-second rate
+	// gauges (see shared.RateTracker) mirroring their corresponding
+	// _total counter's exact label set -- SharesTotal/BlocksTotal
+	// remain completely unchanged; some dashboards/alerting may
+	// already correctly apply rate()/irate() against them. Mirrors
+	// internal/leaflib/direct/metrics's identical Desc vars exactly
+	// (leaf_shares_per_second/leaf_blocks_per_second, not
+	// leaf_direct_*, matching SharesTotal/BlocksTotal's own
+	// leaf-solo-specific naming above).
+	sharesPerSecondDesc = prometheus.NewDesc(
+		"leaf_shares_per_second",
+		"Real, leaf-computed 60-second-rolling-window per-second rate of leaf_shares_total, by result (accepted/rejected) -- computed directly by this leaf (see shared.RateTracker) rather than relying on a dashboard panel applying rate()/irate() against the _total counter itself.",
+		[]string{"result"}, nil,
+	)
+	blocksPerSecondDesc = prometheus.NewDesc(
+		"leaf_blocks_per_second",
+		"Real, leaf-computed 60-second-rolling-window per-second rate of leaf_blocks_total, by result (accepted/rejected).",
+		[]string{"result"}, nil,
+	)
+	rejectionReasonPerSecondDesc = prometheus.NewDesc(
+		"leaf_share_rejection_reason_per_second",
+		"Real, leaf-computed 60-second-rolling-window per-second rate of leaf_share_rejection_reason_total, by reason (see the RejectionReason* consts for the full, closed enum).",
+		[]string{"reason"}, nil,
+	)
 )
 
 // vardiffDifficultyBuckets covers LEAF_SOLO_MIN_DIFFICULTY..
@@ -415,6 +610,16 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(asyncPoolQueueDepthDesc, prometheus.GaugeValue, float64(stats.QueueDepth))
 		ch <- prometheus.MustNewConstMetric(asyncPoolInFlightWorkersDesc, prometheus.GaugeValue, float64(stats.InFlightWorkers))
 		ch <- prometheus.MustNewConstMetric(asyncPoolSubmitBlockedTotalDesc, prometheus.CounterValue, float64(stats.SubmitBlockedTotal))
+	}
+
+	ch <- prometheus.MustNewConstMetric(sharesPerSecondDesc, prometheus.GaugeValue, m.sharesRate.Rate(ResultAccepted), ResultAccepted)
+	ch <- prometheus.MustNewConstMetric(sharesPerSecondDesc, prometheus.GaugeValue, m.sharesRate.Rate(ResultRejected), ResultRejected)
+
+	ch <- prometheus.MustNewConstMetric(blocksPerSecondDesc, prometheus.GaugeValue, m.blocksRate.Rate(ResultAccepted), ResultAccepted)
+	ch <- prometheus.MustNewConstMetric(blocksPerSecondDesc, prometheus.GaugeValue, m.blocksRate.Rate(ResultRejected), ResultRejected)
+
+	for _, reason := range AllRejectionReasons {
+		ch <- prometheus.MustNewConstMetric(rejectionReasonPerSecondDesc, prometheus.GaugeValue, m.rejectionReasonRate.Rate(reason), reason)
 	}
 }
 

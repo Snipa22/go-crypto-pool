@@ -164,6 +164,12 @@ type config struct {
 	invalidShareDisconnectEnabled   bool
 	invalidShareDisconnectThreshold int
 
+	// randomxQueueSize mirrors cmd/leaf-solo's own identical field
+	// exactly -- see that file's doc comment for the full rationale
+	// (DefaultAsyncValidationQueueSize's own doc comment in
+	// internal/leaflib/solo/asyncvalidation.go).
+	randomxQueueSize int
+
 	// poolDiffCapEnabled is -pool-diff-cap-enabled/
 	// LEAF_PROXY_POOL_DIFF_CAP_ENABLED: toggles the login-time
 	// pool-target-diff cap added by commit 46a6e2c (none of the
@@ -190,6 +196,14 @@ type config struct {
 	// binary unchanged, just with the LEAF_PROXY_ prefix.
 	metricsListenAddress string
 	maxAddressLabels     int
+
+	// statsPageMaxSessions is this feature's own
+	// -stats-page-max-sessions/LEAF_PROXY_STATS_PAGE_MAX_SESSIONS
+	// flag (see its flag.IntVar registration below and
+	// proxy.Server.SetStatsPageMaxSessions's doc comment for the
+	// full rationale). 0/negative disables the cap entirely,
+	// mirroring this codebase's zero-disables convention.
+	statsPageMaxSessions int
 
 	// hideRemoteAddress mirrors cmd/leaf-solo's identical flag
 	// exactly (see solo.Server.SetHideRemoteAddress's doc comment
@@ -313,6 +327,7 @@ func loadConfig() (config, error) {
 	flag.DurationVar(&cfg.requestTimeout, "upstream-request-timeout", envOrDuration("LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT", 15*time.Second), "timeout for a single upstream request/response round-trip. Env: LEAF_PROXY_UPSTREAM_REQUEST_TIMEOUT")
 
 	flag.IntVar(&cfg.randomxWorkers, "randomx-workers", envOrInt("LEAF_PROXY_RANDOMX_WORKERS", 0), "RandomX async validation worker pool size (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, runtime.NumCPU() -- NOT a hardcoded literal. Env: LEAF_PROXY_RANDOMX_WORKERS")
+	flag.IntVar(&cfg.randomxQueueSize, "randomx-queue-size", envOrInt("LEAF_PROXY_RANDOMX_QUEUE_SIZE", 0), "RandomX async validation pool's bounded queue capacity (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented default, max(256, randomx-workers*16) -- NOT a hardcoded flat literal. Env: LEAF_PROXY_RANDOMX_QUEUE_SIZE")
 	flag.BoolVar(&cfg.invalidShareDisconnectEnabled, "invalid-share-disconnect-enabled", envOr("LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED", "true") == "true", "disconnect a downstream session after too many CONSECUTIVE real RandomX validation failures (see internal/leaflib.InvalidShareGuard) -- a security-hardening default, enabled unless explicitly turned off. Env: LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED (\"false\" to disable)")
 	flag.IntVar(&cfg.invalidShareDisconnectThreshold, "invalid-share-disconnect-threshold", envOrInt("LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD", 0), "consecutive-invalid-share threshold before a downstream session is disconnected (see -invalid-share-disconnect-enabled). 0/unset uses the documented default (20). Env: LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD")
 
@@ -321,6 +336,7 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.metricsListenAddress, "metrics-listen-address", envOr("LEAF_PROXY_METRICS_LISTEN_ADDRESS", "127.0.0.1:9601"), "HTTP listen address for /metrics (Prometheus) and the stats page. Separate from -listen-address (the downstream-facing stratum port). Defaults to loopback-only (127.0.0.1) -- an operator must explicitly set this to a wildcard/public address to expose stats/metrics publicly. Set to empty string to disable. Env: LEAF_PROXY_METRICS_LISTEN_ADDRESS")
 	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOrBool("LEAF_PROXY_HIDE_REMOTE_ADDRESS", false), "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_PROXY_HIDE_REMOTE_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_PROXY_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_PROXY_MAX_ADDRESS_LABELS")
+	flag.IntVar(&cfg.statsPageMaxSessions, "stats-page-max-sessions", envOrInt("LEAF_PROXY_STATS_PAGE_MAX_SESSIONS", proxy.DefaultStatsPageMaxSessions), "cap on how many session rows the stats HTML page's \"Connected sessions\" table renders (the separate \"Active connections\" summary count is always accurate/uncapped). 0 or negative disables the cap entirely (render every session). Env: LEAF_PROXY_STATS_PAGE_MAX_SESSIONS")
 
 	flag.StringVar(&cfg.addressFlagsFile, "address-flags-file", envOr("LEAF_PROXY_ADDRESS_FLAGS_FILE", ""), "path to a local, operator-maintained JSON file of manually banned payment addresses (see internal/leaflib/addressflags.FileSource's doc comment for the file format). Empty (default) disables the feature entirely -- leaf-proxy has no go-crypto-pool backend to poll instead. Env: LEAF_PROXY_ADDRESS_FLAGS_FILE")
 	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_PROXY_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often -address-flags-file is re-read. Ignored if -address-flags-file is unset. Env: LEAF_PROXY_ADDRESS_FLAGS_POLL_INTERVAL")
@@ -394,6 +410,7 @@ type fileConfig struct {
 	RequestTimeoutSeconds *int `toml:"upstream_request_timeout_seconds"`
 
 	RandomXWorkers                  *int  `toml:"randomx_workers"`
+	RandomXQueueSize                *int  `toml:"randomx_queue_size"`
 	InvalidShareDisconnectEnabled   *bool `toml:"invalid_share_disconnect_enabled"`
 	InvalidShareDisconnectThreshold *int  `toml:"invalid_share_disconnect_threshold"`
 
@@ -401,6 +418,7 @@ type fileConfig struct {
 
 	MetricsListenAddress *string `toml:"metrics_listen_address"`
 	MaxAddressLabels     *int    `toml:"max_address_labels"`
+	StatsPageMaxSessions *int    `toml:"stats_page_max_sessions"`
 	HideRemoteAddress    *bool   `toml:"hide_remote_address"`
 
 	AddressFlagsFile                *string `toml:"address_flags_file"`
@@ -471,6 +489,7 @@ func applyConfigFile(cfg *config) error {
 	}
 
 	cfgfile.ApplyInt(&cfg.randomxWorkers, fc.RandomXWorkers, visited, "randomx-workers", "LEAF_PROXY_RANDOMX_WORKERS")
+	cfgfile.ApplyInt(&cfg.randomxQueueSize, fc.RandomXQueueSize, visited, "randomx-queue-size", "LEAF_PROXY_RANDOMX_QUEUE_SIZE")
 	cfgfile.ApplyBool(&cfg.invalidShareDisconnectEnabled, fc.InvalidShareDisconnectEnabled, visited, "invalid-share-disconnect-enabled", "LEAF_PROXY_INVALID_SHARE_DISCONNECT_ENABLED")
 	cfgfile.ApplyInt(&cfg.invalidShareDisconnectThreshold, fc.InvalidShareDisconnectThreshold, visited, "invalid-share-disconnect-threshold", "LEAF_PROXY_INVALID_SHARE_DISCONNECT_THRESHOLD")
 
@@ -478,6 +497,7 @@ func applyConfigFile(cfg *config) error {
 
 	cfgfile.ApplyString(&cfg.metricsListenAddress, fc.MetricsListenAddress, visited, "metrics-listen-address", "LEAF_PROXY_METRICS_LISTEN_ADDRESS")
 	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_PROXY_MAX_ADDRESS_LABELS")
+	cfgfile.ApplyInt(&cfg.statsPageMaxSessions, fc.StatsPageMaxSessions, visited, "stats-page-max-sessions", "LEAF_PROXY_STATS_PAGE_MAX_SESSIONS")
 	cfgfile.ApplyBool(&cfg.hideRemoteAddress, fc.HideRemoteAddress, visited, "hide-remote-address", "LEAF_PROXY_HIDE_REMOTE_ADDRESS")
 
 	cfgfile.ApplyString(&cfg.addressFlagsFile, fc.AddressFlagsFile, visited, "address-flags-file", "LEAF_PROXY_ADDRESS_FLAGS_FILE")
@@ -774,10 +794,15 @@ func main() {
 	// count is runtime.NumCPU() by DEFAULT (proxy.NewServer's own
 	// construction already applies this), not a hardcoded literal 8;
 	// an operator who wants a different fixed count can still get one
-	// via -randomx-workers.
-	if cfg.randomxWorkers > 0 {
-		server.SetRandomXWorkerPoolSize(cfg.randomxWorkers, 0)
-		logger.Printf("RandomX async validation worker pool size overridden to %d (default would have been runtime.NumCPU()=%d)", cfg.randomxWorkers, runtime.NumCPU())
+	// via -randomx-workers. Queue size DEFAULTS to
+	// solo.DefaultAsyncValidationQueueSize(workers) (max(256,
+	// workers*16)) -- scales with the pool's own real worker count
+	// instead of the old flat 256 literal; an operator who wants a
+	// different fixed queue size can still get one via
+	// -randomx-queue-size.
+	if cfg.randomxWorkers > 0 || cfg.randomxQueueSize > 0 {
+		server.SetRandomXWorkerPoolSize(cfg.randomxWorkers, cfg.randomxQueueSize)
+		logger.Printf("RandomX async validation worker pool size overridden to %d (default would have been runtime.NumCPU()=%d), queue size overridden to %d (0 means the documented default, max(256, workers*16), is in effect)", cfg.randomxWorkers, runtime.NumCPU(), cfg.randomxQueueSize)
 	}
 
 	// HARDENING FIX (DISPATCH_BRIEF.md, 2026-09-10, Fix 2b): disconnect
@@ -826,6 +851,7 @@ func main() {
 	// flag/env prefix and leaf-proxy's own metrics.Metrics type.
 	if cfg.metricsListenAddress != "" {
 		server.SetHideRemoteAddress(cfg.hideRemoteAddress)
+		server.SetStatsPageMaxSessions(cfg.statsPageMaxSessions)
 		server.EnableMetrics(version, cfg.maxAddressLabels)
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", server.MetricsHandler())
