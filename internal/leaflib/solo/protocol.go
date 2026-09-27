@@ -222,6 +222,15 @@ type SubmitRequest struct {
 // ever populated for ALGO_RXM and ALGO_RXT jobs on an XNP-proxy-
 // detected session; every other algo/session combination leaves all
 // four nil.
+//
+// XNP-PROXY SHAPE, DIFFICULTY HALF (Difficulty/TargetDiff/
+// TargetDiffHex): the same real proxy-class job shape also carries the
+// difficulty under its own key names instead of a bare "target" —
+// their absence here caused a real, confirmed "job difficulty of 1"
+// production incident. Same pointer/omitempty/additive convention as
+// the four offset fields; see those three fields' own doc comment
+// below for the full legacy source citation, the affected client's
+// exact fallback-to-1 code path, and the value each one carries.
 type JobPayload struct {
 	Algo     string `json:"algo"`
 	Blob     string `json:"blob"`
@@ -275,6 +284,89 @@ type JobPayload struct {
 	// rationale as ReservedOffset above — there is no real reserved
 	// coinbase area for RXT to report an offset within.
 	ClientPoolOffset *int `json:"client_pool_offset,omitempty"`
+
+	// Difficulty, TargetDiff, and TargetDiffHex are the difficulty half
+	// of the SAME real XNP-proxy job shape as the four offset fields
+	// above, and their absence was the confirmed, mechanical root cause
+	// of a real production incident: a MoneroOcean-fork
+	// xmr-node-proxy user reported "getting a job difficulty of 1" from
+	// this leaf.
+	//
+	// The real legacy reference's proxy-class cachedJob (nodejs-pool-
+	// sxmr lib/pool.js, Miner.getJob ~654-736 — the exact shape put on
+	// the wire to an XNP-class client) carries NO bare "target" key at
+	// all; it uses these three instead:
+	//
+	//	this.cachedJob = {
+	//	    blocktemplate_blob:  blob,
+	//	    difficulty:          activeBlockTemplate.difficulty,
+	//	    height:              activeBlockTemplate.height,
+	//	    reserved_offset:     activeBlockTemplate.reserveOffset,
+	//	    client_nonce_offset: activeBlockTemplate.clientNonceLocation,
+	//	    client_pool_offset:  activeBlockTemplate.clientPoolLocation,
+	//	    seed_hash:           ...,
+	//	    target_diff:         this.difficulty,
+	//	    target_diff_hex:     this.diffHex,
+	//	    job_id:              newJob.id,
+	//	    id:                  this.id,
+	//	    blockHash:           activeBlockTemplate.idHash
+	//	};
+	//
+	// and every xmr-node-proxy-family client reads exactly those keys,
+	// never a bare "target", for a proxy-class upstream connection:
+	// the original Snipa22/xmr-node-proxy's lib/xmr.js and the affected
+	// user's MoneroOcean/xmr-node-proxy fork's coins/template.js
+	// (MasterBlockTemplate ctor) both take template.target_diff /
+	// template.difficulty directly. This repo's OWN leaf-proxy is that
+	// same class of client on the other end of this same hop and does
+	// the identical thing — see proxy/protocol.go's UpstreamJobPayload
+	// (`Difficulty uint64 \`json:"difficulty"\``, `TargetDiff uint64
+	// \`json:"target_diff"\``, `TargetDiffHex string
+	// \`json:"target_diff_hex,omitempty"\``), ported field-for-field
+	// from lib/xmr.js.
+	//
+	// The MoneroOcean fork's own normalizeDifficulty helper is where
+	// the incident's "1" came from:
+	//
+	//	function normalizeDifficulty(value, fallback = 1) {
+	//	    const numericValue = Number(value);
+	//	    if (Number.isFinite(numericValue) && numericValue > 0) return Math.max(1, Math.floor(numericValue));
+	//	    const fallbackValue = Number(fallback);
+	//	    if (Number.isFinite(fallbackValue) && fallbackValue > 0) return Math.max(1, Math.floor(fallbackValue));
+	//	    return 1;
+	//	}
+	//
+	// called as normalizeDifficulty(template.target_diff,
+	// this.difficulty) where this.difficulty itself came from
+	// normalizeDifficulty(template.difficulty). With neither key ever
+	// emitted, BOTH calls got undefined and fell through to the final
+	// hardcoded `return 1`.
+	//
+	// Values (see session.go's jobPayload, both here and in
+	// internal/leaflib/direct):
+	//   - Difficulty and TargetDiff are BOTH the session's own real,
+	//     current stamped difficulty (job.StaticDifficulty) — the same
+	//     value Target above is derived from. Legacy itself sends one
+	//     plain numeric difficulty under two different keys
+	//     (`target_diff: this.difficulty`), so these deliberately carry
+	//     the identical value rather than two separately-computed ones.
+	//   - TargetDiffHex is the byte-for-byte SAME hex string already
+	//     computed for Target on the SAME job (legacy:
+	//     `target_diff_hex: this.diffHex`, and this.diffHex is the
+	//     identical value this.getTargetHex() produces for `target`
+	//     too) — two wire key names for one encoding, NOT two different
+	//     width/endianness encodings.
+	//
+	// Pointer-typed with omitempty on the SAME convention as the four
+	// offset fields above: nil, and provably absent from the marshaled
+	// wire JSON, for every non-XNP-proxy session (see
+	// protocol_xnp_test.go's real byte-diff non-regression tests). And
+	// like those four, these are strictly ADDITIVE — Target is left
+	// completely unchanged and always present, since ordinary
+	// xmrig-class clients still need it.
+	Difficulty    *uint64 `json:"difficulty,omitempty"`
+	TargetDiff    *uint64 `json:"target_diff,omitempty"`
+	TargetDiffHex *string `json:"target_diff_hex,omitempty"`
 }
 
 // xnpProxyAgentSubstring is the exact, case-sensitive substring real

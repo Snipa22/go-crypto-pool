@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"math"
+	"strconv"
 	"testing"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
@@ -14,14 +16,16 @@ import (
 // legacyJobPayload captures the EXACT JobPayload wire shape as it
 // existed immediately BEFORE this XNP-proxy-detection fix (i.e.
 // protocol.go's JobPayload with no BlocktemplateBlob/ReservedOffset/
-// ClientNonceOffset/ClientPoolOffset fields at all) — used below as an
-// independent, byte-for-byte non-regression oracle: for any
-// non-proxy-detected session, marshaling the SAME real field values
-// through this frozen pre-change shape and through the real
-// (post-change) JobPayload must produce byte-identical JSON. If the
-// fix ever leaked one of the four new fields onto a non-proxy job's
-// wire output, this comparison would fail (the real JobPayload's JSON
-// would carry an extra key the legacy shape never could).
+// ClientNonceOffset/ClientPoolOffset fields at all — nor the later
+// Difficulty/TargetDiff/TargetDiffHex difficulty half of the same
+// shape) — used below as an independent, byte-for-byte non-regression
+// oracle: for any non-proxy-detected session, marshaling the SAME real
+// field values through this frozen pre-change shape and through the
+// real (post-change) JobPayload must produce byte-identical JSON. If
+// the fix ever leaked one of the seven new fields onto a non-proxy
+// job's wire output, this comparison would fail (the real
+// JobPayload's JSON would carry an extra key the legacy shape never
+// could).
 type legacyJobPayload struct {
 	Algo     string `json:"algo"`
 	Blob     string `json:"blob"`
@@ -33,9 +37,10 @@ type legacyJobPayload struct {
 }
 
 // asLegacy projects a real JobPayload's already-existing (pre-fix)
-// fields onto legacyJobPayload, deliberately dropping the four new
-// pointer fields — the point of the comparison is exactly that
-// dropping them changes nothing for a non-proxy job.
+// fields onto legacyJobPayload, deliberately dropping the seven new
+// pointer fields (four offset + three difficulty) — the point of the
+// comparison is exactly that dropping them changes nothing for a
+// non-proxy job.
 func asLegacy(p JobPayload) legacyJobPayload {
 	return legacyJobPayload{
 		Algo:     p.Algo,
@@ -45,6 +50,108 @@ func asLegacy(p JobPayload) legacyJobPayload {
 		Target:   p.Target,
 		XN:       p.XN,
 		SeedHash: p.SeedHash,
+	}
+}
+
+// legacyJobPayloadWithDifficulty is legacyJobPayload PLUS only the
+// three difficulty fields this pass added (difficulty/target_diff/
+// target_diff_hex), in the same relative order the real JobPayload
+// declares them. It exists for exactly one test —
+// TestJobPayloadXNPReservationUnavailableRXM — whose property under
+// test is that a ReservedOffsetUsable=false job omits the FOUR OFFSET
+// fields from the wire even for a detected XNP-proxy agent. That test
+// proves it the same way it always has (a real marshaled-JSON
+// byte-diff against a projection that drops the fields in question),
+// just with the difficulty half retained, because the difficulty half
+// is deliberately NOT gated on the reserved-offset bounds check — see
+// session.go's jobPayload and protocol.go's Difficulty doc comment: an
+// XNP-proxy client whose template fails that bounds check still must
+// not be told its difficulty is 1.
+type legacyJobPayloadWithDifficulty struct {
+	Algo          string  `json:"algo"`
+	Blob          string  `json:"blob"`
+	Height        uint64  `json:"height"`
+	JobID         string  `json:"job_id"`
+	Target        string  `json:"target"`
+	XN            string  `json:"xn,omitempty"`
+	SeedHash      string  `json:"seed_hash,omitempty"`
+	Difficulty    *uint64 `json:"difficulty,omitempty"`
+	TargetDiff    *uint64 `json:"target_diff,omitempty"`
+	TargetDiffHex *string `json:"target_diff_hex,omitempty"`
+}
+
+func asLegacyWithDifficulty(p JobPayload) legacyJobPayloadWithDifficulty {
+	return legacyJobPayloadWithDifficulty{
+		Algo:          p.Algo,
+		Blob:          p.Blob,
+		Height:        p.Height,
+		JobID:         p.JobID,
+		Target:        p.Target,
+		XN:            p.XN,
+		SeedHash:      p.SeedHash,
+		Difficulty:    p.Difficulty,
+		TargetDiff:    p.TargetDiff,
+		TargetDiffHex: p.TargetDiffHex,
+	}
+}
+
+// assertNoDifficultyKeysOnWire asserts that NONE of the three
+// difficulty keys this pass added appears in payload's marshaled JSON
+// — the required "absent from the wire, not merely nil in Go"
+// assertion for every non-XNP-proxy session (see the task brief).
+// Checked against the real decoded key set rather than by substring
+// search, so it cannot be fooled by a key name appearing inside a hex
+// blob value.
+func assertNoDifficultyKeysOnWire(t *testing.T, payload JobPayload) {
+	t.Helper()
+	if payload.Difficulty != nil || payload.TargetDiff != nil || payload.TargetDiffHex != nil {
+		t.Fatalf("non-proxy job payload has a non-nil XNP difficulty field, want all three nil: difficulty=%v target_diff=%v target_diff_hex=%v",
+			payload.Difficulty, payload.TargetDiff, payload.TargetDiffHex)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal JobPayload: %v", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("unmarshal marshaled JobPayload into a key map: %v", err)
+	}
+	for _, key := range []string{"difficulty", "target_diff", "target_diff_hex"} {
+		if _, present := keys[key]; present {
+			t.Errorf("marshaled non-proxy job JSON carries key %q, want it absent (omitempty): %s", key, raw)
+		}
+	}
+}
+
+// assertXNPDifficultyFields asserts the required post-fix invariants
+// for an XNP-proxy-detected session's job payload: all three
+// difficulty fields non-nil, Difficulty == TargetDiff ==
+// job.StaticDifficulty, and TargetDiffHex byte-identical to the job's
+// own Target field (legacy's `target_diff_hex: this.diffHex` is the
+// SAME value its `target` would carry — see protocol.go's doc
+// comment; not a different width/endianness encoding).
+func assertXNPDifficultyFields(t *testing.T, got JobPayload, wantDifficulty uint64) {
+	t.Helper()
+	if got.Difficulty == nil {
+		t.Fatalf("Difficulty is nil, want a pointer to %d -- this is the exact field whose absence made a real MoneroOcean-fork xmr-node-proxy fall back to difficulty 1", wantDifficulty)
+	}
+	if *got.Difficulty != wantDifficulty {
+		t.Errorf("Difficulty = %d, want %d (job.StaticDifficulty)", *got.Difficulty, wantDifficulty)
+	}
+	if got.TargetDiff == nil {
+		t.Fatalf("TargetDiff is nil, want a pointer to %d (legacy: `target_diff: this.difficulty`)", wantDifficulty)
+	}
+	if *got.TargetDiff != wantDifficulty {
+		t.Errorf("TargetDiff = %d, want %d (the SAME plain numeric value as Difficulty)", *got.TargetDiff, wantDifficulty)
+	}
+	if *got.TargetDiff != *got.Difficulty {
+		t.Errorf("TargetDiff (%d) != Difficulty (%d): legacy sends one plain numeric difficulty under both keys", *got.TargetDiff, *got.Difficulty)
+	}
+	if got.TargetDiffHex == nil {
+		t.Fatalf("TargetDiffHex is nil, want the SAME hex string as Target (%q)", got.Target)
+	}
+	if *got.TargetDiffHex != got.Target {
+		t.Errorf("TargetDiffHex = %q, want it byte-identical to Target %q (legacy's this.diffHex IS what its `target` carries)", *got.TargetDiffHex, got.Target)
 	}
 }
 
@@ -116,6 +223,7 @@ func TestJobPayloadXNPNonRegressionRXM(t *testing.T) {
 	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
 		t.Fatalf("non-proxy RXM job payload has a non-nil XNP field, want all four nil: %+v", got)
 	}
+	assertNoDifficultyKeysOnWire(t, got)
 
 	gotJSON, err := json.Marshal(got)
 	if err != nil {
@@ -142,6 +250,7 @@ func TestJobPayloadXNPNonRegressionRXT(t *testing.T) {
 	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
 		t.Fatalf("non-proxy RXT job payload has a non-nil XNP field, want all four nil: %+v", got)
 	}
+	assertNoDifficultyKeysOnWire(t, got)
 
 	gotJSON, err := json.Marshal(got)
 	if err != nil {
@@ -167,6 +276,7 @@ func TestJobPayloadXNPNonRegressionNoAgent(t *testing.T) {
 	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
 		t.Fatalf("empty-agent RXM job payload has a non-nil XNP field, want all four nil: %+v", got)
 	}
+	assertNoDifficultyKeysOnWire(t, got)
 	gotJSON, _ := json.Marshal(got)
 	legacyJSON, _ := json.Marshal(asLegacy(got))
 	if !bytes.Equal(gotJSON, legacyJSON) {
@@ -233,8 +343,16 @@ func TestJobPayloadXNPProxyShapeRXM(t *testing.T) {
 		t.Errorf("SeedHash = %q, want %q", got.SeedHash, hex.EncodeToString(job.VmKey))
 	}
 
-	t.Logf("RXM proxy-shape OK — reserved_offset=%d client_nonce_offset=%d (want %d) client_pool_offset=%d (want %d) blocktemplate_blob_len=%d",
-		*got.ReservedOffset, *got.ClientNonceOffset, reservedOffset+12, *got.ClientPoolOffset, reservedOffset+8, len(*got.BlocktemplateBlob))
+	// DIFFICULTY HALF of the same real proxy-class job shape (the
+	// "difficulty 1" incident fix): difficulty/target_diff/
+	// target_diff_hex must all be present, with both numeric keys
+	// carrying job.StaticDifficulty and target_diff_hex byte-identical
+	// to target.
+	assertXNPDifficultyFields(t, got, job.StaticDifficulty)
+
+	t.Logf("RXM proxy-shape OK — reserved_offset=%d client_nonce_offset=%d (want %d) client_pool_offset=%d (want %d) blocktemplate_blob_len=%d difficulty=%d target_diff=%d target_diff_hex=%s",
+		*got.ReservedOffset, *got.ClientNonceOffset, reservedOffset+12, *got.ClientPoolOffset, reservedOffset+8, len(*got.BlocktemplateBlob),
+		*got.Difficulty, *got.TargetDiff, *got.TargetDiffHex)
 }
 
 // TestJobPayloadXNPProxyShapeRXT is the required proxy-detection+shape
@@ -267,9 +385,10 @@ func TestJobPayloadXNPProxyShapeRXT(t *testing.T) {
 	if *got.BlocktemplateBlob != got.Blob {
 		t.Errorf("BlocktemplateBlob = %q, want it identical to Blob %q (RXT has no raw-template/hashing-blob distinction)", *got.BlocktemplateBlob, got.Blob)
 	}
+	assertXNPDifficultyFields(t, got, job.StaticDifficulty)
 
-	t.Logf("RXT proxy-shape OK — client_nonce_offset=%d (want %d), reserved_offset=nil, client_pool_offset=nil, blocktemplate_blob==blob (%d hex chars)",
-		*got.ClientNonceOffset, rxtXmrigNonceOffset, len(*got.BlocktemplateBlob))
+	t.Logf("RXT proxy-shape OK — client_nonce_offset=%d (want %d), reserved_offset=nil, client_pool_offset=nil, blocktemplate_blob==blob (%d hex chars), difficulty=%d target_diff=%d target_diff_hex=%s",
+		*got.ClientNonceOffset, rxtXmrigNonceOffset, len(*got.BlocktemplateBlob), *got.Difficulty, *got.TargetDiff, *got.TargetDiffHex)
 }
 
 // TestJobPayloadXNPCaseSensitivity is the required case-sensitivity
@@ -294,6 +413,54 @@ func TestJobPayloadXNPCaseSensitivity(t *testing.T) {
 	got := s.jobPayload(job)
 	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
 		t.Fatalf("wrong-case agent must not trigger proxy shape, got: %+v", got)
+	}
+	assertNoDifficultyKeysOnWire(t, got)
+}
+
+// TestJobPayloadXNPDifficultyAllMoneroFamilyAlgos covers the
+// difficulty half of the XNP-proxy shape across EVERY algo the
+// existing proxy-shape switch already handles as monerod-family
+// (session.go's jobPayload: RXM/XMR/ARQ/XEQ/GRFT/SFX/ZEPH/SAL),
+// paired with the matching non-proxy (ordinary agent) case on the
+// SAME algo — proving both halves of the required behavior on all of
+// them, not just RXM.
+func TestJobPayloadXNPDifficultyAllMoneroFamilyAlgos(t *testing.T) {
+	algos := []poolpb.Algo{
+		poolpb.Algo_ALGO_RXM,
+		poolpb.Algo_ALGO_XMR,
+		poolpb.Algo_ALGO_ARQ,
+		poolpb.Algo_ALGO_XEQ,
+		poolpb.Algo_ALGO_GRFT,
+		poolpb.Algo_ALGO_SFX,
+		poolpb.Algo_ALGO_ZEPH,
+		poolpb.Algo_ALGO_SAL,
+	}
+	const difficulty = 50000
+
+	for _, algo := range algos {
+		t.Run(algo.String(), func(t *testing.T) {
+			newJob := func() *Job {
+				job := newXNPTestJobRXM(171, []byte("this is a fake raw monero blocktemplate_blob used only as a test fixture, deliberately longer than 32 bytes"))
+				job.Algo = algo
+				job.StaticDifficulty = difficulty
+				return job
+			}
+
+			proxySession := newXNPTestSession("xmr-node-proxy/0.0.3", "ab12")
+			proxyJob := proxySession.jobPayload(newJob())
+			assertXNPDifficultyFields(t, proxyJob, difficulty)
+
+			ordinarySession := newXNPTestSession("XMRig/6.21.0", "ab12")
+			ordinaryJob := ordinarySession.jobPayload(newJob())
+			assertNoDifficultyKeysOnWire(t, ordinaryJob)
+
+			// And the ordinary client's own Target is identical either
+			// way: this fix is strictly additive (see protocol.go's
+			// "ADDITIONAL, not a replacement" convention).
+			if proxyJob.Target != ordinaryJob.Target {
+				t.Errorf("Target differs between proxy (%q) and ordinary (%q) sessions on the same job; the fix must be purely additive", proxyJob.Target, ordinaryJob.Target)
+			}
+		})
 	}
 }
 
@@ -339,11 +506,19 @@ func TestJobPayloadXNPReservationUnavailableRXM(t *testing.T) {
 		t.Fatalf("ReservedOffsetUsable=false must omit all four XNP-proxy-shape fields even for a detected XNP-proxy agent, got: %+v", got)
 	}
 
+	// The DIFFICULTY half of the XNP-proxy shape is deliberately NOT
+	// gated on this bounds check (see session.go's jobPayload): an
+	// XNP-proxy client whose template fails it still must not be told
+	// its difficulty is 1. So the byte-diff below runs against a
+	// projection that keeps those three keys and drops only the four
+	// offset fields whose absence is this test's actual subject.
+	assertXNPDifficultyFields(t, got, job.StaticDifficulty)
+
 	gotJSON, err := json.Marshal(got)
 	if err != nil {
 		t.Fatalf("marshal actual JobPayload: %v", err)
 	}
-	legacyJSON, err := json.Marshal(asLegacy(got))
+	legacyJSON, err := json.Marshal(asLegacyWithDifficulty(got))
 	if err != nil {
 		t.Fatalf("marshal legacy projection: %v", err)
 	}
@@ -351,6 +526,150 @@ func TestJobPayloadXNPReservationUnavailableRXM(t *testing.T) {
 		t.Fatalf("ReservedOffsetUsable=false non-regression FAILED (a real byte-diff, not just struct fields):\n  before (legacy shape): %s\n  after  (actual JobPayload): %s", legacyJSON, gotJSON)
 	}
 	t.Logf("ReservedOffsetUsable=false degrades correctly, real byte-diff proof — before: %s\n                                                    after:  %s", legacyJSON, gotJSON)
+}
+
+// TestJobPayloadXNPTargetDiffLiveIncidentRXM is the real,
+// live-shaped end-to-end regression test for the reported incident: a
+// MoneroOcean-fork xmr-node-proxy (agent "xmr-node-proxy/0.0.3")
+// logging into this leaf and "getting a job difficulty of 1". The job
+// is built at 50000 — today's real production min-difficulty — and
+// the assertion is made on the MARSHALED WIRE JSON, decoded the way a
+// JavaScript client actually reads it (Number(json.target_diff)), NOT
+// on the Go struct: the whole failure mode was that the key never
+// reached the wire at all, so the fork's own
+//
+//	normalizeDifficulty(template.target_diff, this.difficulty)
+//
+// chain (see protocol.go's Difficulty doc comment for its verbatim
+// source) received undefined twice and fell through to its final
+// hardcoded `return 1`.
+func TestJobPayloadXNPTargetDiffLiveIncidentRXM(t *testing.T) {
+	const liveMinDifficulty = 50000
+	const reservedOffset = 171
+
+	s := newXNPTestSession("xmr-node-proxy/0.0.3", "ab12")
+	job := newXNPTestJobRXM(reservedOffset, []byte("this is a fake raw monero blocktemplate_blob used only as a test fixture, deliberately longer than 32 bytes"))
+	job.StaticDifficulty = liveMinDifficulty
+
+	wireJSON, err := json.Marshal(s.jobPayload(job))
+	if err != nil {
+		t.Fatalf("marshal XNP-proxy-shape JobPayload: %v", err)
+	}
+	t.Logf("live-shaped XNP-proxy job wire JSON: %s", wireJSON)
+
+	// Decode exactly as a JS client does: the raw key set off the
+	// wire, with numbers left as json.Number so this test observes
+	// what Number(json.target_diff) would observe, not a
+	// Go-struct-typed re-read of our own field.
+	decoder := json.NewDecoder(bytes.NewReader(wireJSON))
+	decoder.UseNumber()
+	var wire map[string]any
+	if err := decoder.Decode(&wire); err != nil {
+		t.Fatalf("decode marshaled wire JSON: %v", err)
+	}
+
+	for _, key := range []string{"difficulty", "target_diff", "target_diff_hex"} {
+		if _, present := wire[key]; !present {
+			t.Fatalf("marshaled XNP-proxy job JSON is MISSING key %q -- this is the exact, confirmed cause of the reported 'job difficulty of 1' incident: %s", key, wireJSON)
+		}
+	}
+
+	for _, key := range []string{"target_diff", "difficulty"} {
+		num, ok := wire[key].(json.Number)
+		if !ok {
+			t.Fatalf("wire key %q is %T, want a JSON number (a JS client calls Number() on it directly)", key, wire[key])
+		}
+		got, err := num.Int64()
+		if err != nil {
+			t.Fatalf("wire key %q = %q, which does not decode as an integer: %v", key, num, err)
+		}
+		if got != liveMinDifficulty {
+			t.Fatalf("wire key %q decodes to %d, want %d -- a downstream Number(json.%s) must NOT fall through to the hardcoded fallback of 1", key, got, liveMinDifficulty, key)
+		}
+	}
+
+	// And the full fallback chain the affected fork actually runs,
+	// reproduced in Go over the REAL decoded wire values: with both
+	// keys present and positive, neither normalizeDifficulty call can
+	// reach `return 1`.
+	poolDifficulty := normalizeDifficultyLikeMoneroOceanFork(wire["difficulty"], nil)
+	if poolDifficulty != liveMinDifficulty {
+		t.Fatalf("normalizeDifficulty(template.difficulty) = %d, want %d", poolDifficulty, liveMinDifficulty)
+	}
+	effective := normalizeDifficultyLikeMoneroOceanFork(wire["target_diff"], json.Number(strconv.FormatInt(poolDifficulty, 10)))
+	if effective != liveMinDifficulty {
+		t.Fatalf("normalizeDifficulty(template.target_diff, this.difficulty) = %d, want %d (1 would be the exact reported incident)", effective, liveMinDifficulty)
+	}
+	if effective == 1 {
+		t.Fatalf("the reported incident reproduced: an XNP-proxy client still resolves difficulty 1 from %s", wireJSON)
+	}
+
+	// target_diff_hex must be the SAME string the ordinary "target"
+	// key carries, byte-for-byte (legacy: `target_diff_hex:
+	// this.diffHex`) -- and "target" itself must still be present and
+	// unchanged for ordinary xmrig-class consumers.
+	target, ok := wire["target"].(string)
+	if !ok {
+		t.Fatalf("wire key \"target\" is %T, want a string still present and unchanged for ordinary clients: %s", wire["target"], wireJSON)
+	}
+	targetDiffHex, ok := wire["target_diff_hex"].(string)
+	if !ok {
+		t.Fatalf("wire key \"target_diff_hex\" is %T, want a string", wire["target_diff_hex"])
+	}
+	if targetDiffHex != target {
+		t.Fatalf("target_diff_hex = %q, want it byte-identical to target %q", targetDiffHex, target)
+	}
+	if want := diffToTargetHex(liveMinDifficulty); target != want {
+		t.Fatalf("target = %q, want %q (diffToTargetHex(%d)) -- the existing Target field must be left completely unchanged by this fix", target, want, liveMinDifficulty)
+	}
+}
+
+// normalizeDifficultyLikeMoneroOceanFork is a faithful Go port of the
+// affected user's MoneroOcean/xmr-node-proxy fork's own helper
+// (coins/template.js), used above to prove the real client-side
+// fallback chain no longer bottoms out at 1 against this leaf's real
+// marshaled wire JSON:
+//
+//	function normalizeDifficulty(value, fallback = 1) {
+//	    const numericValue = Number(value);
+//	    if (Number.isFinite(numericValue) && numericValue > 0) return Math.max(1, Math.floor(numericValue));
+//	    const fallbackValue = Number(fallback);
+//	    if (Number.isFinite(fallbackValue) && fallbackValue > 0) return Math.max(1, Math.floor(fallbackValue));
+//	    return 1;
+//	}
+//
+// A nil argument models JS `undefined` (an absent JSON key), which is
+// exactly what this leaf used to send.
+func normalizeDifficultyLikeMoneroOceanFork(value, fallback any) int64 {
+	if v, ok := jsNumber(value); ok && v > 0 {
+		return max64(1, v)
+	}
+	if v, ok := jsNumber(fallback); ok && v > 0 {
+		return max64(1, v)
+	}
+	return 1
+}
+
+// jsNumber models JS Number(x) + Number.isFinite(x) for the only two
+// inputs that can reach it here: a decoded JSON number, or
+// nil/undefined (an absent key).
+func jsNumber(value any) (int64, bool) {
+	num, ok := value.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	f, err := num.Float64()
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return int64(math.Floor(f)), true
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // TestSubmitRequestWorkerNoncePoolNonceRoundTrip is the required
