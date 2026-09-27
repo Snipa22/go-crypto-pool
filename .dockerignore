@@ -1,0 +1,29 @@
+.git
+.github
+.gitignore
+.dockerignore
+
+# docs
+*.md
+LICENSE
+
+# build output / local artifacts
+/bin/
+/dist/
+
+# test artifacts
+*.test
+*.out
+coverage.*
+
+# IDE / editor
+.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+
+# local env / config
+.env
+go.work
+go.work.sum

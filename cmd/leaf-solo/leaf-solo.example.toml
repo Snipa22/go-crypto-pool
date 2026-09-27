@@ -1,0 +1,219 @@
+# leaf-solo example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point leaf-solo at a
+# copy of this file (with real values) via -config <path> or
+# LEAF_SOLO_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var >
+# this file > the hardcoded default shown below.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "30s"), since go-toml/v2 does not natively decode into time.Duration.
+
+# Tari base node GRPC address (host:port). REQUIRED when -coin=tari (the
+# default); ignored for any monerod-family coin. (default: "")
+node_grpc_address = ""
+
+# Miner-facing TCP listen address. (default: ":4444")
+listen_address = ":4444"
+
+# Solo payout address; found-block coinbase rewards go here. (default: "")
+payout_address = ""
+
+# Network tag for share/diagnostic records: mainnet|testnet. (default: "testnet")
+network = "testnet"
+
+# Which coin/PoW family this leaf-solo process serves: "tari" (default,
+# unchanged behavior) or a coin ticker from internal/coinprofile.Registry --
+# see that package for the current, authoritative list of supported tickers
+# (as of this writing: xmr, arq, xeq, grft, sfx, zeph, sal; case-insensitive).
+# "monero" remains a backward-compatible alias for "xmr" in its EXACT
+# existing merge-mine (ALGO_RXM) behavior -- see `standalone` below to run
+# non-merge-mined XMR instead. An unregistered ticker fails fast at startup
+# rather than silently falling back to any default. (default: "tari")
+coin = "tari"
+
+# Only meaningful for coin="xmr" (or its "monero" alias): when true, runs
+# standalone (non-merge-mined) XMR against monerod_url, tracked under its own
+# new ALGO_XMR value, instead of the default Tari-merge-mined ALGO_RXM
+# behavior. Has no effect for coin="tari" or any OTHER registered coin ticker
+# (arq, xeq, grft, sfx, zeph, sal), which have no merge-mine concept at all
+# and are therefore always standalone already. (default: false)
+standalone = false
+
+# Real monerod-JSON-RPC-compatible base URL (e.g. http://148.163.90.157:28081),
+# no trailing slash or /json_rpc suffix required. REQUIRED when `coin`
+# resolves to any monerod-family coin; ignored for coin="tari". For
+# coin="monero" (or coin="xmr" without standalone=true), point this at your
+# local minotari_merge_mining_proxy listener, NOT raw monerod -- pointing at
+# raw monerod mines Monero-only with no Tari merge-mine revenue. (default: "")
+monerod_url = ""
+
+# Enable the real, legacy-ported probabilistic RandomX-validation-skip
+# mechanism for RXT/RXM shares. Disabled by default -- every share is always
+# fully, cryptographically validated. Has no effect for SHA3X/C29.
+# (default: false)
+#
+# REMOVED (DISPATCH_BRIEF.md, 2026-09-10, Fix 5): this mechanism has been
+# removed from leaf-solo entirely -- post the block-find-only RXT/RXM
+# validation change, it was unreachable dead weight here (real validation,
+# the only thing this mechanism could ever skip, now only ever runs at the
+# rare block-find level). These trust_* keys are IGNORED if still present in
+# an existing config file; direct.EnableTrust still exists for leaf-direct,
+# where this mechanism remains a real, live tradeoff. Left commented out
+# here for documentation/history only.
+# trust_enabled = false
+# trust_threshold = 0
+# trust_penalty = 0
+# trust_change = 0
+# trust_min = 0
+
+# RandomX-family (RXT/RXM) async validation worker pool size (see
+# internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented
+# default, runtime.NumCPU() -- NOT a hardcoded literal. (default: 0)
+randomx_workers = 0
+
+# RandomX-family (RXT/RXM) async validation pool's bounded queue capacity
+# (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the
+# documented default, max(256, randomx_workers*16) -- NOT a hardcoded flat
+# literal. (default: 0)
+randomx_queue_size = 0
+
+# Disconnect a session after too many CONSECUTIVE real RandomX-family
+# (RXT/RXM) block-find-level validation failures (see
+# internal/leaflib.InvalidShareGuard) -- a security-hardening default,
+# enabled unless explicitly turned off. (default: true)
+invalid_share_disconnect_enabled = true
+
+# Consecutive-invalid-share threshold before a session is disconnected (see
+# invalid_share_disconnect_enabled above). 0/unset uses the documented
+# default (20). (default: 0)
+invalid_share_disconnect_threshold = 0
+
+# Which single mining algorithm this leaf-solo process serves: sha3x
+# (default), c29, or rxt -- for coin="tari" only. Ignored (always resolves
+# to that coin's own dedicated algo instead) for any monerod-family coin.
+# (default: "sha3x")
+algo = "sha3x"
+
+# RandomX-verification HTTP daemon address (consulted for algo="rxt", and for
+# every monerod-family coin's real RandomX/rx validation -- they all share
+# the same real randomx-service-backed RandomXValidator).
+# (default: "http://127.0.0.1:39093")
+randomx_service_url = "http://127.0.0.1:39093"
+
+# Coinbase-extra ownership tag appended to every fetched Tari block template
+# (identifies this leaf's found blocks on-chain). Left unset (the default), a
+# per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 /
+# supportxtm-rxt / supportxtm-rxm / supportxtm-<ticker> (e.g. supportxtm-arq)
+# -- see internal/coinprofile.Registry for the per-coin default. (default: "")
+coinbase_extra_tag = ""
+
+# Starting share difficulty for a newly-connected session; vardiff adjusts it
+# from here based on that session's own accept history. (default: 10000)
+starting_difficulty = 10000
+
+# Comma-separated list of address:difficulty[:desc][:tls] port tiers, e.g.
+# ":4444:10000:low-diff,:4445:1000000:high-diff:tls". The optional trailing
+# ":tls" marker (case-insensitive) enables the shared self-signed TLS
+# listener for that ONE port tier only -- see tls_cert_file/tls_key_file/
+# tls_cert_persist_path below. When set, this REPLACES listen_address/
+# starting_difficulty entirely (they are ignored). When unset (the
+# default), listen_address/starting_difficulty are used as a single
+# implicit port tier. (default: "")
+ports = ""
+
+# Optional PEM-encoded TLS certificate file for the shared, process-wide
+# self-signed-or-operator-supplied cert used by any ":tls"-suffixed ports
+# entry. Empty (default) auto-generates a self-signed cert instead -- see
+# tls_cert_persist_path. Ignored entirely if no port has TLS enabled.
+# (default: "")
+tls_cert_file = ""
+
+# Optional PEM-encoded TLS private key file paired with tls_cert_file.
+# (default: "")
+tls_key_file = ""
+
+# Where to persist an auto-generated self-signed TLS cert/key pair so
+# restarts reload it instead of rotating it. Empty (default) means
+# in-memory only -- a fresh self-signed cert is generated on every restart.
+# Ignored if tls_cert_file/tls_key_file are set. (default: "")
+tls_cert_persist_path = ""
+
+# Absolute floor vardiff will never retarget below. (default: 100)
+min_difficulty = 100
+
+# Absolute ceiling vardiff will never retarget above. (default: 1000000000)
+max_difficulty = 1000000000
+
+# Seconds between shares vardiff aims for. (default: 30)
+vardiff_target_time_seconds = 30
+
+# How often each session's own vardiff retarget timer fires (also the
+# minimum connection age before a session's first retarget), in seconds.
+# (default: 60)
+vardiff_retarget_interval_seconds = 60
+
+# Unconditional block-template refresh interval, in seconds. (default: 30)
+refresh_interval_seconds = 30
+
+# Chain-tip poll interval (forces an immediate refresh on tip movement), in
+# seconds. (default: 5)
+tip_poll_interval_seconds = 5
+
+# Real per-job expiry threshold, independent of tip-invalidation; a submit
+# against an older job is rejected as expired, in seconds. (default: 360)
+job_max_age_seconds = 360
+
+# Max concurrent miner connections, 0 = unlimited. (default: 0)
+max_connections = 0
+
+# Rolling per-connection idle timeout, in seconds. (default: 120)
+idle_timeout_seconds = 120
+
+# HTTP listen address for /metrics (Prometheus) and the stats page. Separate
+# from listen_address (the miner-facing stratum port). Defaults to
+# loopback-only; set to an empty string to disable.
+# (default: "127.0.0.1:9600")
+metrics_listen_address = "127.0.0.1:9600"
+
+# Cap on distinct payment-address labels tracked by leaf_miners_by_address
+# and the stats page's per-address breakdown (0 = package default).
+# (default: 0)
+max_address_labels = 0
+
+# Cap on how many session rows the stats HTML page's "Connected sessions"
+# table renders (the separate "Active connections" summary count is always
+# accurate/uncapped). 0 or negative disables the cap entirely (render every
+# session). (default: 150)
+stats_page_max_sessions = 150
+
+# Omit the "Remote address" column from the stats HTML page entirely --
+# recommended for public-facing deployments so remote miner IPs are never
+# exposed on a page anyone can load. (default: false)
+hide_remote_address = false
+
+# Path to a local, operator-maintained JSON file of manually banned/
+# forced-minimum-difficulty payment addresses. Empty (default) disables the
+# feature entirely -- leaf-solo has no backend to poll instead. (default: "")
+address_flags_file = ""
+
+# How often address_flags_file is re-read. Ignored if address_flags_file is
+# unset, in seconds. (default: 30)
+address_flags_poll_interval_seconds = 30
+
+# leaf-solo has NO relay code of any kind -- no found-block relay, no
+# template relay, no NATS wiring whatsoever. It is a fully standalone
+# binary with no cross-leaf networking (architecture rule: "The only
+# system that has relays is the relay system itself [relay-node] and
+# the leaf-direct... leaf-solo is just that. Solo."). See leaf-direct
+# for the leaf binary that has both found-block and template relay.
+
+# Real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL,
+# faster block-invalidation trigger on top of the existing tip-poll baseline.
+# Empty (default) disables this entirely -- a complete no-op. Ignored for
+# coin=tari. (default: "")
+monero_zmq_url = ""
+
+# Enable verbose [DEBUG]-tagged logging: share submit params, validation
+# attempt/result, job/template lifecycle, connection lifecycle, and vardiff
+# retarget events. OFF by default -- purely additive, never changes any
+# existing log line. (default: false)
+debug = false

@@ -1,0 +1,391 @@
+# leaf-direct example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point leaf-direct at
+# a copy of this file (with real values) via -config <path> or
+# LEAF_DIRECT_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var
+# > this file > the hardcoded default shown below.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "30s"), since go-toml/v2 does not natively decode into time.Duration.
+
+# Tari base node GRPC address (host:port); also the primary template-source
+# AND is always included in the multi-node submit set. REQUIRED when
+# -coin=tari (the default); ignored for any monerod-family coin. (default: "")
+node_grpc_address = ""
+
+# Miner-facing TCP listen address. (default: ":4444")
+listen_address = ":4444"
+
+# Pool payout/coinbase address for fetched block templates. (default: "")
+payout_address = ""
+
+# Network tag for share/block records: mainnet|testnet. (default: "testnet")
+network = "testnet"
+
+# Which coin/PoW family this leaf-direct process serves: "tari" (default,
+# unchanged behavior) or a coin ticker from internal/coinprofile.Registry --
+# see that package for the current, authoritative list of supported tickers
+# (as of this writing: xmr, arq, xeq, grft, sfx, zeph, sal; case-insensitive).
+# "monero" remains a backward-compatible alias for "xmr" in its EXACT
+# existing merge-mine (ALGO_RXM) behavior -- see `standalone` below to run
+# non-merge-mined XMR instead. An unregistered ticker fails fast at startup.
+# (default: "tari")
+coin = "tari"
+
+# Only meaningful for coin="xmr" (or its "monero" alias): when true, runs
+# standalone (non-merge-mined) XMR against monerod_url, tracked under its own
+# new ALGO_XMR value, instead of the default Tari-merge-mined ALGO_RXM
+# behavior. Has no effect for coin="tari" or any OTHER registered coin ticker
+# (already always standalone). (default: false)
+standalone = false
+
+# Real monerod-JSON-RPC-compatible base URL (e.g. http://148.163.90.157:28081).
+# REQUIRED when `coin` resolves to any monerod-family coin; ignored for
+# coin="tari". (default: "")
+monerod_url = ""
+
+# Comma-separated NAME:auxid pairs naming every merge-mined chain this leaf should ALSO
+# check the same PoW submission against, on top of the primary chain -- only meaningful
+# for coin="monero"/"xmr" (RXM merge-mining), ignored for coin="tari" or any OTHER
+# monerod-family coin (no merge-mine concept). auxid is the aux-chain identifier a
+# merge-mining proxy's own submit_block response tags that chain's aux_chain_data entry
+# with (Tari's own real minotari_merge_mining_proxy convention, confirmed live, is "xtr").
+# Empty (default) disables merge-mine-chain checking entirely. Example: 'TARI:xtr'.
+# (default: "")
+merge_mine_chains = ""
+
+# Enable the real, legacy-ported probabilistic RandomX-validation-skip
+# mechanism for RXT/RXM shares. Disabled by default. (default: false)
+#
+# REAL-MONEY RISK (DISPATCH_BRIEF.md, 2026-09-10): unlike leaf-solo (this
+# mechanism has since been removed there entirely -- see leaf-solo.example
+# .toml), a leaf-direct share that skips validation here still reaches the
+# real backend's payout accounting on the miner's own claimed value, with no
+# cryptographic re-check by this leaf -- see
+# internal/leaflib/direct.Server.EnableTrust's doc comment for the full risk
+# framing. A deliberate trust-for-throughput tradeoff, not a free feature.
+trust_enabled = false
+
+# Real trust-ramp threshold gate -- 0/unset uses the documented default (10).
+# (default: 0)
+trust_threshold = 0
+
+# Real trust-ramp penalty gate, re-armed after any rejected share -- 0/unset
+# uses the documented default (30). (default: 0)
+trust_penalty = 0
+
+# Real per-accepted-share probability decrement -- 0/unset uses the
+# documented default (1). (default: 0)
+trust_change = 0
+
+# Real probability floor -- 0/unset uses the documented default (20).
+# (default: 0)
+trust_min = 0
+
+# RandomX-family (RXT/RXM) async validation worker pool size (see
+# internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented
+# default, runtime.NumCPU() -- NOT a hardcoded literal. (default: 0)
+randomx_workers = 0
+
+# RandomX-family (RXT/RXM) async validation pool's bounded queue capacity
+# (see internal/leaflib/solo/asyncvalidation.go). 0/unset uses the
+# documented default, max(256, randomx_workers*16) -- NOT a hardcoded flat
+# literal. (default: 0)
+randomx_queue_size = 0
+
+# Job-template-fetch (login/getjob) async worker pool size (see
+# internal/leaflib/direct.Server.jobFetchPool's doc comment for the
+# CLOSE-WAIT production-incident fix this pool exists for). 0/unset uses
+# the documented default, runtime.NumCPU() -- NOT a hardcoded literal.
+# (default: 0)
+job_fetch_workers = 0
+
+# Disconnect a session after too many CONSECUTIVE real RandomX-family
+# (RXT/RXM) validation failures (see internal/leaflib.InvalidShareGuard) --
+# a security-hardening default, enabled unless explicitly turned off.
+# (default: true)
+invalid_share_disconnect_enabled = true
+
+# Consecutive-invalid-share threshold before a session is disconnected (see
+# invalid_share_disconnect_enabled above). 0/unset uses the documented
+# default (20). (default: 0)
+invalid_share_disconnect_threshold = 0
+
+# Which single mining algorithm this leaf-direct process serves: sha3x
+# (default), c29, or rxt -- for coin="tari" only. Ignored (always resolves
+# to that coin's own dedicated algo instead) for any monerod-family coin.
+# (default: "sha3x")
+algo = "sha3x"
+
+# Real pool payout model stamped onto every share/block forwarded to the
+# backend: pplns|pps|prop|solo. REQUIRED (no safe silent default -- determines
+# real payout accounting semantics). (default: "")
+pool_type = ""
+
+# Real, static, operator-assigned pool-server-source identifier stamped onto
+# every share/block forwarded to the backend. REQUIRED, must be > 0 (no safe
+# silent default). (default: 0)
+pool_id = 0
+
+# RandomX-verification HTTP daemon address (only consulted when -algo=rxt).
+# (default: "http://127.0.0.1:39093")
+randomx_service_url = "http://127.0.0.1:39093"
+
+# Coinbase-extra ownership tag appended to every fetched Tari block template
+# (identifies this leaf's found blocks on-chain). Left unset (the default), a
+# per-algo default is computed instead: supportxtm-sha3x / supportxtm-c29 /
+# supportxtm-rxt / supportxtm-rxm / supportxtm-<ticker> (e.g. supportxtm-arq),
+# based on algo/coin -- see internal/coinprofile.Registry for the per-coin
+# default. When set, this value is used verbatim, overriding the per-algo
+# default. (default: "")
+coinbase_extra_tag = ""
+
+# Starting share difficulty for a newly-connected session. (default: 10000)
+starting_difficulty = 10000
+
+# Comma-separated list of address:difficulty[:desc][:tls] port tiers. The
+# optional trailing ":tls" marker (case-insensitive) enables the shared
+# self-signed TLS listener for that ONE port tier only -- see tls_cert_file/
+# tls_key_file/tls_cert_persist_path below. When unset, listen_address/
+# starting_difficulty are used as a single implicit tier (plain, no TLS).
+# (default: "")
+ports = ""
+
+# Optional PEM-encoded TLS certificate file for the shared, process-wide
+# self-signed-or-operator-supplied cert used by any ":tls"-suffixed ports
+# entry. Empty (default) auto-generates a self-signed cert instead -- see
+# tls_cert_persist_path. Ignored entirely if no port has TLS enabled.
+# (default: "")
+tls_cert_file = ""
+
+# Optional PEM-encoded TLS private key file paired with tls_cert_file.
+# (default: "")
+tls_key_file = ""
+
+# Where to persist an auto-generated self-signed TLS cert/key pair so
+# restarts reload it instead of rotating it. Empty (default) means
+# in-memory only -- a fresh self-signed cert is generated on every restart.
+# Ignored if tls_cert_file/tls_key_file are set. (default: "")
+tls_cert_persist_path = ""
+
+# Absolute floor vardiff will never retarget below. (default: 100)
+min_difficulty = 100
+
+# Absolute ceiling vardiff will never retarget above. (default: 1000000000)
+max_difficulty = 1000000000
+
+# Seconds between shares vardiff aims for. (default: 30)
+vardiff_target_time_seconds = 30
+
+# How often each session's own vardiff retarget timer fires, in seconds.
+# (default: 60)
+vardiff_retarget_interval_seconds = 60
+
+# Unconditional block-template refresh interval, in seconds. (default: 30)
+refresh_interval_seconds = 30
+
+# Chain-tip poll interval, in seconds. (default: 5)
+tip_poll_interval_seconds = 5
+
+# Real per-job expiry threshold, independent of tip-invalidation, in seconds.
+# (default: 360)
+job_max_age_seconds = 360
+
+# Max concurrent miner connections, 0 = unlimited. (default: 0)
+max_connections = 0
+
+# Rolling per-connection idle timeout, in seconds. (default: 120)
+idle_timeout_seconds = 120
+
+# HTTP listen address for /metrics. Defaults to loopback-only (127.0.0.1); an
+# operator must explicitly set this to a wildcard/public address to expose it
+# publicly. Empty disables it. Includes real found-block/template NATS relay
+# observability (leaf_relay_block_publish_total, leaf_relay_block_receive_total,
+# leaf_relay_template_publish_total, leaf_relay_template_receive_total,
+# leaf_relay_connected, leaf_relay_last_{block,template}_{publish,receive}_unixtime,
+# leaf_direct_relay_resubmit_total) whenever relay_nats_url below is
+# configured -- always present, reporting zero, when it is not. (default:
+# "127.0.0.1:9601")
+metrics_listen_address = "127.0.0.1:9601"
+
+# Cap on distinct payment-address labels tracked by metrics (0 = package
+# default). (default: 0)
+max_address_labels = 0
+
+# Cap on how many session rows the stats HTML page's "Connected sessions"
+# table renders (the separate "Active connections" summary count is always
+# accurate/uncapped). 0 or negative disables the cap entirely (render every
+# session). (default: 150)
+stats_page_max_sessions = 150
+
+# Omit the "Remote address" column from the stats HTML page entirely --
+# recommended for public-facing deployments. (default: false)
+hide_remote_address = false
+
+# Real backend base URL every validated share/block is forwarded to over
+# HTTP+Protobuf. REQUIRED. (default: "")
+backend_base_url = ""
+
+# Optional shared-secret/bearer auth header name sent with every backend
+# request. (default: "")
+backend_auth_header = ""
+
+# Value for backend_auth_header. (default: "")
+backend_auth_value = ""
+
+# Per-call timeout forwarding a share to the backend, in seconds.
+# (default: 5)
+backend_share_timeout_seconds = 5
+
+# Per-call timeout reporting a found block to the backend, in seconds.
+# (default: 10)
+backend_block_timeout_seconds = 10
+
+# How often the backend's GET /api/v1/leaf/address-flags endpoint is polled
+# for manual ban/forced-minimum-difficulty state, in seconds. (default: 30)
+address_flags_poll_interval_seconds = 30
+
+# Comma-separated list of ADDITIONAL Tari base node GRPC addresses (beyond
+# node_grpc_address, which is always included) to submit a genuine block find
+# to, in real parallel. (default: "")
+submit_nodes = ""
+
+# NATS server URL for the best-effort found-block relay broadcast/resubmit
+# mechanism. Empty (default) fully disables the relay -- a complete no-op,
+# never required. (default: "")
+relay_nats_url = ""
+
+# NATS subject for the relay (empty = relay package default). (default: "")
+relay_subject = ""
+
+# NATS subject for the template (new-tip) relay fast-invalidation broadcast
+# (empty = relay.DefaultTemplateSubject). Reuses the SAME relay_nats_url
+# connection above -- no second NATS URL. Fully active: this leaf-direct's
+# JobManager publishes a TemplateMessage on every genuine local tip increase
+# and subscribes to sibling instances' template messages for immediate
+# per-xn job-cache invalidation (see internal/leaflib/solo/job.go's
+# tipPollLoop/startTemplateRelaySubscription) -- a real latency win across
+# the leaf fleet whenever relay_nats_url is configured. (default: "")
+template_relay_subject = ""
+
+# Optional NATS username for the relay connection above (mirrors
+# nats.UserInfo). Empty (default) connects with no auth. (default: "")
+relay_nats_username = ""
+
+# Optional NATS password paired with relay_nats_username (mirrors
+# nats.UserInfo). Never logged. (default: "")
+relay_nats_password = ""
+
+# Optional CA bundle file to verify the NATS server's TLS certificate
+# against (mirrors nats.RootCAs). Empty (default) appends no TLS CA
+# option. (default: "")
+relay_nats_tls_ca_file = ""
+
+# Optional client certificate file for mutual TLS against the NATS server
+# (mirrors nats.ClientCert; must be set together with relay_nats_tls_key_file).
+# (default: "")
+relay_nats_tls_cert_file = ""
+
+# Optional client private key file paired with relay_nats_tls_cert_file
+# (mirrors nats.ClientCert). (default: "")
+relay_nats_tls_key_file = ""
+
+
+# Real monerod ZMQ endpoint (e.g. tcp://127.0.0.1:28082) for an ADDITIONAL,
+# faster block-invalidation trigger on top of the existing tip-poll baseline.
+# Empty (default) disables this entirely -- a complete no-op. Ignored for
+# coin=tari. (default: "")
+monero_zmq_url = ""
+
+# Opt-in, default-off legacy nodejs-pool-sxmr /leafApi wire-protocol mode:
+# when true, leaf-direct forwards validated shares/blocks to a legacy
+# nodejs-pool-sxmr backend (internal/leaflib/legacytransport) instead of the
+# normal HTTP+Protobuf backend transport above. Requires legacy_backend_url/
+# legacy_auth_key/legacy_pool_type/legacy_pool_id to all be set below.
+# Disabled by default -- zero behavior change for existing deployments.
+# (default: false)
+legacy_mode = false
+
+# Legacy nodejs-pool-sxmr backend base URL (e.g.
+# "https://schwifty37.snipanet.com:4443") -- the transport appends /leafApi
+# itself. No scheme is assumed; the real target very likely terminates TLS
+# externally in front of the Node process's plain app.listen(8000), so https
+# is the expected common case. REQUIRED when legacy_mode=true, ignored
+# otherwise. (default: "")
+legacy_backend_url = ""
+
+# Real legacy WSData.key secret (a plain string field checked server-side,
+# NOT an HTTP header). Never logged. REQUIRED when legacy_mode=true, ignored
+# otherwise. (default: "")
+legacy_auth_key = ""
+
+# Legacy backend payout-model value stamped onto every share/block
+# forwarded in legacy mode: pplns|pps|prop|solo. Deliberately SEPARATE from
+# pool_type above -- the legacy backend is a genuinely different deployment
+# that may use a different payout model value. OPEN DESIGN QUESTION: confirm
+# with Alex whether legacy-mode pool-type/pool-id should ever be allowed to
+# just mirror pool_type/pool_id above, or whether they must always be
+# independently configured like this; defaulting to independent config here
+# as the safer assumption. REQUIRED when legacy_mode=true, ignored
+# otherwise. (default: "")
+legacy_pool_type = ""
+
+# Legacy backend pool-server-source identifier stamped onto every
+# share/block forwarded in legacy mode, must be > 0. Deliberately SEPARATE
+# from pool_id above -- same OPEN DESIGN QUESTION/rationale as
+# legacy_pool_type above; confirm with Alex. REQUIRED when legacy_mode=true,
+# ignored otherwise. (default: 0)
+legacy_pool_id = 0
+
+# Real legacy /poolCheckin heartbeat (internal/leaflib/legacytransport/
+# checkin.go): every legacy_checkin_interval_seconds, POSTs
+# {current_time, pool_id, block_id, ports} to
+# <legacy_checkin_api_url>poolCheckin with header x-pool-auth set to
+# legacy_checkin_auth_token. Without this, pool-core's own routing/
+# health-check logic silently drains miner traffic away from an
+# otherwise healthy leaf within ~10-20 minutes (see checkin.go's package
+# doc comment) -- this replaces a throwaway Python sidecar stopgap.
+#
+# legacy_checkin_enabled defaults to TRUE whenever legacy_mode is also
+# true (an OPEN DESIGN QUESTION flagged for Alex's review -- the
+# heartbeat is a genuinely separate concern from core share/block
+# forwarding, but defaults to the safer/stricter option). Set to false
+# to forward shares/blocks in legacy mode WITHOUT the heartbeat (e.g.
+# during a staged rollout while the Python sidecar is still running).
+# Ignored entirely when legacy_mode=false. (default: true)
+legacy_checkin_enabled = true
+
+# The legacy backend's real config_api base URL, e.g.
+# "http://203.0.113.10:32322/poolApi/" in production -- the heartbeat
+# appends "poolCheckin" itself. REQUIRED when legacy_mode=true and
+# legacy_checkin_enabled=true (the default), ignored otherwise.
+# (default: "")
+legacy_checkin_api_url = ""
+
+# The real legacy api_auth_token secret, sent as the x-pool-auth HTTP
+# header on every /poolCheckin POST. DELIBERATELY SEPARATE from
+# legacy_auth_key above (the WSData.key checked on /leafApi) -- these
+# are two distinct real secrets on the real legacy backend. Never
+# logged. REQUIRED when legacy_mode=true and legacy_checkin_enabled=true
+# (the default), ignored otherwise. (default: "")
+legacy_checkin_auth_token = ""
+
+# How often the /poolCheckin heartbeat fires, in seconds -- matches the
+# real legacy sender's exact cadence by default. (default: 10)
+legacy_checkin_interval_seconds = 10
+
+# Total wall-clock budget (seconds) legacytransport's SubmitBlock
+# retry-with-backoff loop keeps retrying a found block against the
+# legacy backend before giving up -- real production-incident fix,
+# 2026-09-23: absorbs the legacy backend's own transient chain-sync-lag
+# race that previously permanently lost a genuine mainnet block find
+# (height 351096). Ignored when legacy_mode = false. (default: 300 = 5
+# minutes -- Alex's explicit direction)
+legacy_block_retry_budget_seconds = 300
+
+# Enable verbose [DEBUG]-tagged logging: share submit params, validation
+# attempt/result, backend HTTP forward attempts (URL/status/response
+# summary), job/template lifecycle, connection lifecycle, and vardiff
+# retarget events. OFF by default -- purely additive, never changes any
+# existing log line. (default: false)
+debug = false
+

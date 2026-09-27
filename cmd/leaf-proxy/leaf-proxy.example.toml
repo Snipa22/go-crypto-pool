@@ -1,0 +1,207 @@
+# leaf-proxy example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point leaf-proxy at a
+# copy of this file (with real values) via -config <path> or
+# LEAF_PROXY_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var >
+# this file > the hardcoded default shown below.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "30s"), since go-toml/v2 does not natively decode into time.Duration.
+#
+# NOTE on coin scope: leaf-proxy has no coin/algo flag at all -- it is a
+# wire-protocol-level, coin-generic proxy that forwards whatever
+# monerod-shaped block-template/submit traffic the configured upstream pool
+# hands it, regardless of which monerod-family coin (see
+# internal/coinprofile.Registry for the full list this repo's leaf-solo/
+# leaf-direct binaries can now serve directly) that upstream pool actually
+# mines. Point upstream_host/upstream_port at that coin's own real upstream
+# pool; there is nothing else to configure here per-coin.
+
+# Real upstream Monero-family pool hostname. (default: "pool.supportxmr.com")
+upstream_host = "pool.supportxmr.com"
+
+# Real upstream pool stratum port (SupportXMR: 3333 low-diff, 5555 medium-diff,
+# 7777 high-diff, 9000 TLS). (default: 7777)
+upstream_port = 7777
+
+# Dial the upstream pool over TLS. (default: false)
+upstream_tls = false
+
+# Skip TLS certificate verification for the upstream pool (testing only).
+# (default: false)
+upstream_tls_insecure_skip_verify = false
+
+# Real XMR payout address to log in to the upstream pool with. (default: "")
+upstream_login = ""
+
+# Real upstream pool worker identifier/password. (default: "go-crypto-pool-leaf-proxy")
+upstream_pass = "go-crypto-pool-leaf-proxy"
+
+# Mining-client agent string sent on upstream login -- deliberately DOES
+# contain the literal substring "xmr-node-proxy": that substring is what
+# opts this leaf into a pool's "advanced xmr-node-proxy client" protocol
+# dialect, which is required to receive client_nonce_offset/
+# client_pool_offset on jobs (needed so downstream miners behind this leaf
+# get non-colliding blobs). The dialect's raw, untrimmed
+# blocktemplate_blob is safely handled via a real conversion step.
+# (default: "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0")
+upstream_agent = "go-crypto-pool-leaf-proxy/xmr-node-proxy-1.0"
+
+
+# Downstream miner-facing TCP listen address. Used as -ports' own fallback
+# default (see ports below) when ports is unset. (default: ":5555")
+listen_address = ":5555"
+
+# Optional SECOND downstream miner-facing TCP listen address, served over
+# TLS using the shared self-signed-or-operator-supplied cert (see
+# tls_cert_file/tls_key_file/tls_cert_persist_path below), alongside (never
+# instead of) listen_address. Empty (default) disables it entirely -- zero
+# behavior change. Only consulted when ports (below) is UNSET -- setting
+# both is a fatal startup misconfiguration; move any TLS tier into a ports
+# entry instead. (default: "")
+tls_listen_address = ""
+
+# Comma-separated list of address:difficulty[:desc][:tls] port tiers, e.g.
+# "0.0.0.0:5555:1000:medium-plain,0.0.0.0:5556:1000:medium-tls:tls" (first
+# entry plain, second entry the same difficulty on a different port with
+# TLS enabled). The optional trailing ":tls" marker (case-insensitive)
+# enables the shared self-signed TLS listener for that ONE port tier only
+# -- see tls_cert_file/tls_key_file/tls_cert_persist_path below. When unset
+# (the default), listen_address/starting_difficulty are used as a single
+# implicit tier (plain, no TLS), and tls_listen_address (if also set) is
+# added as a second, TLS-enabled tier exactly as before this key existed --
+# fully backward-compatible, zero behavior change for any deployment that
+# doesn't set this. Setting BOTH ports and tls_listen_address is a fatal
+# startup misconfiguration. (default: "")
+ports = ""
+
+# Optional PEM-encoded TLS certificate file for the shared, process-wide
+# self-signed-or-operator-supplied cert used by any ":tls"-suffixed ports
+# entry (or tls_listen_address, in the fallback case). Empty (default)
+# auto-generates a self-signed cert instead -- see tls_cert_persist_path.
+# Ignored entirely if no port has TLS enabled. (default: "")
+tls_cert_file = ""
+
+# Optional PEM-encoded TLS private key file paired with tls_cert_file.
+# (default: "")
+tls_key_file = ""
+
+# Where to persist an auto-generated self-signed TLS cert/key pair so
+# restarts reload it instead of rotating it. Empty (default) means
+# in-memory only -- a fresh self-signed cert is generated on every restart.
+# Ignored if tls_cert_file/tls_key_file are set. (default: "")
+tls_cert_persist_path = ""
+
+# Starting downstream share difficulty; vardiff adjusts it from here.
+# Ignored when ports (above) is set -- each port tier carries its own
+# starting difficulty instead. (default: 20000)
+starting_difficulty = 20000
+
+# Absolute floor vardiff will never retarget below. (default: 20000)
+min_difficulty = 20000
+
+# Absolute ceiling vardiff will never retarget above. (default: 1000000000)
+max_difficulty = 1000000000
+
+# Seconds between shares vardiff aims for. (default: 15)
+vardiff_target_time_seconds = 15
+
+# How often each downstream session's own vardiff retarget timer fires, in
+# seconds. (default: 30)
+vardiff_retarget_interval_seconds = 30
+
+# Real per-job expiry threshold, in seconds; a submit against an older job is
+# rejected. (default: 360)
+job_max_age_seconds = 360
+
+# Max concurrent downstream miner connections, 0 = unlimited. (default: 0)
+max_connections = 0
+
+# Rolling per-downstream-connection idle timeout, in seconds. (default: 120)
+idle_timeout_seconds = 120
+
+# Timeout for dialing the upstream pool, in seconds. (default: 10)
+upstream_dial_timeout_seconds = 10
+
+# Timeout for a single upstream request/response round-trip, in seconds.
+# (default: 15)
+upstream_request_timeout_seconds = 15
+
+# RandomX async validation worker pool size (see
+# internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented
+# default, runtime.NumCPU() -- NOT a hardcoded literal. (default: 0)
+randomx_workers = 0
+
+# RandomX async validation pool's bounded queue capacity (see
+# internal/leaflib/solo/asyncvalidation.go). 0/unset uses the documented
+# default, max(256, randomx_workers*16) -- NOT a hardcoded flat literal.
+# (default: 0)
+randomx_queue_size = 0
+
+# Disconnect a downstream session after too many CONSECUTIVE real RandomX
+# validation failures (see internal/leaflib.InvalidShareGuard) -- a
+# security-hardening default, enabled unless explicitly turned off.
+# (default: true)
+invalid_share_disconnect_enabled = true
+
+# Consecutive-invalid-share threshold before a downstream session is
+# disconnected (see invalid_share_disconnect_enabled above). 0/unset uses
+# the documented default (20). (default: 0)
+invalid_share_disconnect_threshold = 0
+
+# Cap all three login-time difficulty floors (port starting_difficulty
+# above, min_difficulty above, and any per-address operator-forced
+# ForcedMinDifficulty floor) so none may leave a downstream session
+# starting ABOVE the upstream pool's own current target_diff -- a
+# mis-configuration guardrail. Most proxy operators with reasonable
+# starting points won't hit this; an operator who genuinely wants the
+# pre-existing uncapped max()-of-floors behavior can set this to false.
+# (default: true)
+pool_diff_cap_enabled = true
+
+# HTTP listen address for /metrics (Prometheus) and the stats page. Separate
+# from listen_address (the downstream-facing stratum port). Defaults to
+# loopback-only; set to an empty string to disable.
+# (default: "127.0.0.1:9601")
+metrics_listen_address = "127.0.0.1:9601"
+
+# Cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address
+# and the stats page's per-address breakdown (0 = package default). (default: 0)
+max_address_labels = 0
+
+# Cap on how many session rows the stats HTML page's "Connected sessions"
+# table renders (the separate "Active connections" summary count is always
+# accurate/uncapped). 0 or negative disables the cap entirely (render every
+# session). (default: 150)
+stats_page_max_sessions = 150
+
+# Omit the "Remote address" column from the stats HTML page entirely --
+# recommended for public-facing deployments. (default: false)
+hide_remote_address = false
+
+# Path to a local, operator-maintained JSON file of manually banned payment
+# addresses (see internal/leaflib/addressflags.FileSource's doc comment for
+# the file format). Empty (default) disables the feature entirely --
+# leaf-proxy has no go-crypto-pool backend to poll instead. (default: "")
+address_flags_file = ""
+
+# How often address_flags_file is re-read. Ignored if address_flags_file is
+# unset, in seconds. (default: 30)
+address_flags_poll_interval_seconds = 30
+
+# Enable verbose [DEBUG]-tagged logging: downstream submit params,
+# validation attempt/result, upstream forward attempts/responses, upstream
+# template lifecycle, connection lifecycle, and vardiff retarget events. OFF
+# by default -- purely additive, never changes any existing log line.
+# (default: false)
+debug = false
+
+# Percentage (0-100) of job issuances/upstream-forwarded share traffic
+# routed to a SECOND, independent upstream connection logged in under a
+# hardcoded (NOT operator-configurable -- there is no dev_fee_login/
+# dev_fee_pass key) dev-fee login, against the same upstream_host/
+# upstream_port/upstream_tls as above. See
+# internal/leaflib/proxy/devfee.go's doc comment for the full mechanism.
+# 0 disables the mechanism entirely: no second connection is ever dialed.
+# (default: 1.0)
+dev_fee_percent = 1.0
+

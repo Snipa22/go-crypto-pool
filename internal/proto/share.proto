@@ -1,0 +1,246 @@
+// Copyright and license: see repository LICENSE (MIT).
+//
+// Share/Block wire schema for go-crypto-pool, exchanged between leaf
+// binaries (leaf-direct, leaf-solo, leaf-proxy) and the backend over the
+// HTTP+Protobuf edge transport (see internal/leaflib/transport).
+//
+// Design notes / deltas from the legacy SXMR proto2 schema
+// (nodejs-pool-sxmr's Share/Block), which this schema generalizes for a
+// multi-algo, multi-network omni-pool:
+//
+//   - Algo is now a required, explicit field on every Share/Block. The
+//     legacy schema had no coin/algo tag at all because it assumed one
+//     deployment per coin. go-crypto-pool serves RXT/C29/SHA3X/RXM out of
+//     one backend, so every message must self-identify its algo.
+//   - Network (MAINNET/TESTNET) is likewise now a required, explicit
+//     field on every Share/Block, per the project requirement to support
+//     testnet operation for all algos during development.
+//   - The legacy `bitcoin bool` payout-currency flag is dropped entirely —
+//     it was a Monero-fork-specific hack that doesn't generalize to Tari's
+//     multi-algo model and isn't used here.
+//   - The legacy `trustedShare bool` field is carried forward as
+//     `trusted_share` — it is still actively used in production
+//     (accounting/payout trust-boundary flag), do not drop it.
+//   - `blockHeight` is int64, not int32 (legacy proto2 used int32, which
+//     is a real overflow bug waiting to happen well before height 2^31).
+//   - The legacy RandomX-specific trio (`blobData`, `minerHex`,
+//     `seedHash`) is replaced by a `oneof raw_proof` with one message per
+//     algo family, since C29 (Cuckaroo29 cycle-proof) and SHA3X (plain
+//     hash) are structurally different from RandomX's blob/seed/hash
+//     model and don't fit the same three fields. This raw proof is
+//     optional supporting data for a future secondary/audit validator;
+//     the backend itself does NOT re-validate PoW (see AGENTS.md — it's a
+//     trust boundary, leaves own all algo-specific validation).
+//
+// NOTE on C29Proof: field shapes were checked against the real Tari C29
+// miner implementation (go-tari-c29-solo-stratum's SubmitJob, via
+// snipa22/powkit's cuckoo.Client.Verify) as part of building the
+// internal/leaflib/validator package. `edge_bits` + repeated `cycle` (the
+// 42-edge Cuckaroo29 cycle, u64 edge nonces) matches the real proof shape.
+// `header` was ADDED here (it did not exist in the original placeholder)
+// because the real cycle-verify primitive needs header/merge-mining-hash
+// material to derive its siphash keys (see legacy SubmitJob:
+// `nonceBytes = nonce || job.BlockResult.MergeMiningHash`, hashed to
+// derive `hasher.Verify(nonceBytes, submittedWork.POW)`'s keys) — the
+// original placeholder had no field carrying that, which would have made
+// real verification impossible. See internal/leaflib/validator for the
+// port.
+syntax = "proto3";
+
+package pool.v1;
+
+option go_package = "github.com/Snipa22/go-crypto-pool/internal/proto;poolpb";
+
+// Algo identifies the mining algorithm / share stream a message belongs
+// to. go-crypto-pool is an omni-pool serving all four from one backend,
+// so this tag is mandatory on every Share and Block.
+enum Algo {
+  ALGO_UNSPECIFIED = 0;
+  ALGO_RXT = 1;   // RandomX-Tari
+  ALGO_C29 = 2;   // Cuckaroo/Cuckatoo29
+  ALGO_SHA3X = 3; // SHA3-256 (Tari merge-mining / SHA3X)
+  ALGO_RXM = 4;   // RandomX-Monero-family (Tari-merge-mined Monero via mmproxy -- unchanged, do not repurpose)
+
+  // ALGO_XMR and below (5+) are standalone (non-merge-mined)
+  // RandomX/Monero-codebase-family coins, each pointed directly at that
+  // coin's own real monerod-compatible daemon rather than a merge-mining
+  // proxy. See internal/coinprofile.Registry for the CoinProfile entry
+  // (ticker, decimals, address network bytes, default RPC port) backing
+  // each one, and the PR description for the primary-source citation
+  // proving each coin is a genuine monerod-JSON-RPC-compatible fork
+  // (get_block_template/submit_block shape) -- NOT merely "uses RandomX".
+  ALGO_XMR = 5;  // Monero, standalone. https://github.com/monero-project/monero
+  ALGO_ARQ = 6;  // ArQmA. https://github.com/arqma/arqma
+  ALGO_XEQ = 7;  // Equilibria. https://github.com/EquilibriaCC/Equilibria
+  ALGO_GRFT = 8; // Graft Network. https://github.com/graft-project/GraftNetwork
+  ALGO_SFX = 9;  // Safex Cash. https://github.com/safex/safexcore
+  ALGO_ZEPH = 10; // Zephyr Protocol. https://github.com/ZephyrProtocol/zephyr
+  ALGO_SAL = 11;  // Salvium. https://github.com/salvium/salvium
+}
+
+// Network distinguishes mainnet from testnet deployments. Required on
+// every Share/Block so a single backend can safely serve both without
+// cross-contaminating payout/accounting state.
+enum Network {
+  NETWORK_UNSPECIFIED = 0;
+  NETWORK_MAINNET = 1;
+  NETWORK_TESTNET = 2;
+}
+
+// PoolType mirrors the legacy SXMR POOLTYPE enum — this part of the
+// legacy design generalizes fine as-is.
+enum PoolType {
+  POOL_TYPE_UNSPECIFIED = 0;
+  POOL_TYPE_PPLNS = 1;
+  POOL_TYPE_PPS = 2;
+  POOL_TYPE_PROP = 3;
+  POOL_TYPE_SOLO = 4;
+}
+
+// RandomXProof carries the legacy blob/seed/result trio for RXT and RXM,
+// which are both RandomX-family algos and share the same proof shape.
+message RandomXProof {
+  bytes blob = 1;       // block template blob that was hashed
+  bytes seed_hash = 2;  // RandomX seed hash in effect for this height
+  string result_hex = 3; // claimed PoW hash result, hex-encoded
+}
+
+// C29Proof carries a Cuckaroo/Cuckatoo29 cycle-proof. See the top-of-file
+// note: field shapes are checked against the real go-tari-c29-solo-stratum
+// SubmitJob verification path.
+message C29Proof {
+  uint32 edge_bits = 1;   // graph size parameter (29 for Tari's Cuckaroo29)
+  repeated uint64 cycle = 2; // the proof cycle's 42 edge nonces
+
+  // header is the nonce-independent header/merge-mining-hash material the
+  // real verifier hashes (blake2b-256) to derive its siphash keys — ported
+  // from go-tari-c29-solo-stratum's `nonceBytes = nonce || MergeMiningHash`
+  // construction. Added in this pass: the original placeholder omitted it,
+  // which would have made real cycle verification impossible.
+  bytes header = 3;
+  uint64 nonce = 4; // the submitted nonce, combined with header per above
+}
+
+// SHA3XProof carries a straight header+nonce pair for the SHA3X algo,
+// which has no intermediate blob/seed concept the way RandomX does.
+message SHA3XProof {
+  bytes header = 1;
+  uint64 nonce = 2;
+}
+
+// Share represents one accepted share submission from a leaf to the
+// backend. Every field the backend needs for accounting/payout is
+// present without decoding raw_proof; raw_proof is optional supporting
+// data for a future secondary/audit validator only.
+//
+// pool_id (below) is this repo's scoped-down analogue of the legacy
+// nodejs-pool stack's /poolInit registration: the legacy pool ran
+// several worker processes that registered themselves at startup and
+// got handed back a numeric pool id, which was then stamped on every
+// share so operators could tell which physical pool-server process
+// produced it. go-crypto-pool has no multi-process cluster
+// coordination at all (confirmed with Alex, 2026-08-23) — there is no
+// runtime registration handshake to reproduce. Instead, pool_id is
+// simply a static, operator-assigned integer every leaf-direct process
+// is configured with at startup (see cmd/leaf-direct's
+// -pool-id/LEAF_DIRECT_POOL_ID) and stamps on every Share/Block it
+// forwards, unconditionally. It answers the same "which pool-server
+// instance produced this row" question the legacy field did, without
+// any of the process-registration machinery that question doesn't
+// need here.
+message Share {
+  Algo algo = 1;
+  Network network = 2;
+
+  int64 shares = 3;
+  string payment_address = 4;
+  bool found_block = 5;
+  optional string payment_id = 6;
+  PoolType pool_type = 7;
+  int32 pool_id = 8;
+  int64 block_diff = 9;
+  int64 block_height = 10; // int64: legacy int32 overflows well before real chain heights
+  int64 timestamp = 11;
+  string identifier = 12; // worker/rig identifier
+
+  // raw_proof is optional, algo-tagged proof material kept around for a
+  // future audit/secondary-validation path. The backend does not decode
+  // or validate this today.
+  oneof raw_proof {
+    RandomXProof randomx_proof = 13;
+    C29Proof c29_proof = 14;
+    SHA3XProof sha3x_proof = 15;
+  }
+
+  // trusted_share carried over from the legacy schema — actively used in
+  // production (accounting/payout trust-boundary flag), do not drop.
+  bool trusted_share = 16;
+
+  // network_diff is the REAL network/block target difficulty a share's
+  // hash must beat to constitute a genuine block find (populated from
+  // solo.Job.NetworkTargetDifficulty at submit time) -- NOT the same
+  // thing as block_diff (field 9) above, which despite its name is,
+  // today, actually the session's own current vardiff/share-weight
+  // value (identical to `shares`), because internal/backend/db's
+  // address-difficulty-floor enforcement (checkAddressFlags,
+  // migrations/0004_address_flags.up.sql) deliberately reads
+  // Share.block_diff as "the difficulty this share was submitted at"
+  // to enforce an operator-set per-address floor, independent of the
+  // leaf's own vardiff. Renaming/repurposing block_diff itself for
+  // legacy's real network-difficulty need would silently defeat that
+  // floor enforcement for the normal (non-legacy) backend path (real
+  // network difficulty is always vastly larger than any sane floor),
+  // so this is a NEW, additive field instead. legacytransport's
+  // buildLegacyShare is the only current consumer -- it maps this
+  // field onto the legacy Share.block_diff wire field, which the real
+  // legacy nodejs-pool-sxmr backend DOES expect to be genuine network
+  // difficulty (confirmed via live tcpdump capture, 2026-09-23).
+  int64 network_diff = 17;
+}
+
+// Block represents a block found and reported by a leaf.
+message Block {
+  Algo algo = 1;
+  Network network = 2;
+
+  string hash = 3;
+  int64 difficulty = 4;
+  int64 shares = 5;
+  int64 timestamp = 6;
+  PoolType pool_type = 7;
+  bool unlocked = 8;
+  bool valid = 9;
+  optional int64 value = 10;
+  int64 height = 11; // block_height wasn't in the legacy Block message; added since the backend needs it for the same overflow reasons as Share
+
+  // pool_id mirrors Share.pool_id (see that field's doc comment) —
+  // the same static, operator-assigned pool-server-source identifier,
+  // stamped on a found block's report exactly like it is on every
+  // share.
+  int32 pool_id = 12;
+
+  // merge_mine_chain names which merge-mined chain this Block row
+  // belongs to, for algos where ONE real PoW submission can
+  // independently clear more than one chain's own real difficulty
+  // target (today: ALGO_RXM/Monero, merge-mined with Tari via a
+  // minotari_merge_mining_proxy sitting between the leaf and real
+  // monerod). unset (nil)/absent means this row is the PRIMARY leg
+  // (Monero, for ALGO_RXM) — every historical Block/blocks row before
+  // this field existed is implicitly the primary leg. A non-nil value
+  // (e.g. "TARI") means this row is the SECONDARY merge-mined chain's
+  // OWN leg of that same submission: its own real, independently
+  // resolved hash, independently verified/matured/paid via that
+  // chain's own existing ChainVerifier (see
+  // internal/backend/chain.TariVerifier and
+  // internal/backend/unlocker's merge_mine_chain-keyed dispatch) --
+  // never the primary chain's verifier. ONE PoW submission that
+  // clears both chains' targets produces TWO separate Block messages
+  // (one with merge_mine_chain unset, one with it set) — never a
+  // single row trying to represent both. Deliberately a free-form
+  // string, not a new Algo enum value: the merge-mined chain is NOT a
+  // distinct algo/leaf (ALGO_RXT's own dedicated leaf-direct-rxt.service
+  // and blocks rows are completely separate and untouched by this
+  // field), and a string leaves room for more than one configured
+  // merge-mined chain per leaf in the future without an enum change.
+  optional string merge_mine_chain = 13;
+}

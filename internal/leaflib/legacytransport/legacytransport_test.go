@@ -1,0 +1,771 @@
+// Copyright and license: see repository LICENSE (MIT).
+package legacytransport
+
+import (
+	"context"
+	"io"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	legacypb "github.com/Snipa22/go-crypto-pool/internal/legacyproto"
+	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
+	"google.golang.org/protobuf/proto"
+)
+
+// --- field-mapping / overflow-guard tests (buildLegacyShare/buildLegacyBlock) ---
+
+func TestBuildLegacyShare_HappyPath(t *testing.T) {
+	share := &poolpb.Share{
+		Algo:           poolpb.Algo_ALGO_RXT,           // dropped, no legacy equivalent
+		Network:        poolpb.Network_NETWORK_TESTNET, // dropped
+		Shares:         100,
+		PaymentAddress: "addr-1",
+		FoundBlock:     true,
+		PaymentId:      proto.String("pid-1"),
+		PoolType:       poolpb.PoolType_POOL_TYPE_PPLNS,
+		PoolId:         999, // must NOT be used -- own legacyPoolID used instead
+		// BlockDiff (share weight, NOT network difficulty -- see
+		// poolpb.Share.network_diff's doc comment) is deliberately
+		// NOT what legacy's BlockDiff maps from; NetworkDiff is the
+		// real source now (bug fix, 2026-09-23).
+		BlockDiff:    12345,
+		NetworkDiff:  30238431225,
+		BlockHeight:  500000,
+		Timestamp:    1700000000,
+		Identifier:   "worker-1",
+		TrustedShare: true,
+	}
+
+	legacyShare, err := buildLegacyShare(share, legacypb.POOLTYPE_PPLNS, 42)
+	if err != nil {
+		t.Fatalf("buildLegacyShare: %v", err)
+	}
+
+	if legacyShare.GetShares() != 100 {
+		t.Errorf("Shares = %d, want 100", legacyShare.GetShares())
+	}
+	if legacyShare.GetPaymentAddress() != "addr-1" {
+		t.Errorf("PaymentAddress = %q, want %q", legacyShare.GetPaymentAddress(), "addr-1")
+	}
+	if !legacyShare.GetFoundBlock() {
+		t.Errorf("FoundBlock = false, want true")
+	}
+	if legacyShare.GetPaymentID() != "pid-1" {
+		t.Errorf("PaymentID = %q, want %q", legacyShare.GetPaymentID(), "pid-1")
+	}
+	if !legacyShare.GetTrustedShare() {
+		t.Errorf("TrustedShare = false, want true")
+	}
+	if legacyShare.GetPoolType() != legacypb.POOLTYPE_PPLNS {
+		t.Errorf("PoolType = %v, want PPLNS", legacyShare.GetPoolType())
+	}
+	// The transport's OWN configured legacy pool ID (42) must be used,
+	// NOT the incoming share's own PoolId (999).
+	if legacyShare.GetPoolID() != 42 {
+		t.Errorf("PoolID = %d, want 42 (the transport's own configured legacy pool ID, not the incoming share's pool_id=999)", legacyShare.GetPoolID())
+	}
+	if legacyShare.GetBlockDiff() != 30238431225 {
+		t.Errorf("BlockDiff = %d, want 30238431225 (share.network_diff, NOT share.block_diff=12345 -- bug fix, 2026-09-23)", legacyShare.GetBlockDiff())
+	}
+	if legacyShare.GetBitcoin() != false {
+		t.Errorf("Bitcoin = %v, want false always", legacyShare.GetBitcoin())
+	}
+	if legacyShare.GetBlockHeight() != 500000 {
+		t.Errorf("BlockHeight = %d, want 500000", legacyShare.GetBlockHeight())
+	}
+	if legacyShare.GetTimestamp() != 1700000000000 {
+		t.Errorf("Timestamp = %d, want 1700000000000 (share.timestamp=1700000000 seconds * 1000 -- legacy expects milliseconds, bug fix 2026-09-23)", legacyShare.GetTimestamp())
+	}
+	if legacyShare.GetIdentifier() != "worker-1" {
+		t.Errorf("Identifier = %q, want %q", legacyShare.GetIdentifier(), "worker-1")
+	}
+
+	// Must genuinely marshal (all required proto2 fields populated).
+	if _, err := proto.Marshal(legacyShare); err != nil {
+		t.Fatalf("Marshal built legacy share: %v", err)
+	}
+}
+
+func TestBuildLegacyShare_PaymentIDUnsetWhenNilOnInput(t *testing.T) {
+	share := &poolpb.Share{
+		Shares:         1,
+		PaymentAddress: "addr",
+		PoolType:       poolpb.PoolType_POOL_TYPE_SOLO,
+		Identifier:     "worker",
+		// PaymentId left nil.
+	}
+
+	legacyShare, err := buildLegacyShare(share, legacypb.POOLTYPE_SOLO, 1)
+	if err != nil {
+		t.Fatalf("buildLegacyShare: %v", err)
+	}
+	if legacyShare.PaymentID != nil {
+		t.Errorf("PaymentID = %v, want nil (unset) when input PaymentId is nil", legacyShare.PaymentID)
+	}
+}
+
+func TestBuildLegacyShare_BitcoinAlwaysFalse(t *testing.T) {
+	// There is no "bitcoin" field on poolpb.Share at all -- this test
+	// exists to make the invariant explicit and regression-proof: no
+	// matter what, the built legacy Share always has Bitcoin=false.
+	share := &poolpb.Share{
+		Shares:         1,
+		PaymentAddress: "addr",
+		PoolType:       poolpb.PoolType_POOL_TYPE_PPS,
+		Identifier:     "worker",
+	}
+	legacyShare, err := buildLegacyShare(share, legacypb.POOLTYPE_PPS, 1)
+	if err != nil {
+		t.Fatalf("buildLegacyShare: %v", err)
+	}
+	if legacyShare.GetBitcoin() != false {
+		t.Errorf("Bitcoin = %v, want false", legacyShare.GetBitcoin())
+	}
+}
+
+func TestBuildLegacyShare_SharesOverflowsInt32_ReturnsError(t *testing.T) {
+	share := &poolpb.Share{
+		Shares:         math.MaxInt32 + 1,
+		PaymentAddress: "addr",
+		PoolType:       poolpb.PoolType_POOL_TYPE_PPLNS,
+		Identifier:     "worker",
+	}
+	_, err := buildLegacyShare(share, legacypb.POOLTYPE_PPLNS, 1)
+	if err == nil {
+		t.Fatal("expected error for shares overflowing int32, got nil")
+	}
+}
+
+func TestBuildLegacyShare_BlockHeightOverflowsInt32_ReturnsError(t *testing.T) {
+	share := &poolpb.Share{
+		Shares:         1,
+		PaymentAddress: "addr",
+		PoolType:       poolpb.PoolType_POOL_TYPE_PPLNS,
+		Identifier:     "worker",
+		BlockHeight:    math.MaxInt32 + 1,
+	}
+	_, err := buildLegacyShare(share, legacypb.POOLTYPE_PPLNS, 1)
+	if err == nil {
+		t.Fatal("expected error for block_height overflowing int32, got nil")
+	}
+}
+
+func TestBuildLegacyShare_UnspecifiedPoolType_ReturnsError(t *testing.T) {
+	share := &poolpb.Share{
+		Shares:         1,
+		PaymentAddress: "addr",
+		PoolType:       poolpb.PoolType_POOL_TYPE_UNSPECIFIED,
+		Identifier:     "worker",
+	}
+	_, err := buildLegacyShare(share, legacypb.POOLTYPE_PPLNS, 1)
+	if err == nil {
+		t.Fatal("expected error for POOL_TYPE_UNSPECIFIED, got nil")
+	}
+}
+
+func TestBuildLegacyShare_NegativeSharesOverflow_ReturnsError(t *testing.T) {
+	share := &poolpb.Share{
+		Shares:         math.MinInt32 - 1,
+		PaymentAddress: "addr",
+		PoolType:       poolpb.PoolType_POOL_TYPE_PPLNS,
+		Identifier:     "worker",
+	}
+	_, err := buildLegacyShare(share, legacypb.POOLTYPE_PPLNS, 1)
+	if err == nil {
+		t.Fatal("expected error for shares underflowing int32, got nil")
+	}
+}
+
+func TestBuildLegacyBlock_HappyPath(t *testing.T) {
+	block := &poolpb.Block{
+		Algo:       poolpb.Algo_ALGO_C29,           // dropped
+		Network:    poolpb.Network_NETWORK_MAINNET, // dropped
+		Hash:       "0xdeadbeef",
+		Difficulty: 5000000,
+		Shares:     100,
+		Timestamp:  1700000001,
+		PoolType:   poolpb.PoolType_POOL_TYPE_PROP,
+		Unlocked:   true,
+		Valid:      true,
+		Value:      proto.Int64(987654321),
+		Height:     123456,
+		PoolId:     7, // dropped -- no legacy Block destination
+	}
+
+	legacyBlock, height32, err := buildLegacyBlock(block, legacypb.POOLTYPE_PROP)
+	if err != nil {
+		t.Fatalf("buildLegacyBlock: %v", err)
+	}
+
+	if height32 != 123456 {
+		t.Errorf("height32 = %d, want 123456", height32)
+	}
+	if legacyBlock.GetHash() != "0xdeadbeef" {
+		t.Errorf("Hash = %q, want %q", legacyBlock.GetHash(), "0xdeadbeef")
+	}
+	if legacyBlock.GetDifficulty() != 5000000 {
+		t.Errorf("Difficulty = %d, want 5000000", legacyBlock.GetDifficulty())
+	}
+	if legacyBlock.GetShares() != 100 {
+		t.Errorf("Shares = %d, want 100", legacyBlock.GetShares())
+	}
+	if legacyBlock.GetTimestamp() != 1700000001000 {
+		t.Errorf("Timestamp = %d, want 1700000001000 (block.timestamp=1700000001 seconds * 1000 -- legacy expects milliseconds, bug fix 2026-09-23)", legacyBlock.GetTimestamp())
+	}
+	if legacyBlock.GetPoolType() != legacypb.POOLTYPE_PROP {
+		t.Errorf("PoolType = %v, want PROP", legacyBlock.GetPoolType())
+	}
+	if !legacyBlock.GetUnlocked() {
+		t.Errorf("Unlocked = false, want true")
+	}
+	if !legacyBlock.GetValid() {
+		t.Errorf("Valid = false, want true")
+	}
+	if legacyBlock.GetValue() != 987654321 {
+		t.Errorf("Value = %d, want 987654321", legacyBlock.GetValue())
+	}
+
+	if _, err := proto.Marshal(legacyBlock); err != nil {
+		t.Fatalf("Marshal built legacy block: %v", err)
+	}
+}
+
+func TestBuildLegacyBlock_ValueUnsetWhenNilOnInput(t *testing.T) {
+	block := &poolpb.Block{
+		Hash:     "0xhash",
+		PoolType: poolpb.PoolType_POOL_TYPE_SOLO,
+		// Value left nil.
+	}
+	legacyBlock, _, err := buildLegacyBlock(block, legacypb.POOLTYPE_SOLO)
+	if err != nil {
+		t.Fatalf("buildLegacyBlock: %v", err)
+	}
+	if legacyBlock.Value != nil {
+		t.Errorf("Value = %v, want nil (unset)", legacyBlock.Value)
+	}
+}
+
+func TestBuildLegacyBlock_HeightOverflowsInt32_ReturnsError(t *testing.T) {
+	block := &poolpb.Block{
+		Hash:     "0xhash",
+		PoolType: poolpb.PoolType_POOL_TYPE_PPLNS,
+		Height:   math.MaxInt32 + 1,
+	}
+	_, _, err := buildLegacyBlock(block, legacypb.POOLTYPE_PPLNS)
+	if err == nil {
+		t.Fatal("expected error for height overflowing int32, got nil")
+	}
+}
+
+func TestBuildLegacyBlock_UnspecifiedPoolType_ReturnsError(t *testing.T) {
+	block := &poolpb.Block{
+		Hash:     "0xhash",
+		PoolType: poolpb.PoolType_POOL_TYPE_UNSPECIFIED,
+	}
+	_, _, err := buildLegacyBlock(block, legacypb.POOLTYPE_PPLNS)
+	if err == nil {
+		t.Fatal("expected error for POOL_TYPE_UNSPECIFIED, got nil")
+	}
+}
+
+// --- SubmitShare/SubmitBlock overflow-guard tests (through the full public API) ---
+
+func TestSubmitShare_ShareOverflowsInt32_ReturnsErrorWithoutNetworkCall(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	share := &poolpb.Share{
+		Shares:         math.MaxInt32 + 1,
+		PaymentAddress: "addr",
+		PoolType:       poolpb.PoolType_POOL_TYPE_PPLNS,
+		Identifier:     "worker",
+	}
+	if err := tr.SubmitShare(context.Background(), share); err == nil {
+		t.Fatal("expected error for overflowing shares, got nil")
+	}
+	if called {
+		t.Error("expected no HTTP call to be made for an invalid share, but the server was hit")
+	}
+}
+
+func TestSubmitBlock_HeightOverflowsInt32_ReturnsErrorWithoutNetworkCall(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	block := &poolpb.Block{
+		Hash:     "0xhash",
+		PoolType: poolpb.PoolType_POOL_TYPE_PPLNS,
+		Height:   math.MaxInt32 + 1,
+	}
+	if err := tr.SubmitBlock(context.Background(), block); err == nil {
+		t.Fatal("expected error for overflowing height, got nil")
+	}
+	if called {
+		t.Error("expected no HTTP call to be made for an invalid block, but the server was hit")
+	}
+}
+
+// --- HTTP-transport-level tests ---
+
+func TestSubmitShare_SendsRawProtobufWithKeyInBodyNotHeader(t *testing.T) {
+	var (
+		gotPath           string
+		gotBody           []byte
+		gotAuthHeaderKey  string
+		gotAuthHeaderAuth string
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		// The real legacy server has no HTTP-header-based auth at all --
+		// confirm the auth key never leaks into any header.
+		gotAuthHeaderKey = r.Header.Get("key")
+		gotAuthHeaderAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL,
+		AuthKey:        "the-real-secret",
+		LegacyPoolType: legacypb.POOLTYPE_PPLNS,
+		LegacyPoolID:   5,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	share := &poolpb.Share{
+		Shares:         10,
+		PaymentAddress: "addr-x",
+		FoundBlock:     true,
+		PoolType:       poolpb.PoolType_POOL_TYPE_PPLNS,
+		BlockDiff:      99,
+		BlockHeight:    12345,
+		Timestamp:      1700000005,
+		Identifier:     "worker-x",
+		TrustedShare:   true,
+	}
+
+	if err := tr.SubmitShare(context.Background(), share); err != nil {
+		t.Fatalf("SubmitShare: %v", err)
+	}
+
+	if gotPath != "/leafApi" {
+		t.Errorf("path = %q, want %q", gotPath, "/leafApi")
+	}
+	if gotAuthHeaderKey != "" {
+		t.Errorf("auth key leaked into a 'key' HTTP header: %q -- must be carried only in decoded WSData.key", gotAuthHeaderKey)
+	}
+	if gotAuthHeaderAuth != "" {
+		t.Errorf("auth key leaked into an Authorization HTTP header: %q -- must be carried only in decoded WSData.key", gotAuthHeaderAuth)
+	}
+
+	// Raw protobuf body, no JSON wrapper.
+	decoded := &legacypb.WSData{}
+	if err := proto.Unmarshal(gotBody, decoded); err != nil {
+		t.Fatalf("server received invalid protobuf WSData: %v", err)
+	}
+	if decoded.GetMsgType() != legacypb.MESSAGETYPE_SHARE {
+		t.Errorf("MsgType = %v, want SHARE", decoded.GetMsgType())
+	}
+	if decoded.GetKey() != "the-real-secret" {
+		t.Errorf("WSData.Key = %q, want %q", decoded.GetKey(), "the-real-secret")
+	}
+	// exInt is unused/irrelevant for SHARE.
+	if decoded.GetExInt() != 0 {
+		t.Errorf("ExInt = %d, want 0 for a SHARE message", decoded.GetExInt())
+	}
+
+	decodedShare := &legacypb.Share{}
+	if err := proto.Unmarshal(decoded.GetMsg(), decodedShare); err != nil {
+		t.Fatalf("server received invalid protobuf Share in WSData.Msg: %v", err)
+	}
+	if decodedShare.GetPaymentAddress() != "addr-x" {
+		t.Errorf("decoded Share.PaymentAddress = %q, want %q", decodedShare.GetPaymentAddress(), "addr-x")
+	}
+	if decodedShare.GetPoolID() != 5 {
+		t.Errorf("decoded Share.PoolID = %d, want 5 (the transport's configured legacy pool ID)", decodedShare.GetPoolID())
+	}
+}
+
+func TestSubmitBlock_SendsRawProtobufWithHeightAsExInt(t *testing.T) {
+	var gotBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL,
+		AuthKey:        "secret-2",
+		LegacyPoolType: legacypb.POOLTYPE_SOLO,
+		LegacyPoolID:   9,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	block := &poolpb.Block{
+		Hash:     "0xblockhash",
+		PoolType: poolpb.PoolType_POOL_TYPE_SOLO,
+		Valid:    true,
+		Height:   777777,
+	}
+
+	if err := tr.SubmitBlock(context.Background(), block); err != nil {
+		t.Fatalf("SubmitBlock: %v", err)
+	}
+
+	decoded := &legacypb.WSData{}
+	if err := proto.Unmarshal(gotBody, decoded); err != nil {
+		t.Fatalf("server received invalid protobuf WSData: %v", err)
+	}
+	if decoded.GetMsgType() != legacypb.MESSAGETYPE_BLOCK {
+		t.Errorf("MsgType = %v, want BLOCK", decoded.GetMsgType())
+	}
+	if decoded.GetKey() != "secret-2" {
+		t.Errorf("WSData.Key = %q, want %q", decoded.GetKey(), "secret-2")
+	}
+	if decoded.GetExInt() != 777777 {
+		t.Errorf("ExInt = %d, want 777777 (the real block height)", decoded.GetExInt())
+	}
+
+	decodedBlock := &legacypb.Block{}
+	if err := proto.Unmarshal(decoded.GetMsg(), decodedBlock); err != nil {
+		t.Fatalf("server received invalid protobuf Block in WSData.Msg: %v", err)
+	}
+	if decodedBlock.GetHash() != "0xblockhash" {
+		t.Errorf("decoded Block.Hash = %q, want %q", decodedBlock.GetHash(), "0xblockhash")
+	}
+}
+
+func TestSubmitShare_403Response_ReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{BackendBaseURL: srv.URL, AuthKey: "wrong-key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	share := &poolpb.Share{
+		Shares: 1, PaymentAddress: "addr", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS, Identifier: "w",
+	}
+	if err := tr.SubmitShare(context.Background(), share); err == nil {
+		t.Fatal("expected error for 403 response, got nil")
+	}
+}
+
+func TestSubmitBlock_400Response_ReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	// Short retry budget/interval -- this test intentionally exercises
+	// the "give up cleanly once the budget is exhausted" path (see
+	// TestSubmitBlock_RetriesUntilBudgetExhaustedThenGivesUpCleanly for
+	// the fuller version with attempt-count assertions); it must not
+	// take the real 5-minute default budget to run.
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		BlockSubmitRetryBudget: 50 * time.Millisecond, BlockSubmitRetryInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	block := &poolpb.Block{Hash: "0xh", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS}
+	if err := tr.SubmitBlock(context.Background(), block); err == nil {
+		t.Fatal("expected error for 400 response, got nil")
+	}
+}
+
+// TestSubmitShare_200SuccessTrue_NoError proves the transport-level
+// contract works for the real legacy "unconditional success" SHARE
+// semantics. NOTE (per this test's own comment, and the package doc
+// comment): a 200 {"success":true} here does NOT prove the inner Share
+// payload was actually accepted/processed server-side -- the real
+// nodejs-pool remoteShare.js silently swallows inner-Share decode
+// failures in a try/catch and responds 200 regardless. This test only
+// proves the outer WSData envelope was delivered and the HTTP-level
+// contract is satisfied.
+func TestSubmitShare_200SuccessTrue_NoError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	share := &poolpb.Share{
+		Shares: 1, PaymentAddress: "addr", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS, Identifier: "w",
+	}
+	if err := tr.SubmitShare(context.Background(), share); err != nil {
+		t.Fatalf("SubmitShare: unexpected error: %v", err)
+	}
+}
+
+func TestSubmitShare_TimesOutOnSlowServer(t *testing.T) {
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-unblock
+	}))
+	defer func() {
+		close(unblock)
+		srv.Close()
+	}()
+
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		ShareTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	share := &poolpb.Share{
+		Shares: 1, PaymentAddress: "addr", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS, Identifier: "w",
+	}
+
+	start := time.Now()
+	err = tr.SubmitShare(context.Background(), share)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SubmitShare took %v to time out, want well under 2s given a 100ms configured timeout", elapsed)
+	}
+}
+
+func TestNew_RequiresBackendBaseURL(t *testing.T) {
+	if _, err := New(Config{AuthKey: "key"}); err == nil {
+		t.Fatal("expected error for empty BackendBaseURL, got nil")
+	}
+}
+
+func TestNew_RequiresAuthKey(t *testing.T) {
+	if _, err := New(Config{BackendBaseURL: "https://example.com"}); err == nil {
+		t.Fatal("expected error for empty AuthKey, got nil")
+	}
+}
+
+// --- SubmitBlock retry-with-backoff tests (2026-09-23 production fix) ---
+
+// TestSubmitBlock_RetriesThenSucceedsWithinBudget proves the core fix:
+// a backend that returns non-2xx N times then 200 is retried and
+// SubmitBlock eventually returns success, well within the configured
+// budget. This is the exact real-world shape of the 2026-09-23
+// incident (height 351096) -- the legacy backend's own chain view
+// catches up after a few attempts, and this must no longer be a
+// permanent, unrecoverable failure.
+func TestSubmitBlock_RetriesThenSucceedsWithinBudget(t *testing.T) {
+	var attempts int32
+	const failuresBeforeSuccess = 3
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attempts, 1)
+		if n <= failuresBeforeSuccess {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		BlockSubmitRetryBudget: 2 * time.Second, BlockSubmitRetryInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	block := &poolpb.Block{Hash: "0xretry", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS, Height: 351096}
+
+	start := time.Now()
+	if err := tr.SubmitBlock(context.Background(), block); err != nil {
+		t.Fatalf("SubmitBlock: expected eventual success, got error: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if got := atomic.LoadInt32(&attempts); got != failuresBeforeSuccess+1 {
+		t.Errorf("server received %d attempts, want %d (failures + 1 success)", got, failuresBeforeSuccess+1)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("SubmitBlock took %v, want well under the 2s configured budget", elapsed)
+	}
+}
+
+// TestSubmitBlock_GivesUpCleanlyWhenBudgetExhausted proves the "never
+// retry forever" half of the fix: a backend that ALWAYS returns
+// non-2xx must make SubmitBlock return a real, clear error once the
+// configured retry budget is exhausted -- not hang, and not silently
+// succeed.
+func TestSubmitBlock_GivesUpCleanlyWhenBudgetExhausted(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	budget := 150 * time.Millisecond
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		BlockSubmitRetryBudget: budget, BlockSubmitRetryInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	block := &poolpb.Block{Hash: "0xnever", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS}
+
+	start := time.Now()
+	err = tr.SubmitBlock(context.Background(), block)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a real error once the retry budget is exhausted, got nil")
+	}
+	// Bounded: must not hang well past the configured budget (some
+	// slack for the in-flight final attempt/scheduling jitter, but
+	// nowhere near the package's 5-minute DEFAULT budget -- proving
+	// this genuinely respects the configured budget rather than
+	// falling back to the default or retrying forever).
+	if elapsed > 2*time.Second {
+		t.Fatalf("SubmitBlock took %v to give up, want well under 2s given a %v configured budget (must never hang/retry forever)", elapsed, budget)
+	}
+	if got := atomic.LoadInt32(&attempts); got < 2 {
+		t.Errorf("server received %d attempts, want at least 2 (proving it actually retried, not just failed once)", got)
+	}
+}
+
+// TestSubmitBlock_RespectsCallerContextCancellation proves the retry
+// loop does not out-live the caller's own ctx -- e.g. session.go's
+// forwardBlock context.WithTimeout wrapping the whole call (see that
+// method's own fix for this exact scenario).
+func TestSubmitBlock_RespectsCallerContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		// A budget far longer than the ctx below -- the ctx deadline,
+		// not the budget, must be what actually cuts this short.
+		BlockSubmitRetryBudget: time.Minute, BlockSubmitRetryInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	block := &poolpb.Block{Hash: "0xctx", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS}
+
+	start := time.Now()
+	err = tr.SubmitBlock(ctx, block)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error once the caller's ctx is done, got nil")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SubmitBlock took %v, want well under 2s given a 100ms caller ctx timeout (must not out-live the caller's own deadline)", elapsed)
+	}
+}
+
+// TestSubmitShare_NeverRetries proves the retry logic added to
+// SubmitBlock does NOT leak into SubmitShare -- shares are still
+// fire-and-forget/best-effort by original design (see SubmitShare's
+// own doc comment), so a non-2xx response must still fail on the
+// FIRST attempt, with no retry/backoff delay at all.
+func TestSubmitShare_NeverRetries(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	// A generous retry budget/short interval configured on the
+	// transport (as if SubmitBlock's retry were mistakenly shared) --
+	// if SubmitShare respected this at all, this test would be slow
+	// and/or see more than one attempt. It must see neither.
+	tr, err := New(Config{
+		BackendBaseURL: srv.URL, AuthKey: "key", LegacyPoolType: legacypb.POOLTYPE_PPLNS, LegacyPoolID: 1,
+		BlockSubmitRetryBudget: 5 * time.Second, BlockSubmitRetryInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	share := &poolpb.Share{
+		Shares: 1, PaymentAddress: "addr", PoolType: poolpb.PoolType_POOL_TYPE_PPLNS, Identifier: "w",
+	}
+
+	start := time.Now()
+	if err := tr.SubmitShare(context.Background(), share); err == nil {
+		t.Fatal("expected error for 400 response, got nil")
+	}
+	elapsed := time.Since(start)
+
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("server received %d attempts, want exactly 1 (SubmitShare must never retry)", got)
+	}
+	if elapsed > time.Second {
+		t.Errorf("SubmitShare took %v, want near-instant (no retry/backoff delay)", elapsed)
+	}
+}

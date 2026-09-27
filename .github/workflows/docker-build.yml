@@ -1,0 +1,208 @@
+name: docker-build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, vet, fmt, test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go test
+        run: go test ./...
+
+  docker:
+    name: Docker build (${{ matrix.binary }})
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binary: backend
+            dockerfile: docker/backend/Dockerfile
+          - binary: leaf-direct
+            dockerfile: docker/leaf-direct/Dockerfile
+          - binary: leaf-proxy
+            dockerfile: docker/leaf-proxy/Dockerfile
+          - binary: leaf-solo
+            dockerfile: docker/leaf-solo/Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Only push (and tag `latest`) on version tags. Plain pushes to
+      # main build and validate the image but never publish it.
+      - name: Determine whether to push
+        id: push-gate
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.push-gate.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/snipa22/go-crypto-pool-${{ matrix.binary }}
+          tags: |
+            type=sha
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ steps.push-gate.outputs.push == 'true' }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ steps.push-gate.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.binary }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.binary }}
+
+  # Cross-compiled leaf-proxy release archives. Only built on version
+  # tags (never on plain main pushes) — mirrors the docker job's
+  # push-gate above. leaf-proxy has no CGO dependency (see
+  # docker/leaf-proxy/Dockerfile, which already builds with
+  # CGO_ENABLED=0), so cross-compilation needs no target toolchain.
+  release-archives:
+    name: Release archive (${{ matrix.os }}/${{ matrix.arch }})
+    needs: test
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+          - os: darwin
+            arch: arm64
+            ext: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build leaf-proxy binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" \
+            -o "dist/leaf-proxy${{ matrix.ext }}" \
+            ./cmd/leaf-proxy
+
+      - name: Stage and package archive
+        id: archive
+        run: |
+          set -euo pipefail
+          version="${{ github.ref_name }}"
+          stage_dir="leaf-proxy-${version}-${{ matrix.os }}-${{ matrix.arch }}"
+          archive="${stage_dir}.tar.gz"
+          mkdir -p "$stage_dir"
+          cp "dist/leaf-proxy${{ matrix.ext }}" "$stage_dir/"
+          cp cmd/leaf-proxy/leaf-proxy.example.toml "$stage_dir/"
+          tar -czf "$archive" "$stage_dir"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.archive }}
+          path: ${{ steps.archive.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 90
+
+  # Attaches every release-archives matrix leg's tar.gz to the GitHub
+  # Release for this tag, creating the Release first if one doesn't
+  # already exist (softprops/action-gh-release upserts). Kept as a
+  # separate job (rather than uploading from inside the matrix) so
+  # the 4 legs don't race each other creating/updating the same
+  # Release.
+  publish-release:
+    name: Publish release archives
+    needs: release-archives
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "leaf-proxy-*.tar.gz"
+          path: archives
+          merge-multiple: true
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: archives/*.tar.gz

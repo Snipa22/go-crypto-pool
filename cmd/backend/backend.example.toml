@@ -1,0 +1,259 @@
+# backend example configuration file.
+# This file is a TEMPLATE ONLY -- it is never auto-loaded. Point backend at a
+# copy of this file (with real values) via -config <path> or
+# BACKEND_CONFIG_FILE=<path>. Precedence: explicit -flag > explicit env var >
+# this file > the hardcoded default shown below. Only the default (no
+# subcommand) run() path honors -config -- the block/retention/address/migrate
+# CLI subcommands are unaffected.
+#
+# Durations are given in plain integer seconds (not Go duration strings like
+# "30s"), since go-toml/v2 does not natively decode into time.Duration.
+
+# (required) Postgres DSN, e.g.
+# "postgres://user:pass@host:5432/db?sslmode=disable". No default -- startup
+# fails fast if this is missing.
+db_dsn = ""
+
+# HTTP listen address. (default: ":8080")
+listen_addr = ":8080"
+
+# HTTP listen address for GET /metrics ONLY -- deliberately separate from
+# listen_addr above (see PROD_HARDENING_REVIEW.md finding #12: /metrics
+# exposes wallet_balance_atomic, the real hot-wallet balance, and must not
+# share a public listener with share/block ingestion). Defaults to
+# loopback-only, matching the leaf binaries' own metrics_listen_address
+# convention. Empty disables the /metrics endpoint entirely.
+# (default: "127.0.0.1:9602")
+metrics_listen_addr = "127.0.0.1:9602"
+
+# Max concurrent TCP connections the main HTTP listener (listen_addr) will
+# accept, 0 = unlimited. (default: 10000)
+max_connections = 10000
+
+# Sustained requests-per-second allowed per source IP across /api/v1/share
+# and /api/v1/block combined, 0 (or negative) = disabled (no rate limiting).
+# This is a genuinely different defense than max_connections above: that
+# caps total concurrent TCP connections across ALL sources combined, this
+# bounds the request RATE of any one individual source (e.g. a single
+# misbehaving/malicious leaf). Default chosen to comfortably exceed the
+# aggregate submit rate of a single leaf proxying hundreds of workers at
+# the pool's own ~15-30s per-worker vardiff target. (default: 200)
+ingestion_rate_limit = 200
+
+# Burst size (rate.Limiter's burst parameter) for the same per-source-IP
+# limiter ingestion_rate_limit configures. Only consulted when
+# ingestion_rate_limit > 0. (default: 400)
+ingestion_rate_burst = 400
+
+# Shared-secret auth header name to require on /api/v1/share and
+# /api/v1/block, e.g. "Authorization". Must be set together with
+# auth_header_value.
+#
+# REQUIRED unless insecure_allow_unauthenticated_ingestion below is set --
+# run() refuses to start with this and auth_header_value both empty
+# otherwise. POST /api/v1/share and /api/v1/block are the leaf-to-backend
+# trust boundary carrying real payout-triggering data; leaving them
+# unauthenticated by default would let anyone with network reach to this
+# backend submit fabricated shares/blocks and get paid real coin.
+# (default: "" -- but see above, empty is only accepted with the override)
+auth_header_name = ""
+
+# Expected value for auth_header_name above. REQUIRED alongside it (see
+# above). (default: "")
+auth_header_value = ""
+
+# LOCAL/DEV USE ONLY. Explicit, loudly-logged override that allows this
+# command to start with auth_header_name/auth_header_value both empty,
+# leaving /api/v1/share and /api/v1/block completely unauthenticated.
+# Disabled by default -- with nothing set at all, run() refuses to start
+# rather than silently accepting every share/block. (default: false)
+insecure_allow_unauthenticated_ingestion = false
+
+# (required) the network this backend is configured for. Accepts "mainnet" or
+# "testnet" (case-insensitive). No default -- startup fails fast if this is
+# missing or does not parse to a valid network.
+network = ""
+
+# Sustained requests/second, per source IP, allowed against the public,
+# unauthenticated GET routes registered by internal/backend/statsapi,
+# internal/backend/networkapi, and internal/backend/legacyconfig. These are
+# public stats-page endpoints, expected to be polled more frequently and by
+# more distinct legitimate clients (browsers, dashboards, monitoring) than the
+# leaf-to-backend ingestion endpoints -- hence a materially higher default
+# than an ingestion-appropriate rate. <= 0 disables rate limiting entirely.
+# (default: 30)
+stats_api_rate_limit_per_second = 30
+
+# Token-bucket burst size (per source IP) for
+# stats_api_rate_limit_per_second above. Only consulted when the rate limit
+# is enabled. (default: 90)
+stats_api_rate_limit_burst = 90
+
+# host:port of a real Tari base node's GRPC endpoint. When set, the block
+# unlocker polls every pending ALGO_RXT/ALGO_C29/ALGO_SHA3X block against it
+# to detect maturity/orphaning. When unset, those algos' blocks are simply
+# never auto-unlocked. (default: "")
+tari_grpc_addr = ""
+
+# base URL of a real monerod JSON-RPC endpoint (e.g. "http://127.0.0.1:18081").
+# When set, the unlocker polls every pending ALGO_RXM block against it. Same
+# opt-in behavior as tari_grpc_addr above. (default: "")
+monero_rpc_addr = ""
+
+# How often the unlocker re-checks pending blocks, in seconds. Only consulted
+# if at least one of tari_grpc_addr/monero_rpc_addr is set. (default: 60)
+unlocker_poll_interval_seconds = 60
+
+# Confirmations required before a Tari-family block (RXT/C29/SHA3X) is marked
+# unlocked/payable. A PLACEHOLDER, operationally-tunable value, not a Tari
+# protocol constant. (default: 60)
+unlocker_tari_maturity = 60
+
+# Confirmations required before an RXM block is marked unlocked/payable,
+# mirroring Monero's own CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW. (default: 60)
+unlocker_monero_maturity = 60
+
+# How long a chain-unresolved pending block (Verify error, not-found, or
+# below-maturity-depth) may sit before the unlocker gives up and auto-marks it
+# invalid+unlocked instead of retrying it forever, in seconds. Does NOT apply
+# to a confirmed-mature block whose payout failed -- that always retries
+# forever, since money already confirmed owed must never time out.
+# Deliberately ON by default; set to 0 to restore forever-retry for
+# chain-unresolved blocks too. (default: 1800, i.e. 30 minutes)
+unlocker_stuck_timeout_seconds = 1800
+
+# How often the network-state poller re-checks the real upstream chain(s)
+# configured via tari_grpc_addr/monero_rpc_addr, in seconds. (default: 60)
+network_poller_poll_interval_seconds = 60
+
+# Pool operator fee-collection payment address for Tari-family algos
+# (RXT/C29/SHA3X). When set, every matured Tari-family block also triggers a
+# real payout cycle for that block, crediting miner balances. When unset,
+# Tari-family blocks still mature/unlock correctly, they are simply never
+# auto-paid out. (default: "")
+payout_tari_fee_address = ""
+
+# Pool operator fee-collection payment address for RXM (Monero). When set,
+# every matured RXM block also triggers a real payout cycle for that block,
+# crediting miner balances. When unset, RXM blocks still mature/unlock
+# correctly, they are simply never auto-paid out. (default: "")
+payout_monero_fee_address = ""
+
+# Donation address for Tari-family (RXT/C29/SHA3X) payout cycles. (default: "")
+payout_tari_donation_address = ""
+
+# Donation address for RXM (Monero) payout cycles. (default: "")
+payout_monero_donation_address = ""
+
+# PPS pool-type operator fee percentage (0-100). (default: 0)
+payout_pps_fee_percent = 0
+
+# PPLNS pool-type operator fee percentage (0-100). (default: 0)
+payout_pplns_fee_percent = 0
+
+# Solo pool-type operator fee percentage (0-100). (default: 0)
+payout_solo_fee_percent = 0
+
+# Donation split percentage (0-100) of each fee cut routed to
+# payout_tari_donation_address/payout_monero_donation_address, shared across
+# coin families. (default: 0)
+payout_donation_percent = 0
+
+# PPLNS window multiplier. A placeholder, operator-tunable value -- see
+# payout.Config's doc comment. (default: 2)
+payout_pplns_share_multi = 2
+
+# How often the retention job re-evaluates every target, in seconds. Only
+# consulted if at least one retention window is configured. (default: 3600)
+retention_poll_interval_seconds = 3600
+
+# The DEFAULT retention window, in block-height units, applied to every
+# (algo, pool_type) combination that does not have a more specific override.
+# 0 (or unset) means no default. (default: 0)
+#
+# NOTE: the per-combination override
+# GCPOOL_RETENTION_<ALGO>_<POOL_TYPE>_BLOCKS (e.g.
+# GCPOOL_RETENTION_RXT_PPLNS_BLOCKS) remains ENV-VAR-ONLY and is deliberately
+# not represented in this file -- its key name is only known at runtime
+# (db.ValidAlgos x db.ValidPoolTypes), so it cannot become a static TOML key.
+retention_blocks = 0
+
+# Base URL of a real monero-wallet-rpc endpoint (e.g.
+# "http://127.0.0.1:18083"). When set, accrued pending_balance is periodically
+# paid out via a real on-chain transfer. (default: "")
+monero_wallet_rpc_addr = ""
+
+# HTTP Digest auth username matching whatever --rpc-login the real
+# monero-wallet-rpc process was started with. (default: "")
+monero_wallet_rpc_user = ""
+
+# HTTP Digest auth password matching monero_wallet_rpc_user above.
+# (default: "")
+monero_wallet_rpc_password = ""
+
+# Minimum pending_balance (atomic units) required before a miner is paid out
+# at all. Shared by both the Monero and Tari disbursement engines.
+# (default: 0)
+disburse_min_payout_atomic = 0
+
+# Flat atomic-unit fee charged against every force_payout=TRUE balance row
+# paid out this cycle (see POST /user/forcePayment), deducted from the
+# miner's payout and credited to pool revenue
+# (payouts.force_payout_fee_atomic). Shared by both the Monero and Tari
+# disbursement engines. 0 (default) means no extra fee.
+force_payout_fee_atomic = 0
+
+# Cap on destinations per real Transfer call, for the Monero disbursement
+# engine only (the Tari engine hardcodes 1 -- see buildTariDisburseEngine's
+# doc comment). (default: 15)
+disburse_max_destinations_per_batch = 15
+
+# How often the disbursement engine(s) run a cycle, in seconds. Shared by both
+# the Monero and Tari disbursement engines. (default: 600)
+disburse_poll_interval_seconds = 600
+
+# Timeout for real wallet RPC calls, in seconds: the monero-wallet-rpc HTTP
+# client's timeout, and the bound on Tari's READ-ONLY wallet GRPC lookups.
+#
+# MONEY-CRITICAL, not a routine tuning knob. A real monero-wallet-rpc
+# `transfer` call can take longer than this and STILL broadcast the
+# transaction; when the client gives up first, the backend cannot tell whether
+# the coin moved, so it records the payout AMBIGUOUS and HALTS all
+# disbursement for that algo/network until an operator resolves it by hand
+# (`backend payout list-unresolved`). Set this generously -- too short simply
+# converts good payouts into manual incidents. Too long only risks the
+# disbursement loop stalling on a dead wallet RPC until the next tick.
+# (default: 60)
+wallet_rpc_timeout_seconds = 60
+
+# Address (host:port) of a real Tari console/base wallet GRPC endpoint. When
+# set, enables the Tari payout disbursement engine. (default: "")
+tari_wallet_grpc_addr = ""
+
+# Default fee_per_gram for a Transfer whose Priority is zero. 0 (or unset)
+# leaves wallet.NewTariWalletGRPC's own package default in effect.
+# (default: 0)
+tari_wallet_fee_per_gram = 0
+
+# How often the wallet-stats poller calls GetBalance on every configured
+# wallet, in seconds. Only consulted if at least one wallet RPC is
+# configured. (default: 60)
+wallet_stats_poll_interval_seconds = 60
+
+# (required) HMAC-SHA256 signing secret for internal/backend/authapi's JWTs
+# (also reused as its password-hashing key -- see that package's doc
+# comment). No default -- startup fails fast if this is unset.
+#
+# WARNING: this is a secret. Prefer setting it via the GCPOOL_JWT_SECRET
+# env var or a real secrets manager instead of committing it to a config
+# file on disk. Left commented out here for that reason -- uncomment only
+# if you understand the tradeoff.
+# jwt_secret = ""
+
+# Enable verbose [DEBUG]-tagged logging for the block unlocker/
+# disbursement engines/network-state poller's poll-cycle detail (what was
+# checked, what changed -- e.g. maturity check results, payout batch
+# decisions, network tip state). OFF by default -- purely additive, never
+# changes any existing log line. (default: false)
+debug = false
+
