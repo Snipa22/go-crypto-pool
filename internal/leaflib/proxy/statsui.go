@@ -71,7 +71,7 @@ var statsPageTemplate = template.Must(template.New("proxy-stats").Funcs(template
 const statsPageHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
+<meta charset="utf-8" http-equiv="refresh" content="10">
 <title>leaf-proxy stats</title>
 <style>
   body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; color: #1a1a1a; background: #fafafa; }
