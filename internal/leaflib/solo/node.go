@@ -26,8 +26,8 @@ import (
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/nodeGRPC"
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
-	"github.com/Snipa22/go-xmr-lib/support"
 
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/moneroblob"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -234,72 +234,45 @@ func MoneroHashingBlobForSubmit(job *Job, nonce uint64) ([]byte, error) {
 	return blob, nil
 }
 
-// xnpConvertTemplateBlobTimeout bounds how long
-// convertRawTemplateBlobToHashingBlob will wait for
-// support.ParseBlockFromTemplateBlob + support.GetBlockHashingBlob to
-// complete before giving up and returning an error. This is the SAME
-// timeout value and the SAME rationale as
-// internal/leaflib/proxy/upstream.go's own
-// convertTemplateBlobTimeout — see that constant's doc comment for
-// the full explanation (a real, well-formed template parses in
-// low-single-digit milliseconds; this is a generous multiple of that).
-const xnpConvertTemplateBlobTimeout = 2 * time.Second
-
 // convertRawTemplateBlobToHashingBlob converts a raw hex
 // blocktemplate_blob into the real, correctly-sized RandomX hashing
 // blob via go-xmr-lib/support's ParseBlockFromTemplateBlob +
-// GetBlockHashingBlob, wrapped in BOTH a panic-recovery net AND a
-// hard wall-clock timeout.
+// GetBlockHashingBlob, wrapped in a panic-recovery net, a hard
+// wall-clock timeout, AND the process-wide malformed-blob circuit
+// breaker.
 //
-// THIS IS A DELIBERATE, IMPORT-CYCLE-DRIVEN DUPLICATE of
+// THIS USED TO BE A DELIBERATE, IMPORT-CYCLE-DRIVEN DUPLICATE of
 // internal/leaflib/proxy/upstream.go's convertTemplateBlobToHashingBlob
-// — read THAT function's full doc comment for the complete citation
-// of the genuine, confirmed go-xmr-lib v0.2.5 bug this timeout guards
-// against (serialization.ConstructTXExtra's tx_extra tag-byte switch
-// has no default case and can spin forever on malformed input, not
-// just panic) and for the real panic-based failure modes the recover
-// below guards against (corrupt/truncated length-prefixed fields
-// consumed via direct slicing rather than a bounds-checked read).
+// -- with one real, material difference: the duplicate had NO circuit
+// breaker, only the timeout/recover. That was tolerable while this
+// package only converted on the comparatively rare XNP-proxy submit
+// path, but this package now also converts on its Monero
+// shared-template job-DERIVATION path (job.go's
+// jobFromSharedTemplate extraNonce stamp), i.e. once per new session
+// per template, so it needs the same sustained-malformed-input
+// protection leaf-proxy already had.
 //
-// This package (internal/leaflib/solo) cannot import
-// internal/leaflib/proxy to reuse that function directly:
-// internal/leaflib/proxy already imports internal/leaflib/solo
-// (protocol.go, session.go, for the shared XNP-proxy detection/job
-// types), so solo importing proxy back would create a real import
-// cycle. Duplicating this small wrapper locally is the correct
-// choice here — see this task's own brief for the explicit
-// import-cycle check this duplication was verified against. DO NOT
-// "clean up" this apparent duplication by having one call the other,
-// or by hoisting it to a shared package, without re-checking that
-// cycle first.
+// Both copies are now thin wrappers over the single shared
+// implementation in internal/leaflib/moneroblob, which imports
+// neither this package nor internal/leaflib/proxy and so can be
+// imported by both with no cycle (internal/leaflib/proxy imports
+// internal/leaflib/solo, which is what made solo importing proxy
+// back impossible). Read moneroblob's own package/function doc
+// comments for the complete citation of the genuine, confirmed
+// go-xmr-lib v0.2.5 bug the timeout guards against
+// (serialization.ConstructTXExtra's tx_extra tag-byte switch has no
+// default case and can spin forever on malformed input, not just
+// panic), the real panic-based failure modes the recover guards
+// against (corrupt/truncated length-prefixed fields consumed via
+// direct slicing rather than a bounds-checked read), and why exactly
+// ONE process-wide breaker instance is required.
+//
+// DO NOT call support.ParseBlockFromTemplateBlob/
+// support.GetBlockHashingBlob directly and unwrapped anywhere in
+// production code -- go through this wrapper (or
+// moneroblob.ConvertTemplateBlobToHashingBlob directly).
 func convertRawTemplateBlobToHashingBlob(blobHex string) ([]byte, error) {
-	type outcome struct {
-		blob []byte
-		err  error
-	}
-	ch := make(chan outcome, 1)
-	go func() {
-		var out outcome
-		defer func() {
-			if r := recover(); r != nil {
-				out = outcome{nil, fmt.Errorf("solo: recovered from a panic while parsing/converting a blocktemplate_blob (malformed or truncated input): %v", r)}
-			}
-			ch <- out
-		}()
-		parsedBlock, perr := support.ParseBlockFromTemplateBlob(blobHex)
-		if perr != nil {
-			out = outcome{nil, perr}
-			return
-		}
-		hashingBlob, perr := support.GetBlockHashingBlob(parsedBlock)
-		out = outcome{hashingBlob, perr}
-	}()
-	select {
-	case out := <-ch:
-		return out.blob, out.err
-	case <-time.After(xnpConvertTemplateBlobTimeout):
-		return nil, fmt.Errorf("solo: parsing/converting a blocktemplate_blob did not complete within %s -- likely triggered the known go-xmr-lib v0.2.5 ConstructTXExtra infinite-loop bug on malformed tx_extra data (see proxy/upstream.go's convertTemplateBlobToHashingBlob doc comment); giving up and treating this as a failed conversion rather than blocking forever", xnpConvertTemplateBlobTimeout)
-	}
+	return moneroblob.ConvertTemplateBlobToHashingBlob(blobHex)
 }
 
 // patchMoneroXNPReservedOffsets returns a FRESH COPY of raw with
@@ -763,20 +736,24 @@ func (c *GRPCNodeClient) SubmitBlock(ctx context.Context, candidate any) error {
 }
 
 // errRelayTemplateAdoptionNotSupported is returned by
-// GRPCNodeClient/MoneroNodeClient's JobFromTemplateBytes/
-// TemplateBytesForRelay stubs below. Relay-template adoption
-// (relay-template-adoption brief) is explicitly scoped to
-// leaf-direct's own NodeClient implementation only (see
-// internal/leaflib/direct/node.go) — every leaf-direct instance of a
-// given pool/algo shares the SAME fleet-wide payout_address, so a
-// relayed template already pays the correct destination, unlike
-// leaf-solo (per-operator payout addresses) where adopting a
-// sibling's relayed template would misdirect the coinbase. leaf-solo
-// never wires a non-nil Relay into JobManagerConfig in practice (see
-// cmd/leaf-solo/main.go), so this path is never actually exercised
-// there — but solo.NodeClient's interface still requires both
-// methods to exist so GRPCNodeClient/MoneroNodeClient keep
-// satisfying it.
+// GRPCNodeClient's JobFromTemplateBytes/TemplateBytesForRelay stubs
+// below (leaf-solo's own Tari NodeClient). Relay-template adoption
+// (relay-template-adoption brief) genuinely requires every instance
+// of a given pool/algo to share the SAME fleet-wide payout_address, so
+// a relayed template's coinbase already pays the correct destination
+// — that invariant holds for leaf-direct's own Tari NodeClient (see
+// internal/leaflib/direct/node.go) AND, as of this fix, for
+// MoneroNodeClient's leaf-direct-Monero/RXM path too (see
+// MoneroNodeClient.JobFromTemplateBytes/TemplateBytesForRelay in
+// monero_node.go, this same package). It does NOT hold for
+// GRPCNodeClient's own leaf-solo callers (per-operator payout
+// addresses — adopting a sibling's relayed template there would
+// misdirect the coinbase), which is what this error/these two stubs
+// remain scoped to. leaf-solo never wires a non-nil Relay into
+// JobManagerConfig in practice (see cmd/leaf-solo/main.go), so this
+// path is never actually exercised there — but solo.NodeClient's
+// interface still requires both methods to exist so GRPCNodeClient
+// keeps satisfying it.
 var errRelayTemplateAdoptionNotSupported = errors.New("solo: relay template adoption not supported for leaf-solo")
 
 // JobFromTemplateBytes implements NodeClient. Not supported for

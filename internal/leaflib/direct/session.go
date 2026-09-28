@@ -382,8 +382,17 @@ func (s *Session) handleLogin(req solo.Request) {
 	// divergence (agent-string detection here vs. legacy's
 	// operator-maintained payout-address allowlist), and why the
 	// NiceHash-agent pin is deliberately left untouched.
+	//
+	// Also mirrors solo.Session's ADDITIVE generic-proxy escape
+	// hatch: any OTHER agent that self-identifies as some kind of
+	// proxy (a case-insensitive "proxy" substring, not already
+	// claimed by the XNP check) gets the same unpin treatment, for
+	// either fixed-diff source (suffix or NiceHash-agent) -- see
+	// solo.LoginFields.GenericProxyExemptFromFixedDiffPin
+	// (solo/loginfields.go).
 	if loginFields.FixedDiff {
-		if !loginFields.XNPProxyExemptFromFixedDiffPin(login.Agent) {
+		if !loginFields.XNPProxyExemptFromFixedDiffPin(login.Agent) &&
+			!loginFields.GenericProxyExemptFromFixedDiffPin(login.Agent) {
 			s.fixedDiff.Store(true)
 		}
 		s.currentDifficulty.Store(loginFields.Difficulty)
@@ -1608,9 +1617,12 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	// ReservedOffset/ClientPoolOffset are deliberately left nil for
 	// RXT while ClientNonceOffset is set to the real, meaningful
 	// rxtXmrigNonceOffset constant). solo.IsXNPProxyAgent is the
-	// single shared implementation of the case-sensitive
-	// "xmr-node-proxy" substring check both packages use, so leaf-solo
-	// and leaf-direct can never drift on detection logic.
+	// single shared implementation of the case-INsensitive
+	// "xmr-node-proxy" substring check both packages use (broadened
+	// from the legacy reference's case-sensitive JS check per
+	// product-owner direction — see solo.IsXNPProxyAgent's own doc
+	// comment), so leaf-solo and leaf-direct can never drift on
+	// detection logic.
 	//
 	// NON-REGRESSION: for every non-proxy agent, and for every
 	// non-RXM/RXT algo regardless of agent, all four pointer fields

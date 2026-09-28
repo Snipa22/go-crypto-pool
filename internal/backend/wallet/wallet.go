@@ -152,6 +152,51 @@ type Balance struct {
 	Unlocked int64
 }
 
+// DetailedBalance is a real wallet's balance broken down into its
+// FULL set of independently-meaningful components, for coins whose
+// wallet RPC/GRPC natively reports more than the Total/Unlocked pair
+// Balance carries. Today only *TariWalletGRPC populates this (see
+// DetailedBalanceClient) -- Tari's wallet GRPC genuinely reports
+// available/pending-incoming/pending-outgoing/timelocked as four
+// separate real fields (tari_generated.GetBalanceResponse), unlike
+// monero-wallet-rpc's get_balance, which only ever gives Total/
+// Unlocked.
+type DetailedBalance struct {
+	// Available is the immediately spendable balance -- the same
+	// real figure Balance.Unlocked reports (Balance.GetBalance's
+	// Tari mapping sets Unlocked = Available).
+	Available int64
+	// Timelocked is coin the wallet owns but cannot yet spend due
+	// to an explicit time-lock (e.g. a coinbase maturity lock),
+	// distinct from an ordinary unconfirmed/pending state.
+	Timelocked int64
+	// PendingIncoming is coin belonging to a transaction the
+	// wallet has detected but not yet fully confirmed/received --
+	// not yet part of Available, and not yet spendable.
+	PendingIncoming int64
+	// PendingOutgoing is coin already committed as inputs to an
+	// in-flight outbound transaction this wallet sent -- it has
+	// already left Available (being consumed to pay for that
+	// transaction) but the transaction itself hasn't finished
+	// confirming yet.
+	PendingOutgoing int64
+}
+
+// DetailedBalanceClient is an OPTIONAL capability a WalletClient
+// implementation may additionally satisfy when its coin's real
+// wallet RPC/GRPC natively reports more balance detail than
+// WalletClient.GetBalance's coin-agnostic Total/Unlocked pair can
+// carry (see DetailedBalance's doc comment). Callers that want the
+// richer breakdown when available (e.g. cmd/backend's wallet-stats
+// poller, backing wallet_balance_atomic's pending_incoming/
+// timelocked kinds) should type-assert against this interface and
+// fall back to plain WalletClient.GetBalance's Total/Unlocked split
+// when a given implementation (e.g. *MoneroWalletRPC) doesn't
+// satisfy it.
+type DetailedBalanceClient interface {
+	GetDetailedBalance(ctx context.Context) (DetailedBalance, error)
+}
+
 // WalletClient is the narrow, coin-agnostic surface
 // internal/backend/disburse depends on for actually moving real coin.
 // *MoneroWalletRPC (monero_rpc.go) is the only production

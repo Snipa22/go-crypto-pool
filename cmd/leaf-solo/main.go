@@ -905,7 +905,19 @@ func main() {
 			logger.Printf("NOTE: for RXM/merge-mining revenue, -monerod-url must point at a local minotari_merge_mining_proxy listener, NOT raw monerod -- pointing at raw monerod mines Monero-only with zero Tari merge-mine revenue")
 		}
 		logger.Printf("connecting to monerod-compatible daemon (-coin=%s) at %s", cfg.coin, cfg.monerodURL)
-		node = solo.NewMoneroNodeClient(cfg.monerodURL)
+		moneroNode := solo.NewMoneroNodeClient(cfg.monerodURL)
+		// instance ID: this leaf's own real, per-process
+		// disambiguator stamped into every coinbase's reserved
+		// region (ReservedOffset+4:+8) -- see MoneroNodeClient.
+		// instanceID's doc comment for the full production-bug
+		// rationale (multiple leaves sharing one payout address, or
+		// adopting each other's relayed templates, must never serve
+		// byte-identical coinbases). Logged unconditionally, exactly
+		// like the coinbase-extra tag above, so a deployed leaf's
+		// own instance ID is directly verifiable from its logs.
+		instanceID := moneroNode.InstanceID()
+		logger.Printf("monero per-leaf instance ID: %x", instanceID)
+		node = moneroNode
 	} else {
 		logger.Printf("connecting to Tari base node GRPC at %s", cfg.nodeGRPCAddress)
 		tariNode, err := solo.NewGRPCNodeClient(cfg.nodeGRPCAddress, coinbaseExtraTag)

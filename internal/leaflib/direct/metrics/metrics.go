@@ -271,6 +271,19 @@ type SessionSnapshot struct {
 
 type SnapshotFunc func() []SessionSnapshot
 
+// ChainHeightFunc is a callback returning the last known chain
+// height for a coin/network this leaf talks to, and whether a value
+// is actually available yet (see chainheight.Poller.Height's own
+// "false means no successful poll yet" contract -- ok=false must
+// result in NO Prometheus sample being emitted this scrape, not a 0
+// sample). Backs leaf_monero_chain_height / leaf_tari_chain_height
+// via SetMoneroChainHeightSource / SetTariChainHeightSource -- a
+// single leaf-direct process runs exactly one algo family (Monero or
+// Tari), so in practice only one of the two is ever wired by
+// server.go's EnableMetrics, but both are independently
+// nil-safe/optional at the Metrics level.
+type ChainHeightFunc func() (height uint64, ok bool)
+
 // AsyncPoolStats/AsyncPoolStatsFunc mirror solo/metrics's own
 // identical types exactly (Fix 9, DISPATCH_BRIEF.md 2026-09-10) --
 // leaf-direct shares the exact same solo.AsyncValidationPool
@@ -424,6 +437,13 @@ type Metrics struct {
 	snapshot         SnapshotFunc
 	asyncPoolStats   AsyncPoolStatsFunc
 	relayStats       RelayStatsFunc
+
+	// moneroChainHeight/tariChainHeight back
+	// leaf_monero_chain_height/leaf_tari_chain_height -- see
+	// ChainHeightFunc's doc comment and SetMoneroChainHeightSource/
+	// SetTariChainHeightSource.
+	moneroChainHeight ChainHeightFunc
+	tariChainHeight   ChainHeightFunc
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry.
@@ -544,6 +564,23 @@ func (m *Metrics) SetRelaySource(fn RelayStatsFunc) {
 	m.relayStats = fn
 }
 
+// SetMoneroChainHeightSource wires leaf_monero_chain_height's data
+// source (see ChainHeightFunc's doc comment) -- server.go's
+// EnableMetrics calls this only when this leaf is actually running a
+// Monero-family algo (IsMoneroFamilyAlgo), so a Tari-family leaf
+// never even wires this and the metric is simply absent from its
+// scrape output.
+func (m *Metrics) SetMoneroChainHeightSource(fn ChainHeightFunc) {
+	m.moneroChainHeight = fn
+}
+
+// SetTariChainHeightSource is SetMoneroChainHeightSource's
+// leaf_tari_chain_height analogue, wired instead when this leaf is
+// running a Tari-family algo.
+func (m *Metrics) SetTariChainHeightSource(fn ChainHeightFunc) {
+	m.tariChainHeight = fn
+}
+
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
@@ -642,6 +679,83 @@ var (
 		"leaf_direct_miner_hashrate_hash_per_second",
 		"Real, per-address SUM of currently-connected sessions' estimated hashrate in hashes/second (see leaflib.EstimateHashrateHz's doc comment for the difficulty/time estimation formula). Same capped cardinality as leaf_direct_miners_by_address; overflow aggregated into address=\"other\".",
 		[]string{"address"}, nil,
+	)
+
+	// totalHashrateDesc backs leaf_direct_total_hashrate_hash_per_second
+	// -- a deliberately LOW-CARDINALITY (no address label) gauge
+	// reporting the TRUE total estimated hashrate across every
+	// currently-connected session on this leaf-direct process,
+	// computed by Collect DIRECTLY from the live snapshot (summing
+	// every SessionSnapshot.Hashrate), completely independently of
+	// minerHashrateByAddressDesc/addrHashrates/CapAddressHashrates
+	// above.
+	//
+	// Why this is needed (Alex, pool operator: "we only return the
+	// top 50 miners by connection, so sum() doesn't even work" when
+	// trying to build a leaf-wide total-hashrate panel from
+	// leaf_direct_miner_hashrate_hash_per_second for the Zabbix ->
+	// Grafana migration): investigation of this exact codebase found
+	// the root cause is NEITHER of the two most obvious hypotheses --
+	//
+	//   (a) NOT the snapshot itself: server.go's sessionSnapshots
+	//       iterates s.sessions in full and returns EVERY currently-
+	//       connected session, with no top-N-by-connection (or
+	//       top-N-by-anything) truncation before Collect ever sees
+	//       it. addrHashrates below is built by summing ALL of those
+	//       snapshots' Hashrate by address -- not a top-N subset.
+	//   (b) NOT a bug in CapAddressHashrates/CapAddressCounts: both
+	//       correctly fold every address beyond the kept top
+	//       (maxAddressLabels-1) into a single address="other"
+	//       bucket whose value IS the true, exact sum of that
+	//       overflow (see those functions' own otherTotal
+	//       accumulation) -- so a bare, unfiltered
+	//       sum(leaf_direct_miner_hashrate_hash_per_second) already
+	//       mathematically equals the true total INCLUDING the
+	//       "other" bucket.
+	//
+	// The real, practical problem is that leaf_direct_miner_hashrate
+	// _hash_per_second is fundamentally an address-cardinality-capped
+	// metric BY DESIGN (necessary to keep Prometheus label
+	// cardinality bounded on a pool with far more than
+	// maxAddressLabels distinct payout addresses at any moment): (1)
+	// which specific ~49 addresses are "kept" vs. folded into
+	// "other" is independently re-sorted by current hashrate on
+	// EVERY scrape, so per-address time series for anything outside
+	// the top set churns in and out of existence, is not durable
+	// across scrapes, and any dashboard panel/query that filters or
+	// groups by a specific address (rather than blindly summing
+	// every label value including "other") silently undercounts;
+	// and (2) operators (reasonably) do not expect a per-address
+	// gauge's "other" catch-all bucket to be the one series that
+	// makes their sum() correct, so in practice queries built against
+	// this metric for a leaf-wide total have consistently omitted
+	// it. This new gauge sidesteps all of that by never going
+	// through the capped/bucketed per-address map at all.
+	totalHashrateDesc = prometheus.NewDesc(
+		"leaf_direct_total_hashrate_hash_per_second",
+		"Real, TRUE total estimated hashrate (hashes/second) across ALL currently-connected sessions on this leaf-direct process, computed by summing every session's leaflib.EstimateHashrateHz result directly from the live snapshot -- independent of, and unaffected by, leaf_direct_miner_hashrate_hash_per_second's per-address cardinality cap. Use this metric (not sum() over the per-address one) for any leaf-wide or fleet-wide total-hashrate panel/alert.",
+		nil, nil,
+	)
+
+	// moneroChainHeightDesc/tariChainHeightDesc back
+	// leaf_monero_chain_height/leaf_tari_chain_height -- the
+	// Zabbix-to-Grafana dashboard migration's chain-height gap (the
+	// legacy dashboard sourced these via a per-host Zabbix
+	// UserParameter script hitting monerod/tari_mm_daemon RPC
+	// directly; this is the first Prometheus exposition of either
+	// value anywhere in this codebase). Values come from a
+	// chainheight.Poller wrapping this leaf's own solo.NodeClient
+	// (see SetMoneroChainHeightSource/SetTariChainHeightSource) --
+	// never a direct RPC/GRPC call made at scrape time.
+	moneroChainHeightDesc = prometheus.NewDesc(
+		"leaf_monero_chain_height",
+		"Current Monero (RXM) chain height as last reported by this leaf's own monerod connection's get_info RPC, polled and cached on a background interval (see chainheight.Poller) -- not queried live on every scrape. Absent when this leaf is not running a Monero-family algo, or when no poll has ever succeeded yet.",
+		nil, nil,
+	)
+	tariChainHeightDesc = prometheus.NewDesc(
+		"leaf_tari_chain_height",
+		"Current Tari base-layer chain height as last reported by this leaf's own Tari base-node connection's GetTipInfo GRPC call, polled and cached on a background interval (see chainheight.Poller) -- not queried live on every scrape. Absent when this leaf is not running a Tari-family algo, or when no poll has ever succeeded yet.",
+		nil, nil,
 	)
 
 	// asyncPool*Desc mirrors solo/metrics's own identical Desc vars
@@ -772,6 +886,7 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	ipSet := make(map[string]struct{}, len(snaps))
 	addrCounts := make(map[string]int)
 	addrHashrates := make(map[string]float64)
+	var totalHashrate float64
 	for _, s := range snaps {
 		if s.RemoteIP != "" {
 			ipSet[s.RemoteIP] = struct{}{}
@@ -780,9 +895,19 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 			addrCounts[s.Address]++
 			addrHashrates[s.Address] += s.Hashrate
 		}
+		// totalHashrate sums EVERY session's estimated hashrate,
+		// including sessions with no address yet (not logged in) --
+		// deliberately NOT gated on s.Address != "" like
+		// addrCounts/addrHashrates above, and computed straight from
+		// snaps rather than derived from addrHashrates, so it is
+		// never affected by CapAddressHashrates' per-address
+		// cardinality cap below (see totalHashrateDesc's doc comment
+		// for the full root-cause rationale).
+		totalHashrate += s.Hashrate
 	}
 
 	ch <- prometheus.MustNewConstMetric(uniqueRemoteIPsDesc, prometheus.GaugeValue, float64(len(ipSet)))
+	ch <- prometheus.MustNewConstMetric(totalHashrateDesc, prometheus.GaugeValue, totalHashrate)
 
 	kept, other := CapAddressCounts(addrCounts, m.maxAddressLabels)
 	for addr, count := range kept {
@@ -805,6 +930,22 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(asyncPoolQueueDepthDesc, prometheus.GaugeValue, float64(stats.QueueDepth))
 		ch <- prometheus.MustNewConstMetric(asyncPoolInFlightWorkersDesc, prometheus.GaugeValue, float64(stats.InFlightWorkers))
 		ch <- prometheus.MustNewConstMetric(asyncPoolSubmitBlockedTotalDesc, prometheus.CounterValue, float64(stats.SubmitBlockedTotal))
+	}
+
+	// Chain height: each is independently nil-safe/optional (see
+	// SetMoneroChainHeightSource/SetTariChainHeightSource), and each
+	// emits NO sample at all when the source is wired but hasn't
+	// completed a successful poll yet (ok=false) -- never a
+	// misleading 0.
+	if m.moneroChainHeight != nil {
+		if h, ok := m.moneroChainHeight(); ok {
+			ch <- prometheus.MustNewConstMetric(moneroChainHeightDesc, prometheus.GaugeValue, float64(h))
+		}
+	}
+	if m.tariChainHeight != nil {
+		if h, ok := m.tariChainHeight(); ok {
+			ch <- prometheus.MustNewConstMetric(tariChainHeightDesc, prometheus.GaugeValue, float64(h))
+		}
 	}
 
 	// Relay metrics: emitted ONLY when a source has been wired (see

@@ -108,6 +108,60 @@ func TestDirectLoginXNPProxyExemptionIsAlgoAgnostic(t *testing.T) {
 	}
 }
 
+// TestDirectLoginGenericProxyFixedDiffSuffixStartsThereButStaysRetargetable
+// mirrors TestDirectLoginXNPProxyFixedDiffSuffixStartsThereButStaysRetargetable
+// exactly, but for the new, ADDITIVE generic-proxy carve-out
+// (solo.LoginFields.GenericProxyExemptFromFixedDiffPin /
+// solo.IsGenericProxyAgent): a non-XNP agent that merely contains
+// "proxy" (case-varied) still gets its "+<difficulty>" login-suffix
+// value as its STARTING difficulty, but is likewise NOT permanently
+// pinned -- normal vardiff retargeting keeps running for the life of
+// the connection.
+func TestDirectLoginGenericProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *testing.T) {
+	h := newDirectLoginParseHarness(t, poolpb.Algo_ALGO_SHA3X, 1000, solo.VardiffConfig{
+		MinDifficulty:    100,
+		MaxDifficulty:    1_000_000,
+		TargetTime:       30,
+		RetargetInterval: 60 * time.Second,
+	})
+	addr := realTariTestAddress("direct-login-generic-proxy-fixed-diff")
+	// Mixed case, non-XNP, "claims to be a proxy" agent.
+	sess := directLoginRawFields(t, h, addr+"+50000", "rig1", "SomeProxyThing/1.0", "sha3x")
+	if sess == nil {
+		t.Fatal("generic-proxy login with a +fixed-difficulty suffix was rejected")
+	}
+
+	if got := sess.address.Load().(string); got != addr {
+		t.Errorf("session address = %q, want the STRIPPED address %q", got, addr)
+	}
+	// The operator's requested value IS the starting difficulty --
+	// only the permanent pin is withheld.
+	if got := sess.currentDifficulty.Load(); got != 50000 {
+		t.Errorf("session currentDifficulty = %d, want the requested 50000 as the STARTING difficulty", got)
+	}
+	if sess.fixedDiff.Load() {
+		t.Fatal("BUG: a generic-proxy-claiming session was permanently pinned by its login-time +diff suffix -- the generic carve-out exists precisely so it keeps getting retargeted, same as XNP")
+	}
+
+	// The real proof: (600000/90)*30 = 199980, clamped by the 1.5x
+	// step limit to 50000*1.5 = 75000.
+	sess.connectedAt = time.Now().Add(-90 * time.Second)
+	sess.hashesAccumulated.Store(600_000)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sess.maybeRetarget()
+	}()
+	push := h.recvJobPush()
+	<-done
+	if got := sess.currentDifficulty.Load(); got != 75000 {
+		t.Fatalf("currentDifficulty = %d, want 75000 -- vardiff must remain fully live for a generic-proxy-claiming session", got)
+	}
+	if want := leaflib.DiffToTargetHex(75000); push.Params.Target != want {
+		t.Errorf("pushed job target = %q, want %q", push.Params.Target, want)
+	}
+}
+
 // TestDirectLoginOrdinaryMinerFixedDiffSuffixIsStillPermanentlyPinned
 // is the critical regression-proof that this XNP carve-out did not
 // weaken the ordinary single-miner fixed-difficulty request: the SAME
@@ -119,7 +173,17 @@ func TestDirectLoginOrdinaryMinerFixedDiffSuffixIsStillPermanentlyPinned(t *test
 	for _, agent := range []string{
 		"XMRig/6.21.0",
 		"",
-		"XMR-NODE-PROXY/0.0.3",
+		// "xmr-node-proxie/0.0.3" is a near-miss substring that
+		// matches neither carve-out (no "proxy" case-insensitively
+		// either), so it must stay pinned.
+		//
+		// NOTE: "XMR-NODE-PROXY/0.0.3" is deliberately NOT in this
+		// list -- solo.IsXNPProxyAgent is now case-INsensitive
+		// (product-owner direction), so this agent is now directly
+		// matched by solo.IsXNPProxyAgent and must NOT stay pinned.
+		// See
+		// TestDirectLoginWrongCaseXNPAgentIsUnpinnedByXNPCarveOutDirectly
+		// below.
 		"xmr-node-proxie/0.0.3",
 	} {
 		t.Run("agent="+agent, func(t *testing.T) {
@@ -155,6 +219,45 @@ func TestDirectLoginOrdinaryMinerFixedDiffSuffixIsStillPermanentlyPinned(t *test
 				t.Fatalf("BUG (regression): a NON-XNP fixed-difficulty session was retargeted (idle-reduction path) to %d", got)
 			}
 		})
+	}
+}
+
+// TestDirectLoginWrongCaseXNPAgentIsUnpinnedByXNPCarveOutDirectly
+// mirrors solo's own
+// TestLoginWrongCaseXNPAgentIsUnpinnedByXNPCarveOutDirectly (renamed
+// from TestDirectLoginWrongCaseXNPAgentIsUnpinnedByGenericCarveOut,
+// whose old name no longer describes what it proves): an agent that
+// near-misses the legacy JS reference's case-sensitive XNP literal is
+// now matched DIRECTLY by solo.IsXNPProxyAgent (product-owner
+// direction), and is therefore EXCLUDED from solo.IsGenericProxyAgent,
+// so its fixed-diff unpin now comes from
+// solo.LoginFields.XNPProxyExemptFromFixedDiffPin, not
+// GenericProxyExemptFromFixedDiffPin.
+func TestDirectLoginWrongCaseXNPAgentIsUnpinnedByXNPCarveOutDirectly(t *testing.T) {
+	const agent = "XMR-NODE-PROXY/0.0.3"
+	if !solo.IsXNPProxyAgent(agent) {
+		t.Fatalf("solo.IsXNPProxyAgent(%q) = false, want true -- this predicate is now case-INsensitive per product-owner direction", agent)
+	}
+	if solo.IsGenericProxyAgent(agent) {
+		t.Fatalf("solo.IsGenericProxyAgent(%q) = true, want false -- IsXNPProxyAgent now owns this agent directly, so the generic carve-out must exclude it", agent)
+	}
+
+	h := newDirectLoginParseHarness(t, poolpb.Algo_ALGO_SHA3X, 1000, solo.VardiffConfig{
+		MinDifficulty:    100,
+		MaxDifficulty:    1_000_000,
+		TargetTime:       30,
+		RetargetInterval: 60 * time.Second,
+	})
+	addr := realTariTestAddress("direct-login-wrongcase-xnp-agent-direct-unpin")
+	sess := directLoginRawFields(t, h, addr+"+50000", "rig1", agent, "sha3x")
+	if sess == nil {
+		t.Fatal("login with a +fixed-difficulty suffix was rejected")
+	}
+	if got := sess.currentDifficulty.Load(); got != 50000 {
+		t.Errorf("session currentDifficulty = %d, want the requested 50000 as the STARTING difficulty", got)
+	}
+	if sess.fixedDiff.Load() {
+		t.Fatal("BUG: a wrong-case XNP agent (now matched directly by solo.IsXNPProxyAgent) must be unpinned via XNPProxyExemptFromFixedDiffPin, not left permanently pinned")
 	}
 }
 

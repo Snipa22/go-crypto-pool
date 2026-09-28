@@ -50,13 +50,24 @@
 //     -- mirroring the Tari path exactly.
 //
 // OPEN DESIGN QUESTIONS still remaining:
-//   - TemplateMessage.TemplateData's real encoding (see daemon.go's
-//     templateDataForJob doc comment for the choice made and why).
 //   - No pre-existing systemd unit convention was found anywhere in
 //     this repository (checked: no .service files, no deploy/
 //     directory) -- relay-node.service (this package's own directory)
 //     is a genuinely NEW convention, not a reuse of an established
 //     one.
+//
+// SETTLED (previously open, now resolved by the monero-relay-wire-fix
+// task): TemplateMessage.TemplateData's real encoding (see daemon.go's
+// templateDataForJob doc comment) is CLOSED for both coin families --
+// Tari via proto.Marshal(*tari_generated.GetNewBlockResult), Monero-
+// family via NodeClient.TemplateBytesForRelay(job) (the SAME
+// solo.NodeClient method leaf-direct's own relay-template-adoption
+// feature already uses), producing the richer moneroRelayTemplateWire
+// JSON struct solo.MoneroNodeClient.JobFromTemplateBytes expects --
+// NOT the raw, unconverted RawTemplateBlob bytes this branch
+// previously hand-rolled, which was a real, confirmed-in-production
+// wire-format incompatibility with every leaf-direct-Monero consumer
+// on the same relay subject.
 package main
 
 import (

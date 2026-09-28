@@ -324,20 +324,22 @@ func TestDirectJobPayloadXNPProxyShapeRXT(t *testing.T) {
 		*got.ClientNonceOffset, leaflib.RXTXmrigNonceOffset, len(*got.BlocktemplateBlob), *got.Difficulty, *got.TargetDiff, *got.TargetDiffHex)
 }
 
-// TestDirectJobPayloadXNPCaseSensitivity mirrors solo's
-// TestJobPayloadXNPCaseSensitivity exactly, for leaf-direct.
-func TestDirectJobPayloadXNPCaseSensitivity(t *testing.T) {
-	if solo.IsXNPProxyAgent("XMR-NODE-PROXY/1.0.0") {
-		t.Fatalf("IsXNPProxyAgent(%q) = true, want false — case must matter", "XMR-NODE-PROXY/1.0.0")
+// TestDirectJobPayloadXNPCaseInsensitivity mirrors solo's
+// TestJobPayloadXNPCaseInsensitivity exactly, for leaf-direct (renamed
+// from TestDirectJobPayloadXNPCaseSensitivity -- case sensitivity was
+// intentionally removed per product-owner direction, see
+// solo.IsXNPProxyAgent's doc comment).
+func TestDirectJobPayloadXNPCaseInsensitivity(t *testing.T) {
+	if !solo.IsXNPProxyAgent("XMR-NODE-PROXY/1.0.0") {
+		t.Fatalf("IsXNPProxyAgent(%q) = false, want true — case must NOT matter", "XMR-NODE-PROXY/1.0.0")
 	}
 
 	s := newXNPTestSession("XMR-NODE-PROXY/1.0.0", "ab12")
-	job := newXNPTestJobRXM(171, []byte("fixture"))
+	job := newXNPTestJobRXM(171, []byte("this is a fake raw monero blocktemplate_blob used only as a test fixture, deliberately longer than 32 bytes"))
 	got := s.jobPayload(job)
-	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
-		t.Fatalf("wrong-case agent must not trigger proxy shape, got: %+v", got)
+	if got.BlocktemplateBlob == nil || got.ReservedOffset == nil || got.ClientNonceOffset == nil || got.ClientPoolOffset == nil {
+		t.Fatalf("wrong-case (but now-matching) XNP agent must trigger the proxy shape, got: %+v", got)
 	}
-	assertNoDifficultyKeysOnWire(t, got)
 }
 
 // TestDirectJobPayloadXNPReservationUnavailableRXM mirrors solo's

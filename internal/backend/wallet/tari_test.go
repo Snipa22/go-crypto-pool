@@ -272,3 +272,42 @@ func TestTariWalletGRPC_GetBalance_RPCErrorPropagates(t *testing.T) {
 		t.Fatal("GetBalance: expected an error when the RPC call fails")
 	}
 }
+
+// TestTariWalletGRPC_GetDetailedBalance proves GetDetailedBalance
+// exposes all four real GetBalanceResponse fields independently --
+// UNLIKE GetBalance, which folds pending_outgoing away entirely (see
+// that test's Total=1500 assertion above, deliberately excluding the
+// 50 pending_outgoing units). This is the fix for the wallet-stats
+// poller's previous permanent pending_incoming=0/timelocked=0
+// hardcoding for every wallet target (Zabbix-to-Grafana dashboard
+// migration).
+func TestTariWalletGRPC_GetDetailedBalance(t *testing.T) {
+	rpc := &fakeTariWalletRPC{
+		balanceResp: &tari_generated.GetBalanceResponse{
+			AvailableBalance:       1000,
+			PendingIncomingBalance: 200,
+			PendingOutgoingBalance: 50,
+			TimelockedBalance:      300,
+		},
+	}
+	w := newTariWalletGRPCWithRPC(rpc, defaultFeePerGram)
+
+	got, err := w.GetDetailedBalance(context.Background())
+	if err != nil {
+		t.Fatalf("GetDetailedBalance: unexpected error: %v", err)
+	}
+	want := DetailedBalance{Available: 1000, PendingIncoming: 200, PendingOutgoing: 50, Timelocked: 300}
+	if got != want {
+		t.Fatalf("GetDetailedBalance: got %+v, want %+v", got, want)
+	}
+}
+
+// TestTariWalletGRPC_GetDetailedBalance_RPCErrorPropagates mirrors
+// TestTariWalletGRPC_GetBalance_RPCErrorPropagates for the detailed
+// variant.
+func TestTariWalletGRPC_GetDetailedBalance_RPCErrorPropagates(t *testing.T) {
+	w := newTariWalletGRPCWithRPC(&fakeTariWalletRPC{balanceErr: errors.New("wallet unreachable")}, defaultFeePerGram)
+	if _, err := w.GetDetailedBalance(context.Background()); err == nil {
+		t.Fatal("GetDetailedBalance: expected an error when the RPC call fails")
+	}
+}

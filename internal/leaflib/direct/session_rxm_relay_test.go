@@ -190,20 +190,32 @@ func TestDirectSessionRXMBlockFindPublishesToRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hex.DecodeString(moneroDirectFixtureBlobHex): %v", err)
 	}
-	// The published BlockData is the REAL nonce-patched TemplateBlob,
-	// which differs from the raw fixture template only at the nonce
-	// offset (39) -- see BuildCandidateBlock's own doc comment. Assert
-	// the length matches exactly and everything OUTSIDE the 4-byte
-	// nonce window is byte-identical to the fixture, which is enough
-	// to prove this is genuinely the submitted TemplateBlob and not
-	// some other payload, without over-specifying the exact patched
-	// nonce bytes here (already covered by monero_node_test.go).
+	// The published BlockData is the REAL nonce-patched, per-leaf-
+	// instance-ID-stamped TemplateBlob, which differs from the raw
+	// fixture template at TWO windows: the nonce field itself
+	// (offset 39, see BuildCandidateBlock's own doc comment) AND the
+	// reserved-region instance-ID stamp this fix adds (offset
+	// reservedOffset+4:+8 -- reservedOffset is this mock daemon's own
+	// hardcoded 10, see moneroDirectMockDaemon.handler's
+	// get_block_template response above, so that's byte range
+	// 14:18 -- see MoneroNodeClient.stampInstanceID's doc comment).
+	// Assert the length matches exactly and everything OUTSIDE both
+	// windows is byte-identical to the fixture, which is enough to
+	// prove this is genuinely the submitted TemplateBlob and not some
+	// other payload, without over-specifying the exact patched nonce
+	// bytes or this leaf's own random instance ID here (already
+	// covered by monero_node_test.go's own dedicated instance-ID
+	// tests).
 	if len(msg.BlockData) != len(wantBlob) {
 		t.Fatalf("relay.BlockMessage.BlockData length = %d, want %d (moneroDirectFixtureBlobHex length)", len(msg.BlockData), len(wantBlob))
 	}
 	const nonceOffset = 39
-	if !bytes.Equal(msg.BlockData[:nonceOffset], wantBlob[:nonceOffset]) || !bytes.Equal(msg.BlockData[nonceOffset+4:], wantBlob[nonceOffset+4:]) {
-		t.Fatalf("relay.BlockMessage.BlockData outside the nonce window does not match the real fixture template blob")
+	const instanceIDStampStart = 10 + 4 // reservedOffset (10, see handler above) + 4
+	const instanceIDStampEnd = 10 + 8   // reservedOffset (10) + 8
+	if !bytes.Equal(msg.BlockData[:instanceIDStampStart], wantBlob[:instanceIDStampStart]) ||
+		!bytes.Equal(msg.BlockData[instanceIDStampEnd:nonceOffset], wantBlob[instanceIDStampEnd:nonceOffset]) ||
+		!bytes.Equal(msg.BlockData[nonceOffset+4:], wantBlob[nonceOffset+4:]) {
+		t.Fatalf("relay.BlockMessage.BlockData outside the nonce window and instance-ID stamp window does not match the real fixture template blob")
 	}
 }
 

@@ -17,6 +17,8 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/proxy/metrics"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
+	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
 
 // ShareValidator is the real local-RandomX-re-validation dependency
@@ -94,6 +96,63 @@ type Session struct {
 	loggedIn  atomic.Bool
 	address   atomic.Value // string
 	worker    atomic.Value // string
+
+	// agent is this session's own self-reported LoginRequest.Agent
+	// string, stored at login -- mirrors solo.Session's/
+	// direct.Session's identical field exactly. Before the parity
+	// pass that added it, leaf-proxy dropped the downstream agent
+	// string entirely (handleLogin read login.Agent for nothing at
+	// all), which is precisely why neither of the two
+	// agent-string-gated behaviors leaf-direct/leaf-solo already have
+	// could exist here: solo.IsXNPProxyAgent had nothing to be called
+	// on. It is now read by jobPayload below (the XNP-proxy-shape
+	// difficulty fields) and by handleLogin (the
+	// XNPProxyExemptFromFixedDiffPin escape hatch). Always a string,
+	// never nil -- newSession seeds it with "" so every
+	// s.agent.Load().(string) assertion is safe even for a session
+	// whose miner sent no "agent" field.
+	agent atomic.Value // string
+
+	// paymentID is the genuine Monero payment ID this session's
+	// downstream miner supplied as a 64-lowercase-hex second
+	// dot-segment of its login field (solo.ParseLoginFields /
+	// solo.LoginFields.PaymentID).
+	//
+	// KNOWN, DELIBERATE GAP, and a WIDER one than leaf-solo's own
+	// identically-documented gap: leaf-proxy has no share table, no
+	// payout accounting, and -- unlike leaf-solo, which at least
+	// mines to its own configured address -- no per-session payout
+	// destination of ANY kind. Every share this leaf forwards is
+	// credited by the real upstream pool to the ONE static,
+	// operator-configured payout address this leaf logs in with
+	// (UpstreamConfig.Login, from cmd/leaf-proxy's -upstream-login --
+	// see upstream.go's login()), never to a downstream session's own
+	// login string. So there is no downstream path here for a payment
+	// ID to travel to at all. It is captured purely so the parse is
+	// observable/diagnosable and so this Session's shape stays
+	// parallel with solo.Session's and direct.Session's (this
+	// package's standing convention) -- deliberately NOT half-wiring
+	// payout plumbing leaf-proxy does not have. leaf-direct is where
+	// the real end-to-end payment-ID plumbing lives (it stamps its
+	// own identical field onto poolpb.Share.PaymentId).
+	paymentID atomic.Value // string
+
+	// fixedDiff mirrors solo.Session's/direct.Session's own identical
+	// field exactly -- see solo.Session.fixedDiff's doc comment for
+	// the full rationale and the verbatim legacy retargetMiners
+	// citation (pool.js lines 227-236) it ports, INCLUDING the
+	// XNP-proxy escape hatch
+	// (solo.LoginFields.XNPProxyExemptFromFixedDiffPin, applied
+	// identically by this package's own handleLogin below).
+	//
+	// Written exactly once, in handleLogin, before this session's own
+	// vardiff goroutine is started (server.go's handleConn issues `go
+	// session.runVardiffLoop(...)` only after newSession/the read loop
+	// are set up); vardiff.go's maybeRetarget reads it on every tick
+	// and returns immediately when set, so a session that genuinely
+	// requested a fixed difficulty is never retargeted away from its
+	// requested value for the lifetime of the connection.
+	fixedDiff atomic.Bool
 
 	// Port is the canonical port-tier label this session was
 	// accepted on (see server.go's portLabel helper, the single
@@ -344,6 +403,8 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	}
 	s.address.Store("")
 	s.worker.Store("")
+	s.agent.Store("")
+	s.paymentID.Store("")
 	s.currentDifficulty.Store(startingDifficulty)
 	s.invalidShareGuard = leaflib.NewInvalidShareGuard(server.invalidShareGuardConfig)
 	return s
@@ -440,10 +501,97 @@ func (s *Session) handleLogin(req Request) {
 	// the "non-empty" check above and before any other use of the
 	// string, so an oversized login is rejected with a clean error
 	// response rather than ever touching a map/label/cache.
+	//
+	// ORDERING NOTE (login-field parsing parity pass): this bound is
+	// deliberately still applied to the RAW, UNPARSED login string,
+	// BEFORE the ParseLoginFields call below -- not to the stripped
+	// address afterward. The whole point of this check is to bound an
+	// arbitrary/adversarial string before it is *worked with* at all;
+	// parsing first would mean running strings.Split (and its
+	// allocations) over an unbounded attacker-controlled string to
+	// decide whether it was too long to touch. The two checks are
+	// complementary, not redundant: this one bounds the raw input,
+	// the empty-stripped-address check below bounds the parse's
+	// OUTPUT.
 	if len(login.Login) > maxProxyLoginLen {
 		s.server.logger.Printf("proxy: rejecting login with an oversized login string (%d bytes, max %d) from session %s", len(login.Login), maxProxyLoginLen, s.sessionID)
 		s.server.recordLoginRejection(metrics.LoginRejectionReasonOversizedLogin)
 		s.writeGeneralResponse(req.ID, "invalid address provided: too long", "")
+		return
+	}
+
+	// --- REAL BUG FIX: downstream login-field parsing (parity with
+	// leaf-direct/leaf-solo commits 9196a5a/90c485a) ---
+	//
+	// Until now leaf-proxy's OWN downstream-serving handleLogin did
+	// NO login-field parsing whatsoever: it took login.Login exactly
+	// as the miner sent it and used that RAW string for everything
+	// below. That was strictly worse here than the equivalent pre-fix
+	// bug in leaf-direct/leaf-solo, because leaf-proxy has no address
+	// validator to act as an accidental backstop -- a miner using the
+	// completely standard "<address>+<fixed_diff>" or
+	// "<address>.<workername_or_paymentid>" Monero-family stratum
+	// convention did not get rejected, it got SILENTLY ACCEPTED with
+	// the suffix still attached, so the raw string became:
+	//
+	//   - this session's stored s.address (surfacing verbatim in the
+	//     stats HTML sessions table and as a Prometheus label value),
+	//   - the addressflags ban-cache / forced-floor lookup KEY, both
+	//     at login (just below) and on every subsequent submit
+	//     (handleSubmit's re-check reads s.address). An operator who
+	//     banned or floored "<address>" therefore did NOT ban or floor
+	//     that same miner connecting as "<address>+50000" -- a real
+	//     ban-evasion hole, and the reason the parse MUST happen
+	//     before the lookup below rather than after it,
+	//
+	// and, worst of all for the miner, the requested "+<difficulty>"
+	// was silently discarded instead of honored.
+	//
+	// solo.ParseLoginFields is imported and reused rather than
+	// duplicated -- it is the single, already-tested implementation
+	// leaf-direct already consumes cross-package, and see its doc
+	// comment for the verbatim legacy nodejs-pool-sxmr citation and
+	// every scoping decision it encodes.
+	//
+	// ALGO ARGUMENT: poolpb.Algo_ALGO_RXM, hardcoded, because
+	// leaf-proxy is exclusively a Monero-family RandomX leaf -- it
+	// has no configurable algo at all (jobPayload below hardcodes the
+	// wire algo string "rx/0", and devfee.go's devFeeLogin is a real
+	// Monero mainnet address). That is what enables the "."
+	// payment-ID/identifier split, which solo.ParseLoginFields scopes
+	// to Monero-family algos only.
+	//
+	// CLAMP BOUNDS: this leaf's OWN already-configured
+	// -min-difficulty/-max-difficulty, reached through the (already
+	// Normalized -- see NewServer) VardiffConfig every retarget on
+	// this session is clamped to as well, exactly as leaf-direct/
+	// leaf-solo pass them.
+	loginFields, err := solo.ParseLoginFields(
+		poolpb.Algo_ALGO_RXM,
+		login.Login,
+		login.Agent,
+		s.currentDifficulty.Load(),
+		s.server.vardiff.MinDifficulty,
+		s.server.vardiff.MaxDifficulty,
+	)
+	if err != nil {
+		s.writeGeneralResponse(req.ID, err.Error(), "")
+		return
+	}
+
+	// The parse's OUTPUT must still be a non-empty address. This
+	// check has no counterpart in leaf-direct/leaf-solo because those
+	// leaves hand the stripped address to a real, byte-exact address
+	// validator immediately afterward, which rejects "" for them.
+	// leaf-proxy deliberately does not validate address FORMAT (see
+	// the length-bound comment above for why), so without this a
+	// login of literally "+50000" or ".myrig" -- non-empty raw, and
+	// therefore past the check at the top of this function -- would
+	// strip down to an EMPTY address and be accepted, storing "" as
+	// this session's address and making it the ban-cache lookup key.
+	// Mirrors the wording of the raw-empty rejection above exactly.
+	if loginFields.Address == "" {
+		s.writeGeneralResponse(req.ID, "invalid address provided, please use a valid address", "")
 		return
 	}
 
@@ -465,11 +613,20 @@ func (s *Session) handleLogin(req Request) {
 	// Captured BEFORE the address/loggedIn are stored, alongside the
 	// ban check above, so a forced floor is known before this
 	// session's very first job is ever fetched.
+	//
+	// BUG FIX (login-field parsing parity pass): the lookup key is now
+	// loginFields.Address -- the STRIPPED address -- never the raw
+	// login.Login it used to be. See the ParseLoginFields block above
+	// for the ban-evasion hole that fixes: an operator who banned (or
+	// floored) "<address>" previously did not ban/floor the same miner
+	// reconnecting as "<address>+50000" or "<address>.rig1", because
+	// those were three different cache keys. This is exactly why the
+	// parse is positioned BEFORE this block rather than after it.
 	var forcedFloor uint64
 	if s.server.addressFlags != nil {
-		flags := s.server.addressFlags.Get(login.Login)
+		flags := s.server.addressFlags.Get(loginFields.Address)
 		if flags.Banned {
-			s.server.logger.Printf("proxy: rejecting login for banned address %s (session %s)", login.Login, s.sessionID)
+			s.server.logger.Printf("proxy: rejecting login for banned address %s (session %s)", loginFields.Address, s.sessionID)
 			s.server.recordBanRejection(metrics.BanRejectionPhaseLogin)
 			s.server.recordLoginRejection(metrics.LoginRejectionReasonBanned)
 			s.writeGeneralResponse(req.ID, "this address is banned from this pool", "")
@@ -485,10 +642,93 @@ func (s *Session) handleLogin(req Request) {
 	if worker == "" {
 		worker = "x"
 	}
+	// Legacy identifier precedence, ported exactly as leaf-solo/
+	// leaf-direct already port it (pool.js lines 419-423:
+	// `this.identifier = pass_split[0] === "x" ? addressSplit[N] :
+	// pass_split[0]`) -- the PASSWORD field's own identifier wins, and
+	// a login-field dot-segment identifier is only consulted when that
+	// password is literally "x" (legacy's "old-logins" sentinel, and
+	// also what this handler already substitutes for an entirely
+	// absent password/rigid just above).
+	//
+	// DECISION (the brief asked for this to be explicit): the parsed
+	// dot-segment identifier feeds the SAME `worker` variable this
+	// leaf already derives from login.Pass/login.RigID, and does NOT
+	// get a new field of its own. Reasons: (a) it is the same concept
+	// -- legacy stores both in the one `this.identifier`; (b) s.worker
+	// is the only consumer that exists in leaf-proxy (the stats HTML
+	// sessions table and the per-session Prometheus worker label), so
+	// a second field would have no reader at all; (c) it matches
+	// leaf-solo's and leaf-direct's already-merged decision for the
+	// identical situation, keeping the three leaf modes' behavior
+	// aligned rather than inventing a third convention here.
+	//
+	// The existing RigID-beats-Pass precedence is left completely
+	// untouched: an explicit "rigid" from a modern miner is a strictly
+	// more deliberate rig name than a dot-suffix, and reordering that
+	// would be an unrelated behavior change. Note the interaction this
+	// produces, which is intentional: a login of "<addr>.myrig" with
+	// rigid "realrig" keeps "realrig", while the same login with
+	// pass "x" (or no pass at all) resolves to "myrig".
+	if loginFields.Identifier != "" && worker == "x" {
+		worker = loginFields.Identifier
+	}
 
-	s.address.Store(login.Login)
+	// The STRIPPED address is what becomes session state -- never the
+	// raw login string. Everything downstream of here that reads
+	// s.address (handleSubmit's own addressflags ban re-check, the
+	// stats HTML sessions table, the per-session Prometheus address
+	// label) therefore now sees the same canonical value the
+	// login-time ban check above looked up.
+	s.address.Store(loginFields.Address)
 	s.worker.Store(worker)
+	s.agent.Store(login.Agent)
+	s.paymentID.Store(loginFields.PaymentID)
 	s.loggedIn.Store(true)
+
+	// A miner-requested (or NiceHash-assigned) FIXED difficulty
+	// becomes this session's STARTING difficulty instead of the port
+	// tier's configured default -- mirrors leaf-solo's and
+	// leaf-direct's identical handleLogin blocks exactly (see
+	// solo.Session.handleLogin at this same point, and
+	// solo.Session.fixedDiff's doc comment, for the verbatim legacy
+	// citations).
+	//
+	// Stored into s.currentDifficulty HERE, deliberately, so that the
+	// existing floor/cap block immediately below -- whose first line
+	// reads s.currentDifficulty.Load() -- is FED the parsed value in
+	// place of the port tier's default, with none of its own logic
+	// altered. That block's behavior is therefore unchanged and still
+	// applies in full to a fixed-difficulty session: the global
+	// -min-difficulty floor, an operator's forcedMinDifficulty floor
+	// (an explicit operator floor outranks a miner's own request), and
+	// the pool-target-diff cap (poolDiffCapEnabled) all still bind
+	// exactly as they do for an ordinary session. Note that
+	// ParseLoginFields has already clamped this value to
+	// [vardiff.MinDifficulty, vardiff.MaxDifficulty], so the global
+	// floor below is a no-op for it; the forced floor and the pool cap
+	// are the two that can still genuinely move it.
+	//
+	// XNP-PROXY ESCAPE HATCH (commit 90c485a, ported here verbatim in
+	// intent): an XNP-proxy-detected session whose fixed difficulty
+	// came from the login field's own "+<difficulty>" suffix gets that
+	// value as its STARTING difficulty but is NOT pinned -- normal
+	// vardiff retargeting proceeds from there, so a NESTED aggregating
+	// proxy's difficulty keeps tracking its real (and changing)
+	// downstream-aggregate hashrate. This is this leaf's equivalent of
+	// legacy's `proxyAddressList` clause in retargetMiners; see
+	// solo.LoginFields.XNPProxyExemptFromFixedDiffPin for the verbatim
+	// citation, the mechanism divergence (agent-string detection here
+	// vs. legacy's operator-maintained payout-address allowlist), and
+	// why the NiceHash-agent pin is deliberately left untouched.
+	// solo.IsXNPProxyAgent is reused through that predicate rather
+	// than agent detection being reimplemented here.
+	if loginFields.FixedDiff {
+		if !loginFields.XNPProxyExemptFromFixedDiffPin(login.Agent) {
+			s.fixedDiff.Store(true)
+		}
+		s.currentDifficulty.Store(loginFields.Difficulty)
+	}
 
 	// A forced minimum difficulty always wins over the port tier's
 	// own configured starting difficulty -- mirrors solo.Session's
@@ -1075,6 +1315,60 @@ func (s *Session) pushJob(job *Job) {
 // job history (see ownJob's doc comment): every caller (handleLogin's
 // LoginResponse, pushJob's JobPush) already goes through this before
 // putting a job on the wire.
+//
+// RESERVED-OFFSET DECISION (explicit, per the parity brief): the four
+// reserved-region fields leaf-direct's/leaf-solo's XNP-proxy job shape
+// surfaces -- BlocktemplateBlob/ReservedOffset/ClientNonceOffset/
+// ClientPoolOffset -- are deliberately NOT emitted here, because that
+// mechanism does not apply to leaf-proxy's architecture. The evidence,
+// all from this package's own real code:
+//
+//  1. leaf-proxy ALREADY partitions the worker-nonce and pool-nonce
+//     itself, CENTRALLY, PER ISSUED JOB, and bakes both directly into
+//     the blob before it is ever sent: JobManager.NextJob (job.go)
+//     calls WorkerTemplate.NextBlobForWorkerAndPool, which patches
+//     both values into the buffer and returns it as Job.Blob, with
+//     the values it used captured as Job.WorkerNonce/Job.PoolNonce.
+//     Every login/getjob/vardiff-repush allocates a brand-new pair,
+//     so no two issued jobs share a search space (see Job's own type
+//     doc comment). A reserved region exists for a downstream client
+//     to partition FOR ITSELF; here there is nothing left to
+//     partition.
+//
+//  2. proxy.Job has no ReservedOffset, no RawTemplateBlob, and no
+//     raw-template field of any kind -- unlike solo.Job, which
+//     carries the raw upstream template precisely so its downstream
+//     client can do its own reserved-region work. The offsets exist
+//     in this package only on WorkerTemplate (template.go), as
+//     internal inputs to the patching in point 1.
+//
+//  3. The blob this leaf sends downstream is the CONVERTED, fixed-size
+//     RandomX hashing blob (76 bytes observed), not a raw
+//     blocktemplate_blob -- applyJob (upstream.go) runs
+//     support.ParseBlockFromTemplateBlob + support.GetBlockHashingBlob
+//     to produce it. A reserved_offset is only meaningful relative to
+//     the FULL raw template, so advertising one alongside this blob
+//     would be pointing a client at an out-of-bounds index. That is
+//     not speculative: it is the real, live production failure already
+//     cited verbatim in NextJob's own doc comment --
+//     "worker-nonce offset is out of range for this template's blob:
+//     offset=179 blob_len=76".
+//
+//  4. Emitting them would be actively HARMFUL, not merely useless. A
+//     client that accepts a reserved region partitions its own
+//     sub-miners within it and reports the workerNonce/poolNonce it
+//     chose on submit. handleSubmit ignores a downstream client's
+//     claimed values entirely and forwards job.WorkerNonce/
+//     job.PoolNonce -- THIS leaf's own centrally-allocated pair --
+//     upstream instead. The upstream submit would then carry nonces
+//     that disagree with what the client actually hashed, so shares
+//     that are genuinely valid would be rejected upstream.
+//
+// A nested XNP-proxy client against this leaf therefore correctly
+// receives the ordinary blob/target job shape plus only the difficulty
+// half of the proxy shape (below), which is architecture-agnostic and
+// does apply. session_xnp_test.go pins the absence of all four fields
+// as a deliberate, documented property rather than an oversight.
 func (s *Session) jobPayload(job *Job) JobPayload {
 	s.recordJob(job)
 	// Record what was actually delivered, mirroring solo.Session's/
@@ -1104,5 +1398,91 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	if len(job.SeedHash) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.SeedHash)
 	}
+
+	// --- XNP-PROXY-SHAPE DIFFICULTY FIELDS (parity with commit
+	// f5c9b6a, which fixed a real, confirmed production incident for
+	// leaf-direct/leaf-solo) ---
+	//
+	// proxy.JobPayload IS solo.JobPayload (protocol.go's type alias),
+	// so Difficulty/TargetDiff/TargetDiffHex have existed on this very
+	// struct since f5c9b6a -- they were simply never populated here,
+	// leaving them nil and absent from the wire for EVERY leaf-proxy
+	// session. A NESTED XNP-proxy-class client connecting to THIS
+	// leaf's own downstream listener therefore hit the exact same
+	// "difficulty 1" bug f5c9b6a fixed, by the identical mechanism:
+	// the MoneroOcean xmr-node-proxy fork's
+	// normalizeDifficulty(template.target_diff, this.difficulty) chain
+	// received undefined for both arguments and fell through to its
+	// hardcoded `return 1`. See solo/protocol.go's Difficulty/
+	// TargetDiff/TargetDiffHex doc comment for the verbatim legacy
+	// cachedJob citation (lib/pool.js Miner.getJob), the affected
+	// client's exact fallback code path, and the value each field
+	// carries.
+	//
+	// That mechanism is NOT hypothetical for this leaf mode in
+	// particular: leaf-proxy's OWN upstream-client role is itself
+	// exactly this class of consumer -- protocol.go's
+	// UpstreamJobPayload reads `difficulty`/`target_diff`/
+	// `target_diff_hex`, ported field-for-field from lib/xmr.js -- so
+	// one leaf-proxy pointed at another leaf-proxy's downstream
+	// listener reproduced the incident directly.
+	//
+	// Gated on solo.IsXNPProxyAgent exactly as leaf-direct's and
+	// leaf-solo's jobPayload gate it, and for the same reason: these
+	// keys are additive, not a replacement for Target (which is left
+	// completely unchanged and always present, since ordinary
+	// xmrig-class clients need it), and the existing convention is to
+	// send them ONLY to a detected proxy-class client rather than to
+	// every miner unconditionally -- even though doing so would
+	// probably be harmless. Matching the convention precisely keeps
+	// the three leaf modes' wire output identical for identical
+	// inputs. For every non-XNP session all three stay nil and are
+	// provably absent from the marshaled JSON (omitempty) -- see this
+	// package's session_xnp_test.go for the real byte-diff proof.
+	//
+	// Both numeric fields carry the identical value -- job.
+	// StaticDifficulty, the same value Target above is derived from
+	// via leaflib.DiffToTargetHex -- exactly as legacy itself sends
+	// one plain numeric difficulty under two key names
+	// (`target_diff: this.difficulty`). TargetDiffHex reuses
+	// payload.Target byte-for-byte rather than recomputing a
+	// different width/endianness encoding (legacy's this.diffHex IS
+	// what its `target` carries).
+	//
+	// NOTE on job.UpstreamShareDiff: deliberately NOT used here. The
+	// difficulty a downstream client must be told is THIS session's
+	// own vardiff-current share difficulty (job.StaticDifficulty),
+	// which is what Target already encodes and what this leaf
+	// actually grades its submits against;
+	// job.UpstreamShareDiff is the separate upstream-pool
+	// forwarding threshold (see that field's doc comment). Reporting
+	// the latter would tell the client a difficulty this leaf does not
+	// grade it at.
+	//
+	// DELIBERATELY NOT PORTED: BlocktemplateBlob/ReservedOffset/
+	// ClientNonceOffset/ClientPoolOffset, the OTHER half of
+	// leaf-direct's/leaf-solo's XNP-proxy job shape. That mechanism is
+	// inapplicable to leaf-proxy's architecture -- see this function's
+	// own "RESERVED-OFFSET" note below for the full reasoning and
+	// citations.
+	// The comma-ok assertion (rather than solo's/direct's bare
+	// `.(string)`) is deliberate: newSession seeds s.agent with ""
+	// for every real session, but this package's existing tests
+	// legitimately construct bare `&Session{...}` literals to
+	// exercise jobPayload in isolation (e.g.
+	// e2e_blob_size_test.go), for which the atomic.Value is genuinely
+	// empty. Comma-ok keeps jobPayload total -- an unset agent simply
+	// reads as "" and is correctly not XNP-detected -- instead of
+	// making an unrelated wire-shape test panic.
+	agent, _ := s.agent.Load().(string)
+	if solo.IsXNPProxyAgent(agent) {
+		difficulty := job.StaticDifficulty
+		targetDiff := difficulty
+		targetDiffHex := payload.Target
+		payload.Difficulty = &difficulty
+		payload.TargetDiff = &targetDiff
+		payload.TargetDiffHex = &targetDiffHex
+	}
+
 	return payload
 }

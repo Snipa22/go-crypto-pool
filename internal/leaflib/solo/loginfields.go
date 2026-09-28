@@ -343,6 +343,28 @@ func (f LoginFields) XNPProxyExemptFromFixedDiffPin(agent string) bool {
 	return f.FixedDiff && f.FixedDiffFromLoginSuffix && IsXNPProxyAgent(agent)
 }
 
+// GenericProxyExemptFromFixedDiffPin reports whether this login's
+// fixed-difficulty request must be honored as a STARTING difficulty
+// only, WITHOUT permanently pinning the session out of vardiff
+// retargeting -- the same unpin behavior XNPProxyExemptFromFixedDiffPin
+// grants XNP aggregators above, generalized to any OTHER agent that
+// self-identifies as some kind of proxy (case-insensitive "proxy"
+// substring) via IsGenericProxyAgent (protocol.go). Deliberately
+// additive and independent of XNPProxyExemptFromFixedDiffPin -- does
+// not merge the two checks, and does not touch the XNP path (an XNP
+// agent is excluded from IsGenericProxyAgent, so this method never
+// double-claims an XNP session; that session's unpin is decided solely
+// by XNPProxyExemptFromFixedDiffPin above).
+//
+// Unlike XNPProxyExemptFromFixedDiffPin, this is NOT scoped to
+// FixedDiffFromLoginSuffix only -- it applies whenever f.FixedDiff is
+// true (covers both the "+"-suffix and NiceHash-agent-driven cases),
+// since there is no equivalent narrow legacy citation restricting this
+// new, additive rule the way there was for the XNP case above.
+func (f LoginFields) GenericProxyExemptFromFixedDiffPin(agent string) bool {
+	return f.FixedDiff && IsGenericProxyAgent(agent)
+}
+
 // isLegacyPaymentID mirrors pool.js line 416's exact test for "this
 // second dot-segment is a genuine Monero payment ID, not a worker
 // name": `addressSplit[1].length === 64 && hexMatch.test(addressSplit[1])`.

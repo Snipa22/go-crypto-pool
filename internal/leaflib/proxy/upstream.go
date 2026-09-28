@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
-	"github.com/Snipa22/go-xmr-lib/support"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/moneroblob"
 )
 
 // UpstreamClient is leaf-proxy's real STRATUM CLIENT to an upstream
@@ -826,272 +826,53 @@ func (uc *UpstreamClient) heartbeatLoop(stop <-chan struct{}) {
 	}
 }
 
-// malformedBlobBreakerThreshold/malformedBlobBreakerCooldown tune
-// malformedBlobBreaker (FIX_BRIEF.md, finding #18): after this many
-// CONSECUTIVE convertTemplateBlobToHashingBlob triggers of the known
-// go-xmr-lib bug (a panic OR a timeout -- see that function's doc
-// comment; an ordinary, non-buggy parse error does NOT count, and
-// resets the consecutive counter back to 0), the breaker opens for
-// malformedBlobBreakerCooldown, during which convertTemplateBlobToHashingBlob
-// refuses to spawn any FURTHER recovery-wrapped goroutine at all and
-// returns an error immediately instead -- see malformedBlobBreaker's
-// own doc comment for the full rationale (bounding how many leaked,
-// unkillable, one-full-core goroutines a misbehaving/malicious
-// upstream sending many such malformed blobs in sequence can force
-// this process to spin up). 5 consecutive triggers is deliberately
-// small: a single genuinely malformed blob is already fully
-// mitigated by the per-call timeout/recover below on its own; this
-// breaker exists purely to stop a SUSTAINED, repeated flood of them
-// from spinning up an unbounded number of leaked goroutines, so it
-// should trip well before that flood does serious damage, not act as
-// a large tolerance window for isolated, occasional bad input.
+// The malformed-blob circuit breaker and the real, safety-wrapped
+// blocktemplate_blob -> RandomX-hashing-blob conversion this file used
+// to own outright now live in internal/leaflib/moneroblob, and the
+// identifiers below are thin, behavior-preserving aliases/wrappers
+// over that package. See moneroblob's own package doc comment for WHY
+// the move was necessary (internal/leaflib/solo needs the exact same
+// conversion on its Monero shared-template job-derivation path, and
+// could not import this package back without a real import cycle --
+// internal/leaflib/proxy already imports internal/leaflib/solo --
+// which previously forced a deliberate, BREAKER-LESS duplicate of the
+// conversion wrapper to live in solo/node.go; two independent
+// breakers defeat the entire point of a process-wide guard).
+//
+// Nothing about the behavior changed in that move: the thresholds,
+// the timeout, the "only a panic or a timeout counts as a trigger"
+// rule and the "check the breaker BEFORE spawning any goroutine"
+// ordering are all byte-for-byte the same logic, now shared. The
+// aliases are kept so every existing call site in this package
+// (applyJob here, template.go's WorkerTemplate.BlobForWorker/
+// BlobForWorkerAndPool, server.go's metrics wiring) reads exactly as
+// it did before.
 const (
-	malformedBlobBreakerThreshold = 5
-	malformedBlobBreakerCooldown  = 30 * time.Second
+	malformedBlobBreakerThreshold = moneroblob.BreakerThreshold
+	malformedBlobBreakerCooldown  = moneroblob.BreakerCooldown
 )
 
-// malformedBlobBreaker is a process-wide circuit breaker across every
-// convertTemplateBlobToHashingBlob call (FIX_BRIEF.md, finding #18) --
-// process-wide, not per-UpstreamClient, both because
-// convertTemplateBlobToHashingBlob is a free function called from
-// TWO genuinely different call sites with no shared receiver
-// (UpstreamClient.applyJob here, AND WorkerTemplate.BlobForWorker/
-// BlobForWorkerAndPool in template.go, which has no UpstreamClient
-// reference at all) and because a real leaf-proxy process has
-// exactly ONE upstream pool connection for its entire lifetime (see
-// UpstreamClient's own doc comment) -- a process-wide breaker and a
-// "per the one upstream connection this leaf actually has" breaker
-// are the same thing in practice.
-//
-// WHY a breaker at all, on top of the existing per-call timeout/
-// recover already in convertTemplateBlobToHashingBlob: that existing
-// mitigation bounds the damage of any ONE malformed blob to roughly
-// convertTemplateBlobTimeout of wall-clock time and one leaked
-// goroutine consuming one full CPU core FOREVER afterward (Go has no
-// way to forcibly cancel a goroutine stuck in the vendored library's
-// real infinite loop -- see that function's own doc comment) -- but
-// places NO cap on how many such goroutines a malicious/misbehaving
-// upstream sending MANY malformed blobs in sequence can force this
-// process to leak, one per trigger, each permanently consuming a
-// core. A modest number of these can degrade this leaf to
-// uselessness; enough can exhaust the host entirely. This breaker
-// adds the missing cap: once triggers happen consecutively often
-// enough to look like a sustained pattern rather than an isolated bad
-// blob, stop spawning NEW recovery-wrapped goroutines for a cooldown
-// period (loudly logged/metric'd -- see recordTrigger below) rather
-// than accepting an unbounded number of them.
-type malformedBlobBreaker struct {
-	consecutive   atomic.Int64
-	opensTotal    atomic.Uint64
-	openUntilNano atomic.Int64
-}
-
-// allow reports whether a NEW convertTemplateBlobToHashingBlob attempt
-// (and its recovery-wrapped goroutine) should proceed right now.
-// Returns false while the breaker is open (a recent burst of
-// consecutive triggers tripped it and its cooldown has not yet
-// elapsed) -- the caller must treat that as a real, if temporary,
-// conversion failure and must NOT spawn a goroutine at all in that
-// case (that is the entire point of this breaker). Once the cooldown
-// has elapsed, this transitions the breaker back to closed (allowing
-// exactly one more attempt to determine whether the malformed input
-// has stopped) and returns true.
-func (b *malformedBlobBreaker) allow() bool {
-	until := b.openUntilNano.Load()
-	if until == 0 {
-		return true
-	}
-	if time.Now().UnixNano() < until {
-		return false
-	}
-	// Cooldown elapsed -- close the breaker again (best-effort CAS;
-	// losing a race here just means another concurrent caller already
-	// closed it, which is an equally correct outcome).
-	b.openUntilNano.CompareAndSwap(until, 0)
-	return true
-}
-
-// isOpen reports the breaker's CURRENT open/closed state without any
-// side effect (unlike allow, it never closes an elapsed breaker) --
-// used purely for observability (the leaf_proxy_malformed_blob_breaker_open
-// gauge, see proxy/metrics's doc comment).
-func (b *malformedBlobBreaker) isOpen() bool {
-	until := b.openUntilNano.Load()
-	return until != 0 && time.Now().UnixNano() < until
-}
-
-// recordTrigger records one genuine "known go-xmr-lib bug" trigger
-// (a panic OR a timeout inside convertTemplateBlobToHashingBlob --
-// NOT an ordinary, non-buggy parse error) and opens the breaker, with
-// a loud log line, once malformedBlobBreakerThreshold consecutive
-// triggers have been recorded.
-func (b *malformedBlobBreaker) recordTrigger(logger *log.Logger) {
-	n := b.consecutive.Add(1)
-	if n < malformedBlobBreakerThreshold {
-		return
-	}
-	b.consecutive.Store(0)
-	b.openUntilNano.Store(time.Now().Add(malformedBlobBreakerCooldown).UnixNano())
-	b.opensTotal.Add(1)
-	if logger == nil {
-		logger = log.Default()
-	}
-	logger.Printf("proxy: MALFORMED-BLOB CIRCUIT BREAKER OPEN after %d consecutive go-xmr-lib blocktemplate_blob parse timeouts/panics -- refusing to spawn any further recovery-wrapped conversion goroutines for %s to bound goroutine/CPU-core leakage from a sustained malformed/malicious upstream blob stream (see convertTemplateBlobToHashingBlob's and malformedBlobBreaker's own doc comments)", n, malformedBlobBreakerCooldown)
-}
-
-// resetConsecutive clears the consecutive-trigger streak after any
-// outcome that is NOT itself a trigger (a genuine success, or an
-// ordinary non-buggy parse error) -- only a genuinely CONSECUTIVE run
-// of triggers should ever open the breaker.
-func (b *malformedBlobBreaker) resetConsecutive() {
-	b.consecutive.Store(0)
-}
-
-// OpensTotal/IsOpen back this breaker's real-time metrics exposure
-// (proxy/metrics.MalformedBlobBreakerStatsFunc, wired by
-// Server.EnableMetrics) -- mirrors solo.AsyncValidationPool's own
-// "plain getter methods polled at scrape time" convention exactly
-// (see that type's own doc comment).
-func (b *malformedBlobBreaker) OpensTotal() uint64 { return b.opensTotal.Load() }
-func (b *malformedBlobBreaker) IsOpen() bool       { return b.isOpen() }
+// malformedBlobBreaker is an alias for moneroblob.Breaker -- see that
+// type's doc comment for the full "why a breaker at all" rationale.
+type malformedBlobBreaker = moneroblob.Breaker
 
 // globalMalformedBlobBreaker is the single, process-wide breaker
-// instance every convertTemplateBlobToHashingBlob call shares -- see
-// malformedBlobBreaker's own doc comment for why process-wide (not
-// per-UpstreamClient) is the correct scope here.
-var globalMalformedBlobBreaker = &malformedBlobBreaker{}
+// instance every ConvertTemplateBlobToHashingBlob call shares,
+// now genuinely singular across BOTH this package and
+// internal/leaflib/solo (see moneroblob's package doc comment).
+var globalMalformedBlobBreaker = moneroblob.GlobalBreaker
 
-// convertTemplateBlobTimeout bounds how long
-// convertTemplateBlobToHashingBlob will wait for
-// support.ParseBlockFromTemplateBlob + support.GetBlockHashingBlob to
-// complete before giving up and returning an error -- see that
-// function's doc comment for WHY a timeout, not just a recover, is
-// required. A real, well-formed block template (even a large one,
-// hundreds of transactions) parses in low-single-digit milliseconds;
-// this is a generous multiple of that to avoid any risk of a false
-// timeout on a genuinely slow-but-legitimate call, while still
-// bounding the damage from the known hang described below to a few
-// seconds per malformed input rather than forever.
-const convertTemplateBlobTimeout = 2 * time.Second
+// convertTemplateBlobTimeout is moneroblob.ConvertTimeout -- see that
+// constant's doc comment.
+const convertTemplateBlobTimeout = moneroblob.ConvertTimeout
 
-// convertTemplateBlobToHashingBlob wraps
-// support.ParseBlockFromTemplateBlob + support.GetBlockHashingBlob
-// with BOTH a panic-recovery net AND a hard wall-clock timeout,
-// converting a raw hex blocktemplate_blob straight into the real,
-// correctly-sized RandomX hashing blob (or a normal error). This is
-// used both by applyJob (converting an upstream pool's
-// freshly-received raw blob) and by template.go's
-// WorkerTemplate.BlobForWorker (re-deriving the hashing blob after
-// patching a worker-nonce into a raw blob's coinbase tx_extra field).
-//
-// GENUINE, CONFIRMED go-xmr-lib v0.2.5 BUG (found and verified this
-// pass, not guessed): serialization.ConstructTXExtra's switch
-// statement over a tx_extra tag byte
-// (go-xmr-lib@v0.2.5/support/serialization/transaction.go:200-215)
-// has NO default case, and none of its four cases (0x00/0x01/0x02/
-// 0x03) advance the `mutable` slice when the byte doesn't match one
-// of them -- so ANY tx_extra region byte that isn't exactly one of
-// those four values causes ParseBlockFromTemplateBlob to spin
-// forever in an infinite loop (NOT a panic -- confirmed via a
-// throwaway reproduction: `for range 1800 sequential garbage bytes`
-// hangs indefinitely; `go test -timeout` is the only thing that ever
-// terminates it). This is a strictly worse failure mode than a panic
-// (recover() cannot help at all), and is highly likely to trigger on
-// ANY sufficiently large arbitrary/malformed/adversarial
-// blocktemplate_blob, since roughly 252/256 possible tag byte values
-// are unhandled. This was NOT fixed in the vendored dependency itself
-// per this repo's own conventions (don't silently patch a third-party
-// module as a workaround for one caller's problem) -- instead, this
-// function bounds the damage with the hard timeout above: on timeout,
-// it returns a normal error (leaving the existing good WorkerTemplate
-// untouched, exactly like any other conversion failure) rather than
-// blocking its caller (and, transitively, this leaf's ability to
-// process new upstream jobs) forever. The spawned goroutine itself
-// CANNOT be forcibly cancelled (Go has no such primitive) and will
-// keep spinning/leaking in the background consuming one CPU core for
-// the lifetime of the process if this bug is ever actually triggered
-// by a live pool -- this is a real, known, accepted limitation of
-// this mitigation, not a complete fix. The proper fix is upstream, in
-// go-xmr-lib itself (add a default case to that switch that returns
-// an error) -- flagging this explicitly here and in this task's final
-// summary rather than guessing at (or silently carrying) a deeper fix
-// within this repo.
-//
-// The recover (for the SEPARATE, panic-based failure modes) is a
-// SAFETY NET on top of the above, not a substitute for checking real
-// error returns: ParseBlockFromTemplateBlob does validate several
-// length invariants via real error returns (serialization.ReadUint
-// on a too-short buffer), and this function still checks and
-// propagates those normally. But some of its OTHER fields (e.g. a
-// corrupt/truncated tx_extra length prefix, or a tx-hash count field
-// that claims far more 32-byte hashes than remain in the buffer) are
-// consumed via direct slicing (blobInBytes[0:val]) rather than a
-// bounds-checked read, which panics with a runtime
-// slice-bounds-out-of-range error on sufficiently malformed/truncated
-// input instead of returning a normal error or hanging. A malformed
-// upstream blocktemplate_blob must never be allowed to crash this
-// leaf's entire process merely because one upstream pool (or a
-// downstream worker-nonce patch landing on an unexpected byte)
-// produced bad bytes -- this recovers from that failure mode and
-// reports it as an ordinary error instead.
+// convertTemplateBlobToHashingBlob delegates to
+// moneroblob.ConvertTemplateBlobToHashingBlob (panic-recovery net +
+// hard wall-clock timeout + process-wide circuit breaker) -- see that
+// function's doc comment for the full, confirmed go-xmr-lib v0.2.5
+// bug citation and the exact failure modes each layer guards against.
 func convertTemplateBlobToHashingBlob(blobHex string) ([]byte, error) {
-	// CIRCUIT BREAKER (FIX_BRIEF.md, finding #18): checked BEFORE
-	// spawning the recovery-wrapped goroutine below at all -- see
-	// malformedBlobBreaker's own doc comment for the full rationale.
-	// While open, this refuses every call outright (no goroutine, no
-	// timeout wait) until the cooldown elapses.
-	if !globalMalformedBlobBreaker.allow() {
-		return nil, fmt.Errorf("proxy: malformed-blob circuit breaker is open (too many consecutive go-xmr-lib blocktemplate_blob parse timeouts/panics recently) -- refusing to spawn another recovery-wrapped conversion goroutine until its cooldown elapses")
-	}
-	type outcome struct {
-		blob      []byte
-		err       error
-		recovered bool
-	}
-	ch := make(chan outcome, 1)
-	go func() {
-		var out outcome
-		defer func() {
-			if r := recover(); r != nil {
-				out = outcome{nil, fmt.Errorf("proxy: recovered from a panic while parsing/converting a blocktemplate_blob (malformed or truncated input): %v", r), true}
-			}
-			ch <- out
-		}()
-		parsedBlock, perr := support.ParseBlockFromTemplateBlob(blobHex)
-		if perr != nil {
-			out = outcome{nil, perr, false}
-			return
-		}
-		hashingBlob, perr := support.GetBlockHashingBlob(parsedBlock)
-		out = outcome{hashingBlob, perr, false}
-	}()
-	select {
-	case out := <-ch:
-		// A panic-recovered outcome is a genuine known-bug trigger;
-		// anything else (real success, or an ordinary non-buggy parse
-		// error returned normally by the library) is NOT -- see
-		// malformedBlobBreaker.recordTrigger's own doc comment for
-		// why only a real trigger should count toward the breaker's
-		// consecutive-trigger streak.
-		if out.recovered {
-			globalMalformedBlobBreaker.recordTrigger(nil)
-		} else {
-			globalMalformedBlobBreaker.resetConsecutive()
-		}
-		return out.blob, out.err
-	case <-time.After(convertTemplateBlobTimeout):
-		// A timeout is ALSO a genuine known-bug trigger (very likely
-		// the infinite-loop bug itself, per this function's own doc
-		// comment) -- counts toward the breaker exactly like a
-		// recovered panic does. Note the still-running goroutine
-		// above is intentionally NOT cancelled (Go has no such
-		// primitive) and will keep leaking/spinning in the
-		// background -- this is the exact, already-documented,
-		// accepted limitation the breaker exists to bound the
-		// FREQUENCY of, not eliminate entirely.
-		globalMalformedBlobBreaker.recordTrigger(nil)
-		return nil, fmt.Errorf("proxy: parsing/converting a blocktemplate_blob did not complete within %s -- likely triggered the known go-xmr-lib v0.2.5 ConstructTXExtra infinite-loop bug on malformed tx_extra data (see this function's doc comment); giving up and treating this as a failed conversion rather than blocking forever", convertTemplateBlobTimeout)
-	}
+	return moneroblob.ConvertTemplateBlobToHashingBlob(blobHex)
 }
 
 // applyJob converts an UpstreamJobPayload into a *WorkerTemplate,

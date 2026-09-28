@@ -2602,22 +2602,20 @@ const (
 // to keep wallet_balance_atomic fresh on GET /metrics regardless of
 // how often (or whether) a disbursement cycle actually runs.
 //
-// Note on real field coverage: today, WalletClient.GetBalance's
-// coin-agnostic Balance type only carries Total/Unlocked (see
-// wallet.go's doc comment) -- MoneroWalletRPC and TariWalletGRPC both
-// project their coin's richer real balance response down onto those
-// two fields already (see each implementation's own GetBalance).
-// This poller reports Unlocked as "available" and (Total-Unlocked)
-// as "pending_outgoing" (the same real interpretation
-// disburse.Engine's own insufficient-funds check already relies on:
-// Unlocked is what's actually spendable right now). It does NOT
-// report pending_incoming/timelocked as genuinely distinct numbers
-// -- both are folded into Total today, so they are reported here as
-// 0 rather than a fabricated split. Surfacing Tari's real, richer
-// four-field GetBalanceResponse (which DOES have all four natively)
-// would require extending WalletClient.GetBalance's return type, a
-// deliberate interface change for whoever picks that up next, not
-// something to improvise inline in this poller.
+// Real field coverage: a target whose client additionally satisfies
+// wallet.DetailedBalanceClient (today: *wallet.TariWalletGRPC) is
+// polled via GetDetailedBalance and reports its real, independently
+// meaningful available/pending_incoming/pending_outgoing/timelocked
+// values -- pending_incoming and timelocked are REAL numbers here,
+// not the permanent 0 this poller used to hardcode for every target
+// (Zabbix-to-Grafana dashboard migration, Alex: Tari wallet
+// breakdown was one of the migration's gaps). A target whose client
+// does NOT satisfy that interface (today: *wallet.MoneroWalletRPC,
+// whose get_balance RPC genuinely only ever reports a Total/Unlocked
+// pair) falls back to the plain WalletClient.GetBalance split:
+// Unlocked as "available", (Total-Unlocked) as "pending_outgoing",
+// and pending_incoming/timelocked reported as 0 (correctly -- Monero
+// truly does not distinguish those from Total).
 func runWalletStatsPoller(ctx context.Context, m *metrics.Metrics, targets []walletStatsTarget, interval time.Duration) {
 	if interval <= 0 {
 		log.Print("backend: wallet-stats poller: interval <= 0, not starting")
@@ -2628,6 +2626,20 @@ func runWalletStatsPoller(ctx context.Context, m *metrics.Metrics, targets []wal
 
 	pollOnce := func() {
 		for _, t := range targets {
+			if detailed, ok := t.client.(wallet.DetailedBalanceClient); ok {
+				bal, err := detailed.GetDetailedBalance(ctx)
+				if err != nil {
+					m.WalletBalancePollErrorsTotal.WithLabelValues(t.algo, t.network, t.currency).Inc()
+					log.Printf("backend: wallet-stats poller: %s/%s/%s: GetDetailedBalance: %v", t.algo, t.network, t.currency, err)
+					continue
+				}
+				m.WalletBalance.WithLabelValues(t.algo, t.network, t.currency, walletBalanceKindAvailable).Set(float64(bal.Available))
+				m.WalletBalance.WithLabelValues(t.algo, t.network, t.currency, walletBalanceKindPendingOutgoing).Set(float64(bal.PendingOutgoing))
+				m.WalletBalance.WithLabelValues(t.algo, t.network, t.currency, walletBalanceKindPendingIncoming).Set(float64(bal.PendingIncoming))
+				m.WalletBalance.WithLabelValues(t.algo, t.network, t.currency, walletBalanceKindTimelocked).Set(float64(bal.Timelocked))
+				continue
+			}
+
 			bal, err := t.client.GetBalance(ctx)
 			if err != nil {
 				m.WalletBalancePollErrorsTotal.WithLabelValues(t.algo, t.network, t.currency).Inc()
