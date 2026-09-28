@@ -4,13 +4,16 @@ package solo
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/moneroblob"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -500,6 +503,56 @@ type JobManager struct {
 	// bytes-to-fields bookkeeping is duplicated anywhere.
 	sharedTemplate *Job
 
+	// sharedTemplateGen is THIS shared template generation's own
+	// derivation state -- most importantly its extraNonce counter,
+	// the real, direct port of the legacy
+	// nodejs-pool reference's per-BlockTemplate `this.extraNonce`
+	// (lib/coins/xmr.js, BlockTemplate):
+	//
+	//	this.extraNonce = 0;
+	//	this.nextBlob = function () {
+	//	    // Write a 32 bit integer, big-endian style to the 0 byte
+	//	    // of the reserve offset.
+	//	    this.buffer.writeUInt32BE(++this.extraNonce, this.reserveOffset);
+	//	    return global.coinFuncs.convertBlob(this.buffer).toString("hex");
+	//	};
+	//
+	// WHY THIS FIELD EXISTS (real, live-reproduced production
+	// data-integrity bug, sxmr-phx-dump): before it, two separate
+	// stratum logins against the SAME leaf at the SAME tip received
+	// BYTE-IDENTICAL mining blobs (only job_id/target differed),
+	// because jobFromSharedTemplate copied tpl.Header /
+	// tpl.RawTemplateBlob BY REFERENCE into every per-xn *Job and
+	// patched nothing. Every Monero-family miner on the leaf was
+	// therefore searching the exact same space as every other one.
+	// jobFromSharedTemplate now consumes the next value off this
+	// generation's counter on EVERY derivation and stamps it
+	// big-endian at ReservedOffset+0:+4, re-deriving the hashing blob
+	// from the patched raw template afterward (patching the coinbase
+	// tx changes the merkle root, which is embedded in the hashing
+	// blob).
+	//
+	// DELIBERATELY A POINTER, REPLACED (never merely reset in place)
+	// whenever jm.sharedTemplate is genuinely replaced -- matching
+	// legacy's own `this.extraNonce = 0` living in the BlockTemplate
+	// CONSTRUCTOR, i.e. a fresh template means a fresh counter, and
+	// the counter never persists across template generations. A
+	// pointer rather than inline fields so that the (template,
+	// generation) pair can be snapshotted together under jm.mu and
+	// handed to jobFromSharedTemplate as one consistent unit: that is
+	// what makes it impossible for a derivation racing a template
+	// swap to consume a value from the NEW generation's counter while
+	// stamping it into the OLD generation's bytes (or vice versa),
+	// which would reintroduce duplicate stamps within a single
+	// template generation -- exactly the bug this closes.
+	//
+	// nil whenever jm.sharedTemplate is nil (no template established
+	// yet); read via sharedTemplateSnapshot, written via
+	// setSharedTemplate / invalidateAll / adoptRelayedJobShared,
+	// always in the SAME jm.mu-held critical section that writes
+	// jm.sharedTemplate itself.
+	sharedTemplateGen *sharedTemplateGeneration
+
 	// templateFetchMu is the NEW, single, process-wide single-flight
 	// lock guarding "is there a shared template at all yet" --
 	// deliberately DISTINCT from genLocks below (which is per-xn).
@@ -796,13 +849,78 @@ func (jm *JobManager) usesSharedTemplate() bool {
 	return IsMoneroFamilyAlgo(jm.cfg.Algo)
 }
 
+// sharedTemplateGeneration is the small bundle of per-shared-template
+// derivation state jobFromSharedTemplate needs, minted fresh every
+// time jm.sharedTemplate is genuinely replaced -- see
+// JobManager.sharedTemplateGen's doc comment for the full rationale
+// and the production bug it exists for.
+type sharedTemplateGeneration struct {
+	// extraNonce is this template generation's own monotonically-
+	// incrementing extraNonce counter, starting at 0 (so the first
+	// derivation stamps 1, matching the legacy reference's
+	// `++this.extraNonce` pre-increment).
+	extraNonce atomic.Uint32
+
+	// stampUnavailable latches true the first time this template
+	// generation is found to be un-stampable AT ALL -- its reserved
+	// region doesn't fit inside its own raw template blob, or
+	// go-xmr-lib cannot re-derive a hashing blob from its
+	// (extraNonce-patched) bytes, or the re-derived blob's parsed
+	// nonce offset disagrees with the template's own.
+	//
+	// WHY LATCHED, rather than simply retried per derivation: every
+	// one of those conditions is a property of the TEMPLATE, not of
+	// any individual derivation, so retrying it once per arriving
+	// session is pure waste -- and actively harmful. Each retry
+	// costs a full go-xmr-lib parse attempt (a real CPU cost, once
+	// per session, on the hot job-derivation path), emits another
+	// copy of the same warning, and -- worst -- each panic/timeout
+	// counts toward moneroblob's process-wide malformed-blob circuit
+	// breaker, so a single genuinely unparseable template served to
+	// enough sessions would trip that breaker OPEN and thereby also
+	// refuse conversions on the unrelated XNP-proxy submit path
+	// (node.go's MoneroHashingBlobForXNPSubmit), turning one bad
+	// template into a leaf-wide submit outage. Latching bounds the
+	// damage to exactly ONE attempt, ONE warning and ONE possible
+	// breaker trigger per template generation, and the derivation
+	// itself still succeeds either way (it falls back to the
+	// unstamped shared bytes -- see extraNonceStampedTemplate).
+	stampUnavailable atomic.Bool
+
+	// stampUnavailableLogged guards the ONE additional log line
+	// emitted the first time some OTHER derivation observes
+	// stampUnavailable already latched true (see
+	// extraNonceStampedTemplate's own doc comment and its
+	// gen.stampUnavailable.Load() branch). This is deliberately
+	// SEPARATE from the warning line the original failure itself
+	// already emits when it FIRST sets the latch (the bounds check,
+	// the hashing-blob re-derivation failure, or the nonce-offset
+	// mismatch, each below) -- without this second guard, every
+	// derivation AFTER the first for an un-stampable generation was
+	// completely silent, so a live incident investigation could
+	// only ever see ONE warning line for a template that in fact
+	// went on serving unstamped, potentially-duplicate-search-space
+	// jobs to every other session at that height. A sync.Once (not
+	// a second atomic.Bool CompareAndSwap) is used purely because it
+	// is the more idiomatic "do this exactly once" primitive here;
+	// there is no correctness reason it couldn't be a Bool instead.
+	stampUnavailableLogged sync.Once
+}
+
 // sharedTemplateSnapshot returns the currently-established shared
-// template (see JobManager.sharedTemplate), or (nil, false) if none
-// has been established yet. Safe to call concurrently.
-func (jm *JobManager) sharedTemplateSnapshot() (*Job, bool) {
+// template (see JobManager.sharedTemplate) TOGETHER WITH that same
+// template generation's own derivation state (see
+// JobManager.sharedTemplateGen), or (nil, nil, false) if none has
+// been established yet. Safe to call concurrently.
+//
+// The two values are returned as one atomic pair on purpose: a
+// derivation must never stamp one generation's counter value into a
+// DIFFERENT generation's template bytes -- see
+// JobManager.sharedTemplateGen's doc comment.
+func (jm *JobManager) sharedTemplateSnapshot() (*Job, *sharedTemplateGeneration, bool) {
 	jm.mu.RLock()
 	defer jm.mu.RUnlock()
-	return jm.sharedTemplate, jm.sharedTemplate != nil
+	return jm.sharedTemplate, jm.sharedTemplateGen, jm.sharedTemplate != nil
 }
 
 // setSharedTemplate installs tpl as the shared current template every
@@ -810,14 +928,37 @@ func (jm *JobManager) sharedTemplateSnapshot() (*Job, bool) {
 // local-fetch path (currentSharedTemplate), the local tip-change path
 // (tipPollLoop, via invalidateAll's seed parameter) and the
 // relay-adoption path (adoptRelayedJob).
+//
+// Always installs a FRESH, zero-valued generation alongside it, in
+// the same critical section -- a genuinely new template gets a
+// genuinely new extraNonce counter, exactly like the legacy
+// reference's `this.extraNonce = 0` living in the BlockTemplate
+// constructor. See JobManager.sharedTemplateGen's doc comment.
 func (jm *JobManager) setSharedTemplate(tpl *Job) {
 	jm.mu.Lock()
 	jm.sharedTemplate = tpl
+	jm.sharedTemplateGen = newSharedTemplateGeneration(tpl)
 	jm.mu.Unlock()
 }
 
-// currentSharedTemplate returns the shared current template,
-// fetching it from the real node EXACTLY ONCE if none exists yet.
+// newSharedTemplateGeneration mints the fresh, zero-valued derivation
+// state that accompanies a newly-installed shared template -- nil
+// when there is no template to accompany (tpl == nil, i.e. an
+// unseeded invalidation), so that sharedTemplateSnapshot's
+// (nil, nil, false) contract holds. The single place this pairing is
+// constructed, so no call site can install a template while
+// forgetting its generation (or vice versa).
+func newSharedTemplateGeneration(tpl *Job) *sharedTemplateGeneration {
+	if tpl == nil {
+		return nil
+	}
+	return &sharedTemplateGeneration{}
+}
+
+// currentSharedTemplate returns the shared current template, together
+// with that same generation's own derivation state (see
+// JobManager.sharedTemplateGen), fetching the template from the real
+// node EXACTLY ONCE if none exists yet.
 //
 // This is the single-flight heart of this fix. The fast path is a
 // plain RLock snapshot (no fetch, no exclusive lock) -- that is what
@@ -830,9 +971,9 @@ func (jm *JobManager) setSharedTemplate(tpl *Job) {
 // their own redundant GetBlockTemplate call. See
 // JobManager.templateFetchMu's doc comment for why genLocks alone
 // cannot provide this guarantee.
-func (jm *JobManager) currentSharedTemplate(ctx context.Context) (*Job, error) {
-	if tpl, ok := jm.sharedTemplateSnapshot(); ok {
-		return tpl, nil
+func (jm *JobManager) currentSharedTemplate(ctx context.Context) (*Job, *sharedTemplateGeneration, error) {
+	if tpl, gen, ok := jm.sharedTemplateSnapshot(); ok {
+		return tpl, gen, nil
 	}
 
 	jm.templateFetchMu.Lock()
@@ -843,18 +984,18 @@ func (jm *JobManager) currentSharedTemplate(ctx context.Context) (*Job, error) {
 	// fetch (or a relay adoption / tip-poll seed may have installed
 	// one). Returning it here instead of fetching again is precisely
 	// what collapses N concurrent cold-start requests to 1 real call.
-	if tpl, ok := jm.sharedTemplateSnapshot(); ok {
-		return tpl, nil
+	if tpl, gen, ok := jm.sharedTemplateSnapshot(); ok {
+		return tpl, gen, nil
 	}
 
 	jm.cfg.Debug.Debugf("solo: no shared template established yet -- fetching one (single-flight) for algo=%s", algoWireName(jm.cfg.Algo))
 	tpl, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress, jm.cfg.Algo)
 	if err != nil {
 		jm.cfg.Debug.Debugf("solo: shared-template GetBlockTemplate failed: %v", err)
-		return nil, fmt.Errorf("solo: GetBlockTemplate for the shared current template: %w", err)
+		return nil, nil, fmt.Errorf("solo: GetBlockTemplate for the shared current template: %w", err)
 	}
 	if tpl == nil {
-		return nil, fmt.Errorf("solo: GetBlockTemplate returned a nil shared current template")
+		return nil, nil, fmt.Errorf("solo: GetBlockTemplate returned a nil shared current template")
 	}
 	if tpl.CreatedAt.IsZero() {
 		tpl.CreatedAt = time.Now()
@@ -868,7 +1009,18 @@ func (jm *JobManager) currentSharedTemplate(ctx context.Context) (*Job, error) {
 
 	jm.recordBestIfBetter(tpl)
 	jm.setSharedTemplate(tpl)
-	return tpl, nil
+	// Re-snapshot rather than returning a locally-minted generation:
+	// setSharedTemplate is the single owner of the (template,
+	// generation) pairing, and re-reading it here guarantees this
+	// caller derives against the generation that is genuinely
+	// installed (if a concurrent tip-change/relay adoption slipped a
+	// NEWER template in between, this returns THAT pair --
+	// consistently -- rather than a stale template with a live
+	// counter).
+	if installed, gen, ok := jm.sharedTemplateSnapshot(); ok {
+		return installed, gen, nil
+	}
+	return tpl, newSharedTemplateGeneration(tpl), nil
 }
 
 // recordBestIfBetter applies the tracked-best (height, size)
@@ -911,36 +1063,277 @@ func (jm *JobManager) recordBestIfBetter(job *Job) {
 //     exhaust or interfere with another's tracked-nonce state.
 //
 // Only the immutable, read-only template DATA is shared between them
-// (Header/BlockHash/TemplateData/VmKey/RawTemplateBlob are never
-// mutated in place by any consumer -- see MoneroHashingBlobForSubmit/
-// MoneroHashingBlobForXNPSubmit/patchMoneroXNPReservedOffsets in
-// node.go, every one of which explicitly copies before patching).
+// (BlockHash/VmKey are never mutated in place by any consumer). The
+// three Monero-family fields that used to ALSO be shared by
+// reference -- Header, RawTemplateBlob and TemplateData -- are now
+// freshly allocated per derived Job and carry this job's OWN
+// extraNonce stamp; see the EXTRANONCE STAMP note at the bottom of
+// this comment, and extraNonceStampedTemplate. Every consumer that
+// patches these buffers still copies before writing
+// (MoneroHashingBlobForSubmit/MoneroHashingBlobForXNPSubmit/
+// patchMoneroXNPReservedOffsets in node.go, and
+// MoneroNodeClient.BuildCandidateBlock in monero_node.go).
 //
 // CreatedAt is inherited from the template rather than set to now(),
 // matching RestampDifficulty: a derived job is exactly as stale as
 // the template it came from, so JobManagerConfig.JobMaxAge expiry
 // (session.go's handleSubmit) measures real template age and cannot
 // be indefinitely extended just by a session reconnecting.
-func (jm *JobManager) jobFromSharedTemplate(tpl *Job, difficulty uint64) (*Job, error) {
+//
+// EXTRANONCE STAMP (the real fix for a live-reproduced production
+// data-integrity bug -- see JobManager.sharedTemplateGen's own doc
+// comment for the reproduction): sharing Header/TemplateData/
+// RawTemplateBlob by reference is precisely what made two separate
+// stratum logins against the same leaf at the same tip receive
+// BYTE-IDENTICAL mining blobs. Every call now consumes the next
+// value off this template generation's extraNonce counter and gives
+// the derived Job its OWN freshly-allocated, extraNonce-stamped
+// RawTemplateBlob/Header/TemplateData -- see
+// extraNonceStampedTemplate below for the byte-level mechanics and
+// the graceful-degradation rules.
+//
+// gen may be nil (and tpl may be a non-Monero template), in which
+// case the stamp is skipped entirely and the pre-existing
+// share-by-reference behavior is preserved byte-for-byte -- this is
+// what keeps every Tari/non-Monero caller and every
+// non-Monero-shaped test double behaving exactly as before.
+func (jm *JobManager) jobFromSharedTemplate(tpl *Job, gen *sharedTemplateGeneration, difficulty uint64) (*Job, error) {
 	id, err := newRandomHexID()
 	if err != nil {
 		return nil, fmt.Errorf("solo: generating random job id for a shared-template-derived job: %w", err)
 	}
+
+	// Defaults preserve the exact pre-fix behavior (share the
+	// template's own slices by reference); extraNonceStampedTemplate
+	// overrides all three together, or none of them, never a mix --
+	// a Job whose Header did not come from its own RawTemplateBlob
+	// would be exactly the stale/mismatched-buffer hazard
+	// MoneroNodeClient.BuildCandidateBlock's own nonce-offset
+	// cross-check exists to catch.
+	header := tpl.Header
+	rawTemplateBlob := tpl.RawTemplateBlob
+	templateData := tpl.TemplateData
+	if stamped, ok := jm.extraNonceStampedTemplate(tpl, gen); ok {
+		header = stamped.hashingBlob
+		rawTemplateBlob = stamped.templateBlob
+		templateData = stamped.data
+	}
+
 	return &Job{
 		ID:                      id,
 		Algo:                    tpl.Algo,
 		Height:                  tpl.Height,
-		Header:                  tpl.Header,
+		Header:                  header,
 		BlockHash:               tpl.BlockHash,
 		StaticDifficulty:        difficulty,
 		NetworkTargetDifficulty: tpl.NetworkTargetDifficulty,
-		TemplateData:            tpl.TemplateData,
+		TemplateData:            templateData,
 		VmKey:                   tpl.VmKey,
 		ReservedOffset:          tpl.ReservedOffset,
 		ReservedOffsetUsable:    tpl.ReservedOffsetUsable,
-		RawTemplateBlob:         tpl.RawTemplateBlob,
+		RawTemplateBlob:         rawTemplateBlob,
 		CreatedAt:               tpl.CreatedAt,
 	}, nil
+}
+
+// stampedMoneroTemplate is one derived job's OWN, freshly-allocated,
+// extraNonce-stamped view of a shared Monero template: the patched
+// raw blocktemplate_blob, the hashing blob genuinely RE-DERIVED from
+// those patched bytes, and a fresh *moneroTemplateData carrying
+// exactly those same two buffers.
+//
+// All three travel together on purpose. MoneroNodeClient's
+// BuildCandidateBlock patches the miner's nonce into
+// job.TemplateData.(*moneroTemplateData).TemplateBlob and
+// cross-checks the nonce offset it re-parses from that same struct's
+// HashingBlob -- so a Job whose Header/RawTemplateBlob were stamped
+// while its TemplateData still pointed at the PARENT template's
+// unstamped buffers would submit a block that nobody ever mined
+// (confirmed failure mode: see monero_node.go's GetBlockTemplate
+// comment on the former prevHash+height-derived job IDs, the same
+// class of stale-buffer bug).
+type stampedMoneroTemplate struct {
+	templateBlob []byte
+	hashingBlob  []byte
+	data         *moneroTemplateData
+}
+
+// extraNonceStampedTemplate is the real port of the legacy
+// nodejs-pool reference's BlockTemplate.nextBlob (lib/coins/xmr.js
+// ~line 158, quoted in full on JobManager.sharedTemplateGen's
+// doc comment) into this package's shared-template job-derivation
+// path, and the exact peer of internal/leaflib/proxy's own
+// already-production-proven WorkerTemplate.BlobForWorker /
+// NextBlobForWorker (template.go):
+//
+//  1. Consume the NEXT value off this template generation's own
+//     atomic extraNonce counter (`++this.extraNonce`).
+//  2. COPY tpl.RawTemplateBlob (never patch in place -- the parent
+//     template is shared read-only across every session deriving
+//     from it) and write that value BIG-ENDIAN into the copy's
+//     4 bytes at ReservedOffset+0:+4
+//     (`buffer.writeUInt32BE(++this.extraNonce, this.reserveOffset)`;
+//     Node's Buffer.writeUInt32BE is big-endian).
+//  3. RE-DERIVE the hashing blob from the patched copy
+//     (`convertBlob(this.buffer)`), because the bytes just written
+//     live inside the coinbase transaction's reserved region, and
+//     changing the coinbase tx changes the merkle root, which is
+//     itself embedded in the hashing blob -- the parent's hashing
+//     blob is stale the instant the raw blob is patched. The
+//     re-derivation goes through moneroblob (panic recovery + hard
+//     timeout + the process-wide malformed-blob circuit breaker);
+//     never call go-xmr-lib's parse/convert pair directly and
+//     unwrapped.
+//
+// ReservedOffset+0:+4 is deliberately a DIFFERENT 4 bytes from the
+// already-shipped per-leaf instanceID stamp at ReservedOffset+4:+8
+// (monero_node.go's stampInstanceID) -- the two coexist exactly as
+// legacy's own extraNonce/instanceId do, in the same
+// |+0 extraNonce|+4 instanceId|+8 clientPoolNonce|+12 clientNonce|
+// reserved-region layout this package's minReservedOffsetHeadroom
+// (12) already covers. The instanceID this leaf already wrote into
+// tpl.RawTemplateBlob is preserved verbatim by the copy in step 2.
+//
+// DEGRADES GRACEFULLY, NEVER FAILS DERIVATION (ok=false, caller
+// keeps the parent's unstamped bytes) -- matching this package's
+// pervasive "best-effort, never block the primary path" convention
+// (checkin, relay publish, XNP-proxy reservation):
+//
+//   - gen is nil, or tpl carries no *moneroTemplateData, or it has
+//     no raw template blob: not a Monero-family shared template at
+//     all (e.g. every Tari path, and this package's own Tari-shaped
+//     test doubles) -- nothing to stamp. Every one of these is now
+//     logged (jm.logger, always-on, never Debug-gated) rather than
+//     silent, including the concrete Go type actually found in
+//     tpl.TemplateData, precisely so a real Tari-shaped template
+//     landing on this Monero-only path by mistake is immediately
+//     diagnosable from production logs, instead of indistinguishable
+//     from the ordinary/expected "not Monero-family" case.
+//   - This template generation has ALREADY been found un-stampable
+//     (gen.stampUnavailable is latched): skip immediately, with no
+//     counter consumption, no parse attempt and no further
+//     circuit-breaker exposure -- but NOT silently: the first
+//     derivation to observe the latch already set (i.e. every
+//     session after whichever one originally tripped it) logs
+//     exactly once per template generation
+//     (gen.stampUnavailableLogged), so a live incident investigation
+//     can see that this generation is still being served unstamped,
+//     not just the one original failure. See
+//     sharedTemplateGeneration.stampUnavailable's doc comment for
+//     why latching the SKIP is a correctness requirement, not just
+//     an optimization -- only the skip itself is latched, never the
+//     one-time log.
+//   - ReservedOffset is negative, or
+//     ReservedOffset+minReservedOffsetHeadroom does not fit inside
+//     the raw template blob: the exact same bounds check
+//     stampInstanceID/GetBlockTemplate already apply, with the exact
+//     same verdict they already reach (skip the optional stamp,
+//     still serve the job). Logged as a real, always-on WARNING
+//     (jm.logger, not Debug-gated) -- unlike the analogous check in
+//     GetBlockTemplate, this one is NOT a routine "short, low-tx
+//     coinbase-only template" degradation: a raw Monero block
+//     template is always large enough to fit
+//     ReservedOffset+minReservedOffsetHeadroom bytes in real
+//     production traffic, so this firing at all is itself a
+//     suspicious/anomalous signal (wrong offset math, a corrupted
+//     blob, or a genuine upstream parsing bug), not an expected
+//     soft-degrade.
+//   - The hashing-blob re-derivation errors (a malformed blob, or
+//     the circuit breaker is open): logged as a real WARNING (this
+//     one is genuinely unexpected -- these exact bytes already
+//     parsed successfully once, when the template was fetched or
+//     adopted) and the parent's unstamped bytes are used, exactly as
+//     before this fix. Never an error return.
+//   - The re-derived hashing blob no longer yields the same parsed
+//     nonce offset the template recorded: refuse the stamp rather
+//     than hand a miner a blob whose nonce field
+//     BuildCandidateBlock would later patch at a different offset
+//     than the miner actually mined at.
+//
+// Every one of those failure conditions latches gen.stampUnavailable
+// on its way out, so the cost/noise/breaker exposure of a genuinely
+// un-stampable template is paid exactly ONCE per template
+// generation, not once per arriving session.
+func (jm *JobManager) extraNonceStampedTemplate(tpl *Job, gen *sharedTemplateGeneration) (stampedMoneroTemplate, bool) {
+	var none stampedMoneroTemplate
+	if tpl == nil || gen == nil {
+		jm.logger.Printf("solo: monero: extraNonceStampedTemplate skipped (tpl_nil=%v gen_nil=%v) -- per-job extraNonce stamp omitted for this derivation", tpl == nil, gen == nil)
+		return none, false
+	}
+	data, ok := tpl.TemplateData.(*moneroTemplateData)
+	if !ok || data == nil {
+		jm.logger.Printf("solo: monero: shared template's TemplateData is not a usable *moneroTemplateData (concrete type %T) -- per-job extraNonce stamp omitted for this derivation, height=%d", tpl.TemplateData, tpl.Height)
+		return none, false
+	}
+	if len(tpl.RawTemplateBlob) == 0 {
+		jm.logger.Printf("solo: monero: shared template has an empty RawTemplateBlob -- per-job extraNonce stamp omitted for this derivation, height=%d", tpl.Height)
+		return none, false
+	}
+	if gen.stampUnavailable.Load() {
+		gen.stampUnavailableLogged.Do(func() {
+			jm.logger.Printf("solo: monero: this shared template generation was already latched un-stampable by an earlier derivation (see that earlier WARNING line for the root cause) -- per-job extraNonce stamp omitted for every remaining job derived from it, height=%d", tpl.Height)
+		})
+		return none, false
+	}
+
+	offset := tpl.ReservedOffset
+	if offset < 0 || offset+minReservedOffsetHeadroom > len(tpl.RawTemplateBlob) {
+		gen.stampUnavailable.Store(true)
+		jm.logger.Printf("solo: monero: WARNING: reserved region does not fit in template blob (offset=%d len(blob)=%d) -- this should be structurally impossible for a real Monero block template, treat as a genuine anomaly, not routine degradation -- per-job extraNonce stamp omitted for every job derived from this template, height=%d", offset, len(tpl.RawTemplateBlob), tpl.Height)
+		return none, false
+	}
+
+	// `++this.extraNonce` -- the counter starts at 0 and the FIRST
+	// derivation off a given template therefore stamps 1, exactly
+	// like the legacy pre-increment reference (so "0" is never a
+	// stamped value, and a never-stamped template is distinguishable
+	// from the first stamped job).
+	nonce := gen.extraNonce.Add(1)
+
+	templateBlob := make([]byte, len(tpl.RawTemplateBlob))
+	copy(templateBlob, tpl.RawTemplateBlob)
+	binary.BigEndian.PutUint32(templateBlob[offset:offset+4], nonce)
+
+	hashingBlob, err := moneroblob.ConvertTemplateBlobToHashingBlob(hex.EncodeToString(templateBlob))
+	if err != nil {
+		gen.stampUnavailable.Store(true)
+		jm.logger.Printf("solo: monero: WARNING: could not re-derive the hashing blob after stamping extraNonce=%d at reserved_offset+0 (height=%d): %v -- falling back to the UNSTAMPED shared template bytes for every job derived from this template, which means sessions on it may duplicate each other's search space", nonce, tpl.Height, err)
+		return none, false
+	}
+
+	// Re-parse the nonce offset from the FRESHLY re-derived blob and
+	// require it to still match what the template recorded. The
+	// extraNonce bytes live in the coinbase tx, well past the block
+	// header, so this invariant should always hold -- but
+	// MoneroNodeClient.BuildCandidateBlock hard-fails a submit whose
+	// re-parsed offset disagrees with data.NonceOffset, so proving it
+	// HERE (where the fallback is free) is strictly better than
+	// discovering it at block-find time.
+	nonceOffset, err := parseMoneroBlockHeaderNonceOffset(hashingBlob)
+	if err != nil {
+		gen.stampUnavailable.Store(true)
+		jm.logger.Printf("solo: monero: WARNING: could not parse the nonce offset out of the extraNonce-stamped hashing blob (extra_nonce=%d height=%d): %v -- falling back to the UNSTAMPED shared template bytes for every job derived from this template", nonce, tpl.Height, err)
+		return none, false
+	}
+	if nonceOffset != data.NonceOffset {
+		gen.stampUnavailable.Store(true)
+		jm.logger.Printf("solo: monero: WARNING: stamping extraNonce=%d changed the parsed block-header nonce offset (%d -> %d) at height=%d -- falling back to the UNSTAMPED shared template bytes for every job derived from this template rather than serving a blob BuildCandidateBlock would later reject", nonce, data.NonceOffset, nonceOffset, tpl.Height)
+		return none, false
+	}
+
+	return stampedMoneroTemplate{
+		templateBlob: templateBlob,
+		hashingBlob:  hashingBlob,
+		data: &moneroTemplateData{
+			HashingBlob:    hashingBlob,
+			TemplateBlob:   templateBlob,
+			NonceOffset:    nonceOffset,
+			SeedHash:       data.SeedHash,
+			Difficulty:     data.Difficulty,
+			Height:         data.Height,
+			ReservedOffset: data.ReservedOffset,
+		},
+	}, true
 }
 
 // jobForXNFromSharedTemplate is jobForXN's cache-miss path for the
@@ -970,12 +1363,12 @@ func (jm *JobManager) jobForXNFromSharedTemplate(ctx context.Context, xn string,
 		return job, nil
 	}
 
-	tpl, err := jm.currentSharedTemplate(ctx)
+	tpl, gen, err := jm.currentSharedTemplate(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	job, err := jm.jobFromSharedTemplate(tpl, difficulty)
+	job, err := jm.jobFromSharedTemplate(tpl, gen, difficulty)
 	if err != nil {
 		return nil, err
 	}
@@ -1149,6 +1542,16 @@ func (jm *JobManager) invalidateAll(source string, seed *Job) {
 	// keep deriving jobs from a template for a tip that has already
 	// moved.
 	jm.sharedTemplate = seed
+	// A genuinely new template generation means a genuinely FRESH
+	// extraNonce counter, restarting at 0 -- matching legacy's own
+	// `this.extraNonce = 0` in the BlockTemplate constructor. Written
+	// in the SAME critical section as jm.sharedTemplate so no
+	// derivation can ever observe a new template paired with the old
+	// generation's counter (see
+	// JobManager.sharedTemplateGen's doc comment). nil when seed is
+	// nil (unseeded invalidation), which currentSharedTemplate's
+	// next fetch then replaces.
+	jm.sharedTemplateGen = newSharedTemplateGeneration(seed)
 	jm.mu.Unlock()
 	if seed != nil {
 		jm.cfg.Debug.Debugf("solo: per-xn job cache invalidated and reseeded with an already-fetched shared template (job_id=%s height=%d) -- no per-session daemon calls needed", seed.ID, seed.Height)
@@ -1583,8 +1986,20 @@ func (jm *JobManager) adoptRelayedJobShared(job *Job) {
 
 	newPerXN := make(map[string]*Job, len(difficulties))
 	newJobsByID := make(map[string]*Job, len(difficulties))
+	// A newly-adopted relay template is a genuinely NEW template
+	// generation, so it gets its own FRESH extraNonce counter
+	// (restarting at 0) -- minted here, BEFORE the per-xn derivation
+	// loop below, and installed alongside the template itself under
+	// jm.mu further down. Minting it locally first (rather than
+	// installing the template and then reading the counter back) is
+	// what lets every xn reseeded by THIS adoption draw from the very
+	// same counter the later, lazily-arriving sessions will draw
+	// from, so no two sessions on this template generation can ever
+	// receive the same extraNonce. See
+	// JobManager.sharedTemplateGen's doc comment.
+	gen := newSharedTemplateGeneration(job)
 	for xn, difficulty := range difficulties {
-		derived, err := jm.jobFromSharedTemplate(job, difficulty)
+		derived, err := jm.jobFromSharedTemplate(job, gen, difficulty)
 		if err != nil {
 			// A failed job-ID mint for one xn must not abort the
 			// whole adoption: that xn simply ends up uncached and
@@ -1609,6 +2024,7 @@ func (jm *JobManager) adoptRelayedJobShared(job *Job) {
 
 	jm.mu.Lock()
 	jm.sharedTemplate = job
+	jm.sharedTemplateGen = gen
 	jm.perXN = newPerXN
 	jm.jobsByID = newJobsByID
 	jm.mu.Unlock()

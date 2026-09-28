@@ -6,11 +6,18 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Snipa22/go-xmr-lib/hashValidation"
 
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
+
+// rxHashMaxAttempts/rxHashRetryDelays bound the retry budget for a single
+// randomx-service /hash call (see hashWithRetry below for the reasoning).
+const rxHashMaxAttempts = 3
+
+var rxHashRetryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
 
 // RandomXValidator: HONEST STATUS — READ THIS BEFORE RELYING ON IT.
 //
@@ -82,6 +89,72 @@ type RandomXValidator struct {
 	verifier *hashValidation.RXVerifier
 }
 
+// hashWithRetry wraps v.verifier.Hash(blob, seed) with a small, bounded
+// retry budget so that a single TRANSIENT failure talking to the local
+// randomx-service daemon (e.g. connection refused mid-restart, a brief
+// timeout, a momentary connection reset) does not immediately propagate
+// as an infra error and cost a miner a valid share -- both Validate and
+// ValidateBlobSeedResult are per-share hot-path calls, and rejecting a
+// genuinely-valid share outright because the local verifier daemon
+// hiccuped for a few milliseconds is a real, avoidable financial loss
+// for that miner.
+//
+// This is DELIBERATELY NOT the same retry/backoff shape used elsewhere
+// in this codebase for block submission: that path retries a REMOTE
+// chain daemon across a real chain-sync lag, so it can afford (and
+// needs) a long, patient backoff measured in the same ballpark as block
+// time. This call is against a LOCAL daemon (127.0.0.1) on the
+// hottest, most frequent path in the pool (every share, not just every
+// found block) -- a multi-minute or exponential backoff here would
+// either stall share processing badly or, at pool scale, back up the
+// whole share pipeline behind a single misbehaving daemon. So the
+// budget here is intentionally short and fixed: rxHashMaxAttempts total
+// attempts (1 initial + 2 retries) with short, lightly-increasing
+// delays between them (rxHashRetryDelays), keeping worst-case added
+// latency for an unlucky share well under 200ms while still giving a
+// process that's mid-restart or briefly backlogged a real chance to
+// recover before the share is rejected.
+//
+// Retrying unconditionally on ANY non-nil error from Hash is safe here:
+// RXVerifier.Hash never reports a genuine hash MISMATCH as an error --
+// it always returns a real hash byte slice on success, which the
+// caller compares against the miner's claimed result. Only
+// transport/protocol-level failures (the daemon being unreachable,
+// timing out, or returning something the client can't parse) come
+// back as err != nil from Hash itself, so retrying can never mask a
+// wrong-answer share -- only a failed attempt to get an answer at all.
+//
+// ctx cancellation/deadline is honored between attempts: if ctx is
+// already done, this stops retrying immediately and returns the ctx
+// error rather than retrying into a caller that has already given up.
+// Only the last attempt's error is returned if every attempt fails, so
+// the real underlying failure reason is never lost.
+func (v *RandomXValidator) hashWithRetry(ctx context.Context, blob, seed []byte) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < rxHashMaxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := rxHashRetryDelays[len(rxHashRetryDelays)-1]
+			if attempt-1 < len(rxHashRetryDelays) {
+				delay = rxHashRetryDelays[attempt-1]
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		actual, err := v.verifier.Hash(blob, seed)
+		if err == nil {
+			return actual, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 // NewRandomXValidator returns a RandomXValidator backed by the
 // RandomX-verification HTTP service at serviceURL. Pass "" to use
 // go-xmr-lib's built-in default (http://127.0.0.1:39093). serviceURL is
@@ -129,7 +202,7 @@ func (v *RandomXValidator) Validate(ctx context.Context, share *poolpb.Share) (b
 		return false, err
 	}
 
-	actual, err := v.verifier.Hash(p.GetBlob(), p.GetSeedHash())
+	actual, err := v.hashWithRetry(ctx, p.GetBlob(), p.GetSeedHash())
 	if err != nil {
 		return false, fmt.Errorf("validator: randomx-service hash request failed: %w", err)
 	}
@@ -167,7 +240,7 @@ func (v *RandomXValidator) ValidateBlobSeedResult(ctx context.Context, blob, see
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	actual, err := v.verifier.Hash(blob, seed)
+	actual, err := v.hashWithRetry(ctx, blob, seed)
 	if err != nil {
 		return false, fmt.Errorf("validator: randomx-service hash request failed: %w", err)
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/Snipa22/go-xmr-lib/support"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/moneroblob"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
 )
@@ -203,6 +204,16 @@ func newFakeMoneroXNPNodeClient(t *testing.T) *fakeMoneroXNPNodeClient {
 // back through MoneroHashingBlobForSubmit's own
 // type-assertion/offset-mismatch failure instead).
 func TestSessionRXMXNPSubmitPatchesWorkerAndPoolNonce(t *testing.T) {
+	// See newRXMXNPTestHarness's doc comment on breaker isolation:
+	// moneroblob.GlobalBreaker is a process-wide singleton shared
+	// with every other test in this package, several of which
+	// legitimately (and by design, gracefully) fail conversion on
+	// deliberately synthetic template blobs and thereby trigger it.
+	// Reset it so THIS test's real-fixture conversion is never
+	// refused by another test's leftover state.
+	moneroblob.GlobalBreaker.ResetForTest()
+	t.Cleanup(func() { moneroblob.GlobalBreaker.ResetForTest() })
+
 	node := newFakeMoneroXNPNodeClient(t)
 	h := newRXMXNPTestHarness(t, 1, 1<<62, node)
 
@@ -242,6 +253,16 @@ func TestSessionRXMXNPSubmitPatchesWorkerAndPoolNonce(t *testing.T) {
 // unlike newRXMTestHarness's Tari-shaped fixture) -- proving the
 // dispatch didn't regress the non-XNP case while adding the XNP one.
 func TestSessionRXMOrdinarySubmitStillUsesNonXNPPath(t *testing.T) {
+	// See newRXMXNPTestHarness's doc comment on breaker isolation:
+	// moneroblob.GlobalBreaker is a process-wide singleton shared
+	// with every other test in this package, several of which
+	// legitimately (and by design, gracefully) fail conversion on
+	// deliberately synthetic template blobs and thereby trigger it.
+	// Reset it so THIS test's real-fixture conversion is never
+	// refused by another test's leftover state.
+	moneroblob.GlobalBreaker.ResetForTest()
+	t.Cleanup(func() { moneroblob.GlobalBreaker.ResetForTest() })
+
 	node := newFakeMoneroXNPNodeClient(t)
 	h := newRXMXNPTestHarness(t, 1, 1<<62, node)
 

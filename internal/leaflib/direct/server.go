@@ -52,6 +52,7 @@ import (
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/addressflags"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/chainheight"
 	directmetrics "github.com/Snipa22/go-crypto-pool/internal/leaflib/direct/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
@@ -84,6 +85,12 @@ type Server struct {
 	algo        poolpb.Algo
 	poolType    poolpb.PoolType
 	poolID      int32
+
+	// chainHeightPoller is the leaf_monero_chain_height/
+	// leaf_tari_chain_height background poller (see EnableMetrics),
+	// nil unless EnableMetrics was called AND s.node implements
+	// chainheight.TipInfoSource. Stopped from Shutdown.
+	chainHeightPoller *chainheight.Poller
 
 	vardiff solo.VardiffConfig
 
@@ -777,6 +784,39 @@ func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetr
 		mnc.SetReservationUnavailableMetric(m.XNPReservationUnavailableTotal)
 	}
 	return m
+}
+
+// EnableChainHeightMetrics starts a background chainheight.Poller
+// against this Server's own s.node and wires it into the metrics
+// registered by a prior EnableMetrics call (leaf_monero_chain_height
+// or leaf_tari_chain_height, depending on this leaf's configured
+// algo family -- see solo.IsMoneroFamilyAlgo). Deliberately a
+// SEPARATE opt-in call rather than folded into EnableMetrics itself:
+// EnableMetrics is exercised by a large number of existing
+// lower-level session/server tests using synthetic NodeClient fakes
+// that don't expect (and, in several cases, fail on) an extra real
+// get_info/GetTipInfo call being made against them; production
+// wiring (cmd/leaf-direct/main.go) calls this explicitly right after
+// EnableMetrics, mirroring EnableCaptureAddresses/EnableTrust's own
+// "separate, explicit opt-in" convention. A no-op if EnableMetrics
+// was never called, or if s.node doesn't implement
+// chainheight.TipInfoSource (i.e. some future NodeClient
+// implementation without a GetTipInfo method at all).
+func (s *Server) EnableChainHeightMetrics() {
+	if s.metrics == nil {
+		return
+	}
+	tipSource, ok := s.node.(chainheight.TipInfoSource)
+	if !ok {
+		return
+	}
+	s.chainHeightPoller = chainheight.New(tipSource, chainheight.DefaultInterval, s.logger)
+	s.chainHeightPoller.Start()
+	if solo.IsMoneroFamilyAlgo(s.algo) {
+		s.metrics.SetMoneroChainHeightSource(s.chainHeightPoller.Height)
+	} else {
+		s.metrics.SetTariChainHeightSource(s.chainHeightPoller.Height)
+	}
 }
 
 // SetHideRemoteAddress mirrors internal/leaflib/solo/server.go's
@@ -1740,5 +1780,8 @@ func (s *Server) Shutdown() {
 	}
 	if s.metrics != nil {
 		s.metrics.Stop()
+	}
+	if s.chainHeightPoller != nil {
+		s.chainHeightPoller.Stop()
 	}
 }

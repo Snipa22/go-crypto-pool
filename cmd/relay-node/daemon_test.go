@@ -4,7 +4,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -53,6 +57,56 @@ func startEmbeddedNATSServer(t *testing.T) (url string, shutdown func()) {
 	return srv.ClientURL(), srv.Shutdown
 }
 
+// realMoneroFixtureBlobHex/syntheticMoneroTestnetAddress/
+// mockMoneroGetBlockTemplateServer are deliberately duplicated from
+// internal/leaflib/solo/monero_node_test.go's identical
+// realFixtureBlobHex/syntheticTestnetAddress/
+// mockGetBlockTemplateServer helpers -- this repo's own established
+// convention (see solo/node.go's convertRawTemplateBlobToHashingBlob
+// doc comment) is to duplicate small, single-package test helpers
+// like this rather than export a test-only symbol across a package
+// boundary (and the originals are themselves unexported _test.go
+// symbols in a different package, so they are not reachable from
+// here at all). A real, go-xmr-lib-verified monerod get_block_template
+// blob (both blockhashing_blob and blocktemplate_blob are the SAME
+// fixture bytes, which trivially satisfies GetBlockTemplate's own
+// header-prefix-match check): 76 bytes, real nonce offset 39.
+const realMoneroFixtureBlobHex = "1010c3f4a4d4062d5456c2d3d54707336bc352fc9910c8adbd586603439b548fca04de64c1973d00000000936c23078acfd28dc0b307b8a2e63eb4eef27681ebb63f9ec67f09b8e3b59cef01"
+
+// syntheticMoneroTestnetAddress is a syntactically-valid (correct
+// base58 length/prefix) but NOT real Monero testnet address --
+// GetBlockTemplate only needs a well-formed payout address to build
+// its own outbound RPC request; monerod's response is fully
+// controlled by mockMoneroGetBlockTemplateServer below regardless of
+// what address was sent.
+const syntheticMoneroTestnetAddress = "9tvbsnp9XjUNeDkhsC9JQ7Eh8naZeS6YNFsMbi1oaym83M1FhSjoyToiy2T1F7fSE6MXws1Wypo4XfECHuzqKw7XBMMwQ5e"
+
+// mockMoneroGetBlockTemplateServer starts a real local httptest server
+// whose /json_rpc get_block_template response carries a real,
+// well-formed fixture template (realMoneroFixtureBlobHex, a fixed
+// reserved_offset of 10 which fits within the fixture's 76-byte
+// length) -- enough for a real *solo.MoneroNodeClient.GetBlockTemplate
+// call to succeed end to end.
+func mockMoneroGetBlockTemplateServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/json_rpc", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":"0","jsonrpc":"2.0","result":{
+			"blockhashing_blob":"%s",
+			"blocktemplate_blob":"%s",
+			"difficulty":1000,
+			"height":123,
+			"prev_hash":"%s",
+			"reserved_offset":10,
+			"seed_hash":"%s",
+			"seed_height":100,
+			"status":"OK"
+		}}`, realMoneroFixtureBlobHex, realMoneroFixtureBlobHex, hex.EncodeToString(bytes.Repeat([]byte{0xAB}, 32)), hex.EncodeToString(bytes.Repeat([]byte{0xCD}, 32)))
+	})
+	return httptest.NewServer(mux)
+}
+
 // mockNodeClient is a solo.NodeClient test double -- no real GRPC/RPC
 // connection, deterministic behavior, real call counters so tests can
 // assert exactly how many times each method was invoked. Mirrors
@@ -67,6 +121,17 @@ type mockNodeClient struct {
 
 	job    *solo.Job
 	jobErr error
+
+	// relayTemplateData/relayTemplateErr control TemplateBytesForRelay's
+	// return value -- as of this fix, templateDataForJob's
+	// Monero-family branch genuinely calls this (delegating to
+	// d.Node.TemplateBytesForRelay(job), exactly like leaf-direct's
+	// own solo/job.go), so this mock double needs a real, controllable
+	// implementation rather than the old always-error stub. Both zero
+	// values (nil, nil) mirror solo.NodeClient.TemplateBytesForRelay's
+	// own documented "cannot serialize for a benign reason" contract.
+	relayTemplateData []byte
+	relayTemplateErr  error
 
 	getTipInfoCalls       int
 	getBlockTemplateCalls int
@@ -110,18 +175,27 @@ func (m *mockNodeClient) SubmitBlock(_ context.Context, candidate any) error {
 	return m.submitErr
 }
 
-// JobFromTemplateBytes/TemplateBytesForRelay implement solo.NodeClient
-// -- relay-node itself never calls either (it only PUBLISHES template
-// bytes via templateDataForJob/proto.Marshal directly in daemon.go,
-// it never ADOPTS a relayed template the way leaf-direct's JobManager
-// does), so these are simple, clearly-unused stubs, mirroring
-// solo.GRPCNodeClient's own "not supported" stub convention.
+// JobFromTemplateBytes implements solo.NodeClient -- relay-node itself
+// never calls this (it only PUBLISHES template bytes, it never ADOPTS
+// a relayed template the way leaf-direct's JobManager does), so this
+// is a simple, clearly-unused stub, mirroring solo.GRPCNodeClient's
+// own "not supported" stub convention.
 func (m *mockNodeClient) JobFromTemplateBytes(_ []byte, _ poolpb.Algo) (*solo.Job, error) {
 	return nil, errors.New("mockNodeClient: JobFromTemplateBytes not used by relay-node")
 }
 
+// TemplateBytesForRelay implements solo.NodeClient -- as of this fix,
+// templateDataForJob's Monero-family branch genuinely calls this (see
+// daemon.go), so, unlike JobFromTemplateBytes above, this is a real,
+// test-controllable double, not an unused stub. See
+// relayTemplateData/relayTemplateErr's own doc comment above.
 func (m *mockNodeClient) TemplateBytesForRelay(_ *solo.Job) ([]byte, error) {
-	return nil, errors.New("mockNodeClient: TemplateBytesForRelay not used by relay-node")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.relayTemplateErr != nil {
+		return nil, m.relayTemplateErr
+	}
+	return m.relayTemplateData, nil
 }
 
 func (m *mockNodeClient) callCounts() (tip, template, submit int) {
@@ -153,10 +227,12 @@ func newTariJob(height uint64) *solo.Job {
 // newMoneroJob builds a minimal-but-real solo.Job for a Monero-family
 // algo, carrying a real, non-empty RawTemplateBlob -- exactly the
 // exported field solo.MoneroNodeClient.GetBlockTemplate populates
-// (monero_node.go), which is what templateDataForJob's Monero branch
-// reads directly (job.TemplateData itself holds an unexported type
-// relay-node's own package cannot reach -- see that function's doc
-// comment).
+// (monero_node.go). Used only by tests that don't care about the
+// EXACT bytes templateDataForJob's Monero branch publishes (that
+// branch now delegates entirely to node.TemplateBytesForRelay(job) --
+// see TestTemplateDataForJob_Monero* below, and
+// TestTemplateDataForJob_MoneroRealNodeClientRoundTrip for the real,
+// cross-component wire-compatibility regression test).
 func newMoneroJob(height uint64) *solo.Job {
 	return &solo.Job{
 		Height:          height,
@@ -169,10 +245,16 @@ func newMoneroJob(height uint64) *solo.Job {
 
 // TestTemplateDataForJob_Tari confirms the Tari branch produces a
 // real proto.Marshal of the job's own GetNewBlockResult, decodable
-// back into an equivalent message.
+// back into an equivalent message. This is deliberately NOT delegated
+// to node.TemplateBytesForRelay -- passing a node whose
+// TemplateBytesForRelay would fail/panic if called proves the Tari
+// branch never calls it (see daemon.go's templateDataForJob doc
+// comment for why: -coin=tari's real NodeClient,
+// *solo.GRPCNodeClient, hard-errors on that call).
 func TestTemplateDataForJob_Tari(t *testing.T) {
 	job := newTariJob(100)
-	data, err := templateDataForJob(coinTari, job)
+	node := &mockNodeClient{relayTemplateErr: errors.New("TestTemplateDataForJob_Tari: TemplateBytesForRelay must not be called for a Tari job")}
+	data, err := templateDataForJob(coinTari, node, job)
 	if err != nil {
 		t.Fatalf("templateDataForJob: %v", err)
 	}
@@ -188,33 +270,125 @@ func TestTemplateDataForJob_Tari(t *testing.T) {
 	}
 }
 
-// TestTemplateDataForJob_Monero confirms the Monero-family branch
-// returns the job's real RawTemplateBlob bytes verbatim (a copy, not
-// an alias).
+// TestTemplateDataForJob_Monero is this fix's core unit-level proof:
+// the Monero-family branch no longer hand-rolls its own encoding of
+// job.RawTemplateBlob -- it delegates entirely to
+// node.TemplateBytesForRelay(job) and returns exactly what that call
+// returns, byte for byte. Real end-to-end wire compatibility with
+// solo.MoneroNodeClient.JobFromTemplateBytes is separately covered by
+// TestTemplateDataForJob_MoneroRealNodeClientRoundTrip below.
 func TestTemplateDataForJob_Monero(t *testing.T) {
 	job := newMoneroJob(200)
-	data, err := templateDataForJob(coinMonero, job)
+	want := []byte(`{"hashing_blob":"aabb","template_blob":"aabb","seed_hash":null,"prev_hash":null,"difficulty":42,"height":200,"reserved_offset":0}`)
+	node := &mockNodeClient{relayTemplateData: want}
+	data, err := templateDataForJob(coinMonero, node, job)
 	if err != nil {
 		t.Fatalf("templateDataForJob: %v", err)
 	}
-	if string(data) != string(job.RawTemplateBlob) {
-		t.Errorf("TemplateData = %v, want %v (job.RawTemplateBlob)", data, job.RawTemplateBlob)
-	}
-	// Mutate the returned slice and confirm the job's own field is
-	// untouched -- confirms this is a real copy, not an alias.
-	data[0] = 0xff
-	if job.RawTemplateBlob[0] == 0xff {
-		t.Error("templateDataForJob must return a copy of RawTemplateBlob, not an alias")
+	if string(data) != string(want) {
+		t.Errorf("TemplateData = %s, want %s (node.TemplateBytesForRelay's own return value, verbatim)", data, want)
 	}
 }
 
-// TestTemplateDataForJob_MoneroEmptyBlob confirms an empty
-// RawTemplateBlob is a real, reported error (never silently produces
-// empty-but-"successful" TemplateData).
-func TestTemplateDataForJob_MoneroEmptyBlob(t *testing.T) {
-	job := &solo.Job{Height: 1, Algo: poolpb.Algo_ALGO_XMR}
-	if _, err := templateDataForJob(coinMonero, job); err == nil {
-		t.Fatal("expected an error for an empty RawTemplateBlob, got nil")
+// TestTemplateDataForJob_MoneroPropagatesError confirms a genuine
+// node.TemplateBytesForRelay error is surfaced (never silently
+// swallowed into empty-but-"successful" TemplateData).
+func TestTemplateDataForJob_MoneroPropagatesError(t *testing.T) {
+	job := newMoneroJob(1)
+	node := &mockNodeClient{relayTemplateErr: errors.New("boom")}
+	if _, err := templateDataForJob(coinMonero, node, job); err == nil {
+		t.Fatal("expected an error when node.TemplateBytesForRelay errors, got nil")
+	}
+}
+
+// TestTemplateDataForJob_MoneroEmptyData confirms node.
+// TemplateBytesForRelay's documented (nil, nil) "cannot serialize for
+// a benign reason" contract is still surfaced as a real, reported
+// error from templateDataForJob itself (never silently produces
+// empty-but-"successful" TemplateData) -- matching this function's
+// pre-existing contract for the analogous Tari failure case.
+func TestTemplateDataForJob_MoneroEmptyData(t *testing.T) {
+	job := newMoneroJob(1)
+	node := &mockNodeClient{} // relayTemplateData/relayTemplateErr both zero-value.
+	if _, err := templateDataForJob(coinMonero, node, job); err == nil {
+		t.Fatal("expected an error when node.TemplateBytesForRelay returns (nil, nil), got nil")
+	}
+}
+
+// TestTemplateDataForJob_MoneroRealNodeClientRoundTrip is the real,
+// cross-component wire-compatibility regression test this bug
+// represents (see BRIEF.md): a real *solo.Job produced by a real
+// *solo.MoneroNodeClient.GetBlockTemplate call (against a mocked
+// monerod, via mockMoneroGetBlockTemplateServer) is encoded through
+// templateDataForJob's Monero-family branch -- the EXACT function
+// relay-node's own publishTemplateForHeight calls -- and the
+// resulting bytes are fed straight into a DIFFERENT
+// *solo.MoneroNodeClient's JobFromTemplateBytes, simulating a
+// genuinely separate leaf-direct-Monero process receiving this
+// relay-node instance's published template over the shared NATS
+// subject. Before this fix, templateDataForJob published
+// job.RawTemplateBlob's raw bytes directly, which
+// JobFromTemplateBytes's JSON unmarshal would reject outright (the
+// real production symptom this whole fix exists for -- see BRIEF.md's
+// root-cause section for the exact log line).
+func TestTemplateDataForJob_MoneroRealNodeClientRoundTrip(t *testing.T) {
+	srv := mockMoneroGetBlockTemplateServer(t)
+	defer srv.Close()
+
+	// Both clients pinned to the SAME instanceID: JobFromTemplateBytes
+	// stamps the RECEIVING instance's own instanceID into the
+	// reserved region on every call (see monero_node.go's
+	// stampInstanceID doc comment) -- two genuinely different
+	// instances would legitimately diverge there, which is its own
+	// separately-tested behavior (solo/monero_node_relay_test.go's
+	// TestMoneroNodeClient_JobFromTemplateBytes_StampsDistinctInstanceIDs),
+	// not what THIS test is proving. Pinning both keeps this test's
+	// byte-equality assertions meaningful for every field other than
+	// that stamp.
+	sameInstanceID := [4]byte{0x11, 0x22, 0x33, 0x44}
+	sendingNode := solo.NewMoneroNodeClient(srv.URL)
+	sendingNode.SetInstanceID(sameInstanceID)
+	originalJob, err := sendingNode.GetBlockTemplate(context.Background(), syntheticMoneroTestnetAddress, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("GetBlockTemplate (sending side): %v", err)
+	}
+
+	data, err := templateDataForJob(coinMonero, sendingNode, originalJob)
+	if err != nil {
+		t.Fatalf("templateDataForJob: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("templateDataForJob returned empty data for a real, populated Monero job")
+	}
+
+	// A genuinely different MoneroNodeClient instance -- no shared
+	// state, no baseURL even configured -- simulating a sibling
+	// leaf-direct-Monero process receiving this relay-node instance's
+	// published bytes over NATS.
+	receivingNode := solo.NewMoneroNodeClient("")
+	receivingNode.SetInstanceID(sameInstanceID)
+	reconstructedJob, err := receivingNode.JobFromTemplateBytes(data, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("JobFromTemplateBytes: %v (relay-node's published bytes must be decodable by solo.MoneroNodeClient.JobFromTemplateBytes -- this is the exact regression this fix addresses)", err)
+	}
+	if reconstructedJob == nil {
+		t.Fatal("JobFromTemplateBytes returned a nil job with a nil error")
+	}
+
+	if reconstructedJob.Height != originalJob.Height {
+		t.Errorf("reconstructed Height = %d, want %d", reconstructedJob.Height, originalJob.Height)
+	}
+	if !bytes.Equal(reconstructedJob.Header, originalJob.Header) {
+		t.Errorf("reconstructed Header = %x, want %x", reconstructedJob.Header, originalJob.Header)
+	}
+	if !bytes.Equal(reconstructedJob.RawTemplateBlob, originalJob.RawTemplateBlob) {
+		t.Errorf("reconstructed RawTemplateBlob = %x, want %x", reconstructedJob.RawTemplateBlob, originalJob.RawTemplateBlob)
+	}
+	if reconstructedJob.NetworkTargetDifficulty != originalJob.NetworkTargetDifficulty {
+		t.Errorf("reconstructed NetworkTargetDifficulty = %d, want %d", reconstructedJob.NetworkTargetDifficulty, originalJob.NetworkTargetDifficulty)
+	}
+	if reconstructedJob.Algo != poolpb.Algo_ALGO_RXM {
+		t.Errorf("reconstructed Algo = %v, want ALGO_RXM", reconstructedJob.Algo)
 	}
 }
 

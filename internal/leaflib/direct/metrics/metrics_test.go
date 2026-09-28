@@ -128,6 +128,114 @@ func formatUnix(u int64) string {
 	return strconv.FormatFloat(float64(u), 'g', -1, 64)
 }
 
+// TestTotalHashrateMetric_ReflectsAllSessionsBeyondCap is the
+// required proof for leaf_direct_total_hashrate_hash_per_second: it
+// must equal the sum of every connected session's hashrate even when
+// the number of distinct addresses exceeds maxAddressLabels (default
+// 50) -- i.e. it must NOT be derived from (or limited by)
+// leaf_direct_miner_hashrate_hash_per_second's capped per-address
+// map. 60 synthetic sessions, one address each (so 60 > 50 forces
+// CapAddressHashrates to actually bucket 11 addresses into "other"),
+// each contributing a distinct, easily-summed hashrate.
+func TestTotalHashrateMetric_ReflectsAllSessionsBeyondCap(t *testing.T) {
+	m := New("dev", 0) // maxAddressLabels defaults to 50 via New's own <= 0 fallback
+
+	const sessionCount = 60
+	snaps := make([]SessionSnapshot, 0, sessionCount)
+	var wantTotal float64
+	for i := 0; i < sessionCount; i++ {
+		rate := float64(1000 + i) // distinct per-address rate, easy to sum by hand
+		snaps = append(snaps, SessionSnapshot{
+			Address:  fmt.Sprintf("addr-%02d", i),
+			RemoteIP: fmt.Sprintf("10.0.0.%d", i%254+1),
+			Hashrate: rate,
+		})
+		wantTotal += rate
+	}
+	m.SetSnapshotSource(func() []SessionSnapshot { return snaps })
+
+	body := scrape(t, m)
+
+	wantLine := fmt.Sprintf("leaf_direct_total_hashrate_hash_per_second %s", strconv.FormatFloat(wantTotal, 'g', -1, 64))
+	if !strings.Contains(body, wantLine) {
+		t.Fatalf("expected %q in scrape output, got:\n%s", wantLine, body)
+	}
+
+	// Sanity: confirm the per-address metric really IS capped (fewer
+	// than sessionCount distinct address label values, plus an
+	// "other" bucket) -- otherwise this test would not actually be
+	// exercising the over-the-cap scenario it claims to.
+	addrSeries := strings.Count(body, "leaf_direct_miner_hashrate_hash_per_second{")
+	if addrSeries >= sessionCount {
+		t.Fatalf("expected leaf_direct_miner_hashrate_hash_per_second to be capped below %d series, got %d -- test no longer exercises the over-the-cap case", sessionCount, addrSeries)
+	}
+	if !strings.Contains(body, `leaf_direct_miner_hashrate_hash_per_second{address="other"}`) {
+		t.Fatalf("expected an address=\"other\" overflow bucket once addresses exceed the cap, got:\n%s", body)
+	}
+}
+
+// TestTotalHashrateMetric_EmptyWhenNoSessions is the zero-sessions
+// edge case: with no snapshot source wired (or an empty snapshot),
+// the total must be exactly 0, never absent (this is an unlabeled
+// gauge, always emitted, unlike the relay_* metrics above which are
+// conditionally emitted only when a source is wired).
+func TestTotalHashrateMetric_EmptyWhenNoSessions(t *testing.T) {
+	m := New("dev", 0)
+	body := scrape(t, m)
+	if !strings.Contains(body, "leaf_direct_total_hashrate_hash_per_second 0") {
+		t.Fatalf("expected leaf_direct_total_hashrate_hash_per_second 0 with no sessions, got:\n%s", body)
+	}
+}
+
+// TestChainHeightMetrics_EmittedWhenSourceWired proves
+// leaf_monero_chain_height/leaf_tari_chain_height are each emitted,
+// with the real value, only once their respective source is wired --
+// mirroring the relay_*/asyncPool_* metrics' identical
+// wired-vs-absent convention above.
+func TestChainHeightMetrics_EmittedWhenSourceWired(t *testing.T) {
+	m := New("dev", 0)
+	m.SetMoneroChainHeightSource(func() (uint64, bool) { return 3312345, true })
+	m.SetTariChainHeightSource(func() (uint64, bool) { return 42, true })
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		"leaf_monero_chain_height 3.312345e+06",
+		"leaf_tari_chain_height 42",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, body)
+		}
+	}
+}
+
+// TestChainHeightMetrics_AbsentWithoutSource proves neither chain
+// height metric appears at all when no source has been wired (a
+// Metrics predating this feature, or a leaf whose s.node doesn't
+// implement chainheight.TipInfoSource).
+func TestChainHeightMetrics_AbsentWithoutSource(t *testing.T) {
+	m := New("dev", 0)
+	body := scrape(t, m)
+	for _, absent := range []string{"leaf_monero_chain_height", "leaf_tari_chain_height"} {
+		if strings.Contains(body, absent) {
+			t.Errorf("expected no %q series without a source wired, got:\n%s", absent, body)
+		}
+	}
+}
+
+// TestChainHeightMetrics_AbsentWhenNoSuccessfulPollYet proves a
+// wired source that reports ok=false (no successful poll yet, e.g.
+// daemon unreachable since process start) still emits NO sample --
+// never a misleading 0.
+func TestChainHeightMetrics_AbsentWhenNoSuccessfulPollYet(t *testing.T) {
+	m := New("dev", 0)
+	m.SetMoneroChainHeightSource(func() (uint64, bool) { return 0, false })
+
+	body := scrape(t, m)
+	if strings.Contains(body, "leaf_monero_chain_height") {
+		t.Errorf("expected no leaf_monero_chain_height series when ok=false, got:\n%s", body)
+	}
+}
+
 // TestRelayMetrics_NoSourceIsAbsent mirrors
 // TestAsyncPoolMetrics_NoSourceIsAbsent exactly, for relay metrics --
 // the zero-cost/zero-registration contract at the collector level: an

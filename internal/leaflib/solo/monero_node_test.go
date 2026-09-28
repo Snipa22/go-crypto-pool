@@ -719,3 +719,109 @@ func TestMoneroNodeClient_GetBlockTemplate_ReservationUnavailableIncrementsMetri
 		t.Fatalf("counter = %v after a healthy call, want unchanged at 1", got)
 	}
 }
+
+// TestMoneroNodeClient_GetBlockTemplate_StampsDistinctInstanceIDs is
+// the direct regression test for this fix's core production bug (see
+// DISPATCH_BRIEF_2_INSTANCEID.md): two MoneroNodeClient instances with
+// DIFFERENT instance IDs (injected via SetInstanceID), each calling
+// GetBlockTemplate against the SAME real monerod fixture response
+// (mockGetBlockTemplateServer, byte-identical blobs/reserved_offset on
+// both), must produce two RawTemplateBlobs that DIFFER at exactly
+// ReservedOffset+4:ReservedOffset+8 -- and are otherwise byte-for-byte
+// identical everywhere else. Before this fix, MoneroNodeClient never
+// wrote anything into that region at all, so two pool leaves sharing
+// one payout address served byte-identical coinbases; this test fails
+// against that pre-fix behavior and passes against the fix.
+func TestMoneroNodeClient_GetBlockTemplate_StampsDistinctInstanceIDs(t *testing.T) {
+	const reservedOffset = 10 // 10+12=22 <= 76 (fixture length) -- reservation usable.
+
+	srv1 := mockGetBlockTemplateServer(t, reservedOffset)
+	defer srv1.Close()
+	srv2 := mockGetBlockTemplateServer(t, reservedOffset)
+	defer srv2.Close()
+
+	client1 := NewMoneroNodeClient(srv1.URL)
+	client1.SetInstanceID([4]byte{0x11, 0x22, 0x33, 0x44})
+	client2 := NewMoneroNodeClient(srv2.URL)
+	client2.SetInstanceID([4]byte{0xAA, 0xBB, 0xCC, 0xDD})
+
+	job1, err := client1.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("GetBlockTemplate (client1): %v", err)
+	}
+	job2, err := client2.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("GetBlockTemplate (client2): %v", err)
+	}
+
+	if !job1.ReservedOffsetUsable || !job2.ReservedOffsetUsable {
+		t.Fatalf("test premise violated: reservation must be usable for this offset (job1=%v job2=%v)", job1.ReservedOffsetUsable, job2.ReservedOffsetUsable)
+	}
+
+	stampStart := reservedOffset + 4
+	stampEnd := reservedOffset + 8
+
+	blob1 := job1.RawTemplateBlob
+	blob2 := job2.RawTemplateBlob
+	if len(blob1) != len(blob2) {
+		t.Fatalf("RawTemplateBlob lengths differ: %d vs %d", len(blob1), len(blob2))
+	}
+
+	if !bytes.Equal(blob1[stampStart:stampEnd], client1.instanceID[:]) {
+		t.Fatalf("job1's stamped bytes = %x, want client1's own instanceID %x", blob1[stampStart:stampEnd], client1.instanceID[:])
+	}
+	if !bytes.Equal(blob2[stampStart:stampEnd], client2.instanceID[:]) {
+		t.Fatalf("job2's stamped bytes = %x, want client2's own instanceID %x", blob2[stampStart:stampEnd], client2.instanceID[:])
+	}
+	if bytes.Equal(blob1[stampStart:stampEnd], blob2[stampStart:stampEnd]) {
+		t.Fatalf("job1 and job2 stamped identical instance-ID bytes (%x) despite different instanceIDs -- this is the literal regression test for \"every pool works on the same exact template\"", blob1[stampStart:stampEnd])
+	}
+
+	// Everything OUTSIDE the 4-byte stamp window must be byte-identical
+	// -- this fix must never touch anything but the instance-ID slot.
+	if !bytes.Equal(blob1[:stampStart], blob2[:stampStart]) {
+		t.Fatalf("bytes before the instance-ID stamp differ between job1 and job2:\n job1=%x\n job2=%x", blob1[:stampStart], blob2[:stampStart])
+	}
+	if !bytes.Equal(blob1[stampEnd:], blob2[stampEnd:]) {
+		t.Fatalf("bytes after the instance-ID stamp differ between job1 and job2:\n job1=%x\n job2=%x", blob1[stampEnd:], blob2[stampEnd:])
+	}
+}
+
+// TestMoneroNodeClient_GetBlockTemplate_ReservationUnusableSkipsInstanceIDStamp
+// is the companion negative-case regression guard required alongside
+// the positive case above: when ReservedOffset does not fit within
+// minReservedOffsetHeadroom of the real returned blob (the exact same
+// "reservation unavailable" condition XNP-proxy fields are already
+// skipped under), GetBlockTemplate must still return a valid,
+// UNMODIFIED job -- no error, and the would-be stamp window left
+// completely untouched (even though, for this specific fixture's
+// length, that window is still technically address-in-bounds -- the
+// point is this must never be written to when reservationUsable is
+// false, not merely that it can't be).
+func TestMoneroNodeClient_GetBlockTemplate_ReservationUnusableSkipsInstanceIDStamp(t *testing.T) {
+	const reservedOffset = 65 // 65+12=77 > 76 (fixture length) -- not usable.
+	srv := mockGetBlockTemplateServer(t, reservedOffset)
+	defer srv.Close()
+
+	client := NewMoneroNodeClient(srv.URL)
+	client.SetInstanceID([4]byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+	job, err := client.GetBlockTemplate(context.Background(), syntheticTestnetAddress, poolpb.Algo_ALGO_RXM)
+	if err != nil {
+		t.Fatalf("GetBlockTemplate must not error on an unusable reservation: %v", err)
+	}
+	if job == nil {
+		t.Fatal("GetBlockTemplate returned a nil job")
+	}
+	if job.ReservedOffsetUsable {
+		t.Fatalf("job.ReservedOffsetUsable = true, want false for offset=%d against a %d-byte blob", reservedOffset, len(job.RawTemplateBlob))
+	}
+
+	fixture, err := hex.DecodeString(realFixtureBlobHex)
+	if err != nil {
+		t.Fatalf("decoding fixture: %v", err)
+	}
+	if !bytes.Equal(job.RawTemplateBlob, fixture) {
+		t.Fatalf("job.RawTemplateBlob was modified despite an unusable reservation (got %x, want unmodified fixture %x)", job.RawTemplateBlob, fixture)
+	}
+}

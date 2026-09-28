@@ -15,6 +15,7 @@ import (
 	"github.com/Snipa22/go-xmr-lib/support"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/moneroblob"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -197,6 +198,25 @@ func newDirectRXMXNPTestHarness(t *testing.T, staticDiff, networkTargetDiff uint
 // still fails the submit overall -- that part is expected and out of
 // scope).
 func TestDirectSessionRXMXNPSubmitPatchesWorkerAndPoolNonce(t *testing.T) {
+	// moneroblob.GlobalBreaker is a genuinely process-wide singleton
+	// (see that package's doc comment for why), so it is shared with
+	// every OTHER test in this package -- including the many
+	// Monero-shaped test doubles whose deliberately small, synthetic
+	// template blobs are NOT real, go-xmr-lib-parseable Monero
+	// blocks. Those doubles now reach a real conversion attempt via
+	// solo.JobManager's own per-job extraNonce stamp (which degrades
+	// gracefully, exactly as designed -- but each degradation is a
+	// genuine breaker trigger), and enough of them in sequence trip
+	// the breaker OPEN, which would then refuse THIS test's own,
+	// entirely legitimate conversion of a real fixture. Resetting
+	// the singleton here (and restoring it afterward) is the same
+	// test-isolation discipline internal/leaflib/proxy's own
+	// breaker-wiring test already uses; it does not weaken the
+	// breaker itself, which moneroblob's own unit tests cover
+	// directly against isolated instances.
+	moneroblob.GlobalBreaker.ResetForTest()
+	t.Cleanup(func() { moneroblob.GlobalBreaker.ResetForTest() })
+
 	node := newFakeDirectMoneroXNPNodeClient(t)
 	h := newDirectRXMXNPTestHarness(t, 1, 1<<62, node)
 

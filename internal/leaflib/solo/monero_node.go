@@ -4,6 +4,7 @@ package solo
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -82,6 +83,37 @@ type MoneroNodeClient struct {
 	// counter, matching this field's own "optional observability
 	// hook" nil-is-safe convention.
 	reservationUnavailableCounter prometheus.Counter
+
+	// instanceID is this leaf process's own real per-instance
+	// disambiguator, stamped into every template this client ever
+	// hands back (see stampInstanceID below) at
+	// ReservedOffset+4:ReservedOffset+8 -- the EXACT reserved-region
+	// sub-offset the real, live legacy nodejs-pool-sxmr reference
+	// (lib/coins/xmr.js, `instanceId.copy(this.buffer,
+	// this.reserveOffset + 4, 0, 4)`) uses for the identical purpose:
+	// so that multiple pool-server entities (or, in this codebase,
+	// multiple leaf-direct/leaf-solo processes sharing one relayed
+	// template via TemplateBytesForRelay/JobFromTemplateBytes) never
+	// serve byte-identical coinbases to their own downstream
+	// sessions.
+	//
+	// DELIBERATELY FIXED FOR THE WHOLE PROCESS LIFETIME -- NOT
+	// rotated periodically. Legacy nodejs-pool-sxmr rotates its own
+	// instanceId every 100 blocks; that rotation was a
+	// legacy-cluster-specific detail (multiple worker processes
+	// sharing one Redis-backed pool state, needing to periodically
+	// re-randomize to avoid a different class of collision across
+	// its own worker pool). A single Go process here has no such
+	// multi-worker-sharing concern: this instanceID's only job is to
+	// distinguish THIS process's own served coinbases from every
+	// OTHER leaf process's, for as long as this process is running.
+	// Keeping it fixed for the process's whole lifetime is simpler,
+	// sufficient for that purpose, and easier to reason about/log
+	// (see NewMoneroNodeClient and the cmd/leaf-direct, cmd/leaf-solo
+	// startup log lines) than reimplementing legacy's rotation
+	// scheme would be -- this is an intentional design choice, not
+	// an oversight.
+	instanceID [4]byte
 }
 
 // SetReservationUnavailableMetric wires a Prometheus counter that this
@@ -95,16 +127,59 @@ func (c *MoneroNodeClient) SetReservationUnavailableMetric(counter prometheus.Co
 	c.reservationUnavailableCounter = counter
 }
 
+// SetInstanceID overrides this client's own instanceID (see that
+// field's doc comment) with an explicit 4-byte value, for tests that
+// need two (or more) MoneroNodeClient instances with deterministic,
+// DIFFERENT instance IDs (e.g. proving two clients stamp genuinely
+// distinct bytes into an otherwise-identical template -- see
+// monero_node_test.go/monero_node_relay_test.go). NewMoneroNodeClient
+// already populates a real crypto/rand-drawn instanceID at
+// construction; production call sites never need to call this --
+// it exists purely for deterministic test construction, mirroring
+// this file's existing SetReservationUnavailableMetric precedent for
+// exactly that kind of test-only override. Not safe to call
+// concurrently with in-flight GetBlockTemplate/JobFromTemplateBytes
+// calls on the same client.
+func (c *MoneroNodeClient) SetInstanceID(id [4]byte) {
+	c.instanceID = id
+}
+
+// InstanceID returns this client's own real, process-lifetime-fixed
+// 4-byte instance identifier (see that field's doc comment) --
+// exported so a deployed leaf's own startup log line
+// (cmd/leaf-direct/main.go, cmd/leaf-solo/main.go) can report exactly
+// which bytes this running process is actually stamping into every
+// template it serves.
+func (c *MoneroNodeClient) InstanceID() [4]byte {
+	return c.instanceID
+}
+
 // NewMoneroNodeClient returns a MoneroNodeClient talking to the real
 // monerod JSON-RPC endpoint at baseURL (e.g. "http://148.163.90.157:28081"
 // — no trailing slash or "/json_rpc" suffix required, this type appends
 // it itself).
+//
+// Draws a real, fresh 4-byte instanceID via crypto/rand.Read, once,
+// right here -- see that field's doc comment for the full rationale
+// (mirrors legacy nodejs-pool-sxmr's own crypto.randomBytes(4)
+// instanceId shape, fixed for this process's whole lifetime rather
+// than legacy's periodic rotation). A crypto/rand.Read failure here is
+// effectively unrecoverable (the OS's CSPRNG is unavailable) -- panic
+// rather than silently falling back to a predictable/zero instanceID,
+// which would defeat this field's entire purpose. This mirrors this
+// same package's existing coinbaseExtraRandomSuffix precedent
+// (node.go) for the identical "crypto/rand failure is unrecoverable,
+// panic rather than degrade silently" call.
 func NewMoneroNodeClient(baseURL string) *MoneroNodeClient {
-	return &MoneroNodeClient{
+	c := &MoneroNodeClient{
 		baseURL: bytesTrimSuffix(baseURL, "/"),
 		client:  &http.Client{Timeout: 30 * time.Second},
 		nowFunc: time.Now,
 	}
+	if _, err := cryptorand.Read(c.instanceID[:]); err != nil {
+		panic(fmt.Sprintf("solo: monero: crypto/rand.Read failed while generating this leaf's per-process instance ID: %v", err))
+	}
+	return c
 }
 
 // bytesTrimSuffix trims a single trailing suffix from s if present —
@@ -251,6 +326,84 @@ type moneroGetInfoResult struct {
 	Height uint64 `json:"height"`
 }
 
+// stampInstanceID is the ONE shared, unexported implementation both
+// GetBlockTemplate (local fetch) and JobFromTemplateBytes
+// (relay-adopted) call to write this client's OWN c.instanceID into
+// the reserved region of a template it is about to hand back to a
+// caller -- see MoneroNodeClient.instanceID's doc comment for the
+// full production-bug rationale (multiple pool entities/leaves
+// sharing one wallet address, or one leaf adopting another's relayed
+// template, must never serve byte-identical coinbases).
+//
+// Mirrors the real, confirmed legacy nodejs-pool-sxmr layout EXACTLY:
+// reservedOffset+4 (4 bytes) is instanceId's own slot within the
+// broader |+0 minerNonce/extraNonce|+4 instanceId|+8 clientPoolNonce|
+// +12 clientNonce| reserved-region layout (lib/coins/xmr.js) -- this
+// package's own minReservedOffsetHeadroom (12) already exists
+// specifically to cover that same full layout (client_nonce_offset =
+// ReservedOffset+12 is the binding XNP-proxy constraint -- see that
+// const's doc comment), so no new headroom constant is needed here.
+//
+// Always writes into templateBlob's own reserved region (bounds-
+// checked below). ADDITIONALLY writes the identical bytes into
+// hashingBlob too, IF AND ONLY IF the 4-byte stamp window
+// (reservedOffset+4:reservedOffset+8) falls entirely within the
+// shared header prefix both GetBlockTemplate and JobFromTemplateBytes
+// already verify byte-for-byte equal
+// (hashingBlob[:nonceOffset] == templateBlob[:nonceOffset]) -- this is
+// required to keep that SAME equality check holding after this
+// stamp, per this task's own explicit instruction (see this package's
+// dispatch brief, section 3): "if stamping into that shared-prefix
+// region would now make hashingBlob and templateBlob diverge ...
+// stamp into BOTH blobs identically so the existing equality check
+// still holds."
+//
+// REAL PRODUCTION DATA (this is the offset relationship confirmed and
+// verified live against 148.163.90.157:28081 testnet, height 3097257,
+// as part of this fix): reservedOffset=131, nonceOffset=39,
+// len(blockhashing_blob)=76 -- i.e. reservedOffset+4=135 is both AFTER
+// nonceOffset (39) and past the END of hashingBlob entirely (76). This
+// is expected from Monero's own real block serialization, not a fluke
+// of that one call: blockhashing_blob is a short, fixed-shape derived
+// blob (header + merkle_root + tx-count varint, ~76-78 bytes) that
+// never contains the coinbase transaction's own tx_extra bytes at
+// all, whereas the reserved region lives INSIDE the coinbase tx
+// (which blocktemplate_blob's real block serialization places
+// immediately AFTER the header, i.e. always past nonceOffset+4 in
+// genuine daemon responses). So in real production traffic, this
+// function stamps templateBlob ONLY, and the hashingBlob branch below
+// is simply never taken.
+//
+// It IS taken, however, for this package's own existing small,
+// synthetic test fixtures (e.g. realFixtureBlobHex,
+// monero_node_test.go/monero_node_relay_test.go), which reuse one
+// short byte-identical blob as BOTH hashingBlob and templateBlob with
+// small hand-picked reservedOffset values that legitimately DO fall
+// before nonceOffset -- exercising this exact "stamp both" branch is
+// why that check exists at all, rather than being unreachable
+// dead code.
+//
+// Returns reservationUsable=false (and writes nothing to either blob)
+// under the EXACT SAME condition GetBlockTemplate's own pre-existing
+// XNP-proxy-reservation bounds check used (reservedOffset within
+// [0, len(templateBlob)-minReservedOffsetHeadroom]) -- this function
+// is now the single, canonical place that check lives; callers no
+// longer duplicate it.
+func (c *MoneroNodeClient) stampInstanceID(hashingBlob, templateBlob []byte, reservedOffset, nonceOffset int) (reservationUsable bool) {
+	reservationUsable = reservedOffset >= 0 && reservedOffset+minReservedOffsetHeadroom <= len(templateBlob)
+	if !reservationUsable {
+		return false
+	}
+	copy(templateBlob[reservedOffset+4:reservedOffset+8], c.instanceID[:])
+	// Shared-header-prefix case (see doc comment above): only reached
+	// by this package's own small synthetic test fixtures today, real
+	// daemon responses' reservedOffset is always well past nonceOffset.
+	if reservedOffset+8 <= nonceOffset && reservedOffset+8 <= len(hashingBlob) {
+		copy(hashingBlob[reservedOffset+4:reservedOffset+8], c.instanceID[:])
+	}
+	return true
+}
+
 // GetBlockTemplate implements NodeClient. algo is expected to be
 // poolpb.Algo_ALGO_RXM (Monero's own RandomX PoW family, merge-mined)
 // OR any of the standalone monerod-family algos this MoneroNodeClient
@@ -334,30 +487,39 @@ func (c *MoneroNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress s
 		return nil, fmt.Errorf("solo: monero: blockhashing_blob and blocktemplate_blob header prefixes (through the parsed nonce offset %d) do not match — refusing to build a job from mismatched blobs", nonceOffset)
 	}
 
-	// XNP-PROXY RESERVATION BOUNDS CHECK — the actual fix for a real,
-	// confirmed production bug (see Job.ReservedOffsetUsable's doc
-	// comment for the full live-reproduction evidence: leaf-proxy
-	// correctly rejected a job with "offset=179 blob_len=76" rather
-	// than corrupting data, because monerod's own real reserved_offset
-	// for that low-tx-volume testnet block did not actually fit
-	// within its own returned blocktemplate_blob).
+	// XNP-PROXY RESERVATION BOUNDS CHECK, AND per-leaf-instance-ID
+	// STAMPING — the actual fix for two real, confirmed production
+	// bugs, both hinging on the exact same bounds check: (1) see
+	// Job.ReservedOffsetUsable's doc comment for the full
+	// live-reproduction evidence that an out-of-bounds
+	// ReservedOffset must degrade gracefully rather than corrupt
+	// data or fail the whole call (leaf-proxy correctly rejected a
+	// job with "offset=179 blob_len=76" rather than corrupting data,
+	// because monerod's own real reserved_offset for that
+	// low-tx-volume testnet block did not actually fit within its
+	// own returned blocktemplate_blob); (2) see stampInstanceID's
+	// and MoneroNodeClient.instanceID's doc comments for why this
+	// SAME reserved region also carries this leaf's own instance ID,
+	// so that multiple pool leaves sharing one payout address never
+	// serve byte-identical coinbases to their own downstream miners.
 	//
 	// This is deliberately NOT folded into the fmt.Errorf checks
-	// above: an out-of-bounds ReservedOffset is a defect in ONE
-	// specific, optional job feature (the XNP-proxy-shape fields),
-	// not in the template as a whole — an ordinary xmrig-class miner
-	// never reads ReservedOffset at all (it mines against
-	// job.Header/the converted blockhashing_blob via the completely
-	// separate nonceOffset already validated above), so failing the
-	// WHOLE GetBlockTemplate call over this would incorrectly take
-	// down normal mining every time monerod returns a genuinely
-	// short, low-tx coinbase-only block. Degrading gracefully (job
-	// still returned, ReservedOffsetUsable left false) keeps normal
-	// mining unaffected and only removes the proxy-shape fields for
-	// this one job.
-	reservationUsable := result.ReservedOffset >= 0 && result.ReservedOffset+minReservedOffsetHeadroom <= len(templateBlob)
+	// above: an out-of-bounds ReservedOffset is a defect in
+	// optional job features (the XNP-proxy-shape fields, and the
+	// instance-ID stamp), not in the template as a whole — an
+	// ordinary xmrig-class miner never reads ReservedOffset at all
+	// (it mines against job.Header/the converted blockhashing_blob
+	// via the completely separate nonceOffset already validated
+	// above), so failing the WHOLE GetBlockTemplate call over this
+	// would incorrectly take down normal mining every time monerod
+	// returns a genuinely short, low-tx coinbase-only block.
+	// Degrading gracefully (job still returned, ReservedOffsetUsable
+	// left false, instance-ID stamp skipped) keeps normal mining
+	// unaffected and only removes the proxy-shape fields/instance-ID
+	// disambiguation for this one job.
+	reservationUsable := c.stampInstanceID(hashingBlob, templateBlob, result.ReservedOffset, nonceOffset)
 	if !reservationUsable {
-		log.Printf("solo: monero: get_block_template's real reservation region (offset=%d) does not fit in the returned template blob (len=%d) -- XNP-proxy shape omitted for this job, height=%d", result.ReservedOffset, len(templateBlob), result.Height)
+		log.Printf("solo: monero: get_block_template's real reservation region (offset=%d) does not fit in the returned template blob (len=%d) -- XNP-proxy shape and per-instance stamp omitted for this job, height=%d", result.ReservedOffset, len(templateBlob), result.Height)
 		if c.reservationUnavailableCounter != nil {
 			c.reservationUnavailableCounter.Inc()
 		}
@@ -574,20 +736,202 @@ func (c *MoneroNodeClient) SubmitBlock(ctx context.Context, candidate any) error
 	return err
 }
 
-// JobFromTemplateBytes implements NodeClient. Not supported for
-// Monero/RXM's own leaf-solo/leaf-direct path — the relay-template-
-// adoption feature (see node.go's errRelayTemplateAdoptionNotSupported
-// doc comment) is explicitly scoped to leaf-direct's Tari NodeClient
-// only for this pass; MoneroNodeClient still needs both interface
-// methods to exist so it keeps satisfying solo.NodeClient.
-func (c *MoneroNodeClient) JobFromTemplateBytes(_ []byte, _ poolpb.Algo) (*Job, error) {
-	return nil, errRelayTemplateAdoptionNotSupported
+// moneroRelayTemplateWire is the small, explicit wire struct
+// TemplateBytesForRelay serializes (via plain encoding/json, matching
+// relay.TemplateMessage's own JSON-over-NATS convention -- there is no
+// existing protobuf schema for Monero's template shape the way Tari
+// has tari_generated.GetNewBlockResult, so inventing one here would be
+// pure overhead) and JobFromTemplateBytes deserializes, carrying every
+// field a receiving leaf-direct-Monero instance needs to reconstruct
+// an equivalent *Job WITHOUT a local get_block_template round-trip --
+// see GetBlockTemplate above, which is this type's own source of
+// truth for exactly which fields are needed.
+//
+// Deliberately NOT included: NonceOffset and any pre-computed
+// "reservation usable" bool. Both are re-derived independently by
+// JobFromTemplateBytes from the deserialized HashingBlob/TemplateBlob
+// bytes themselves (parseMoneroBlockHeaderNonceOffset + the same
+// ReservedOffset+minReservedOffsetHeadroom bounds check
+// GetBlockTemplate performs) rather than trusted verbatim from the
+// sender -- matching this file's own "never assume stability, always
+// re-derive" convention (see the package doc comment): a receiving
+// instance validates the bytes it actually got, exactly like the
+// sending instance validated its own local fetch, rather than
+// propagating a value that could be stale or simply wrong for bytes
+// that traveled over the wire.
+type moneroRelayTemplateWire struct {
+	HashingBlob    []byte `json:"hashing_blob"`
+	TemplateBlob   []byte `json:"template_blob"`
+	SeedHash       []byte `json:"seed_hash"`
+	PrevHash       []byte `json:"prev_hash"`
+	Difficulty     uint64 `json:"difficulty"`
+	Height         uint64 `json:"height"`
+	ReservedOffset int    `json:"reserved_offset"`
 }
 
-// TemplateBytesForRelay implements NodeClient. Not supported -- see
-// JobFromTemplateBytes's doc comment above.
-func (c *MoneroNodeClient) TemplateBytesForRelay(_ *Job) ([]byte, error) {
-	return nil, errRelayTemplateAdoptionNotSupported
+// JobFromTemplateBytes implements NodeClient -- the real, production
+// implementation for leaf-direct's relay-template-adoption feature
+// (see internal/leaflib/direct/node.go's Tari NodeClient.
+// JobFromTemplateBytes, the pattern this mirrors), now genuinely wired
+// for Monero/RXM leaf-direct too: every leaf-direct-Monero instance of
+// a given pool/algo shares the SAME fleet-wide payout_address (unlike
+// leaf-solo's per-operator addresses -- see
+// errRelayTemplateAdoptionNotSupported's doc comment in node.go), so a
+// relayed Monero template's coinbase already pays the correct
+// destination -- adopting a sibling's relayed template is exactly as
+// safe here as it already is for Tari leaf-direct.
+//
+// Deserializes data into a moneroRelayTemplateWire, then rebuilds a
+// *Job via the exact same field shape/validation GetBlockTemplate
+// itself produces (see that method above -- this deliberately never
+// duplicates its bounds-checking logic with different rules):
+//   - nonceOffset is re-parsed from the deserialized HashingBlob via
+//     parseMoneroBlockHeaderNonceOffset, never trusted from the wire.
+//   - The real header-prefix-match bounds check
+//     (HashingBlob[:nonceOffset] == TemplateBlob[:nonceOffset], and
+//     nonceOffset+4 fitting both blobs) is re-run against the
+//     deserialized bytes -- a genuine error (never a fabricated Job)
+//     is returned if it fails. Per startTemplateRelaySubscription's
+//     existing caller code (job.go), an error here already falls back
+//     gracefully to a plain cache invalidation, so failing loudly is
+//     safe, not fatal.
+//   - reservationUsable is likewise re-derived from
+//     ReservedOffset+minReservedOffsetHeadroom against the
+//     deserialized TemplateBlob's own real length, never trusted
+//     verbatim from the sender.
+//   - id is a freshly minted newRandomHexID() -- NEVER derived from
+//     any relayed content (see the long comment directly above
+//     GetBlockTemplate's own `id, err := newRandomHexID()` call for
+//     the exact, already-diagnosed production incident this rule
+//     prevents; a relay-adopted job follows the identical rule).
+//
+// Returns a real error (never a corrupted/partial Job) for malformed,
+// truncated, or algo-mismatched input.
+func (c *MoneroNodeClient) JobFromTemplateBytes(data []byte, algo poolpb.Algo) (*Job, error) {
+	if !IsMoneroFamilyAlgo(algo) {
+		return nil, fmt.Errorf("solo: monero: JobFromTemplateBytes does not support algo %v (only ALGO_RXM or a registered monerod-compatible coin algo is supported)", algo)
+	}
+
+	var wire moneroRelayTemplateWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, fmt.Errorf("solo: monero: JobFromTemplateBytes: unmarshaling relay template wire struct: %w", err)
+	}
+	if len(wire.HashingBlob) == 0 || len(wire.TemplateBlob) == 0 {
+		return nil, fmt.Errorf("solo: monero: JobFromTemplateBytes: relayed template is missing hashing_blob/template_blob")
+	}
+
+	// Real, per-call re-derivation -- never trusted from the wire.
+	// See this file's package doc comment and moneroRelayTemplateWire's
+	// own doc comment above.
+	nonceOffset, err := parseMoneroBlockHeaderNonceOffset(wire.HashingBlob)
+	if err != nil {
+		return nil, fmt.Errorf("solo: monero: JobFromTemplateBytes: parsing nonce offset from relayed blockhashing_blob: %w", err)
+	}
+	if nonceOffset+4 > len(wire.TemplateBlob) || nonceOffset+4 > len(wire.HashingBlob) {
+		return nil, fmt.Errorf("solo: monero: JobFromTemplateBytes: parsed nonce offset %d + 4 exceeds relayed blob length (hashing=%d, template=%d)", nonceOffset, len(wire.HashingBlob), len(wire.TemplateBlob))
+	}
+	// Same defensive header-prefix-match check GetBlockTemplate
+	// performs on its own local fetch -- re-run here against the
+	// deserialized bytes rather than assumed to still hold after a
+	// wire round-trip.
+	if !bytes.Equal(wire.HashingBlob[:nonceOffset], wire.TemplateBlob[:nonceOffset]) {
+		return nil, fmt.Errorf("solo: monero: JobFromTemplateBytes: relayed blockhashing_blob and blocktemplate_blob header prefixes (through the parsed nonce offset %d) do not match -- refusing to build a job from mismatched blobs", nonceOffset)
+	}
+
+	// Stamps THIS receiving instance's OWN c.instanceID into the
+	// reserved region of the deserialized wire.TemplateBlob -- NOT
+	// whatever the originating leaf may or may not have already
+	// stamped (that leaf's own stamp, if any, was itself made
+	// against ITS copy of these template bytes' underlying array
+	// before serialization; this call operates on a fresh copy
+	// decoded from the wire by json.Unmarshal above, so overwriting
+	// here cannot clobber anything the sender needed -- see
+	// stampInstanceID's doc comment for the full bounds/shared-prefix
+	// rationale). This is the critical correctness property this
+	// whole fix exists for: two different leaves adopting the
+	// IDENTICAL relayed template bytes must still end up serving
+	// DISTINCT coinbases to their own sessions. Also re-derives the
+	// SAME reservationUsable bounds check GetBlockTemplate performs
+	// (never trusted verbatim from the sender) -- see
+	// moneroRelayTemplateWire's own doc comment.
+	reservationUsable := c.stampInstanceID(wire.HashingBlob, wire.TemplateBlob, wire.ReservedOffset, nonceOffset)
+	if !reservationUsable {
+		log.Printf("solo: monero: JobFromTemplateBytes: relayed template's real reservation region (offset=%d) does not fit in the relayed template blob (len=%d) -- XNP-proxy shape and per-instance stamp omitted for this job, height=%d", wire.ReservedOffset, len(wire.TemplateBlob), wire.Height)
+	}
+
+	// job_id must be a purely random, opaque wire token -- NEVER
+	// derived from relayed content (PrevHash/Height/any template
+	// bytes). See GetBlockTemplate's own doc comment above for the
+	// full, already-diagnosed production incident this rule
+	// prevents; a relay-adopted job follows the identical rule.
+	id, err := newRandomHexID()
+	if err != nil {
+		return nil, fmt.Errorf("solo: monero: JobFromTemplateBytes: generating random job id: %w", err)
+	}
+
+	job := &Job{
+		ID:                      id,
+		Algo:                    algo,
+		Height:                  wire.Height,
+		Header:                  wire.HashingBlob,
+		BlockHash:               wire.PrevHash,
+		NetworkTargetDifficulty: wire.Difficulty,
+		TemplateData: &moneroTemplateData{
+			HashingBlob:    wire.HashingBlob,
+			TemplateBlob:   wire.TemplateBlob,
+			NonceOffset:    nonceOffset,
+			SeedHash:       wire.SeedHash,
+			Difficulty:     wire.Difficulty,
+			Height:         wire.Height,
+			ReservedOffset: wire.ReservedOffset,
+		},
+		VmKey:                wire.SeedHash,
+		ReservedOffset:       wire.ReservedOffset,
+		ReservedOffsetUsable: reservationUsable,
+		RawTemplateBlob:      wire.TemplateBlob,
+		CreatedAt:            c.now(),
+	}
+	return job, nil
+}
+
+// TemplateBytesForRelay implements NodeClient -- the real, production
+// counterpart to JobFromTemplateBytes above: serializes job's real
+// underlying *moneroTemplateData (plus job.BlockHash, the real
+// prev_hash JobFromTemplateBytes needs to rebuild Job.BlockHash) into
+// the moneroRelayTemplateWire bytes JobFromTemplateBytes reconstructs
+// from, for relay publishing/comparison (job.go's
+// publishTemplateForJob and jobForXN's own tracked-best bookkeeping).
+//
+// Returns (nil, nil) -- never an error -- if job is nil or
+// job.TemplateData does not hold the expected real *moneroTemplateData
+// (e.g. a nil/zero-value Job, or one built by some other coin's
+// NodeClient): this must never be treated as a reason to fail the
+// primary tip-poll/publish path, matching solo.NodeClient.
+// TemplateBytesForRelay's own interface doc comment and the Tari
+// NodeClient implementation's identical contract.
+func (c *MoneroNodeClient) TemplateBytesForRelay(job *Job) ([]byte, error) {
+	if job == nil {
+		return nil, nil
+	}
+	data, ok := job.TemplateData.(*moneroTemplateData)
+	if !ok || data == nil {
+		return nil, nil
+	}
+
+	wire := moneroRelayTemplateWire{
+		HashingBlob:    data.HashingBlob,
+		TemplateBlob:   data.TemplateBlob,
+		SeedHash:       data.SeedHash,
+		PrevHash:       job.BlockHash,
+		Difficulty:     data.Difficulty,
+		Height:         data.Height,
+		ReservedOffset: data.ReservedOffset,
+	}
+	out, err := json.Marshal(wire)
+	if err != nil {
+		return nil, fmt.Errorf("solo: monero: TemplateBytesForRelay: marshaling relay template wire struct: %w", err)
+	}
+	return out, nil
 }
 
 // SubmitBlockWithID performs the exact SAME real submit_block call as

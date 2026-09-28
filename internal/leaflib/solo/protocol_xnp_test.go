@@ -391,15 +391,16 @@ func TestJobPayloadXNPProxyShapeRXT(t *testing.T) {
 		*got.ClientNonceOffset, rxtXmrigNonceOffset, len(*got.BlocktemplateBlob), *got.Difficulty, *got.TargetDiff, *got.TargetDiffHex)
 }
 
-// TestJobPayloadXNPCaseSensitivity is the required case-sensitivity
-// test: an agent containing "XMR-NODE-PROXY" (wrong case) must NOT
-// trigger proxy detection — this repo's IsXNPProxyAgent uses
-// strings.Contains (case-sensitive), matching JavaScript's
-// String.prototype.includes exactly, NOT an EqualFold-style
-// case-insensitive comparison.
-func TestJobPayloadXNPCaseSensitivity(t *testing.T) {
-	if IsXNPProxyAgent("XMR-NODE-PROXY/1.0.0") {
-		t.Fatalf("IsXNPProxyAgent(%q) = true, want false — case must matter (real reference uses case-sensitive JS .includes())", "XMR-NODE-PROXY/1.0.0")
+// TestJobPayloadXNPCaseInsensitivity is the required
+// case-INsensitivity test (renamed from
+// TestJobPayloadXNPCaseSensitivity — case sensitivity was intentionally
+// removed per product-owner direction, see IsXNPProxyAgent's doc
+// comment in protocol.go): an agent containing "XMR-NODE-PROXY" (wrong
+// case relative to the legacy JS reference) MUST now trigger proxy
+// detection, exactly like the canonical lowercase substring.
+func TestJobPayloadXNPCaseInsensitivity(t *testing.T) {
+	if !IsXNPProxyAgent("XMR-NODE-PROXY/1.0.0") {
+		t.Fatalf("IsXNPProxyAgent(%q) = false, want true — case must NOT matter (product-owner direction: broaden past the legacy case-sensitive JS .includes())", "XMR-NODE-PROXY/1.0.0")
 	}
 	if !IsXNPProxyAgent("xmr-node-proxy/1.0.0") {
 		t.Fatalf("IsXNPProxyAgent(%q) = false, want true", "xmr-node-proxy/1.0.0")
@@ -409,12 +410,41 @@ func TestJobPayloadXNPCaseSensitivity(t *testing.T) {
 	}
 
 	s := newXNPTestSession("XMR-NODE-PROXY/1.0.0", "ab12")
-	job := newXNPTestJobRXM(171, []byte("fixture"))
+	job := newXNPTestJobRXM(171, []byte("this is a fake raw monero blocktemplate_blob used only as a test fixture, deliberately longer than 32 bytes"))
 	got := s.jobPayload(job)
-	if got.BlocktemplateBlob != nil || got.ReservedOffset != nil || got.ClientNonceOffset != nil || got.ClientPoolOffset != nil {
-		t.Fatalf("wrong-case agent must not trigger proxy shape, got: %+v", got)
+	if got.BlocktemplateBlob == nil || got.ReservedOffset == nil || got.ClientNonceOffset == nil || got.ClientPoolOffset == nil {
+		t.Fatalf("wrong-case (but now-matching) XNP agent must trigger the proxy shape, got: %+v", got)
 	}
-	assertNoDifficultyKeysOnWire(t, got)
+}
+
+// TestIsXNPProxyAgentCaseInsensitiveTable is the required table-driven
+// test proving IsXNPProxyAgent matches the "xmr-node-proxy" substring
+// regardless of case, and still correctly rejects unrelated/empty
+// agents.
+func TestIsXNPProxyAgentCaseInsensitiveTable(t *testing.T) {
+	cases := []struct {
+		name  string
+		agent string
+		want  bool
+	}{
+		{name: "lowercase", agent: "xmr-node-proxy", want: true},
+		{name: "uppercase", agent: "XMR-NODE-PROXY", want: true},
+		{name: "mixed-case", agent: "Xmr-Node-Proxy", want: true},
+		{
+			name:  "full-agent-string-mixed-case-substring",
+			agent: "SomeClient/XMR-Node-Proxy/1.2.3",
+			want:  true,
+		},
+		{name: "unrelated-agent", agent: "XMRig/6.21.0", want: false},
+		{name: "empty-string", agent: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsXNPProxyAgent(tc.agent); got != tc.want {
+				t.Errorf("IsXNPProxyAgent(%q) = %v, want %v", tc.agent, got, tc.want)
+			}
+		})
+	}
 }
 
 // TestJobPayloadXNPDifficultyAllMoneroFamilyAlgos covers the

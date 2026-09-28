@@ -215,10 +215,12 @@ type SubmitRequest struct {
 //
 // All four fields are pointer-typed with omitempty specifically so
 // they are PROVABLY ABSENT from the wire for the overwhelming majority
-// of real logins (anything whose agent does not contain the literal,
-// case-sensitive substring "xmr-node-proxy") — see session.go's
-// jobPayload for the detection/branch logic and protocol_xnp_test.go
-// for a real marshaled-JSON non-regression diff proving this. Only
+// of real logins (anything whose agent does not contain the
+// case-insensitive substring "xmr-node-proxy" — see IsXNPProxyAgent's
+// own doc comment below for why this is case-insensitive) — see
+// session.go's jobPayload for the detection/branch logic and
+// protocol_xnp_test.go for a real marshaled-JSON non-regression diff
+// proving this. Only
 // ever populated for ALGO_RXM and ALGO_RXT jobs on an XNP-proxy-
 // detected session; every other algo/session combination leaves all
 // four nil.
@@ -369,28 +371,58 @@ type JobPayload struct {
 	TargetDiffHex *string `json:"target_diff_hex,omitempty"`
 }
 
-// xnpProxyAgentSubstring is the exact, case-sensitive substring real
+// xnpProxyAgentSubstring is the lowercase substring real
 // nodejs-pool-sxmr gates its own proxy-vs-ordinary-miner job-payload
 // shape on (lib/pool.js ~211-231: `if (agent &&
-// agent.includes('xmr-node-proxy')) { this.proxy = true; }`).
+// agent.includes('xmr-node-proxy')) { this.proxy = true; }`). The
+// legacy reference's own check is case-sensitive; this leaf's
+// IsXNPProxyAgent below deliberately matches case-INsensitively
+// instead, per explicit product-owner direction — see that function's
+// doc comment for the full rationale. This constant itself stays
+// lowercase; IsXNPProxyAgent lowercases the input agent string before
+// comparing against it.
 const xnpProxyAgentSubstring = "xmr-node-proxy"
 
 // IsXNPProxyAgent reports whether agent (a login's self-reported
 // LoginRequest.Agent string, e.g. "xmr-node-proxy/0.0.3") identifies
-// the connecting client as an XNP-class multi-tier proxy, using the
-// SAME case-sensitive substring check the real reference uses
-// (JavaScript's String.prototype.includes is case-sensitive — this
-// deliberately uses strings.Contains, NOT strings.EqualFold or any
-// other case-insensitive comparison, to match that exactly: an agent
-// containing "XMR-NODE-PROXY" in the wrong case must NOT be detected
-// as a proxy). Exported so both leaf-solo's own session.go and
-// leaf-direct's session.go (which has no protocol.go/job.go of its
-// own — see this package's doc comment on why leaf-direct reuses
-// these types directly rather than duplicating them) share one single
-// implementation of this detection, rather than two copies that could
-// drift.
+// the connecting client as an XNP-class multi-tier proxy, matching the
+// xnpProxyAgentSubstring literal CASE-INSENSITIVELY (agent is
+// lowercased via strings.ToLower before the strings.Contains check).
+//
+// This is a DELIBERATE divergence from the real legacy nodejs-pool-sxmr
+// reference, which gates the identical detection on JavaScript's
+// case-sensitive String.prototype.includes
+// (`agent.includes('xmr-node-proxy')`) — under that reference, an
+// agent like "XMR-NODE-PROXY/0.0.3" would NOT be detected as a proxy.
+// This leaf's product owner (Alex) explicitly directed broadening this
+// check ("Remove case sensitive for the XNP check."), so it now also
+// matches "XMR-NODE-PROXY", "Xmr-Node-Proxy", and any other casing of
+// the same substring, anywhere in the agent string.
+//
+// Exported so both leaf-solo's own session.go and leaf-direct's
+// session.go (which has no protocol.go/job.go of its own — see this
+// package's doc comment on why leaf-direct reuses these types directly
+// rather than duplicating them) share one single implementation of
+// this detection, rather than two copies that could drift.
 func IsXNPProxyAgent(agent string) bool {
-	return strings.Contains(agent, xnpProxyAgentSubstring)
+	return strings.Contains(strings.ToLower(agent), xnpProxyAgentSubstring)
+}
+
+// IsGenericProxyAgent reports whether agent contains the substring
+// "proxy" case-insensitively, EXCLUDING agents already identified as
+// XNP (xmr-node-proxy) by IsXNPProxyAgent -- XNP has its own, separate,
+// untouched detection and handling above. This is a broader, generic
+// "self-identifies as some kind of proxy" signal, additive to (never a
+// replacement for) IsXNPProxyAgent, used ONLY to unpin a fixed-diff
+// request from its permanent pin (never to deny/alter the requested
+// starting difficulty itself) -- see
+// LoginFields.GenericProxyExemptFromFixedDiffPin (loginfields.go) for
+// the call site.
+func IsGenericProxyAgent(agent string) bool {
+	if IsXNPProxyAgent(agent) {
+		return false
+	}
+	return strings.Contains(strings.ToLower(agent), "proxy")
 }
 
 // LoginResult is the real login response's nested "result" object.

@@ -78,6 +78,29 @@ func (s *Session) runVardiffLoop(ctx context.Context) {
 }
 
 func (s *Session) maybeRetarget() {
+	// A session that requested (or was assigned) a FIXED difficulty at
+	// login is NEVER retargeted, for the lifetime of the connection --
+	// mirrors solo.Session.maybeRetarget's/direct.Session.maybeRetarget's
+	// identical gate exactly. See solo.Session.fixedDiff's doc comment
+	// for the verbatim legacy retargetMiners citation
+	// (nodejs-pool-sxmr lib/pool.js lines 227-236) this ports.
+	// Checked first, before the connection-age gate and before any
+	// ComputeRetarget work, so a fixed-difficulty session costs
+	// nothing per tick.
+	//
+	// An XNP-proxy-detected session that requested a "+<difficulty>"
+	// suffix deliberately never reaches this gate as "fixed": it is
+	// exempted from the pin at login time instead (session.go's
+	// handleLogin, via solo.LoginFields.XNPProxyExemptFromFixedDiffPin
+	// -- legacy's own `proxyAddressList` clause of this very same
+	// retargetMiners check), so it flows through the full retarget
+	// below like any ordinary session. That matters more for THIS leaf
+	// mode than for leaf-solo/leaf-direct: a nested proxy in front of
+	// leaf-proxy is aggregating hashrate that genuinely moves.
+	if s.fixedDiff.Load() {
+		return
+	}
+
 	cfg := s.server.vardiff
 	connSeconds := int(time.Since(s.connectedAt).Seconds())
 	if connSeconds < int(cfg.RetargetInterval.Seconds()) {

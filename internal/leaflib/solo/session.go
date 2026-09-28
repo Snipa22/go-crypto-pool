@@ -564,8 +564,18 @@ func (s *Session) handleLogin(req Request) {
 	// detection here vs. legacy's operator-maintained payout-address
 	// allowlist, which has no equivalent in this leaf), and why the
 	// NiceHash-agent pin is deliberately left untouched.
+	//
+	// GENERIC-PROXY ESCAPE HATCH: additive to the XNP one above, ANY
+	// OTHER agent that self-identifies as some kind of proxy (a
+	// case-insensitive "proxy" substring, not already claimed by the
+	// XNP check) gets the same unpin treatment, for either fixed-diff
+	// source (suffix or NiceHash-agent) -- see
+	// LoginFields.GenericProxyExemptFromFixedDiffPin (loginfields.go)
+	// for the full rationale and how it differs in scope from the XNP
+	// case.
 	if loginFields.FixedDiff {
-		if !loginFields.XNPProxyExemptFromFixedDiffPin(login.Agent) {
+		if !loginFields.XNPProxyExemptFromFixedDiffPin(login.Agent) &&
+			!loginFields.GenericProxyExemptFromFixedDiffPin(login.Agent) {
 			s.fixedDiff.Store(true)
 		}
 		s.currentDifficulty.Store(loginFields.Difficulty)

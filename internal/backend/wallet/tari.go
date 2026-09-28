@@ -461,4 +461,34 @@ func (w *TariWalletGRPC) GetBalance(ctx context.Context) (Balance, error) {
 	}, nil
 }
 
+// GetDetailedBalance implements DetailedBalanceClient, exposing
+// Tari's real four-field GetBalanceResponse breakdown directly
+// (available_balance/pending_incoming_balance/
+// pending_outgoing_balance/timelocked_balance) rather than
+// GetBalance's coin-agnostic Total/Unlocked projection -- see
+// DetailedBalance's own doc comment for what each field means.
+// Unlike GetBalance's Total (which deliberately excludes
+// pending_outgoing_balance, see that method's doc comment), this
+// reports pending_outgoing_balance as its own genuine value rather
+// than folding it away.
+func (w *TariWalletGRPC) GetDetailedBalance(ctx context.Context) (DetailedBalance, error) {
+	resp, err := callWithReadTimeout(ctx, w.readTimeout, "GetBalance", func() (*tari_generated.GetBalanceResponse, error) {
+		return w.rpc.GetBalance(ctx)
+	})
+	if err != nil {
+		return DetailedBalance{}, fmt.Errorf("wallet: tari: GetDetailedBalance: %w", err)
+	}
+	if resp == nil {
+		return DetailedBalance{}, fmt.Errorf("wallet: tari: GetDetailedBalance: RPC reported success but returned no response")
+	}
+	return DetailedBalance{
+		Available:       int64(resp.GetAvailableBalance()),
+		Timelocked:      int64(resp.GetTimelockedBalance()),
+		PendingIncoming: int64(resp.GetPendingIncomingBalance()),
+		PendingOutgoing: int64(resp.GetPendingOutgoingBalance()),
+	}, nil
+}
+
+var _ DetailedBalanceClient = (*TariWalletGRPC)(nil)
+
 var _ WalletClient = (*TariWalletGRPC)(nil)

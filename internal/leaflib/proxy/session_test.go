@@ -112,20 +112,28 @@ func (f *fakeValidator) callCount() int {
 
 // fakeUpstream is a mock UpstreamSubmitter that records whether
 // SubmitShare was ever called, so tests can assert it was NOT invoked
-// for a below-block-target share, without touching a real pool.
+// for a below-block-target share, without touching a real pool. It
+// also records the workerNonce/poolNonce pair it was handed, which is
+// what session_xnp_test.go's reserved-offset decision test asserts
+// against (leaf-proxy must forward its OWN Job.WorkerNonce/
+// Job.PoolNonce, never a downstream client's claimed values).
 type fakeUpstream struct {
-	mu      sync.Mutex
-	calls   int
-	lastJob string
-	accept  bool
-	err     error
+	mu              sync.Mutex
+	calls           int
+	lastJob         string
+	lastWorkerNonce uint32
+	lastPoolNonce   uint32
+	accept          bool
+	err             error
 }
 
-func (f *fakeUpstream) SubmitShare(_ context.Context, jobID, _, _ string, _, _ uint32) (bool, error) {
+func (f *fakeUpstream) SubmitShare(_ context.Context, jobID, _, _ string, workerNonce, poolNonce uint32) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastJob = jobID
+	f.lastWorkerNonce = workerNonce
+	f.lastPoolNonce = poolNonce
 	return f.accept, f.err
 }
 
@@ -133,6 +141,14 @@ func (f *fakeUpstream) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// lastNonces reports the workerNonce/poolNonce pair the most recent
+// SubmitShare call was handed.
+func (f *fakeUpstream) lastNonces() (workerNonce, poolNonce uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastWorkerNonce, f.lastPoolNonce
 }
 
 // hashForDifficulty computes a 32-byte little-endian hash whose

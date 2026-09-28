@@ -178,7 +178,7 @@ func (d *Daemon) publishTemplateForHeight(ctx context.Context, height uint64) er
 		return fmt.Errorf("relay-node: GetBlockTemplate: %w", err)
 	}
 
-	data, err := templateDataForJob(d.Coin, job)
+	data, err := templateDataForJob(d.Coin, d.Node, job)
 	if err != nil {
 		// Not fatal to the poll loop -- log and still publish a bare
 		// (empty-TemplateData) tip notification, mirroring
@@ -209,10 +209,7 @@ func (d *Daemon) publishTemplateForHeight(ctx context.Context, height uint64) er
 // template payload as the []byte relay.TemplateMessage.TemplateData
 // carries -- see this package's own doc comment (main.go) for the
 // full design-decision writeup (also called out explicitly in the PR
-// description, per the brief's own requirement): this picks the REAL
-// raw upstream RPC/GRPC template bytes already sitting on job, for
-// EITHER coin family, rather than re-deriving/re-encoding a NEW
-// coin-agnostic shape:
+// description, per the brief's own requirement):
 //
 //   - Tari (job.TemplateData holds a real, EXPORTED
 //     *tari_generated.GetNewBlockResult -- see solo/node.go's
@@ -222,23 +219,45 @@ func (d *Daemon) publishTemplateForHeight(ctx context.Context, height uint64) er
 //     own job-construction code to rebuild an equivalent Job from
 //     scratch, since it is byte-for-byte the same message
 //     solo.GetBlockTemplate itself just received from the base node.
-//   - Monero-family (RXM/XMR): job.RawTemplateBlob -- the real, RAW,
-//     UNCONVERTED monerod blocktemplate_blob bytes for this job (see
-//     solo/job.go's Job.RawTemplateBlob doc comment). job.TemplateData
-//     itself holds an UNEXPORTED *moneroTemplateData for Monero (see
-//     solo/monero_node.go), which this package cannot reach at all
-//     (different package, lowercase type) -- RawTemplateBlob is the
-//     real, already-exported escape hatch solo/job.go itself created
-//     for exactly this "a coin-agnostic caller outside solo needs the
-//     real raw bytes" need (session.go's jobPayload uses the SAME
-//     field for its own XNP-proxy wire-shape purposes).
+//     Deliberately NOT delegated to
+//     node.TemplateBytesForRelay(job) here even though the Monero
+//     branch below now is: relay-node's -coin=tari NodeClient is
+//     always a real *solo.GRPCNodeClient (see main.go's NewGRPCNodeClient
+//     construction), and GRPCNodeClient.TemplateBytesForRelay is a
+//     hard-coded "not supported" stub for every call (see node.go's
+//     errRelayTemplateAdoptionNotSupported doc comment: leaf-solo's
+//     per-operator payout addresses make relay-template ADOPTION
+//     unsafe for that NodeClient, full stop) -- calling it here would
+//     make every single Tari publish fail. This mirrors solo/job.go's
+//     own publishTemplate, whose TemplateMessage.TemplateData is
+//     likewise never populated via that path for a leaf-solo-style
+//     NodeClient.
+//   - Monero-family (RXM/XMR): delegates to
+//     node.TemplateBytesForRelay(job), the EXACT SAME
+//     solo.NodeClient method leaf-direct's own solo/job.go
+//     (publishTemplateForJob/jobForXN) calls, and whose
+//     *solo.MoneroNodeClient implementation (monero_node.go) encodes
+//     the richer moneroRelayTemplateWire JSON struct (hashing_blob/
+//     template_blob/seed_hash/prev_hash/difficulty/height/
+//     reserved_offset) that MoneroNodeClient.JobFromTemplateBytes
+//     decodes on the receiving side. Previously this branch instead
+//     hand-rolled its own encoding of the raw, unconverted
+//     job.RawTemplateBlob bytes -- a DIFFERENT, incompatible wire
+//     shape publishing onto the SAME NATS subject a leaf-direct
+//     instance's JobFromTemplateBytes was already trying (and
+//     failing) to JSON-decode. See this fix's own PR description /
+//     commit message for the full root-cause writeup (real production
+//     NATS capture + log line).
 //
 // Returns an error (never a panic) if job.TemplateData does not hold
 // the expected real Tari type for a Tari job, or if
-// job.RawTemplateBlob is empty for a Monero-family job -- both
-// indicate a genuinely malformed/unexpected Job from this daemon's
-// own configured NodeClient, not something to silently paper over.
-func templateDataForJob(coin string, job *solo.Job) ([]byte, error) {
+// node.TemplateBytesForRelay errors or returns no data for a
+// Monero-family job -- both indicate a genuinely malformed/unexpected
+// Job from this daemon's own configured NodeClient, not something to
+// silently paper over (publishTemplateForHeight's caller already
+// treats a non-nil error here as non-fatal, publishing a bare tip
+// notification instead -- see that function's doc comment).
+func templateDataForJob(coin string, node solo.NodeClient, job *solo.Job) ([]byte, error) {
 	switch coin {
 	case coinTari:
 		result, ok := job.TemplateData.(*tari_generated.GetNewBlockResult)
@@ -251,17 +270,14 @@ func templateDataForJob(coin string, job *solo.Job) ([]byte, error) {
 		}
 		return data, nil
 	case coinMonero:
-		if len(job.RawTemplateBlob) == 0 {
-			return nil, fmt.Errorf("relay-node: job.RawTemplateBlob is empty for a monero-family job")
+		data, err := node.TemplateBytesForRelay(job)
+		if err != nil {
+			return nil, fmt.Errorf("relay-node: TemplateBytesForRelay: %w", err)
 		}
-		// Return a copy -- job is shared/cached elsewhere (JobManager-
-		// style callers would mutate their own copies via
-		// BuildCandidateBlock, not this one, but relay-node has no
-		// such caller; copying anyway costs nothing and avoids ever
-		// aliasing a slice this daemon does not own).
-		out := make([]byte, len(job.RawTemplateBlob))
-		copy(out, job.RawTemplateBlob)
-		return out, nil
+		if len(data) == 0 {
+			return nil, fmt.Errorf("relay-node: TemplateBytesForRelay returned no data for a monero-family job (job.TemplateData missing or of an unexpected type)")
+		}
+		return data, nil
 	default:
 		return nil, fmt.Errorf("relay-node: unknown coin %q", coin)
 	}
