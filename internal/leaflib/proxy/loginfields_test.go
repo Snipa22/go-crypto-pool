@@ -116,7 +116,7 @@ func TestProxyLogin_FixedDiffSuffixIsHonoredAsStartingDifficulty(t *testing.T) {
 	}
 
 	sess := h.onlySession()
-	if got, _ := sess.address.Load().(string); got != realProxyTestXMRAddress {
+	if got := sess.Identity().Address; got != realProxyTestXMRAddress {
 		t.Errorf("session address = %q, want the STRIPPED address %q (never the raw login string)", got, realProxyTestXMRAddress)
 	}
 	if got := sess.currentDifficulty.Load(); got != 50000 {
@@ -274,7 +274,7 @@ func TestProxyLogin_XNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *te
 	}
 
 	sess := h.onlySession()
-	if got, _ := sess.address.Load().(string); got != realProxyTestXMRAddress {
+	if got := sess.Identity().Address; got != realProxyTestXMRAddress {
 		t.Errorf("session address = %q, want the STRIPPED address %q", got, realProxyTestXMRAddress)
 	}
 	// The operator's requested value IS the starting difficulty --
@@ -286,8 +286,14 @@ func TestProxyLogin_XNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *te
 		t.Fatal("BUG: an XNP-proxy session was permanently pinned by its login-time +diff suffix -- legacy's proxyAddressList clause exists precisely so an aggregating proxy keeps getting retargeted")
 	}
 
-	// The real proof: (600000/90)*30 = 199980, clamped by
-	// leaflib.ComputeRetarget's 1.5x step limit to 50000*1.5 = 75000.
+	// The real proof: BRIEF.md "proxy-aware vardiff target time"
+	// forces this XNP-agent-detected session's target time to
+	// proxyForcedTargetTimeSeconds (10), unconditionally overriding
+	// the harness's configured cfg.TargetTime (30):
+	// (600000/90)*10 = 66660, which does not hit
+	// leaflib.ComputeRetarget's 1.5x step limit (50000*1.5 = 75000)
+	// at all, unlike the pre-this-brief 30s-target-time math this
+	// test used to assert (199980, clamped to 75000).
 	// maybeRetarget runs on its own goroutine because it WILL produce
 	// a real job push needing a concurrent reader on the net.Pipe.
 	sess.connectedAt = time.Now().Add(-90 * time.Second)
@@ -300,10 +306,10 @@ func TestProxyLogin_XNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *te
 	push := c.recvJobPush()
 	<-done
 
-	if got := sess.currentDifficulty.Load(); got != 75000 {
-		t.Fatalf("currentDifficulty = %d, want 75000 -- vardiff must remain fully live for an XNP-proxy session", got)
+	if got := sess.currentDifficulty.Load(); got != 66660 {
+		t.Fatalf("currentDifficulty = %d, want 66660 (10s forced target time) -- vardiff must remain fully live for an XNP-proxy session", got)
 	}
-	if want := leaflib.DiffToTargetHex(75000); push.Params.Target != want {
+	if want := leaflib.DiffToTargetHex(66660); push.Params.Target != want {
 		t.Errorf("pushed job target = %q, want %q", push.Params.Target, want)
 	}
 }
@@ -438,13 +444,13 @@ func TestProxyLogin_OrdinaryLoginVardiffIsStillFullyLive(t *testing.T) {
 	}
 
 	sess := h.onlySession()
-	if got, _ := sess.address.Load().(string); got != realProxyTestXMRAddress {
+	if got := sess.Identity().Address; got != realProxyTestXMRAddress {
 		t.Errorf("session address = %q, want %q", got, realProxyTestXMRAddress)
 	}
-	if got, _ := sess.worker.Load().(string); got != "rig1" {
+	if got := sess.Identity().Worker; got != "rig1" {
 		t.Errorf("session worker = %q, want the password-supplied %q", got, "rig1")
 	}
-	if got, _ := sess.paymentID.Load().(string); got != "" {
+	if got := sess.Identity().PaymentID; got != "" {
 		t.Errorf("session paymentID = %q, want empty", got)
 	}
 	if sess.fixedDiff.Load() {
@@ -489,13 +495,13 @@ func TestProxyLogin_PaymentIDSuffixIsStrippedAndCaptured(t *testing.T) {
 	}
 
 	sess := h.onlySession()
-	if got, _ := sess.address.Load().(string); got != realProxyTestXMRAddress {
+	if got := sess.Identity().Address; got != realProxyTestXMRAddress {
 		t.Errorf("session address = %q, want the STRIPPED address %q", got, realProxyTestXMRAddress)
 	}
-	if got, _ := sess.paymentID.Load().(string); got != paymentID {
+	if got := sess.Identity().PaymentID; got != paymentID {
 		t.Errorf("session paymentID = %q, want %q", got, paymentID)
 	}
-	if got, _ := sess.worker.Load().(string); got != "rig1" {
+	if got := sess.Identity().Worker; got != "rig1" {
 		t.Errorf("session worker = %q, want the password-supplied %q (a 64-hex segment is a payment ID, never a rig name)", got, "rig1")
 	}
 }
@@ -544,13 +550,13 @@ func TestProxyLogin_DotIdentifierFeedsWorkerWithLegacyPrecedence(t *testing.T) {
 			}
 
 			sess := h.onlySession()
-			if got, _ := sess.address.Load().(string); got != realProxyTestXMRAddress {
+			if got := sess.Identity().Address; got != realProxyTestXMRAddress {
 				t.Errorf("session address = %q, want the STRIPPED address %q", got, realProxyTestXMRAddress)
 			}
-			if got, _ := sess.worker.Load().(string); got != tc.wantWorker {
+			if got := sess.Identity().Worker; got != tc.wantWorker {
 				t.Errorf("session worker = %q, want %q", got, tc.wantWorker)
 			}
-			if got, _ := sess.paymentID.Load().(string); got != "" {
+			if got := sess.Identity().PaymentID; got != "" {
 				t.Errorf("session paymentID = %q, want empty (a non-64-hex segment is a worker name)", got)
 			}
 		})
@@ -578,13 +584,13 @@ func TestProxyLogin_CombinedSuffixesAreAllHonored(t *testing.T) {
 	}
 
 	sess := h.onlySession()
-	if got, _ := sess.address.Load().(string); got != realProxyTestXMRAddress {
+	if got := sess.Identity().Address; got != realProxyTestXMRAddress {
 		t.Errorf("session address = %q, want the STRIPPED address %q", got, realProxyTestXMRAddress)
 	}
-	if got, _ := sess.paymentID.Load().(string); got != paymentID {
+	if got := sess.Identity().PaymentID; got != paymentID {
 		t.Errorf("session paymentID = %q, want %q", got, paymentID)
 	}
-	if got, _ := sess.worker.Load().(string); got != "myrig01" {
+	if got := sess.Identity().Worker; got != "myrig01" {
 		t.Errorf("session worker = %q, want %q", got, "myrig01")
 	}
 	if got := sess.currentDifficulty.Load(); got != 50000 {

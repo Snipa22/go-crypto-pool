@@ -69,13 +69,13 @@ func asLegacyProxy(p JobPayload) legacyProxyJobPayload {
 // *Session sufficient to exercise jobPayload in isolation -- mirrors
 // solo's and direct's own identical helpers (protocol_xnp_test.go /
 // session_xnp_test.go). jobPayload itself only touches
-// s.agent/s.jobs/s.lastDelivered*, none of which need a real
-// connection.
+// s.Identity().Agent/s.jobs/s.lastDelivered*, none of which need a
+// real connection.
 func newProxyXNPTestSession(agent string) *Session {
 	s := &Session{
 		jobs: leaflib.NewJobHistory[*Job](defaultProxySessionJobHistorySize),
 	}
-	s.agent.Store(agent)
+	s.identity.Store(&leaflib.MinerIdentity{Agent: agent})
 	return s
 }
 
@@ -395,12 +395,17 @@ func TestProxyJobPayloadXNPDifficultyReachesTheRealWireOnLoginAndPush(t *testing
 	assertProxyXNPDifficultyFields(t, resp.Result.Job, 50_000)
 
 	sess := h.onlySession()
-	if got, _ := sess.agent.Load().(string); got != xnpProxyDownstreamTestAgent {
+	if got := sess.Identity().Agent; got != xnpProxyDownstreamTestAgent {
 		t.Fatalf("session agent = %q, want %q -- handleLogin must store the downstream agent string for the XNP gate to work at all", got, xnpProxyDownstreamTestAgent)
 	}
 
 	// And so does a genuine vardiff-pushed job afterward, at the new
-	// retargeted difficulty (50000 -> 75000, the 1.5x step clamp).
+	// retargeted difficulty. BRIEF.md "proxy-aware vardiff target
+	// time" forces this XNP-agent-detected session's target time to
+	// proxyForcedTargetTimeSeconds (10), unconditionally overriding
+	// the harness's configured cfg.TargetTime (30):
+	// (600000/90)*10 = 66660, which does not hit the 1.5x step
+	// clamp (50000*1.5 = 75000) at all.
 	sess.connectedAt = time.Now().Add(-90 * time.Second)
 	sess.hashesAccumulated.Store(600_000)
 	done := make(chan struct{})
@@ -411,7 +416,7 @@ func TestProxyJobPayloadXNPDifficultyReachesTheRealWireOnLoginAndPush(t *testing
 	push := c.recvJobPush()
 	<-done
 
-	assertProxyXNPDifficultyFields(t, push.Params, 75_000)
+	assertProxyXNPDifficultyFields(t, push.Params, 66_660)
 }
 
 // TestProxyJobPayloadXNPOrdinaryMinerWireIsUnchangedEndToEnd is the

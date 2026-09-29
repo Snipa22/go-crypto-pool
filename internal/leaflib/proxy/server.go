@@ -480,7 +480,7 @@ func (s *Server) sessionSnapshots() []metrics.SessionSnapshot {
 	defer s.mu.RUnlock()
 	out := make([]metrics.SessionSnapshot, 0, len(s.sessions))
 	for _, sess := range s.sessions {
-		addr, _ := sess.address.Load().(string)
+		addr := sess.Identity().Address
 		out = append(out, metrics.SessionSnapshot{
 			Address:    addr,
 			RemoteIP:   metrics.RemoteIPOf(sess.mc.RemoteAddr()),
@@ -554,6 +554,18 @@ func (s *Server) recordLoginRejection(reason string) {
 		return
 	}
 	s.metrics.LoginRejectionsTotal.WithLabelValues(reason).Inc()
+}
+
+// recordRelogin bumps the real leaf_relogin_total counter (see
+// metrics.Metrics.ReloginTotal's doc comment) -- called from
+// session.go's handleLogin at the exact point a re-login is
+// detected, mirroring recordLoginRejection's identical nil-checked
+// convention above.
+func (s *Server) recordRelogin() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.ReloginTotal.Inc()
 }
 
 // resultLabel mirrors solo.Server's own identical helper exactly.
@@ -797,6 +809,10 @@ type SessionStat struct {
 	// metrics.DecisionUpstreamForward) IS real-validated, but this
 	// aggregate figure does not distinguish the two.
 	EstimatedHashrate float64
+	// Relogins is this session's own real re-login count -- mirrors
+	// internal/leaflib/solo/server.go's identical SessionStat.Relogins
+	// exactly.
+	Relogins int
 }
 
 // AddressCount is one entry in Stats.MinersByAddress: a mining/payout
@@ -862,8 +878,8 @@ func (s *Server) Stats() Stats {
 		st.TotalShares += sess.shareCount.Load()
 		st.TotalBlocks += sess.blockCount.Load()
 
-		addr, _ := sess.address.Load().(string)
-		worker, _ := sess.worker.Load().(string)
+		addr := sess.Identity().Address
+		worker := sess.Identity().Worker
 		remoteIP := metrics.RemoteIPOf(sess.mc.RemoteAddr())
 		diff := sess.currentDifficulty.Load()
 
@@ -891,6 +907,7 @@ func (s *Server) Stats() Stats {
 			ShareCount:        sess.shareCount.Load(),
 			BlockCount:        sess.blockCount.Load(),
 			EstimatedHashrate: hashrate,
+			Relogins:          sess.loginHistory.Len(),
 		})
 		st.TotalEstimatedHashrate += hashrate
 	}

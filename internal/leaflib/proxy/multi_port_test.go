@@ -23,7 +23,7 @@ func (h *harness) sessionByAddress(addr string) *Session {
 	h.server.mu.RLock()
 	defer h.server.mu.RUnlock()
 	for _, s := range h.server.sessions {
-		if got, _ := s.address.Load().(string); got == addr {
+		if got := s.Identity().Address; got == addr {
 			return s
 		}
 	}

@@ -9,6 +9,17 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
 
+// proxyForcedTargetTimeSeconds mirrors solo.proxyForcedTargetTimeSeconds
+// exactly -- see that constant's own doc comment (internal/leaflib/
+// solo/vardiff.go) for the full BRIEF.md "Problem 2" rationale.
+// Deliberately duplicated per-package (not shared via leaflib),
+// matching this repo's existing convention of small per-package
+// constants that happen to share a value/name across all three leaf
+// flavors (e.g. defaultSessionJobHistorySize/
+// defaultProxySessionJobHistorySize) rather than always factoring
+// every such constant into leaflib.
+const proxyForcedTargetTimeSeconds = 10
+
 // vardiffJitterFunc is a test-injectable seam over the one-time
 // initial retarget-ticker jitter delay's random source below --
 // mirrors this repo's existing test-injectable-randomness convention
@@ -122,7 +133,16 @@ func (s *Session) maybeRetarget() {
 		minDiff = floor
 	}
 
-	newDiff, changed := leaflib.ComputeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, minDiff, cfg.MaxDifficulty)
+	// BRIEF.md "proxy-aware vardiff target time": mirrors
+	// solo.Session.maybeRetarget's identical block exactly -- a
+	// detected-proxy session's forcedTargetTime (0 when unset) always
+	// wins over cfg.TargetTime, unconditionally.
+	targetTime := cfg.TargetTime
+	if forced := s.forcedTargetTime.Load(); forced != 0 {
+		targetTime = int(forced)
+	}
+
+	newDiff, changed := leaflib.ComputeRetarget(curDiff, hashes, connSeconds, targetTime, minDiff, cfg.MaxDifficulty)
 	s.server.debugLogger.Debugf("proxy: vardiff check: session=%s cur_diff=%d hashes=%d conn_seconds=%d changed=%v", s.sessionID, curDiff, hashes, connSeconds, changed)
 	if !changed {
 		return

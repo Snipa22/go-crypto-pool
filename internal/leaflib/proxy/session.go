@@ -94,48 +94,29 @@ type Session struct {
 
 	sessionID string
 	loggedIn  atomic.Bool
-	address   atomic.Value // string
-	worker    atomic.Value // string
 
-	// agent is this session's own self-reported LoginRequest.Agent
-	// string, stored at login -- mirrors solo.Session's/
-	// direct.Session's identical field exactly. Before the parity
-	// pass that added it, leaf-proxy dropped the downstream agent
-	// string entirely (handleLogin read login.Agent for nothing at
-	// all), which is precisely why neither of the two
-	// agent-string-gated behaviors leaf-direct/leaf-solo already have
-	// could exist here: solo.IsXNPProxyAgent had nothing to be called
-	// on. It is now read by jobPayload below (the XNP-proxy-shape
-	// difficulty fields) and by handleLogin (the
-	// XNPProxyExemptFromFixedDiffPin escape hatch). Always a string,
-	// never nil -- newSession seeds it with "" so every
-	// s.agent.Load().(string) assertion is safe even for a session
-	// whose miner sent no "agent" field.
-	agent atomic.Value // string
+	// identity is this session's ENTIRE miner-identity state
+	// (address/worker/agent/paymentID), held as a single
+	// atomic.Value of *leaflib.MinerIdentity and swapped with ONE
+	// Store call in handleLogin -- mirrors solo.Session's/
+	// direct.Session's identical field exactly. See
+	// leaflib.MinerIdentity's own doc comment for the torn-read
+	// rationale this replaces (four separate atomic.Value fields
+	// mutated sequentially, not as one unit). Read via the
+	// Identity() accessor below, never loaded directly. Never nil
+	// after newSession (seeded with an empty *MinerIdentity).
+	identity atomic.Value // *leaflib.MinerIdentity
 
-	// paymentID is the genuine Monero payment ID this session's
-	// downstream miner supplied as a 64-lowercase-hex second
-	// dot-segment of its login field (solo.ParseLoginFields /
-	// solo.LoginFields.PaymentID).
-	//
-	// KNOWN, DELIBERATE GAP, and a WIDER one than leaf-solo's own
-	// identically-documented gap: leaf-proxy has no share table, no
-	// payout accounting, and -- unlike leaf-solo, which at least
-	// mines to its own configured address -- no per-session payout
-	// destination of ANY kind. Every share this leaf forwards is
-	// credited by the real upstream pool to the ONE static,
-	// operator-configured payout address this leaf logs in with
-	// (UpstreamConfig.Login, from cmd/leaf-proxy's -upstream-login --
-	// see upstream.go's login()), never to a downstream session's own
-	// login string. So there is no downstream path here for a payment
-	// ID to travel to at all. It is captured purely so the parse is
-	// observable/diagnosable and so this Session's shape stays
-	// parallel with solo.Session's and direct.Session's (this
-	// package's standing convention) -- deliberately NOT half-wiring
-	// payout plumbing leaf-proxy does not have. leaf-direct is where
-	// the real end-to-end payment-ID plumbing lives (it stamps its
-	// own identical field onto poolpb.Share.PaymentId).
-	paymentID atomic.Value // string
+	// loginHistory is the bounded, oldest-evicted-first ring of this
+	// session's own past MinerIdentity values -- mirrors
+	// solo.Session's identical field exactly. See
+	// leaflib.LoginHistory's own doc comment.
+	loginHistory *leaflib.LoginHistory
+
+	// reloginDetected is set true the FIRST time handleLogin runs on
+	// an already-logged-in session -- mirrors solo.Session's
+	// identical field exactly. Sticky for the connection's life.
+	reloginDetected atomic.Bool
 
 	// fixedDiff mirrors solo.Session's/direct.Session's own identical
 	// field exactly -- see solo.Session.fixedDiff's doc comment for
@@ -230,6 +211,14 @@ type Session struct {
 	// maybeRetarget.
 	forcedMinDifficulty atomic.Uint64
 
+	// forcedTargetTime mirrors solo.Session's identical field exactly
+	// -- see that field's own doc comment (internal/leaflib/solo/
+	// session.go) for the full rationale. 0 = unset; once set (by
+	// handleLogin, on proxy detection), unconditional and sticky for
+	// the rest of the connection's life; consulted by maybeRetarget
+	// (vardiff.go) BEFORE calling leaflib.ComputeRetarget.
+	forcedTargetTime atomic.Uint64
+
 	// lastDeliveredJobID/lastDeliveredDifficulty mirror
 	// solo.Session's/direct.Session's own identical fields exactly --
 	// see internal/leaflib/solo/session.go's Session type doc comment
@@ -261,6 +250,16 @@ type Session struct {
 	// is the FIRST such abuse-accounting mechanism wired into this
 	// package.
 	invalidShareGuard *leaflib.InvalidShareGuard
+}
+
+// Identity mirrors solo.Session.Identity's own identical accessor
+// exactly -- see that method's doc comment. Never returns nil.
+func (s *Session) Identity() *leaflib.MinerIdentity {
+	ident, _ := s.identity.Load().(*leaflib.MinerIdentity)
+	if ident == nil {
+		return &leaflib.MinerIdentity{}
+	}
+	return ident
 }
 
 // alreadyDelivered mirrors solo.Session's/direct.Session's own
@@ -401,10 +400,8 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		connectedAt: time.Now(),
 		jobs:        leaflib.NewJobHistory[*Job](defaultProxySessionJobHistorySize),
 	}
-	s.address.Store("")
-	s.worker.Store("")
-	s.agent.Store("")
-	s.paymentID.Store("")
+	s.identity.Store(&leaflib.MinerIdentity{})
+	s.loginHistory = leaflib.NewLoginHistory(defaultProxySessionJobHistorySize)
 	s.currentDifficulty.Store(startingDifficulty)
 	s.invalidShareGuard = leaflib.NewInvalidShareGuard(server.invalidShareGuardConfig)
 	return s
@@ -676,15 +673,51 @@ func (s *Session) handleLogin(req Request) {
 
 	// The STRIPPED address is what becomes session state -- never the
 	// raw login string. Everything downstream of here that reads
-	// s.address (handleSubmit's own addressflags ban re-check, the
+	// s.Identity().Address (handleSubmit's own addressflags ban re-check, the
 	// stats HTML sessions table, the per-session Prometheus address
 	// label) therefore now sees the same canonical value the
 	// login-time ban check above looked up.
-	s.address.Store(loginFields.Address)
-	s.worker.Store(worker)
-	s.agent.Store(login.Agent)
-	s.paymentID.Store(loginFields.PaymentID)
+	//
+	// BRIEF.md "decouple TCP/miner-identity": the new identity is
+	// built as ONE value and swapped with a single Store call below
+	// -- mirrors solo.Session.handleLogin's identical block exactly,
+	// see that method's own doc comment for the full torn-read
+	// rationale this fixes and the re-login detection/history/metric
+	// bookkeeping this performs.
+	newIdentity := &leaflib.MinerIdentity{
+		Address:    loginFields.Address,
+		Worker:     worker,
+		Agent:      login.Agent,
+		PaymentID:  loginFields.PaymentID,
+		LoggedInAt: time.Now(),
+	}
+	if s.loggedIn.Load() {
+		oldIdentity := s.Identity()
+		s.loginHistory.Append(*oldIdentity)
+		s.server.recordRelogin()
+		s.reloginDetected.Store(true)
+		s.server.logger.Printf("proxy: session %s re-logged in: old identity address=%q worker=%q agent=%q payment_id=%q logged_in_at=%s -> new identity address=%q worker=%q agent=%q payment_id=%q",
+			s.sessionID,
+			oldIdentity.Address, oldIdentity.Worker, oldIdentity.Agent, oldIdentity.PaymentID, oldIdentity.LoggedInAt.Format(time.RFC3339),
+			newIdentity.Address, newIdentity.Worker, newIdentity.Agent, newIdentity.PaymentID)
+	}
+	s.identity.Store(newIdentity)
 	s.loggedIn.Store(true)
+
+	// BRIEF.md "proxy-aware vardiff target time": a session detected
+	// as a proxy -- by EITHER the pre-existing agent-string signal
+	// (solo.IsXNPProxyAgent/solo.IsGenericProxyAgent) OR the new
+	// behavioral signal above (reloginDetected) -- has its vardiff
+	// share target time forced to proxyForcedTargetTimeSeconds
+	// (vardiff.go), unconditionally, for the rest of the connection's
+	// life. See solo.Session.handleLogin's identical block for the
+	// full "unconditional, sticky" rationale of the
+	// forcedTargetTime.Load() == 0 guard below.
+	if solo.IsXNPProxyAgent(login.Agent) || solo.IsGenericProxyAgent(login.Agent) || s.reloginDetected.Load() {
+		if s.forcedTargetTime.Load() == 0 {
+			s.forcedTargetTime.Store(proxyForcedTargetTimeSeconds)
+		}
+	}
 
 	// A miner-requested (or NiceHash-assigned) FIXED difficulty
 	// becomes this session's STARTING difficulty instead of the port
@@ -998,8 +1031,8 @@ func (s *Session) handleSubmit(req Request) {
 	// solo/direct convention this leaf mirrors, not because either
 	// fix's own rationale requires it ahead of the other.
 	if s.server.addressFlags != nil {
-		if flags := s.server.addressFlags.Get(s.address.Load().(string)); flags.Banned {
-			s.server.logger.Printf("proxy: rejecting submit for now-banned address %s (session %s)", s.address.Load(), s.sessionID)
+		if flags := s.server.addressFlags.Get(s.Identity().Address); flags.Banned {
+			s.server.logger.Printf("proxy: rejecting submit for now-banned address %s (session %s)", s.Identity().Address, s.sessionID)
 			s.server.recordBanRejection(metrics.BanRejectionPhaseSubmit)
 			s.writeShareResponse(req.ID, false, "this address is banned from this pool")
 			return
@@ -1183,7 +1216,7 @@ func (s *Session) handleSubmit(req Request) {
 			disconnect := s.invalidShareGuard.RecordOutcome(false)
 			s.writeShareResponse(req.ID, false, "share is not a cryptographically valid RandomX proof for this job")
 			if disconnect {
-				s.server.logger.Printf("proxy: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
+				s.server.logger.Printf("proxy: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.Identity().Address)
 				s.mc.Close("exceeded consecutive invalid-share threshold")
 			}
 			return
@@ -1241,7 +1274,7 @@ func (s *Session) handleSubmit(req Request) {
 		}
 
 		s.blockCount.Add(1)
-		s.server.logger.Printf("proxy: share forwarded upstream by session %s (address %s) at height %d, upstream job %s, diff %d, accepted=%v", s.sessionID, s.address.Load(), job.Height, job.UpstreamJobID, diff, accepted)
+		s.server.logger.Printf("proxy: share forwarded upstream by session %s (address %s) at height %d, upstream job %s, diff %d, accepted=%v", s.sessionID, s.Identity().Address, job.Height, job.UpstreamJobID, diff, accepted)
 		s.server.recordBlock(true)
 		s.writeShareResponse(req.ID, true, "")
 	}
@@ -1474,7 +1507,7 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	// empty. Comma-ok keeps jobPayload total -- an unset agent simply
 	// reads as "" and is correctly not XNP-detected -- instead of
 	// making an unrelated wire-shape test panic.
-	agent, _ := s.agent.Load().(string)
+	agent := s.Identity().Agent
 	if solo.IsXNPProxyAgent(agent) {
 		difficulty := job.StaticDifficulty
 		targetDiff := difficulty
