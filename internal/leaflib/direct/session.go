@@ -40,6 +40,16 @@ const (
 // job-history rationale (the real security fix from PR #14).
 const defaultSessionJobHistorySize = 8
 
+// freshJobOnStaleSubmitMinInterval mirrors solo.Session's own
+// identical constant exactly -- see that constant's doc comment
+// (internal/leaflib/solo/session.go) for the full job-push-storm
+// mitigation rationale (DISPATCH_BRIEF.md, "throttle
+// pushFreshJobOnStaleSubmit to at most once every 10s per session",
+// fix/throttle-fresh-job-push-rxm). Applied identically here since
+// this leaf has its own separate pushFreshJobOnStaleSubmit
+// implementation rather than reusing solo's.
+const freshJobOnStaleSubmitMinInterval = 10 * time.Second
+
 // Session drives one miner connection's request/response loop, using
 // the EXACT same real Monero-family JSON-RPC 2.0 stratum wire types
 // leaf-solo already defined (solo.Request/LoginRequest/SubmitRequest/
@@ -167,6 +177,18 @@ type Session struct {
 	// server.go's invalidateAndRepushJobs via alreadyDelivered.
 	lastDeliveredJobID      atomic.Value // string
 	lastDeliveredDifficulty atomic.Uint64
+
+	// lastFreshJobPushUnixNano/pushFreshJobOnStaleSubmitNow mirror
+	// solo.Session's own identical fields exactly -- see that type's
+	// doc comments (internal/leaflib/solo/session.go) for the full
+	// job-push-storm throttle rationale and concurrency need. This
+	// leaf has its OWN separate pushFreshJobOnStaleSubmit
+	// implementation (dispatched onto s.server.jobFetchPool rather
+	// than solo's inline JobForXNAtDifficulty call -- see that
+	// method's own doc comment below), so it needs its own copy of
+	// this state rather than sharing solo's.
+	lastFreshJobPushUnixNano     atomic.Int64
+	pushFreshJobOnStaleSubmitNow func() time.Time
 }
 
 // Identity mirrors solo.Session.Identity's own identical accessor
@@ -669,7 +691,29 @@ func (s *Session) fetchAndDeliverGetJob(reqID int) {
 // what makes the new finishSubmit call site safe: finishSubmit may
 // already be running on a randomxPool worker goroutine rather than
 // the read loop, and TrySubmit is callable from either.
+//
+// THROTTLED to at most once every freshJobOnStaleSubmitMinInterval
+// per session, mirroring solo.Session's own identical throttle
+// exactly (see that method's doc comment for the full rationale and
+// concurrency argument). The throttle check/update happens HERE,
+// before ever touching s.server.jobFetchPool: a throttled call does
+// not enqueue any work onto that pool at all, exactly matching the
+// "no-op, does not even fetch" semantics the brief requires.
 func (s *Session) pushFreshJobOnStaleSubmit() {
+	now := time.Now
+	if s.pushFreshJobOnStaleSubmitNow != nil {
+		now = s.pushFreshJobOnStaleSubmitNow
+	}
+	nowNanos := now().UnixNano()
+	if last := s.lastFreshJobPushUnixNano.Load(); nowNanos-last < int64(freshJobOnStaleSubmitMinInterval) {
+		return
+	} else if !s.lastFreshJobPushUnixNano.CompareAndSwap(last, nowNanos) {
+		// Lost the race to another concurrent call for this same
+		// session -- see solo.Session.pushFreshJobOnStaleSubmit's
+		// identical comment for why this is a no-op, not a retry.
+		return
+	}
+
 	if ok := s.server.jobFetchPool.TrySubmit(func() { s.fetchAndPushFreshJobOnStaleSubmit() }); !ok {
 		s.server.logger.Printf("direct: job fetch pool saturated or shutting down, could not push fresh job to session %s after a stale-job-class submit rejection", s.sessionID)
 	}
