@@ -260,6 +260,10 @@ type Metrics struct {
 	// to report the same count for that one reason value.
 	LoginRejectionsTotal *prometheus.CounterVec
 
+	// ReloginTotal mirrors internal/leaflib/solo/metrics's identical
+	// ReloginTotal exactly -- see that field's own doc comment.
+	ReloginTotal prometheus.Counter
+
 	// UpstreamConnected is 1 when the single upstream pool
 	// connection is currently up, 0 when it is down/reconnecting.
 	UpstreamConnected prometheus.Gauge
@@ -335,6 +339,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Name: "leaf_proxy_login_rejections_total",
 		Help: "Real, per-category breakdown of every login-time rejection in session.go's handleLogin (see this package's LoginRejectionReason* consts for the full, closed enum and the exact call site each one maps to) -- previously every one of these rejection points was log-only, with no counter of any kind (except the banned reason, which also increments the pre-existing leaf_proxy_ban_rejections_total{phase=\"login\"} -- both are expected to report the same count for that one reason value; see LoginRejectionReasonBanned's doc comment).",
 	}, []string{"reason"})
+
+	m.ReloginTotal = shared.RegisterCounter(reg, prometheus.CounterOpts{
+		Name: "leaf_relogin_total",
+		Help: "Total number of real re-login events detected in session.go's handleLogin: a session receiving a second (or Nth) login message on an already-logged-in connection (e.g. an xmrig-proxy --reuse-timeout connection-reuse slot rotation). Incremented once per re-login event, not once per login overall.",
+	})
 
 	m.UpstreamConnected = shared.RegisterGauge(reg, prometheus.GaugeOpts{
 		Name: "leaf_proxy_upstream_connected",

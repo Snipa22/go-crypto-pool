@@ -22,7 +22,7 @@ import (
 // "+<difficulty>" suffix from one of leaf-proxy's OWN downstream
 // clients might be corrupting the payout address this leaf sends to
 // ITS OWN upstream pool, because handleLogin stored login.Login raw
-// and something downstream forwarded s.address.Load() upstream as-is.
+// and something downstream forwarded s.Identity().Address upstream as-is.
 //
 // FINDING: that bug does NOT exist in leaf-proxy's architecture, and
 // the tests in this file exist to prove that -- and, more importantly,
@@ -231,7 +231,7 @@ func TestUpstreamLoginIsNeverDerivedFromADownstreamSessionLoginString(t *testing
 	if sess == nil {
 		t.Fatal("no downstream session was registered")
 	}
-	if got, _ := sess.address.Load().(string); got != downstreamMinerAddr {
+	if got := sess.Identity().Address; got != downstreamMinerAddr {
 		t.Errorf("downstream session address = %q, want the STRIPPED downstream address %q", got, downstreamMinerAddr)
 	}
 

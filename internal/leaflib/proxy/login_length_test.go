@@ -35,7 +35,7 @@ func TestSessionLogin_RejectsOversizedLoginString(t *testing.T) {
 	if sess.loggedIn.Load() {
 		t.Fatal("expected loggedIn to remain false after a rejected (oversized) login")
 	}
-	if addr, _ := sess.address.Load().(string); addr == oversized {
+	if addr := sess.Identity().Address; addr == oversized {
 		t.Fatal("expected the oversized login string to never be stored as this session's address")
 	}
 }
