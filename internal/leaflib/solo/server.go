@@ -648,11 +648,12 @@ func resultLabel(accepted bool) string {
 }
 
 // invalidateAndRepushJobs is called whenever JobManager invalidates its
-// per-xn job cache (tip movement or periodic refresh — see
-// JobManager.Subscribe's doc comment). Since jobs are now per-xn (see
+// per-session job cache (tip movement or periodic refresh — see
+// JobManager.Subscribe's doc comment). Since jobs are per-session (see
 // job.go's doc comment), there is no single new Job to broadcast:
 // instead, for every currently-connected, logged-in session, a fresh
-// (or freshly-regenerated) job is fetched for THAT session's own xn,
+// (or freshly-regenerated) job is fetched for THAT session's own
+// job-cache key,
 // AT THAT SESSION'S OWN CURRENT VARDIFF DIFFICULTY (not any global
 // static value — a tip-triggered regeneration must not silently reset
 // a session's difficulty back to the starting value), and pushed to it
@@ -668,9 +669,9 @@ func (s *Server) invalidateAndRepushJobs() {
 		if !sess.loggedIn.Load() {
 			continue
 		}
-		job, err := s.jobManager.JobForXNAtDifficulty(context.Background(), sess.XN(), sess.currentDifficulty.Load())
+		job, err := s.jobManager.JobForSessionAtDifficulty(context.Background(), sess.JobKey(), sess.currentDifficulty.Load())
 		if err != nil {
-			s.logger.Printf("solo: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.XN(), err)
+			s.logger.Printf("solo: failed to regenerate job for session %s (job_key %s) after cache invalidation: %v", sess.sessionID, sess.JobKey(), err)
 			continue
 		}
 		// BUG FIX (Alex, live production report: "we're sending

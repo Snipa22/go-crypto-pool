@@ -127,7 +127,7 @@ func (s *Session) maybeRetarget() {
 
 	s.currentDifficulty.Store(newDiff)
 
-	job, err := s.server.jobManager.RestampDifficulty(context.Background(), s.XN(), newDiff)
+	job, err := s.server.jobManager.RestampDifficulty(context.Background(), s.JobKey(), newDiff)
 	if err != nil {
 		s.server.logger.Printf("direct: vardiff retarget for session %s (xn %s) failed to restamp job: %v", s.sessionID, s.XN(), err)
 		return

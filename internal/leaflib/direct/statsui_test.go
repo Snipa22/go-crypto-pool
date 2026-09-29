@@ -25,7 +25,7 @@ func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
 	_, xn := directLogin(t, h, realTariTestAddress("stats-ui-test-address"))
 
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 12345),
@@ -78,7 +78,7 @@ func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 func TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
 	_, xn := directLogin(t, h, realTariTestAddress("hide-remote-addr-test"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 12345),
@@ -226,7 +226,7 @@ func TestServerStats_ReflectsRealBackendTransportHealth(t *testing.T) {
 	// A real successful forward (via the actual session.go code path)
 	// must keep/confirm the healthy state.
 	_, xn := directLogin(t, h, realTariTestAddress("backend-health-test-address"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHex(xn, 555),

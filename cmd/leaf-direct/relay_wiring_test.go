@@ -185,9 +185,9 @@ func TestLeafDirectSharesOneRelayInstanceForFoundBlockAndTemplate(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	firstJob, err := jobManager.JobForXN(context.Background(), "aaaa")
+	firstJob, err := jobManager.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (seed): %v", err)
+		t.Fatalf("JobForSession (seed): %v", err)
 	}
 
 	jobManager.Start(ctx)

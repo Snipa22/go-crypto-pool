@@ -3,7 +3,6 @@ package direct
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -62,7 +61,7 @@ func (d *delayedDirectNodeClient) callCount() int64 {
 // together exactly like NewServer's own production wiring (including
 // the real Server.repushPool/invalidateAndRepushJobs subscription --
 // see NewServer), backed by a delayedDirectNodeClient so every
-// cache-miss JobForXNAtDifficulty call takes real, measurable wall-
+// cache-miss JobForSessionAtDifficulty call takes real, measurable wall-
 // clock time.
 func newRepushFanoutTestServer(t *testing.T, delay time.Duration) (*Server, *solo.JobManager, *delayedDirectNodeClient, *leaflib.ConnectionManager, context.Context) {
 	t.Helper()
@@ -94,13 +93,29 @@ func newRepushFanoutTestServer(t *testing.T, delay time.Duration) (*Server, *sol
 }
 
 // addSyntheticLoggedInSession registers one synthetic, already-
-// logged-in *Session (distinct, randomly-generated xn -- see
-// newSession) directly into server.sessions (this test lives in
+// logged-in *Session directly into server.sessions (this test lives in
 // package direct, same as server.go/session.go, so reaching into
 // that package-internal field/newSession is fine -- mirrors this
 // package's other white-box tests, e.g. session_jobfetch_closewait_
 // test.go reaching into server.sessions/server.jobFetchPool
 // directly).
+//
+// NO xn OVERRIDE IS NEEDED ANY MORE. This helper used to take a
+// caller-supplied uniqueXN and Store it over newSession's own random
+// draw, purely to keep the strict "node.callCount() == numSessions"
+// assertion below deterministic: leaflib.NewSessionXN draws only 2
+// random bytes (65,536 possible values), and back when xn WAS the
+// solo.JobManager job-cache key, two sessions drawing the same xn
+// shared one cached job -- so one fewer real GetBlockTemplate call
+// than sessions. That was measured, not theorised: 500 random draws
+// produced 2 real collisions in one run. The job cache is now keyed by
+// a per-session key that is unique BY CONSTRUCTION
+// (leaflib.NewJobCacheKey, a monotonic counter -- see that function's
+// doc comment for the correctness bug this re-keying fixes), so N
+// sessions are ALWAYS N distinct cache entries and this assertion is
+// deterministic with the real, un-overridden random xn draw. Keeping
+// the override would now actively hide the regression: it would make
+// this test pass even if the cache went back to being xn-keyed.
 //
 // The underlying ManagedConnection is a real one (via cm.Accept, on
 // a real net.Pipe pair) but is closed IMMEDIATELY, before this
@@ -116,7 +131,7 @@ func newRepushFanoutTestServer(t *testing.T, delay time.Duration) (*Server, *sol
 // to it would block forever, which is exactly the kind of stall this
 // whole fix exists to prevent -- not something this test wants to
 // accidentally reintroduce.
-func addSyntheticLoggedInSession(t *testing.T, cm *leaflib.ConnectionManager, ctx context.Context, server *Server, difficulty uint64, uniqueXN string) *Session {
+func addSyntheticLoggedInSession(t *testing.T, cm *leaflib.ConnectionManager, ctx context.Context, server *Server, difficulty uint64) *Session {
 	t.Helper()
 	serverConn, clientConn := net.Pipe()
 	mc, err := cm.Accept(ctx, serverConn)
@@ -128,18 +143,6 @@ func addSyntheticLoggedInSession(t *testing.T, cm *leaflib.ConnectionManager, ct
 
 	sess := newSession(mc, server, difficulty)
 	sess.loggedIn.Store(true)
-	if uniqueXN != "" {
-		// newSession's own leaflib.NewSessionXN() draws only 2 random
-		// bytes (65536 possible values) -- fine for real production
-		// traffic (collisions just mean two sessions briefly share a
-		// cached job, harmless), but a real birthday-paradox risk at
-		// this test's own session counts (confirmed empirically: 500
-		// random draws produced 2 real collisions in one run, making
-		// a strict "node.callCount() == numSessions" assertion
-		// flaky). Overriding with a caller-supplied, guaranteed-
-		// distinct value keeps this test fully deterministic.
-		sess.xn.Store(uniqueXN)
-	}
 
 	server.mu.Lock()
 	server.sessions[mc.ID()] = sess
@@ -176,7 +179,7 @@ func TestServerInvalidateAndRepushJobs_ParallelizesPerSessionFanoutAndRecordsMet
 
 	sessions := make([]*Session, 0, numSessions)
 	for i := 0; i < numSessions; i++ {
-		sessions = append(sessions, addSyntheticLoggedInSession(t, cm, ctx, server, difficulty, fmt.Sprintf("%08x", i)))
+		sessions = append(sessions, addSyntheticLoggedInSession(t, cm, ctx, server, difficulty))
 	}
 
 	start := time.Now()
@@ -195,7 +198,7 @@ func TestServerInvalidateAndRepushJobs_ParallelizesPerSessionFanoutAndRecordsMet
 	t.Logf("invalidateAndRepushJobs(%d sessions, %v/call) completed in %v (sequential worst case would be %v)", numSessions, perCallDelay, elapsed, time.Duration(numSessions)*perCallDelay)
 
 	if got := node.callCount(); got != int64(numSessions) {
-		t.Fatalf("node.callCount() = %d, want %d (every session has a distinct, never-before-cached xn -- each must be a real, distinct GetBlockTemplate call)", got, numSessions)
+		t.Fatalf("node.callCount() = %d, want %d (every session has a distinct, never-before-cached job-cache key -- each must be a real, distinct GetBlockTemplate call; a shortfall here would mean two sessions collided onto one cache entry, i.e. the xn-keyed bug is back)", got, numSessions)
 	}
 
 	// Every session was fresh (never delivered a job before), so
@@ -204,7 +207,7 @@ func TestServerInvalidateAndRepushJobs_ParallelizesPerSessionFanoutAndRecordsMet
 	for _, sess := range sessions {
 		lastID, _ := sess.lastDeliveredJobID.Load().(string)
 		if lastID == "" {
-			t.Fatalf("session %s (xn %s) was never delivered a job by invalidateAndRepushJobs", sess.sessionID, sess.XN())
+			t.Fatalf("session %s (job_key %s) was never delivered a job by invalidateAndRepushJobs", sess.sessionID, sess.JobKey())
 		}
 	}
 
@@ -258,19 +261,19 @@ func TestServerDebouncedInvalidateAndRepushJobs_DecouplesFromCallerGoroutine(t *
 	server.EnableMetrics("repush-decouple-test", 0)
 
 	for i := 0; i < numSessions; i++ {
-		addSyntheticLoggedInSession(t, cm, ctx, server, difficulty, fmt.Sprintf("d%07x", i))
+		addSyntheticLoggedInSession(t, cm, ctx, server, difficulty)
 	}
 
 	// Seed JobManager's own tracked CurrentBest (via one real,
-	// distinct, throwaway-xn fetch) so debouncedInvalidateAndRepushJobs
+	// distinct, throwaway-session-key fetch) so debouncedInvalidateAndRepushJobs
 	// below takes the "genuine height increase" branch (server.go's
 	// !s.lastRepushSet || height > s.lastRepushHeight) -- the SAME
 	// never-debounced, always-immediate-dispatch branch brief2.md's
 	// root cause cites as tipPollLoop's own real call path (line
 	// ~935/~1147 in that doc), rather than the defensive
 	// CurrentBest-not-set fallback.
-	if _, err := jm.JobForXNAtDifficulty(context.Background(), "seed-xn-1", difficulty); err != nil {
-		t.Fatalf("seed JobForXNAtDifficulty: %v", err)
+	if _, err := jm.JobForSessionAtDifficulty(context.Background(), "seed-session-1/1", difficulty); err != nil {
+		t.Fatalf("seed JobForSessionAtDifficulty: %v", err)
 	}
 
 	// First call: dispatches the slow, 500-session repush pass onto
@@ -303,7 +306,8 @@ func TestServerDebouncedInvalidateAndRepushJobs_DecouplesFromCallerGoroutine(t *
 	}
 
 	// Real height increase: seed a strictly higher height via another
-	// distinct, throwaway xn, then call debouncedInvalidateAndRepushJobs
+	// distinct, throwaway session key, then call
+	// debouncedInvalidateAndRepushJobs
 	// again. This must STILL return promptly, even though the first
 	// pass (occupying repushPool's only worker) is still running --
 	// this call's own dispatch just enqueues into repushPool's queue
@@ -311,8 +315,8 @@ func TestServerDebouncedInvalidateAndRepushJobs_DecouplesFromCallerGoroutine(t *
 	node.fakeDirectNodeClient.mu.Lock()
 	node.fakeDirectNodeClient.height = 43
 	node.fakeDirectNodeClient.mu.Unlock()
-	if _, err := jm.JobForXNAtDifficulty(context.Background(), "seed-xn-2", difficulty); err != nil {
-		t.Fatalf("seed JobForXNAtDifficulty (height increase): %v", err)
+	if _, err := jm.JobForSessionAtDifficulty(context.Background(), "seed-session-2/2", difficulty); err != nil {
+		t.Fatalf("seed JobForSessionAtDifficulty (height increase): %v", err)
 	}
 
 	secondCallStart := time.Now()
@@ -331,8 +335,8 @@ func TestServerDebouncedInvalidateAndRepushJobs_DecouplesFromCallerGoroutine(t *
 	// (recordTemplateDistribution fires exactly once per completed
 	// pass -- see that method's own doc comment) -- NOT
 	// node.callCount(), since the second pass's own per-session
-	// JobForXNAtDifficulty calls are almost all cache HITS (the first
-	// pass already warmed every session's per-xn cache entry; only
+	// JobForSessionAtDifficulty calls are almost all cache HITS (the first
+	// pass already warmed every session's own cache entry; only
 	// InvalidateAll -- never called by this test -- would have wiped
 	// it), so it completes near-instantly and adds ~0 extra real
 	// GetBlockTemplate calls, not another numSessions of them.

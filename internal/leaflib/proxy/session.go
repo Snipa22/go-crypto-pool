@@ -84,10 +84,10 @@ type UpstreamSubmitter interface {
 // could explain on its own. Ported from XNP's own getJob() (lib/
 // xmr.js), which short-circuits on an unchanged
 // activeBlockTemplate.id/!miner.newDiff via miner.cachedJob, and from
-// this repo's own already-correct solo.JobManager.jobForXN/
-// JobForXNAtDifficulty (internal/leaflib/solo/job.go), which caches
-// per-xn the same way. See currentJob's own doc comment for the exact
-// caching rule.
+// this repo's own already-correct solo.JobManager.jobForSession/
+// JobForSessionAtDifficulty (internal/leaflib/solo/job.go), which
+// caches per-session the same way. See currentJob's own doc comment
+// for the exact caching rule.
 type Session struct {
 	mc     *leaflib.ManagedConnection
 	server *Server
@@ -282,7 +282,7 @@ func (s *Session) alreadyDelivered(job *Job) bool {
 // maybeRetarget, Server.repushAllSessions) now goes through instead
 // of calling s.server.jobs.NextJob(difficulty) directly. It ports the
 // SAME caching discipline this repo's own already-correct
-// solo.JobManager.jobForXN/JobForXNAtDifficulty
+// solo.JobManager.jobForSession/JobForSessionAtDifficulty
 // (internal/leaflib/solo/job.go) already has, and that XNP's own
 // getJob() (lib/xmr.js) already has via miner.cachedJob/
 // activeBlockTemplate.id/!miner.newDiff -- adapted to leaf-proxy's own

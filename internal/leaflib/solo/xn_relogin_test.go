@@ -12,12 +12,27 @@ import (
 )
 
 // --- BRIEF_xn_relogin_fix.md required test coverage: a re-login must
-// roll a fresh xn (session extranonce) so a genuinely different
-// physical miner reusing the same TCP connection (xmrig-proxy's
-// `simple`-mode `--reuse-timeout` slot rotation) never inherits the
-// PREVIOUS worker's partially-used nonce space on the still-cached
-// job, which caused a real, live production false "duplicate_nonce"
-// rejection. ---
+// roll fresh per-session state so a genuinely different physical miner
+// reusing the same TCP connection (xmrig-proxy's `simple`-mode
+// `--reuse-timeout` slot rotation) never inherits the PREVIOUS
+// worker's partially-used nonce space on the still-cached job, which
+// caused a real, live production false "duplicate_nonce" rejection.
+//
+// WHICH VALUE THE FIX NOW RESTS ON: originally, rolling the xn WAS the
+// mechanism, because xn was also solo.JobManager's job-cache key.
+// That dual role has since been removed as a genuine correctness bug
+// in its own right (two unrelated sessions drawing the same 2-byte xn
+// shared one *Job and one usedNonces map -- see
+// leaflib.NewJobCacheKey and job_cache_key_test.go). handleLogin now
+// rolls BOTH values on a re-login, each for its own reason:
+// Session.jobKey because it is what the job cache is keyed by (so the
+// re-login lookup is a guaranteed MISS -- this is what preserves every
+// false-duplicate_nonce assertion in this file), and Session.xn
+// because it is the new downstream worker's own SHA3X/C29 submit-time
+// nonce-prefix partition and is published on the wire. The wire-xn
+// tests below therefore still assert the xn roll, and the
+// duplicate-nonce tests below still assert the resulting behavior;
+// only the internal value doing the cache-miss work changed. ---
 
 // stubDeterministicSessionXN overrides the package-level newSessionXN
 // func-var (job.go) with a deterministic, monotonically-incrementing
@@ -160,8 +175,9 @@ func TestSessionReloginWireXNReflectsNewValueC29(t *testing.T) {
 // wire-nonce convention at all -- see IsRandomXFamily -- so its own
 // job.XN wire field, unlike SHA3X/C29, is deliberately never sent;
 // this is exactly why the false-duplicate_nonce fix must be proven at
-// the internal JobForXNAtDifficulty cache-key level rather than via
-// any wire-visible xn assertion for this algo).
+// the internal job-cache-key level (Session.jobKey, rolled by
+// handleLogin) rather than via any wire-visible xn assertion for this
+// algo).
 func rxtRelogin(t *testing.T, h *testHarness, id int, addressLabel, pass string) LoginResponse {
 	t.Helper()
 	h.send(Request{ID: id, Method: "login", Params: mustJSON(t, LoginRequest{
@@ -180,8 +196,9 @@ func rxtRelogin(t *testing.T, h *testHarness, id int, addressLabel, pass string)
 // "same raw nonce" scenario impossible to construct honestly), RXT
 // lets this test submit the LITERAL SAME nonce string for both
 // identities and prove the fix operates purely through the internal
-// JobForXNAtDifficulty cache key, exactly as BRIEF_xn_relogin_fix.md's
-// test #2 asks for.
+// per-session job-cache key (Session.jobKey, rolled on every re-login
+// -- see this file's own header comment), exactly as
+// BRIEF_xn_relogin_fix.md's test #2 asks for.
 func TestSessionRXTReloginPreventsFalseDuplicateNonce(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_RXT, 1, 1<<62, 0,
 		validator.Registry{poolpb.Algo_ALGO_RXT: &fakeDelayedRandomXValidator{}}, nil)
@@ -272,7 +289,7 @@ func TestSessionRXTGenuineReplayWithoutReloginStillRejected(t *testing.T) {
 
 // TestSessionRXMReloginPreventsFalseDuplicateNonce is required test #5:
 // RXM (ALGO_RXM) is covered by the SAME fix via the internal
-// JobForXNAtDifficulty cache key, even though RXM's wire job payload
+// per-session job-cache key, even though RXM's wire job payload
 // never carries an "xn" field at all (jobPayload's `if
 // !IsRandomXFamily(job.Algo) { payload.XN = s.XN() }` -- RXM is
 // RandomX-family, so this is always skipped for it). This is

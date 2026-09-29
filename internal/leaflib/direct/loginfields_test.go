@@ -225,7 +225,7 @@ func TestDirectLoginPaymentIDIsStampedOnForwardedShares(t *testing.T) {
 	updated.PaymentID = paymentID
 	sess.identity.Store(&updated)
 
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: directXNPrefixedNonceHex(xn, 1),
 	})})
@@ -250,7 +250,7 @@ func TestDirectLoginPaymentIDIsStampedOnForwardedShares(t *testing.T) {
 func TestDirectLoginNoPaymentIDLeavesShareFieldNil(t *testing.T) {
 	h := newDirectLoginParseHarness(t, poolpb.Algo_ALGO_SHA3X, 1, solo.VardiffConfig{RetargetInterval: 60 * time.Second})
 	sessionID, xn := directLogin(t, h, realTariTestAddress("direct-login-no-payment-id"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: directXNPrefixedNonceHex(xn, 1),

@@ -3,7 +3,6 @@ package solo
 
 import (
 	"bytes"
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"net"
@@ -105,12 +104,9 @@ func TestSessionRXTSubmitAgainstRealRandomXServiceIsAccepted(t *testing.T) {
 	// genuinely-solved-block's exact difficulty magnitude.
 	h := newRXTTestHarness(t, 1, 1<<62, serviceURL)
 	sessionID, xn := login(t, h, "addr-rxt-real")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
-	job, err := h.jm.JobForXN(context.Background(), xn)
-	if err != nil {
-		t.Fatalf("JobForXN: %v", err)
-	}
+	job := currentJobForSession(t, h, xn)
 	if job.Algo != poolpb.Algo_ALGO_RXT {
 		t.Fatalf("job.Algo = %v, want ALGO_RXT", job.Algo)
 	}

@@ -21,7 +21,7 @@ import (
 // job cadence (~5-15s) could explain. See Session.currentJob's own
 // doc comment (session.go) for the exact caching rule being tested
 // here, ported from XNP's own getJob() (lib/xmr.js) and this repo's
-// own already-correct solo.JobManager.jobForXN/JobForXNAtDifficulty
+// own already-correct solo.JobManager.jobForSession/JobForSessionAtDifficulty
 // (internal/leaflib/solo/job.go).
 
 // TestSession_CurrentJob_CacheHitOnRepeatedGetJob_ThenInvalidatesOnRealTemplateChange

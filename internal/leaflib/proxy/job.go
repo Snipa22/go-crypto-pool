@@ -353,8 +353,9 @@ func (jm *JobManager) currentTargetDiffForRoute(route UpstreamRoute) (diff uint6
 // behavior for THIS low-level primitive -- it must remain unconditional
 // because Session.currentJob (session.go) is what adds the actual
 // caching/dedup discipline ON TOP of it (mirroring
-// internal/leaflib/solo/job.go's JobManager.jobForXN/
-// JobForXNAtDifficulty, which caches per-xn, and XNP's own getJob()
+// internal/leaflib/solo/job.go's JobManager.jobForSession/
+// JobForSessionAtDifficulty, which caches per-session, and XNP's own
+// getJob()
 // (lib/xmr.js), which short-circuits on an unchanged
 // activeBlockTemplate.id/!miner.newDiff via miner.cachedJob).
 //

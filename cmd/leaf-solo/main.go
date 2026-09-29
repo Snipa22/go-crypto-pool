@@ -934,15 +934,15 @@ func main() {
 		Node:          node,
 		PayoutAddress: cfg.payoutAddress,
 		Algo:          resolveAlgo(cfg),
-		// StaticDifficulty is only the JobForXN fallback default (see
-		// JobManagerConfig.StaticDifficulty's doc comment) — every
-		// real session created by Server.handleConn goes through
-		// JobForXNAtDifficulty with its OWN port tier's starting
-		// difficulty (or its current vardiff value thereafter), so
-		// this is not "the" difficulty for any port; the first
-		// configured port's difficulty is used here purely as a
-		// reasonable default for any hypothetical direct JobForXN
-		// caller.
+		// StaticDifficulty is only the JobForSession fallback default
+		// (see JobManagerConfig.StaticDifficulty's doc comment) —
+		// every real session created by Server.handleConn goes
+		// through JobForSessionAtDifficulty with its OWN port tier's
+		// starting difficulty (or its current vardiff value
+		// thereafter), so this is not "the" difficulty for any port;
+		// the first configured port's difficulty is used here purely
+		// as a reasonable default for any hypothetical direct
+		// JobForSession caller.
 		StaticDifficulty: ports[0].Difficulty,
 		RefreshInterval:  cfg.refreshInterval,
 		TipPollInterval:  cfg.tipPollInterval,

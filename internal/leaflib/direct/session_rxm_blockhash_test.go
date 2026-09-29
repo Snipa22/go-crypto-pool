@@ -286,7 +286,7 @@ func TestDirectSessionRXMBlockFindUsesRealSubmitBlockID(t *testing.T) {
 	m := h.server.EnableMetrics("test", 0)
 
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 50, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,
@@ -351,7 +351,7 @@ func TestDirectSessionRXMBlockFindSucceedsEvenWhenHeaderLookupWouldFail(t *testi
 	m := h.server.EnableMetrics("test", 0)
 
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 51, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,
@@ -407,7 +407,7 @@ func TestDirectSessionRXMBlockFindMissingBlockIDSkipsBackendForward(t *testing.T
 	m := h.server.EnableMetrics("test", 0)
 
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 52, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,

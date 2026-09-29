@@ -20,11 +20,11 @@ import (
 // CLOSE-WAIT vs 8,636 ESTAB observed via `ss -tn`). See
 // internal/leaflib/direct/server.go's Server.jobFetchPool doc comment and
 // session.go's handleLogin/fetchAndDeliverLoginJob doc comments for the
-// full root-cause explanation: solo.JobManager.jobForXN's per-xn
+// full root-cause explanation: solo.JobManager.jobForSession's per-session
 // cache-miss path (job.go ~line 553-622) can block for an effectively
 // unbounded time on a context-cancellation-immune sync.Mutex (a
-// per-xn generation lock; originally a single process-wide genMu,
-// narrowed to per-xn granularity by a later, related fix -- see
+// per-session generation lock; originally a single process-wide genMu,
+// narrowed to per-session granularity by a later, related fix -- see
 // solo/job.go's genLocks doc comment -- the property this test relies
 // on, an uninterruptible Lock() before the bounded GetBlockTemplate
 // call, holds either way) before ever reaching its own bounded
@@ -38,7 +38,7 @@ import (
 // blockingDirectNodeClient wraps *fakeDirectNodeClient, overriding only
 // GetBlockTemplate to block until either the test-controlled release
 // channel is closed or the caller's own ctx is done -- lets this test
-// deterministically simulate exactly the "stuck behind the per-xn
+// deterministically simulate exactly the "stuck behind the per-session
 // generation lock, then a
 // slow downstream GetBlockTemplate call" condition the production
 // incident hit, without needing a real monerod/base-node.
@@ -131,7 +131,7 @@ func TestDirectSession_LoginJobFetchBlocked_ClientDisconnectStillCleansUpPromptl
 	}
 
 	// A fresh session's xn has never been seen before -- this login
-	// unconditionally hits jobForXN's cache-miss path (the per-xn
+	// unconditionally hits jobForSession's cache-miss path (the per-session
 	// generation lock, then the blocked GetBlockTemplate call below),
 	// exactly the production incident's own trigger condition.
 	h.send(solo.Request{ID: 1, Method: "login", Params: mustDirectJSON(t, solo.LoginRequest{
@@ -139,7 +139,7 @@ func TestDirectSession_LoginJobFetchBlocked_ClientDisconnectStillCleansUpPromptl
 	})})
 
 	// Wait until the mock GetBlockTemplate call has genuinely been
-	// entered (i.e. the per-xn generation lock was acquired and the
+	// entered (i.e. the per-session generation lock was acquired and the
 	// blocked HTTP-call stand-in is now in flight) before proceeding
 	// -- otherwise this test could race ahead of the dispatch and
 	// prove nothing.
@@ -167,7 +167,7 @@ func TestDirectSession_LoginJobFetchBlocked_ClientDisconnectStillCleansUpPromptl
 	// CORE ASSERTION: server-side session cleanup (handleConn's defer
 	// -- delete(s.sessions, mc.ID())) must happen promptly, well before
 	// the still-blocked job fetch is ever released below. Before this
-	// fix, handleLogin ran JobForXNAtDifficulty INLINE on Session.Run's
+	// fix, handleLogin ran JobForSessionAtDifficulty INLINE on Session.Run's
 	// read-loop goroutine, so Run could never get back to
 	// scanner.Scan() (and therefore never notice the client's
 	// disconnect, and therefore never return, and therefore

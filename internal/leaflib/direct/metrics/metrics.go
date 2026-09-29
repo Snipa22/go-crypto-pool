@@ -220,7 +220,7 @@ const OtherAddressLabel = "other"
 //   - LoginRejectionReasonBanned: s.server.addressFlags.Get(...)
 //     .Banned is true.
 //   - LoginRejectionReasonNoJobTemplate:
-//     s.server.jobManager.JobForXNAtDifficulty failed -- reached from
+//     s.server.jobManager.JobForSessionAtDifficulty failed -- reached from
 //     fetchAndDeliverLoginJob (the jobFetchPool-dispatched closure
 //     handleLogin's own TrySubmit call defers this same real login
 //     rejection to), not handleLogin's own body directly -- see that

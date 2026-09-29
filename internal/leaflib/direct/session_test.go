@@ -484,13 +484,55 @@ func directSessionXN(t *testing.T, h *directTestHarness, sessionID string) strin
 	return ""
 }
 
-func directCurrentJobIDForXN(t *testing.T, h *directTestHarness, xn string) string {
+// directSessionByXN returns the single live Session on h.server whose
+// xn is xn -- mirrors solo package's own sessionByXN helper exactly
+// (including its refusal to disambiguate an xn shared by more than one
+// session, since xn is no longer an identity).
+func directSessionByXN(t *testing.T, h *directTestHarness, xn string) *Session {
 	t.Helper()
-	job, err := h.jm.JobForXN(context.Background(), xn)
+	h.server.mu.RLock()
+	defer h.server.mu.RUnlock()
+	var found []*Session
+	for _, s := range h.server.sessions {
+		if s.XN() == xn {
+			found = append(found, s)
+		}
+	}
+	if len(found) == 0 {
+		t.Fatalf("could not find a session with xn %q on server", xn)
+	}
+	if len(found) > 1 {
+		t.Fatalf("found %d sessions sharing xn %q on server -- this helper cannot disambiguate them (xn is not an identity)", len(found), xn)
+	}
+	return found[0]
+}
+
+// directCurrentJobIDForSession mirrors solo package's own
+// currentJobIDForSession helper exactly -- see that function's doc
+// comment for why this resolves through the owning session's OWN
+// job-cache key (Session.JobKey) rather than through its xn.
+func directCurrentJobIDForSession(t *testing.T, h *directTestHarness, xn string) string {
+	t.Helper()
+	sess := directSessionByXN(t, h, xn)
+	job, err := h.jm.JobForSessionAtDifficulty(context.Background(), sess.JobKey(), sess.currentDifficulty.Load())
 	if err != nil {
-		t.Fatalf("JobForXN(%q): %v", xn, err)
+		t.Fatalf("JobForSessionAtDifficulty(session %s, xn %q): %v", sess.sessionID, xn, err)
 	}
 	return job.ID
+}
+
+// directCurrentJobForSession is directCurrentJobIDForSession's
+// whole-*solo.Job counterpart, for the handful of tests that need the
+// real template material (pow_data/header) rather than just the
+// job_id.
+func directCurrentJobForSession(t *testing.T, h *directTestHarness, xn string) *solo.Job {
+	t.Helper()
+	sess := directSessionByXN(t, h, xn)
+	job, err := h.jm.JobForSessionAtDifficulty(context.Background(), sess.JobKey(), sess.currentDifficulty.Load())
+	if err != nil {
+		t.Fatalf("JobForSessionAtDifficulty(session %s, xn %q): %v", sess.sessionID, xn, err)
+	}
+	return job
 }
 
 // directRecvJobPush reads and decodes one unsolicited "job" push --
@@ -561,12 +603,15 @@ func TestDirectInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T
 	h.server.invalidateAndRepushJobs(solo.TemplateSourceLocal)
 	directExpectNoJobPush(t, h)
 
-	baselineJobID := directCurrentJobIDForXN(t, h, xn)
+	baselineJobID := directCurrentJobIDForSession(t, h, xn)
 
 	sess := directSessionByID(t, h, sessionID)
 	newDiff := sess.currentDifficulty.Load() * 2
 	sess.currentDifficulty.Store(newDiff)
-	if _, err := h.jm.RestampDifficulty(context.Background(), xn, newDiff); err != nil {
+	// Keyed by the session's OWN job-cache key (never its xn -- see
+	// leaflib.NewJobCacheKey), exactly as the real vardiff retarget
+	// path does.
+	if _, err := h.jm.RestampDifficulty(context.Background(), sess.JobKey(), newDiff); err != nil {
 		t.Fatalf("RestampDifficulty: %v", err)
 	}
 
@@ -604,7 +649,7 @@ func TestDirectInvalidateAndRepushJobsRecordsTemplateDistributionMetrics(t *test
 	h := newDirectTestHarness(t, 1000, 1<<62)
 	h.server.EnableMetrics("dev", 0)
 
-	sessionID, xn := directLogin(t, h, realTariTestAddress("direct-template-dist-1"))
+	sessionID, _ := directLogin(t, h, realTariTestAddress("direct-template-dist-1"))
 
 	// A second connection that never logs in -- invalidateAndRepushJobs
 	// must skip it (sess.loggedIn.Load() == false, the FIRST continue
@@ -638,7 +683,10 @@ func TestDirectInvalidateAndRepushJobsRecordsTemplateDistributionMetrics(t *test
 	sess := directSessionByID(t, h, sessionID)
 	newDiff := sess.currentDifficulty.Load() * 2
 	sess.currentDifficulty.Store(newDiff)
-	if _, err := h.jm.RestampDifficulty(context.Background(), xn, newDiff); err != nil {
+	// Keyed by the session's OWN job-cache key (never its xn -- see
+	// leaflib.NewJobCacheKey), exactly as the real vardiff retarget
+	// path does.
+	if _, err := h.jm.RestampDifficulty(context.Background(), sess.JobKey(), newDiff); err != nil {
 		t.Fatalf("RestampDifficulty: %v", err)
 	}
 
@@ -783,7 +831,7 @@ func newDirectRXTTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64,
 func TestDirectSessionRXTSubmitWithoutXNPrefixIsNotRejectedByXNCheck(t *testing.T) {
 	h := newDirectRXTTestHarness(t, 1, 1<<62, "http://127.0.0.1:1") // deliberately unreachable
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-rxt-noxn"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	badNonce := directXNPrefixedNonceHexBigEndian(xn, 0xdeadbeef)
 	badNonce = flipFirstHexNibble(badNonce)
@@ -813,7 +861,7 @@ func TestDirectSessionRXTSubmitWithoutXNPrefixIsNotRejectedByXNCheck(t *testing.
 func TestDirectSessionSHA3XSubmitWithoutXNPrefixIsStillRejected(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-sha3x-noxn"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	badNonce := directXNPrefixedNonceHex(xn, 1)
 	badNonce = flipFirstHexNibble(badNonce)
@@ -844,7 +892,7 @@ func TestDirectSessionSHA3XSubmitWithoutXNPrefixIsStillRejected(t *testing.T) {
 func TestDirectSessionSHA3XShareCarriesNonZeroTimestamp(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-sha3x-ts"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	before := time.Now().Unix()
 	h.send(solo.Request{ID: 72, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -910,7 +958,7 @@ func TestDirectSessionC29ShareCarriesNonZeroTimestamp(t *testing.T) {
 	t.Cleanup(func() { _ = clientConn.Close() })
 
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-c29-ts"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	before := time.Now().Unix()
 	cycle := make([]uint64, 42) // structurally-shaped, non-solving -- see solo's own C29 test honesty note
@@ -973,12 +1021,9 @@ func TestDirectSessionRXTShareCarriesNonZeroTimestamp(t *testing.T) {
 
 	h := newDirectRXTTestHarness(t, 1, 1<<62, serviceURL)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-rxt-ts"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
-	job, err := h.jm.JobForXN(context.Background(), xn)
-	if err != nil {
-		t.Fatalf("JobForXN: %v", err)
-	}
+	job := directCurrentJobForSession(t, h, xn)
 
 	nonceHex := directXNPrefixedNonceHexBigEndian(xn, 0x1122334455)
 	nonceBytes, err := hex.DecodeString(nonceHex)
@@ -1116,7 +1161,7 @@ func TestDirectSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-1"))
 
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -1155,7 +1200,7 @@ func TestDirectSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-2"))
 
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 3, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -1248,7 +1293,7 @@ func TestDirectSessionBlockFindCarriesNonZeroShares(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-shares"))
 
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 4, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -1284,7 +1329,7 @@ func TestDirectSessionSubmitCryptographicallyInvalid(t *testing.T) {
 	h := newDirectTestHarness(t, 1<<63, 1<<63)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-3"))
 
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 4, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -1329,7 +1374,7 @@ func TestDirectSessionSubmitDuplicateNonceIsRejected(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-6"))
 
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	submit := func() solo.LegacyShareResponse {
 		h.send(solo.Request{ID: 7, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 			ID:    sessionID,
@@ -1383,7 +1428,7 @@ func TestDirectSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
 		t.Fatalf("expected sessions A and B to get different xn values, both got %q", xnA)
 	}
 
-	jobIDA := directCurrentJobIDForXN(t, hA, xnA)
+	jobIDA := directCurrentJobIDForSession(t, hA, xnA)
 
 	hB.send(solo.Request{ID: 20, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:    sessionIDA,
@@ -1511,7 +1556,7 @@ func newDirectRXMTestHarness(t *testing.T, staticDiff, networkTargetDiff uint64)
 func TestDirectSessionRXMAccepts4ByteNonce(t *testing.T) {
 	h := newDirectRXMTestHarness(t, 1, 1<<62)
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	const xmrigCaptureNonce = "818d1a00" // real capture: 4 bytes, 8 hex chars
 	h.send(solo.Request{ID: 70, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -1535,7 +1580,7 @@ func TestDirectSessionRXMAccepts4ByteNonce(t *testing.T) {
 func TestDirectSessionRXMRejectsBadLengthNonce(t *testing.T) {
 	h := newDirectRXMTestHarness(t, 1, 1<<62)
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 71, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,
@@ -1559,7 +1604,7 @@ func TestDirectSessionRXMRejectsBadLengthNonce(t *testing.T) {
 func TestDirectSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
 	sessionID, xn := directLogin(t, h, realTariTestAddress("addr-direct-sha3x-4byte"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	shortNonce := xn + strings.Repeat("0", 8-len(xn))
 	h.send(solo.Request{ID: 72, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{

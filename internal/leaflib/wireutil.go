@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"math"
+	"strconv"
+	"sync/atomic"
 
 	"github.com/holiman/uint256"
 	"google.golang.org/protobuf/proto"
@@ -81,12 +83,74 @@ func NewRandomHexID() (string, error) {
 // m.xn = fmt.Sprintf("%x", buf[0:2])`): same size (2 bytes/4 hex
 // chars) and same "generated once per connection at accept time, not
 // per-job" timing, sourced from crypto/rand.
+//
+// IMPORTANT — xn is a WIRE-PROTOCOL value ONLY, never an identity.
+// 2 bytes is a 65,536-value space, so two genuinely unrelated
+// sessions drawing the SAME xn is an ordinary, empirically-observed
+// birthday-paradox event, not a pathological one (this repo's own
+// internal/leaflib/direct/server_repush_stale_sessions_test.go
+// records "500 random draws produced 2 real collisions in one run").
+// That is perfectly fine for what xn is actually FOR — the
+// SHA3X/C29 submit-time nonce-prefix partitioning check
+// (solo/session.go's handleSubmit) — but it makes xn categorically
+// unfit as a per-session identity/cache key. Use NewJobCacheKey
+// below for that; see its own doc comment for the real production
+// bug that distinction fixes.
 func NewSessionXN() (string, error) {
 	buf := make([]byte, 2)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// jobCacheKeySeq backs NewJobCacheKey's uniqueness guarantee: a
+// plain process-wide monotonic counter, deliberately NOT a random
+// draw of any width. See NewJobCacheKey.
+var jobCacheKeySeq atomic.Uint64
+
+// NewJobCacheKey returns a fresh job-cache identity key for one
+// session (solo.Session/direct.Session), of the form
+// "<sessionID>/<n>" where n is a process-wide monotonically
+// increasing counter.
+//
+// WHY THIS EXISTS (real correctness bug, maintainer-confirmed):
+// solo.JobManager used to cache the *Job it served to a session in a
+// map keyed by that session's xn (NewSessionXN above). Because the
+// cache lookup happens BEFORE any fresh per-session job is minted,
+// two UNRELATED sessions that happened to draw the same 2-byte xn
+// were handed the SAME *Job object by reference — same job.ID, same
+// template bytes, and critically the same usedNonces map
+// (solo.Job.MarkNonceUsed). For ALGO_RXM in particular (where the
+// xn-prefix wire check is deliberately skipped, since RandomX-family
+// miners control the whole nonce field) that meant two independent
+// miners hashing an IDENTICAL template with ZERO pool-imposed nonce
+// separation, producing spurious "duplicate nonce" rejections of
+// genuinely valid, never-before-seen shares. The intended design has
+// always been "one shared block template -> each miner gets its OWN
+// job, stamped with its own ID"; keying the cache off a 2-byte
+// random value silently violated it.
+//
+// UNIQUENESS IS BY CONSTRUCTION, NOT BY PROBABILITY. The counter is
+// what guarantees two live keys can never be equal, so there is no
+// collision probability to reason about at any session count — that
+// is the entire point, and it is why this is a counter rather than
+// "more random bytes than xn has". It also means there is no
+// error/degraded path to fall back to (contrast NewSessionXN's
+// callers, which must handle a crypto/rand failure and historically
+// fell back to a FIXED "0000" xn — itself a deliberate collision).
+// The sessionID prefix carries no uniqueness weight at all; it is
+// there purely so a key appearing in a log line is traceable back to
+// the session that owns it.
+//
+// Called once per session at connect time AND again on every
+// re-login (see solo/direct newSession + handleLogin), so a
+// connection handed to a genuinely different downstream worker by an
+// xmrig-proxy `--reuse-timeout` slot rotation gets a genuinely fresh
+// job with an empty used-nonce set instead of inheriting the
+// previous worker's partially-used nonce space.
+func NewJobCacheKey(sessionID string) string {
+	return sessionID + "/" + strconv.FormatUint(jobCacheKeySeq.Add(1), 10)
 }
 
 // AlgoWireName maps a Job's stamped poolpb.Algo onto the real wire

@@ -37,7 +37,7 @@ func TestDirectSessionRXTBelowStaticDifficultyFloorIsRejected(t *testing.T) {
 	h, tr := newDirectHardeningTestHarness(t, staticDiff, networkTargetDiff, &fakeDelayedDirectRandomXValidator{})
 
 	_, xn := directLogin(t, h, realTariTestAddress("addr-rxt-floor-below"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	nonce := make([]byte, 4)
 	nonce[0] = 0xaa
@@ -68,7 +68,7 @@ func TestDirectSessionRXTAtStaticDifficultyFloorIsAccepted(t *testing.T) {
 	h, tr := newDirectHardeningTestHarness(t, staticDiff, networkTargetDiff, &fakeDelayedDirectRandomXValidator{})
 
 	_, xn := directLogin(t, h, realTariTestAddress("addr-rxt-floor-at"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	nonce := make([]byte, 4)
 	nonce[0] = 0xbb
@@ -106,7 +106,7 @@ func TestDirectSessionRXTRepeatedFabricatedClaimsGetDisconnected(t *testing.T) {
 		leaflib.InvalidShareGuardConfig{Enabled: true, Threshold: threshold})
 
 	_, xn := directLogin(t, h, realTariTestAddress("addr-rxt-dos"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	for i := 0; i < threshold; i++ {
 		nonce := make([]byte, 4)

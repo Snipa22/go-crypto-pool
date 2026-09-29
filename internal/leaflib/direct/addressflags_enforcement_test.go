@@ -90,7 +90,7 @@ func TestDirectSessionSubmit_RejectsAddressBannedMidSession(t *testing.T) {
 	h.server.EnableAddressFlags(cache)
 
 	sessionID, xn := directLogin(t, h, addr)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	src.set(addr, addressflags.Flags{Banned: true})
 	waitForDirectCachePoll(t, cache, addr, true)

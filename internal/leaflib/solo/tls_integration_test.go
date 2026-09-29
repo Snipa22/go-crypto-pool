@@ -110,9 +110,9 @@ func TestServeOverRealTLSListener(t *testing.T) {
 		t.Fatalf("xn %q is not valid hex: %v", xn, err)
 	}
 
-	job, err := jm.JobForXN(context.Background(), xn)
+	job, err := jm.JobForSession(context.Background(), xn)
 	if err != nil {
-		t.Fatalf("JobForXN(%q): %v", xn, err)
+		t.Fatalf("JobForSession(%q): %v", xn, err)
 	}
 	if job.StaticDifficulty != startingDifficulty {
 		t.Fatalf("job.StaticDifficulty = %d, want %d (this TLS-served port tier's configured starting difficulty)", job.StaticDifficulty, startingDifficulty)

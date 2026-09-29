@@ -23,7 +23,7 @@ func TestStatsHTMLHandler_RendersRealConnectedSessionData(t *testing.T) {
 	h := newTestHarness(t, 1, math.MaxUint64)
 	_, xn := login(t, h, "stats-ui-test-address")
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 12345),
@@ -89,7 +89,7 @@ func TestStatsHTMLHandler_EmptyServerRendersWithoutError(t *testing.T) {
 func TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured(t *testing.T) {
 	h := newTestHarness(t, 1, math.MaxUint64)
 	_, xn := login(t, h, "hide-remote-addr-test")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 12345),

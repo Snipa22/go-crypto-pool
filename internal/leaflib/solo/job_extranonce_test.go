@@ -26,7 +26,7 @@ import (
 // port, two separate logins, same leaf, same tip): both sessions got
 // a BYTE-IDENTICAL `blob` in their job payloads, only job_id/target
 // differed. Root cause: JobManager.jobFromSharedTemplate derived
-// every per-xn *Job by copying tpl.Header/tpl.RawTemplateBlob BY
+// every per-session *Job by copying tpl.Header/tpl.RawTemplateBlob BY
 // REFERENCE and patching nothing, so every Monero-family miner on the
 // leaf searched the exact same space as every other one.
 //
@@ -249,41 +249,41 @@ func stampedInstanceID(t *testing.T, job *Job) []byte {
 	return parsedExtraNonceRegion(t, job)[4:8]
 }
 
-// TestSharedTemplateDifferentXNsGetDistinctExtraNonceStampedBlobs is
-// THE regression test for the reported bug: two sequential jobForXN
-// calls for two genuinely DIFFERENT xns, against the SAME shared
+// TestSharedTemplateDifferentSessionsGetDistinctExtraNonceStampedBlobs is
+// THE regression test for the reported bug: two sequential jobForSession
+// calls for two genuinely DIFFERENT sessions, against the SAME shared
 // template (proved by the single GetBlockTemplate call), must produce
 // two *Jobs whose Header (the hashing blob a miner actually mines)
 // AND RawTemplateBlob genuinely differ -- and must differ for the
 // RIGHT reason (a real, incrementing extraNonce in the real coinbase
 // tx_extra reserved region, not incidental noise).
-func TestSharedTemplateDifferentXNsGetDistinctExtraNonceStampedBlobs(t *testing.T) {
+func TestSharedTemplateDifferentSessionsGetDistinctExtraNonceStampedBlobs(t *testing.T) {
 	const height = 3_500_777
 	jm, node := newExtraNonceFixtureJobManager(t, height)
 	ctx := context.Background()
 
-	jobA, err := jm.JobForXN(ctx, "aaaa")
+	jobA, err := jm.JobForSession(ctx, "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN(aaaa): %v", err)
+		t.Fatalf("JobForSession(aaaa): %v", err)
 	}
-	jobB, err := jm.JobForXN(ctx, "bbbb")
+	jobB, err := jm.JobForSession(ctx, "bbbb")
 	if err != nil {
-		t.Fatalf("JobForXN(bbbb): %v", err)
+		t.Fatalf("JobForSession(bbbb): %v", err)
 	}
 
 	// Still ONE shared template (this fix must not reintroduce the
 	// per-session daemon-call stampede the shared-template feature
 	// removed -- see job_shared_template_test.go).
 	if got := node.callCount(); got != 1 {
-		t.Fatalf("GetBlockTemplate call count = %d, want exactly 1 (both xns must still share ONE template)", got)
+		t.Fatalf("GetBlockTemplate call count = %d, want exactly 1 (both sessions must still share ONE template)", got)
 	}
 
 	// THE actual bug: byte-identical blobs across sessions.
 	if bytes.Equal(jobA.Header, jobB.Header) {
-		t.Fatalf("BUG REGRESSION: two different xns got BYTE-IDENTICAL hashing blobs (Header) from the same shared template: %s", hex.EncodeToString(jobA.Header))
+		t.Fatalf("BUG REGRESSION: two different sessions got BYTE-IDENTICAL hashing blobs (Header) from the same shared template: %s", hex.EncodeToString(jobA.Header))
 	}
 	if bytes.Equal(jobA.RawTemplateBlob, jobB.RawTemplateBlob) {
-		t.Fatal("BUG REGRESSION: two different xns got BYTE-IDENTICAL RawTemplateBlobs from the same shared template")
+		t.Fatal("BUG REGRESSION: two different sessions got BYTE-IDENTICAL RawTemplateBlobs from the same shared template")
 	}
 
 	// ...and differ for the RIGHT reason: a real, incrementing
@@ -316,19 +316,19 @@ func TestSharedTemplateDifferentXNsGetDistinctExtraNonceStampedBlobs(t *testing.
 	// the merkle root, hence the hashing blob -- but never its shape).
 	for name, job := range map[string]*Job{"aaaa": jobA, "bbbb": jobB} {
 		if len(job.Header) != xnpFixtureHashingBlobLen {
-			t.Errorf("job for xn %s: len(Header) = %d, want %d (the real, correctly-sized RandomX hashing blob for this fixture)", name, len(job.Header), xnpFixtureHashingBlobLen)
+			t.Errorf("job for session %s: len(Header) = %d, want %d (the real, correctly-sized RandomX hashing blob for this fixture)", name, len(job.Header), xnpFixtureHashingBlobLen)
 		}
 	}
 
-	// Repeat requests for an already-cached xn must still return the
-	// SAME Job (JobForXN's documented contract) -- the stamp happens
+	// Repeat requests for an already-cached session must still return the
+	// SAME Job (JobForSession's documented contract) -- the stamp happens
 	// once per genuinely-new derivation, not once per getjob.
-	again, err := jm.JobForXN(ctx, "aaaa")
+	again, err := jm.JobForSession(ctx, "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN(aaaa) repeat: %v", err)
+		t.Fatalf("JobForSession(aaaa) repeat: %v", err)
 	}
 	if again != jobA {
-		t.Fatal("a repeat JobForXN call for an already-cached xn returned a different *Job -- the extraNonce stamp must not fire on cache hits")
+		t.Fatal("a repeat JobForSession call for an already-cached session returned a different *Job -- the extraNonce stamp must not fire on cache hits")
 	}
 }
 
@@ -349,9 +349,9 @@ func TestSharedTemplateStampedJobCarriesItsOwnTemplateData(t *testing.T) {
 	const height = 3_500_778
 	jm, _ := newExtraNonceFixtureJobManager(t, height)
 
-	job, err := jm.JobForXN(context.Background(), "cccc")
+	job, err := jm.JobForSession(context.Background(), "cccc")
 	if err != nil {
-		t.Fatalf("JobForXN: %v", err)
+		t.Fatalf("JobForSession: %v", err)
 	}
 
 	data, ok := job.TemplateData.(*moneroTemplateData)
@@ -420,13 +420,13 @@ func TestSharedTemplateExtraNonceRestartsOnGenuinelyNewTemplate(t *testing.T) {
 	jm, node := newExtraNonceFixtureJobManager(t, heightOne, heightTwo)
 	ctx := context.Background()
 
-	first, err := jm.JobForXN(ctx, "aaaa")
+	first, err := jm.JobForSession(ctx, "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN(aaaa): %v", err)
+		t.Fatalf("JobForSession(aaaa): %v", err)
 	}
-	second, err := jm.JobForXN(ctx, "bbbb")
+	second, err := jm.JobForSession(ctx, "bbbb")
 	if err != nil {
-		t.Fatalf("JobForXN(bbbb): %v", err)
+		t.Fatalf("JobForSession(bbbb): %v", err)
 	}
 	if got := stampedExtraNonce(t, first); got != 1 {
 		t.Fatalf("generation 1, first derivation: extraNonce = %d, want 1", got)
@@ -439,13 +439,13 @@ func TestSharedTemplateExtraNonceRestartsOnGenuinelyNewTemplate(t *testing.T) {
 	node.setHeight(heightTwo)
 	jm.InvalidateAll(TemplateSourceLocal)
 
-	afterOne, err := jm.JobForXN(ctx, "aaaa")
+	afterOne, err := jm.JobForSession(ctx, "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN(aaaa) after invalidation: %v", err)
+		t.Fatalf("JobForSession(aaaa) after invalidation: %v", err)
 	}
-	afterTwo, err := jm.JobForXN(ctx, "bbbb")
+	afterTwo, err := jm.JobForSession(ctx, "bbbb")
 	if err != nil {
-		t.Fatalf("JobForXN(bbbb) after invalidation: %v", err)
+		t.Fatalf("JobForSession(bbbb) after invalidation: %v", err)
 	}
 	if got := node.callCount(); got != 2 {
 		t.Fatalf("GetBlockTemplate call count = %d, want 2 (one per template generation)", got)
@@ -465,25 +465,25 @@ func TestSharedTemplateExtraNonceRestartsOnGenuinelyNewTemplate(t *testing.T) {
 // relay-adoption half of the brief: a leaf that ADOPTS a sibling's
 // relayed template must give ITS OWN sessions the same "every new job
 // gets a fresh stamp" treatment, on top of the already-shipped
-// instanceID stamp -- both for the xns reseeded by the adoption
+// instanceID stamp -- both for the sessions reseeded by the adoption
 // itself (adoptRelayedJobShared) and for sessions arriving later off
 // the adopted shared template (jobForXNFromSharedTemplate). Both go
 // through the SAME jobFromSharedTemplate helper, which is exactly
 // what this asserts (no forked second implementation).
 func TestSharedTemplateRelayAdoptionAlsoStampsExtraNonce(t *testing.T) {
 	const (
-		localHeight    = 3_500_900
-		adoptedHeight  = 3_500_950
-		knownXNCount   = 3
-		wantAdoptCalls = 1
+		localHeight       = 3_500_900
+		adoptedHeight     = 3_500_950
+		knownSessionCount = 3
+		wantAdoptCalls    = 1
 	)
 	jm, node := newExtraNonceFixtureJobManager(t, localHeight, adoptedHeight)
 	ctx := context.Background()
 
-	knownXNs := []string{"aa01", "aa02", "aa03"}
-	for _, xn := range knownXNs {
-		if _, err := jm.JobForXN(ctx, xn); err != nil {
-			t.Fatalf("JobForXN(%s): %v", xn, err)
+	knownSessionKeys := []string{"known-a/1", "known-b/2", "known-c/3"}
+	for _, sessionKey := range knownSessionKeys {
+		if _, err := jm.JobForSession(ctx, sessionKey); err != nil {
+			t.Fatalf("JobForSession(%s): %v", sessionKey, err)
 		}
 	}
 	if got := node.callCount(); got != wantAdoptCalls {
@@ -503,40 +503,40 @@ func TestSharedTemplateRelayAdoptionAlsoStampsExtraNonce(t *testing.T) {
 	}
 
 	seen := map[uint32]string{}
-	for _, xn := range knownXNs {
-		job, err := jm.JobForXN(ctx, xn)
+	for _, sessionKey := range knownSessionKeys {
+		job, err := jm.JobForSession(ctx, sessionKey)
 		if err != nil {
-			t.Fatalf("JobForXN(%s) after adoption: %v", xn, err)
+			t.Fatalf("JobForSession(%s) after adoption: %v", sessionKey, err)
 		}
 		if job.Height != adoptedHeight {
-			t.Fatalf("xn %s: height = %d, want the adopted %d", xn, job.Height, adoptedHeight)
+			t.Fatalf("session %s: height = %d, want the adopted %d", sessionKey, job.Height, adoptedHeight)
 		}
 		nonce := stampedExtraNonce(t, job)
 		if nonce == 0 {
-			t.Fatalf("xn %s: job derived from the ADOPTED relay template carries no extraNonce stamp -- the relay-adoption path must stamp too", xn)
+			t.Fatalf("session %s: job derived from the ADOPTED relay template carries no extraNonce stamp -- the relay-adoption path must stamp too", sessionKey)
 		}
 		if prev, dup := seen[nonce]; dup {
-			t.Fatalf("xn %s and xn %s were both derived from the adopted relay template with the SAME extraNonce %d -- duplicate search space", xn, prev, nonce)
+			t.Fatalf("session %s and session %s were both derived from the adopted relay template with the SAME extraNonce %d -- duplicate search space", sessionKey, prev, nonce)
 		}
-		seen[nonce] = xn
+		seen[nonce] = sessionKey
 	}
 
 	// A session arriving AFTER the adoption (a plain cache miss
 	// against the adopted shared template) must draw from the SAME
-	// counter, so it cannot collide with any of the reseeded xns.
-	late, err := jm.JobForXN(ctx, "bb99")
+	// counter, so it cannot collide with any of the reseeded sessions.
+	late, err := jm.JobForSession(ctx, "bb99")
 	if err != nil {
-		t.Fatalf("JobForXN(bb99) after adoption: %v", err)
+		t.Fatalf("JobForSession(bb99) after adoption: %v", err)
 	}
 	if got := node.callCount(); got != wantAdoptCalls {
-		t.Fatalf("a post-adoption new xn triggered a local GetBlockTemplate (count = %d) -- it must derive from the adopted shared template", got)
+		t.Fatalf("a post-adoption new session triggered a local GetBlockTemplate (count = %d) -- it must derive from the adopted shared template", got)
 	}
 	lateNonce := stampedExtraNonce(t, late)
 	if prev, dup := seen[lateNonce]; dup {
-		t.Fatalf("a session arriving after the adoption reused xn %s's extraNonce %d -- the adopting leaf's later sessions must draw from the same per-template counter", prev, lateNonce)
+		t.Fatalf("a session arriving after the adoption reused session %s's extraNonce %d -- the adopting leaf's later sessions must draw from the same per-template counter", prev, lateNonce)
 	}
-	if len(seen) != knownXNCount {
-		t.Fatalf("expected %d distinct extraNonce values across the reseeded xns, got %d", knownXNCount, len(seen))
+	if len(seen) != knownSessionCount {
+		t.Fatalf("expected %d distinct extraNonce values across the reseeded sessions, got %d", knownSessionCount, len(seen))
 	}
 }
 
@@ -611,7 +611,7 @@ func TestSharedTemplateUnparseableBlobDegradesToUnstampedBytes(t *testing.T) {
 	tpl := malformedMoneroTemplateJob()
 	jm.setSharedTemplate(tpl)
 
-	job, err := jm.JobForXN(context.Background(), "dead")
+	job, err := jm.JobForSession(context.Background(), "dead")
 	if err != nil {
 		t.Fatalf("job derivation failed outright on an unparseable template blob -- it must degrade gracefully, never fail: %v", err)
 	}
@@ -668,8 +668,8 @@ func TestSharedTemplateUnparseableBlobDoesNotWedgeTheCircuitBreaker(t *testing.T
 
 	derivations := 4 * moneroblob.BreakerThreshold
 	for i := 0; i < derivations; i++ {
-		xn := hex.EncodeToString([]byte{byte(i >> 8), byte(i)})
-		if _, err := jm.JobForXN(context.Background(), xn); err != nil {
+		sessionKey := hex.EncodeToString([]byte{byte(i >> 8), byte(i)})
+		if _, err := jm.JobForSession(context.Background(), sessionKey); err != nil {
 			t.Fatalf("derivation %d failed outright: %v", i, err)
 		}
 	}
@@ -723,9 +723,9 @@ func TestSharedTemplateStampIsSkippedForNonMoneroTemplateData(t *testing.T) {
 	})
 	jm.setSharedTemplate(tpl)
 
-	job, err := jm.JobForXN(context.Background(), "beef")
+	job, err := jm.JobForSession(context.Background(), "beef")
 	if err != nil {
-		t.Fatalf("JobForXN: %v", err)
+		t.Fatalf("JobForSession: %v", err)
 	}
 	if !bytes.Equal(job.Header, tpl.Header) || !bytes.Equal(job.RawTemplateBlob, tpl.RawTemplateBlob) {
 		t.Error("a non-Monero shared template's Header/RawTemplateBlob were altered -- the stamp must be Monero-family-only")
@@ -740,7 +740,7 @@ func TestSharedTemplateStampIsSkippedForNonMoneroTemplateData(t *testing.T) {
 // line (see this fix's own dispatch brief) -- none of the actual
 // stamping logic/bounds-check thresholds/control flow changes; these
 // tests exist purely to prove the NEW observability, calling
-// extraNonceStampedTemplate directly (rather than through JobForXN)
+// extraNonceStampedTemplate directly (rather than through JobForSession)
 // so each path can be exercised and asserted on in isolation.
 
 // newLoggingTestJobManager returns a bare JobManager whose jm.logger

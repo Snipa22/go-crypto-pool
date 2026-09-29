@@ -204,14 +204,15 @@ type Server struct {
 	// observed via `ss -tn`, leaf_direct_active_connections gauge
 	// tracking process fd count ~1:1): session.go's
 	// handleLogin/handleGetJob used to call
-	// s.server.jobManager.JobForXNAtDifficulty DIRECTLY on
+	// s.server.jobManager.JobForSessionAtDifficulty DIRECTLY on
 	// Session.Run's own read-loop goroutine, with NO worker-pool
 	// dispatch at all -- unlike forwardShare/forwardBlock
 	// (forwardPool, above) and RandomX-family finishSubmit
 	// (randomxPool, above), which already got this exact fix. On a
 	// per-xn job-cache MISS (first time a session's xn is seen, or --
 	// critically -- after chain-tip movement invalidates EVERY
-	// currently-cached xn at once, see solo/job.go's jobForXN doc
+	// currently-cached session at once, see solo/job.go's
+	// jobForSession doc
 	// comment), that call acquires a per-xn generation lock inside
 	// solo.JobManager (originally a single server/process-wide genMu
 	// sync.Mutex shared across EVERY xn; narrowed to per-xn
@@ -258,7 +259,7 @@ type Server struct {
 	// ~2 minutes, with zero "new tip detected... invalidating" log
 	// lines in that window (journalctl still showed unrelated
 	// per-session "new block template fetched" lines from job.go's
-	// jobForXN, which fires on ANY cache-miss job generation, not just
+	// jobForSession, which fires on ANY cache-miss job generation, not just
 	// tip movement). Root cause chain, all synchronous on ONE
 	// goroutine -- solo/job.go's tipPollLoop (~line 899-967) calls
 	// InvalidateAll (~line 737-744) inline, which calls notify
@@ -1341,8 +1342,9 @@ func (s *Server) recordTemplateDistribution(source string, seconds float64, mine
 // debouncedInvalidateAndRepushJobs -- see repushPool's own doc comment
 // for that half of the fix, which gets THIS call itself off that
 // goroutine). Because a cache invalidation wipes solo.JobManager's
-// ENTIRE per-xn map and every session has a unique xn,
-// JobForXNAtDifficulty below is a guaranteed cache MISS for every
+// ENTIRE per-session map and every session has a unique job-cache
+// key,
+// JobForSessionAtDifficulty below is a guaranteed cache MISS for every
 // single session -- a real, synchronous GetBlockTemplate HTTP round
 // trip each. Confirmed live: with s.sessions bloated to ~100,000+
 // entries (the sibling CLOSE-WAIT leak's own symptom -- jobFetchPool's
@@ -1385,9 +1387,9 @@ func (s *Server) invalidateAndRepushJobs(source string) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			job, err := s.jobManager.JobForXNAtDifficulty(context.Background(), sess.XN(), sess.currentDifficulty.Load())
+			job, err := s.jobManager.JobForSessionAtDifficulty(context.Background(), sess.JobKey(), sess.currentDifficulty.Load())
 			if err != nil {
-				s.logger.Printf("direct: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.XN(), err)
+				s.logger.Printf("direct: failed to regenerate job for session %s (job_key %s) after cache invalidation: %v", sess.sessionID, sess.JobKey(), err)
 				return
 			}
 			// BUG FIX (Alex, live production report: "we're sending
@@ -1408,7 +1410,7 @@ func (s *Server) invalidateAndRepushJobs(source string) {
 }
 
 // repushFanoutConcurrency bounds how many of invalidateAndRepushJobs'
-// own per-session JobForXNAtDifficulty calls (each a real,
+// own per-session JobForSessionAtDifficulty calls (each a real,
 // independent GetBlockTemplate HTTP round trip on a cache miss -- see
 // that method's own doc comment) may be genuinely in flight
 // simultaneously. A plain semaphore-gated sync.WaitGroup is used

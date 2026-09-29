@@ -147,7 +147,7 @@ func submitTrustedRXTShare(t *testing.T, h *directTestHarness, sess *Session, se
 func TestDirectSessionRXTBlockFindSetsFoundBlockTrue(t *testing.T) {
 	const staticDiff, networkTargetDiff = uint64(1), uint64(1)
 	h, sess, sessionID, xn := newDirectFoundBlockRXTHarness(t, staticDiff, networkTargetDiff)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	accepted, lastErr := submitTrustedRXTShare(t, h, sess, sessionID, xn, jobID, 501, 0xdeadbeef)
 	if !accepted {
@@ -173,7 +173,7 @@ func TestDirectSessionRXTBlockFindSetsFoundBlockTrue(t *testing.T) {
 func TestDirectSessionRXTOrdinarySubmitLeavesFoundBlockFalse(t *testing.T) {
 	const staticDiff, networkTargetDiff = uint64(1), uint64(1) << 62
 	h, sess, sessionID, xn := newDirectFoundBlockRXTHarness(t, staticDiff, networkTargetDiff)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	accepted, lastErr := submitTrustedRXTShare(t, h, sess, sessionID, xn, jobID, 502, 0x1000)
 	if !accepted {
@@ -216,7 +216,7 @@ func TestDirectSessionRXMBlockFindSetsFoundBlockTrue(t *testing.T) {
 
 	h := newDirectRXMBlockFindHarness(t, srv, 1)
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 503, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,
@@ -257,7 +257,7 @@ func TestDirectSessionRXMOrdinarySubmitLeavesFoundBlockFalse(t *testing.T) {
 
 	h := newDirectRXMBlockFindHarness(t, srv, 1)
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 504, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,

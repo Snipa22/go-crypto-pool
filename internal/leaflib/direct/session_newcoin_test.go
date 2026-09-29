@@ -123,7 +123,7 @@ func TestDirectSessionNewCoinAlgoBlockFind(t *testing.T) {
 	h := newDirectNewCoinBlockFindHarness(t, srv, 1, poolpb.Algo_ALGO_ARQ, realDirectARQMainnetAddr)
 
 	sessionID, xn := directLoginNewCoin(t, h, realDirectARQMainnetAddr)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 50, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,

@@ -29,7 +29,7 @@ func TestServerStats_TotalEstimatedHashrateEqualsSumOfSessions(t *testing.T) {
 	_, xnA := directLogin(t, h, realTariTestAddress("hashrate-test-addr-a"))
 
 	const sharesA = 5
-	jobIDA := directCurrentJobIDForXN(t, h, xnA)
+	jobIDA := directCurrentJobIDForSession(t, h, xnA)
 	for i := 0; i < sharesA; i++ {
 		h.send(solo.Request{ID: 10 + i, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 			JobID: jobIDA,
@@ -50,7 +50,7 @@ func TestServerStats_TotalEstimatedHashrateEqualsSumOfSessions(t *testing.T) {
 	_, xnB := directLogin(t, hB, realTariTestAddress("hashrate-test-addr-b"))
 
 	const sharesB = 3
-	jobIDB := directCurrentJobIDForXN(t, hB, xnB)
+	jobIDB := directCurrentJobIDForSession(t, hB, xnB)
 	for i := 0; i < sharesB; i++ {
 		hB.send(solo.Request{ID: 20 + i, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 			JobID: jobIDB,
@@ -93,7 +93,7 @@ func TestServerStats_TotalEstimatedHashrateEqualsSumOfSessions(t *testing.T) {
 func TestStatsHTMLHandler_RendersGlobalHashrateCard(t *testing.T) {
 	h := newDirectTestHarness(t, 1, 1<<62)
 	_, xn := directLogin(t, h, realTariTestAddress("global-hashrate-fixture-addr"))
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		JobID: jobID,
 		Nonce: directXNPrefixedNonceHexBigEndian(xn, 12345),

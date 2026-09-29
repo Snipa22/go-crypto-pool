@@ -81,7 +81,7 @@ func TestSessionSubmitDebugDisabledProducesNoDebugOutput(t *testing.T) {
 	h := newDebugTestHarness(t, 1, math.MaxUint64, logger, false)
 	sessionID, xn := login(t, h, "addr-debug-off")
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -113,7 +113,7 @@ func TestSessionSubmitDebugEnabledProducesDebugOutput(t *testing.T) {
 	h := newDebugTestHarness(t, 1, math.MaxUint64, logger, true)
 	sessionID, xn := login(t, h, "addr-debug-on")
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	nonceHex := xnPrefixedNonceHex(xn, 54321)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,

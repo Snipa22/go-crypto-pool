@@ -169,7 +169,7 @@ func scrapeSoloMetrics(t *testing.T, s *Server) string {
 }
 
 // TestSessionLoginRejectionReason_NoJobTemplate covers handleLogin's
-// s.server.jobManager.JobForXNAtDifficulty failure call site -- a
+// s.server.jobManager.JobForSessionAtDifficulty failure call site -- a
 // real, valid, unbanned login that still can't be issued a job
 // because the node's GetBlockTemplate call itself fails.
 func TestSessionLoginRejectionReason_NoJobTemplate(t *testing.T) {
