@@ -70,7 +70,7 @@ func waitForHistogramSampleCountAtLeast(t *testing.T, hv *prometheus.HistogramVe
 func TestDirectSubmitProcessingSeconds_AcceptedAndRejected_HaveNonZeroObservations(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("timing-accept-reject"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	// Accepted: a genuine, ordinary submit against the real,
 	// currently-owned job.
@@ -128,7 +128,7 @@ func TestDirectSubmitProcessingSeconds_LoginRequiredEarlyExit_IsTimed(t *testing
 func TestDirectSubmitValidationSeconds_ObservedForRealValidatedSubmit(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_RXT, 1, 1<<62, validator.Registry{poolpb.Algo_ALGO_RXT: &fakeControllableValidator{valid: true}}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("timing-validation-real"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID,
@@ -157,7 +157,7 @@ func TestDirectSubmitValidationSeconds_ObservedForRealValidatedSubmit(t *testing
 func TestDirectSubmitValidationSeconds_NotObservedForTrustedMinerSkip(t *testing.T) {
 	h := newClassificationTestHarness(t, true)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("timing-validation-skip"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.server.mu.RLock()
 	var sess *Session

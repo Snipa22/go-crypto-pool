@@ -70,7 +70,7 @@ func waitForHistogramSampleCountAtLeast(t *testing.T, hv *prometheus.HistogramVe
 func TestSubmitProcessingSeconds_AcceptedAndRejected_HaveNonZeroObservations(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, 0, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "timing-accept-reject")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	// Accepted: a genuine, ordinary submit against the real,
 	// currently-owned job.
