@@ -276,6 +276,122 @@ func TestLoadConfig_StatsAPIRateLimit_FlagEnvFileDefault(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_HashHistory_FlagEnvFileDefault proves the new
+// -hash-history-interval/GCPOOL_HASH_HISTORY_INTERVAL and
+// -hash-history-max-points/GCPOOL_HASH_HISTORY_MAX_POINTS flags/env
+// vars/TOML fields are wired into loadConfig() following the same
+// flag > env > file > hardcoded-default precedence as every other
+// setting in this file.
+func TestLoadConfig_HashHistory_FlagEnvFileDefault(t *testing.T) {
+	cases := []precedenceCase{
+		// -- duration field: hash-history-interval ------------------------
+		{
+			name: "interval/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryInterval != defaultHashHistoryInterval {
+					t.Errorf("hashHistoryInterval = %v, want hardcoded default %v", cfg.hashHistoryInterval, defaultHashHistoryInterval)
+				}
+			},
+		},
+		{
+			name: "interval/file-only",
+			toml: `hash_history_interval_seconds = 30`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryInterval != 30*time.Second {
+					t.Errorf("hashHistoryInterval = %v, want file value 30s", cfg.hashHistoryInterval)
+				}
+			},
+		},
+		{
+			name: "interval/env-only",
+			env:  map[string]string{"GCPOOL_HASH_HISTORY_INTERVAL": "45s"},
+			toml: `hash_history_interval_seconds = 30`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryInterval != 45*time.Second {
+					t.Errorf("hashHistoryInterval = %v, want env value 45s (env must beat file)", cfg.hashHistoryInterval)
+				}
+			},
+		},
+		{
+			name: "interval/flag-only",
+			args: []string{"-hash-history-interval=90s"},
+			toml: `hash_history_interval_seconds = 30`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryInterval != 90*time.Second {
+					t.Errorf("hashHistoryInterval = %v, want flag value 90s (flag must beat env absence and file)", cfg.hashHistoryInterval)
+				}
+			},
+		},
+		{
+			name: "interval/flag-env-file-all-set",
+			args: []string{"-hash-history-interval=90s"},
+			env:  map[string]string{"GCPOOL_HASH_HISTORY_INTERVAL": "45s"},
+			toml: `hash_history_interval_seconds = 30`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryInterval != 90*time.Second {
+					t.Errorf("hashHistoryInterval = %v, want flag value 90s (flag must win full precedence)", cfg.hashHistoryInterval)
+				}
+			},
+		},
+
+		// -- int field: hash-history-max-points ---------------------------
+		{
+			name: "max-points/default",
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryMaxPoints != defaultHashHistoryMaxPoints {
+					t.Errorf("hashHistoryMaxPoints = %d, want hardcoded default %d", cfg.hashHistoryMaxPoints, defaultHashHistoryMaxPoints)
+				}
+			},
+		},
+		{
+			name: "max-points/file-only",
+			toml: `hash_history_max_points = 100`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryMaxPoints != 100 {
+					t.Errorf("hashHistoryMaxPoints = %d, want file value 100", cfg.hashHistoryMaxPoints)
+				}
+			},
+		},
+		{
+			name: "max-points/env-only",
+			env:  map[string]string{"GCPOOL_HASH_HISTORY_MAX_POINTS": "200"},
+			toml: `hash_history_max_points = 100`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryMaxPoints != 200 {
+					t.Errorf("hashHistoryMaxPoints = %d, want env value 200 (env must beat file)", cfg.hashHistoryMaxPoints)
+				}
+			},
+		},
+		{
+			name: "max-points/flag-only",
+			args: []string{"-hash-history-max-points=300"},
+			toml: `hash_history_max_points = 100`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryMaxPoints != 300 {
+					t.Errorf("hashHistoryMaxPoints = %d, want flag value 300 (flag must beat env absence and file)", cfg.hashHistoryMaxPoints)
+				}
+			},
+		},
+		{
+			name: "max-points/flag-env-file-all-set",
+			args: []string{"-hash-history-max-points=300"},
+			env:  map[string]string{"GCPOOL_HASH_HISTORY_MAX_POINTS": "200"},
+			toml: `hash_history_max_points = 100`,
+			check: func(t *testing.T, cfg config) {
+				if cfg.hashHistoryMaxPoints != 300 {
+					t.Errorf("hashHistoryMaxPoints = %d, want flag value 300 (flag must win full precedence)", cfg.hashHistoryMaxPoints)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runPrecedenceCase(t, tc)
+		})
+	}
+}
+
 // precedenceCase drives one subtest of TestLoadConfigPrecedence. toml, if
 // non-empty, is written to a temp file and wired in via "-config=<path>";
 // env is applied with t.Setenv (auto-restored); args are appended after the

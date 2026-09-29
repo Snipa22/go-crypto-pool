@@ -231,6 +231,38 @@ func (r *Repository) NetworkStatsSince(ctx context.Context, algo, network string
 	return s, nil
 }
 
+// CurrentNetworkDifficulty returns the real chain's own current
+// difficulty for (algo, network) as last recorded by
+// internal/backend/networkpoller's independent poll loop in
+// `network_state` -- a cheap, single-row read of already-fresh data,
+// NOT a new upstream RPC call. Returns (nil, nil) when no
+// network_state row exists yet for this (algo, network) (no poller
+// configured, or it has not successfully polled yet) -- this is a
+// legitimate "no value yet" outcome, not an error, mirroring
+// NetworkStats.NetworkDifficulty's own nil-means-"never polled"
+// convention. Used by cmd/backend's runHashHistoryPoller to snapshot
+// hash_history's HashHistoryScopeNetworkDifficulty rows on the same
+// cadence as every other hash-history sample, without this backend
+// ever making its own separate upstream chain-state query.
+func (r *Repository) CurrentNetworkDifficulty(ctx context.Context, algo, network string) (*float64, error) {
+	if err := ValidateAlgo(algo); err != nil {
+		return nil, err
+	}
+	if err := ValidateNetwork(network); err != nil {
+		return nil, err
+	}
+
+	var difficulty *float64
+	err := r.pool.QueryRow(ctx, `SELECT difficulty FROM network_state WHERE algo = $1 AND network = $2`, algo, network).Scan(&difficulty)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("db: querying current network difficulty for %s/%s: %w", algo, network, err)
+	}
+	return difficulty, nil
+}
+
 // NetworkState is one real, live chain-state snapshot this backend's
 // networkpoller has recorded for one (algo, network) -- see
 // migrations/0005_network_state.up.sql's doc comment for the full

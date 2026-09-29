@@ -82,6 +82,18 @@ func (f *fakeStatsRepo) PoolSourceShareStatsSince(_ context.Context, _, _, _ str
 	return statsapi.PoolSourceShareStatsResultRecord{}, nil
 }
 
+func (f *fakeStatsRepo) PoolTypeHashHistory(_ context.Context, _, _, _ string, _ int64) ([]statsapi.HashSampleRecord, error) {
+	return nil, nil
+}
+
+func (f *fakeStatsRepo) MinerHashHistory(_ context.Context, _, _, _ string, _, _ *string, _ int64) ([]statsapi.HashSampleRecord, error) {
+	return nil, nil
+}
+
+func (f *fakeStatsRepo) NetworkDifficultyHistory(_ context.Context, _, _ string, _ int64) ([]statsapi.DifficultySampleRecord, error) {
+	return nil, nil
+}
+
 type fakeAddrMapRepo struct {
 	rec addressmap.Record
 	err error

@@ -494,6 +494,28 @@ type Metrics struct {
 	// much this pool currently owes its miners in total, regardless
 	// of whether any payout/disbursement cycle has run recently.
 	PendingBalanceOutstanding *prometheus.GaugeVec
+
+	// HashHistoryPollErrorsTotal counts every failed step (pool-type
+	// query/insert, network-difficulty query/insert, active-miner
+	// query/insert, or prune) cmd/backend's hash-history poller
+	// (runHashHistoryPoller) makes for one (algo, network) target on
+	// one poll tick, labeled by algo and network -- mirrors
+	// WalletBalancePollErrorsTotal's own per-target error-counter
+	// shape. A single tick can increment this more than once (one
+	// per failed step), unlike HashHistoryLastPollTimestamp below,
+	// which only ever reflects "the poller ran," not "every step
+	// succeeded."
+	HashHistoryPollErrorsTotal *prometheus.CounterVec
+	// HashHistoryLastPollTimestamp is the Unix timestamp (seconds) of
+	// the end of the most recently COMPLETED hash-history poll tick
+	// (cmd/backend's runHashHistoryPoller), process-wide (not
+	// per-target, since one tick always evaluates every configured
+	// target together) -- a Gauge, so a stuck/dead poller goroutine
+	// is directly visible as this value simply stopping advancing,
+	// exactly like WalletBalance's own "still the last real value vs.
+	// the poller is broken" distinction WalletBalancePollErrorsTotal
+	// exists to disambiguate.
+	HashHistoryLastPollTimestamp prometheus.Gauge
 }
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry
@@ -697,6 +719,16 @@ func New(version string) *Metrics {
 		Name: "pending_balance_outstanding",
 		Help: "Current sum of every positive balance.pending_balance row, by algo and network -- the total this pool currently owes its miners.",
 	}, []string{"algo", "network"})
+
+	m.HashHistoryPollErrorsTotal = registerCounterVec(reg, prometheus.CounterOpts{
+		Name: "hash_history_poll_errors_total",
+		Help: "Total number of failed steps (pool-type/network-difficulty/active-miner query or insert, or prune) made by the hash-history poller, by algo and network.",
+	}, []string{"algo", "network"})
+
+	m.HashHistoryLastPollTimestamp = registerGauge(reg, prometheus.GaugeOpts{
+		Name: "hash_history_last_poll_timestamp",
+		Help: "Unix timestamp (seconds) of the end of the most recently completed hash-history poller tick. A stuck/dead poller is directly visible as this value simply stopping advancing.",
+	})
 
 	return m
 }

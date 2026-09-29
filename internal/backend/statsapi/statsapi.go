@@ -47,6 +47,37 @@
 //     leaf-direct process against this backend see hashrate/share
 //     volume attributed per physical pool-server instance.
 //
+//   - GET /api/v1/stats/hashrate/history?payment_address=<addr>&algo=<ALGO>
+//     [&network=<NETWORK>][&payment_id=<id>][&worker=<identifier>]
+//     [&window_hours=<hours>]
+//     Returns the real, bounded time series of periodic hashrate
+//     samples cmd/backend's hash-history poller has recorded for this
+//     miner (see internal/backend/db/hashhistory.go) — worker-level
+//     if `worker` is set, miner-level (summed across every worker
+//     that address had active at each sample point) otherwise.
+//     window_hours defaults to DefaultHashHistoryWindowHours and is
+//     capped at whatever retention window this backend's poller is
+//     actually configured to keep (Config.HashHistoryRetention) —
+//     a caller can never be told there is more history than is truly
+//     retained, but an empty/short-retention deployment simply
+//     returns fewer samples, never an error.
+//
+//   - GET /api/v1/stats/pool/history?algo=<ALGO>[&network=<NETWORK>]
+//     [&pool_type=<SOLO|PPS|PPLNS|PROP>][&window_hours=<hours>]
+//     Pool-wide (not scoped to any one miner) hashrate history for
+//     one of legacy's 5 buckets — pool_type omitted defaults to the
+//     GLOBAL pseudo-bucket (the whole pool, every pool_type
+//     combined).
+//
+//   - GET /api/v1/stats/network/history?algo=<ALGO>[&network=<NETWORK>]
+//     [&window_hours=<hours>]
+//     The real chain's own difficulty history, as periodically
+//     snapshotted from network_state by the same hash-history poller
+//     (see internal/backend/db.CurrentNetworkDifficulty) — distinct
+//     from every hashrate endpoint above exactly the way
+//     internal/backend/db/network.go's NetworkStats.NetworkDifficulty
+//     is distinct from its own SharesSum-derived figures.
+//
 // network is optional on every endpoint above ONLY when this Handler
 // was constructed with a configured Config.Network (poolpb.Network,
 // mirroring api.Config.Network's role) — in that case an omitted
@@ -86,6 +117,19 @@ const DefaultWindowSeconds = 600
 // protecting the shares table from an unbounded full-table aggregate
 // scan triggered by a single crafted query string.
 const MaxWindowSeconds = 7 * 24 * 3600 // 7 days
+
+// DefaultHashHistoryWindowHours is the lookback window, in hours,
+// used by /hashrate/history, /pool/history, and /network/history when
+// a request omits the optional window_hours query parameter.
+const DefaultHashHistoryWindowHours = 1
+
+// globalPoolType is /pool/history's default pool_type value —
+// mirrors db.HashHistoryGlobalPoolType's exact string, duplicated
+// here (rather than importing internal/backend/db) for the same
+// dependency-direction reason validateAlgoParam duplicates
+// db.ValidateAlgo's fixed value set instead of importing that
+// package directly — see this package's doc comment.
+const globalPoolType = "GLOBAL"
 
 // BalanceRecord mirrors db.Balance field-for-field (see that package's
 // doc comment on Balance) — kept as this package's own type for the
@@ -155,6 +199,22 @@ type PoolSourceShareStatsResultRecord struct {
 	Other *PoolSourceShareStatsOtherRecord
 }
 
+// HashSampleRecord mirrors db.HashSample — one hash-history sample's
+// (hashrate, sample_time) pair, backing /hashrate/history and
+// /pool/history.
+type HashSampleRecord struct {
+	HashrateHS float64
+	SampleTime time.Time
+}
+
+// DifficultySampleRecord mirrors db.DifficultySample — one
+// hash-history sample's (difficulty, sample_time) pair, backing
+// /network/history.
+type DifficultySampleRecord struct {
+	Difficulty float64
+	SampleTime time.Time
+}
+
 // Repository is the narrow, read-only persistence surface this
 // package's handlers depend on. *db.Repository satisfies this as-is
 // (see internal/backend/db/stats.go); tests inject a fake.
@@ -163,6 +223,15 @@ type Repository interface {
 	ShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (ShareStatsRecord, error)
 	WorkerShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (WorkerShareStatsResultRecord, error)
 	PoolSourceShareStatsSince(ctx context.Context, algo, network, paymentAddress string, paymentID *string, sinceUnix int64) (PoolSourceShareStatsResultRecord, error)
+
+	// PoolTypeHashHistory/MinerHashHistory/NetworkDifficultyHistory
+	// mirror db.Repository's own methods of the same name (see
+	// internal/backend/db/hashhistory.go) — the read-side surface
+	// backing handleHashrateHistory/handlePoolHistory/
+	// handleNetworkHistory.
+	PoolTypeHashHistory(ctx context.Context, algo, network, poolType string, sinceUnix int64) ([]HashSampleRecord, error)
+	MinerHashHistory(ctx context.Context, algo, network, paymentAddress string, paymentID *string, worker *string, sinceUnix int64) ([]HashSampleRecord, error)
+	NetworkDifficultyHistory(ctx context.Context, algo, network string, sinceUnix int64) ([]DifficultySampleRecord, error)
 }
 
 // StatsMetrics is the narrow metrics surface this package's handlers
@@ -195,6 +264,20 @@ type Config struct {
 	// Metrics, if non-nil, receives ObserveRequest calls for every
 	// handled request. If nil, a no-op implementation is used.
 	Metrics StatsMetrics
+
+	// HashHistoryRetention, if > 0, is the real retention window
+	// cmd/backend's hash-history poller is configured to keep (see
+	// that poller's own maxPoints*pollInterval computation) — every
+	// /hashrate/history, /pool/history, and /network/history request's
+	// window_hours parameter is capped at this value's duration in
+	// hours (see parseWindowHours), so a caller can never be told
+	// there is more history retained than actually is. Zero (the
+	// default) means "no known cap" — a caller-requested window_hours
+	// is honored as-is (still bounded by there simply being no older
+	// rows to return, since PruneHashHistory will have already
+	// deleted them either way; this field only changes what a caller
+	// is TOLD they may ask for, not the real data availability).
+	HashHistoryRetention time.Duration
 }
 
 // Handler implements the backend's read-only miner stats endpoints.
@@ -237,6 +320,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/stats/hashrate", h.handleHashrate)
 	mux.HandleFunc("GET /api/v1/stats/hashrate/workers", h.handleHashrateWorkers)
 	mux.HandleFunc("GET /api/v1/stats/hashrate/sources", h.handleHashrateSources)
+	mux.HandleFunc("GET /api/v1/stats/hashrate/history", h.handleHashrateHistory)
+	mux.HandleFunc("GET /api/v1/stats/pool/history", h.handlePoolHistory)
+	mux.HandleFunc("GET /api/v1/stats/network/history", h.handleNetworkHistory)
 }
 
 // EstimateHashrateHS applies the standard difficulty/elapsed-time
@@ -627,6 +713,248 @@ func (h *Handler) handleHashrateSources(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// parseWindowHours parses the optional window_hours query parameter,
+// defaulting to DefaultHashHistoryWindowHours and rejecting a
+// non-positive or unparseable value, then clamps the result down to
+// h.cfg.HashHistoryRetention's own duration in hours when that field
+// is configured (> 0) and the requested value exceeds it — see
+// Config.HashHistoryRetention's doc comment: a caller is never told
+// there is more history retained than actually is, but an
+// over-large request is silently clamped (returns what's available),
+// never rejected with an error.
+func (h *Handler) parseWindowHours(raw string) (float64, error) {
+	hours := float64(DefaultHashHistoryWindowHours)
+	if raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return 0, fmt.Errorf("window_hours: %w", err)
+		}
+		if v <= 0 {
+			return 0, errors.New("window_hours: must be a positive number of hours")
+		}
+		hours = v
+	}
+	if h.cfg.HashHistoryRetention > 0 {
+		if maxHours := h.cfg.HashHistoryRetention.Hours(); hours > maxHours {
+			hours = maxHours
+		}
+	}
+	return hours, nil
+}
+
+// hashHistorySampleRow is one hash-history sample's JSON shape,
+// shared by /hashrate/history and /pool/history.
+type hashHistorySampleRow struct {
+	HashrateHS float64 `json:"hashrate_hs"`
+	SampleTime string  `json:"sample_time"`
+}
+
+// difficultyHistorySampleRow is one network-difficulty sample's JSON
+// shape, used by /network/history.
+type difficultyHistorySampleRow struct {
+	Difficulty float64 `json:"difficulty"`
+	SampleTime string  `json:"sample_time"`
+}
+
+// handleHashrateHistory implements GET /api/v1/stats/hashrate/history
+// — see this package's doc comment for the full query-parameter/
+// response-shape contract.
+func (h *Handler) handleHashrateHistory(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	q := r.URL.Query()
+
+	paymentAddress := q.Get("payment_address")
+	if paymentAddress == "" {
+		h.m.ObserveRequest("hashrate_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, "payment_address is required")
+		return
+	}
+	algo := q.Get("algo")
+	if algo == "" {
+		h.m.ObserveRequest("hashrate_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, "algo is required")
+		return
+	}
+	if err := validateAlgoParam(algo); err != nil {
+		h.m.ObserveRequest("hashrate_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	network, err := h.resolveNetwork(q.Get("network"), true)
+	if err != nil {
+		h.m.ObserveRequest("hashrate_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	windowHours, err := h.parseWindowHours(q.Get("window_hours"))
+	if err != nil {
+		h.m.ObserveRequest("hashrate_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var worker *string
+	if q.Has("worker") {
+		v := q.Get("worker")
+		worker = &v
+	}
+	paymentID := paymentIDParam(r)
+
+	since := time.Now().Add(-time.Duration(windowHours * float64(time.Hour))).Unix()
+	samples, err := h.repo.MinerHashHistory(r.Context(), algo, network, paymentAddress, paymentID, worker, since)
+	if err != nil {
+		h.m.ObserveRequest("hashrate_history", "error", time.Since(start))
+		writeJSONErr(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+
+	out := make([]hashHistorySampleRow, 0, len(samples))
+	for _, s := range samples {
+		out = append(out, hashHistorySampleRow{HashrateHS: s.HashrateHS, SampleTime: s.SampleTime.UTC().Format(time.RFC3339)})
+	}
+
+	h.m.ObserveRequest("hashrate_history", "ok", time.Since(start))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"algo":            algo,
+		"network":         network,
+		"payment_address": paymentAddress,
+		"payment_id":      paymentID,
+		"worker":          worker,
+		"window_hours":    windowHours,
+		"samples":         out,
+	})
+}
+
+// validatePoolTypeParam validates poolType against the same fixed
+// set as internal/backend/db.ValidPoolTypes plus the globalPoolType
+// sentinel -- see globalPoolType's own doc comment for why this is
+// duplicated here rather than imported.
+func validatePoolTypeParam(poolType string) error {
+	switch poolType {
+	case "SOLO", "PPS", "PPLNS", "PROP", globalPoolType:
+		return nil
+	default:
+		return fmt.Errorf("pool_type: unknown value %q (want one of SOLO, PPS, PPLNS, PROP, %s)", poolType, globalPoolType)
+	}
+}
+
+// handlePoolHistory implements GET /api/v1/stats/pool/history — see
+// this package's doc comment for the full query-parameter/response-
+// shape contract. pool_type is optional; an omitted value defaults to
+// globalPoolType (the whole pool, every pool_type combined).
+func (h *Handler) handlePoolHistory(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	q := r.URL.Query()
+
+	algo := q.Get("algo")
+	if algo == "" {
+		h.m.ObserveRequest("pool_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, "algo is required")
+		return
+	}
+	if err := validateAlgoParam(algo); err != nil {
+		h.m.ObserveRequest("pool_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	network, err := h.resolveNetwork(q.Get("network"), true)
+	if err != nil {
+		h.m.ObserveRequest("pool_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	poolType := q.Get("pool_type")
+	if poolType == "" {
+		poolType = globalPoolType
+	}
+	if err := validatePoolTypeParam(poolType); err != nil {
+		h.m.ObserveRequest("pool_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	windowHours, err := h.parseWindowHours(q.Get("window_hours"))
+	if err != nil {
+		h.m.ObserveRequest("pool_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	since := time.Now().Add(-time.Duration(windowHours * float64(time.Hour))).Unix()
+	samples, err := h.repo.PoolTypeHashHistory(r.Context(), algo, network, poolType, since)
+	if err != nil {
+		h.m.ObserveRequest("pool_history", "error", time.Since(start))
+		writeJSONErr(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+
+	out := make([]hashHistorySampleRow, 0, len(samples))
+	for _, s := range samples {
+		out = append(out, hashHistorySampleRow{HashrateHS: s.HashrateHS, SampleTime: s.SampleTime.UTC().Format(time.RFC3339)})
+	}
+
+	h.m.ObserveRequest("pool_history", "ok", time.Since(start))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"algo":         algo,
+		"network":      network,
+		"pool_type":    poolType,
+		"window_hours": windowHours,
+		"samples":      out,
+	})
+}
+
+// handleNetworkHistory implements GET /api/v1/stats/network/history —
+// see this package's doc comment for the full query-parameter/
+// response-shape contract.
+func (h *Handler) handleNetworkHistory(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	q := r.URL.Query()
+
+	algo := q.Get("algo")
+	if algo == "" {
+		h.m.ObserveRequest("network_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, "algo is required")
+		return
+	}
+	if err := validateAlgoParam(algo); err != nil {
+		h.m.ObserveRequest("network_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	network, err := h.resolveNetwork(q.Get("network"), true)
+	if err != nil {
+		h.m.ObserveRequest("network_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	windowHours, err := h.parseWindowHours(q.Get("window_hours"))
+	if err != nil {
+		h.m.ObserveRequest("network_history", "rejected", time.Since(start))
+		writeJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	since := time.Now().Add(-time.Duration(windowHours * float64(time.Hour))).Unix()
+	samples, err := h.repo.NetworkDifficultyHistory(r.Context(), algo, network, since)
+	if err != nil {
+		h.m.ObserveRequest("network_history", "error", time.Since(start))
+		writeJSONErr(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+
+	out := make([]difficultyHistorySampleRow, 0, len(samples))
+	for _, s := range samples {
+		out = append(out, difficultyHistorySampleRow{Difficulty: s.Difficulty, SampleTime: s.SampleTime.UTC().Format(time.RFC3339)})
+	}
+
+	h.m.ObserveRequest("network_history", "ok", time.Since(start))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"algo":         algo,
+		"network":      network,
+		"window_hours": windowHours,
+		"samples":      out,
+	})
 }
 
 // validateAlgoParam mirrors internal/backend/db.ValidateAlgo without
