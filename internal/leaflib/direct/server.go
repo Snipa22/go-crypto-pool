@@ -615,8 +615,10 @@ type ServerConfig struct {
 	// startNoShareSweep), so a Server built with this left at its
 	// zero value costs not even one extra goroutine. Set from
 	// cmd/leaf-direct's own -no-share-timeout/
-	// LEAF_DIRECT_NO_SHARE_TIMEOUT flag (default 3m, matching Alex's
-	// stated "2-3 minutes" upper bound).
+	// LEAF_DIRECT_NO_SHARE_TIMEOUT flag (default 5m, widened from the
+	// original 3m -- Alex's originally-stated "2-3 minutes" upper
+	// bound -- to cut down on false disconnects for legitimately
+	// slow-to-first-share miners).
 	//
 	// A session that submits its first accepted share is PERMANENTLY
 	// exempt from this specific disconnect for the rest of its life
