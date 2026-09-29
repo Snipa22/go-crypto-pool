@@ -39,6 +39,7 @@ import (
 	"sort"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	shared "github.com/Snipa22/go-crypto-pool/internal/leaflib/metrics"
@@ -313,6 +314,13 @@ func New(version string, maxAddressLabels int) *Metrics {
 		maxAddressLabels = DefaultMaxAddressLabels
 	}
 	reg := prometheus.NewRegistry()
+	// Standard Go runtime/process collectors -- see
+	// internal/leaflib/solo/metrics.New's identical registration for
+	// the full rationale (private registry, not the global default
+	// one client_golang auto-registers these onto). MustRegister:
+	// only ever registered once per New() call.
+	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m := &Metrics{registry: reg, maxAddressLabels: maxAddressLabels}
 
 	m.ShareDecisionsTotal = shared.RegisterCounterVec(reg, prometheus.CounterOpts{

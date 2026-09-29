@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	shared "github.com/Snipa22/go-crypto-pool/internal/leaflib/metrics"
 )
 
@@ -396,4 +398,39 @@ func TestPerSecondRateMetrics_IntegrationAcrossSimulatedTicks(t *testing.T) {
 			t.Errorf("%s{%s=%q} = %v, want %v", tc.name, tc.labels[0], tc.labels[1], got, tc.want)
 		}
 	}
+}
+
+// TestNew_RegistersGoAndProcessCollectors proves New actually wires
+// the standard Go runtime (collectors.NewGoCollector) and process
+// (collectors.NewProcessCollector) collectors onto this Metrics' own
+// private *prometheus.Registry -- not just that the collectors
+// package is imported. go_goroutines is used as the real-Go-collector
+// probe metric (always present, always >= 1: this test goroutine
+// itself). A simple Gather()+scan for the family name is sufficient;
+// this deliberately does not assert specific values (those are
+// runtime-dependent).
+func TestNew_RegistersGoAndProcessCollectors(t *testing.T) {
+	m := New("dev", 0)
+	mfs, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "go_goroutines" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected go_goroutines metric family in Gather() output, proving the Go runtime collector is genuinely registered -- got families: %v", metricFamilyNames(mfs))
+	}
+}
+
+func metricFamilyNames(mfs []*dto.MetricFamily) []string {
+	names := make([]string, 0, len(mfs))
+	for _, mf := range mfs {
+		names = append(names, mf.GetName())
+	}
+	return names
 }

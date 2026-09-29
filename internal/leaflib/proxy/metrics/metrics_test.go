@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 func scrape(t *testing.T, m *Metrics) string {
@@ -261,4 +263,34 @@ func TestAsyncPoolMetrics_NoSourceIsAbsent(t *testing.T) {
 	if strings.Contains(body, "leaf_async_validation_queue_depth") {
 		t.Errorf("expected no leaf_async_validation_queue_depth series without a source, got:\n%s", body)
 	}
+}
+
+// TestNew_RegistersGoAndProcessCollectors mirrors
+// internal/leaflib/solo/metrics's identical test exactly -- see that
+// package's doc comment on the same test name for the full rationale
+// (go_goroutines used as the real-Go-collector probe metric).
+func TestNew_RegistersGoAndProcessCollectors(t *testing.T) {
+	m := New("dev", 0)
+	mfs, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "go_goroutines" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected go_goroutines metric family in Gather() output, proving the Go runtime collector is genuinely registered -- got families: %v", metricFamilyNames(mfs))
+	}
+}
+
+func metricFamilyNames(mfs []*dto.MetricFamily) []string {
+	names := make([]string, 0, len(mfs))
+	for _, mf := range mfs {
+		names = append(names, mf.GetName())
+	}
+	return names
 }

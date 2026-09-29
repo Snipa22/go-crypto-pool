@@ -20,6 +20,7 @@ import (
 	"sort"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	shared "github.com/Snipa22/go-crypto-pool/internal/leaflib/metrics"
@@ -374,6 +375,19 @@ func New(version string, maxAddressLabels int) *Metrics {
 		maxAddressLabels = DefaultMaxAddressLabels
 	}
 	reg := prometheus.NewRegistry()
+	// Standard Go runtime (go_goroutines/go_memstats_*/
+	// go_gc_duration_seconds/...) and process (process_cpu_seconds_total/
+	// process_resident_memory_bytes/...) collectors -- this Metrics'
+	// registry is a private *prometheus.Registry (see this package's
+	// doc comment), not the global default registry client_golang
+	// auto-registers these onto, so without this they would never
+	// appear on this leaf's /metrics at all. MustRegister (not the
+	// AlreadyRegisteredError-tolerant registerCounterVec-style helpers
+	// below): each is only ever registered once per New() call, so a
+	// panic on a genuine double-registration bug is the correct, loud
+	// failure mode here.
+	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m := &Metrics{registry: reg, maxAddressLabels: maxAddressLabels}
 
 	m.SharesTotal = registerCounterVec(reg, prometheus.CounterOpts{
