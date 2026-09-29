@@ -240,6 +240,48 @@ backend_share_timeout_seconds = 5
 # (default: 10)
 backend_block_timeout_seconds = 10
 
+# Opt-in disk-backed durable retry backlog for shares/blocks that fail to
+# reach the backend (see internal/leaflib/transport/backlog) -- for outages
+# LONGER than legacytransport's own short-lived retry budget (15s shares /
+# 5min blocks) can absorb. Empty (the default) disables this feature
+# entirely: byte-for-byte the pre-existing log-and-drop behavior. MUST be a
+# real, persistent disk directory -- NEVER a tmpfs/ephemeral path like /tmp
+# (the whole point is surviving a leaf process crash/restart mid-outage).
+# (default: "")
+backlog_dir = ""
+
+# Total on-disk byte cap (not entry count) for backlog_dir's queue, across
+# shares and blocks combined -- once reached, further failed shares/blocks
+# fall back to the pre-backlog log-and-drop behavior instead of silently
+# evicting older queued entries. Validated safe up to at least 100 GiB by
+# the operator; this default is a conservative starting point to explicitly
+# raise for a real fleet's expected outage-window sizing. Ignored when
+# backlog_dir is empty. (default: 5368709120 = 5 GiB)
+backlog_max_bytes = 5368709120
+
+# Background worker pool size continuously retrying backlog_dir's queued
+# entries against the backend, indefinitely (no time budget, only
+# backlog_max_bytes bounds how long this can absorb). Ignored when
+# backlog_dir is empty. 0/unset uses the documented default (8).
+# (default: 0)
+backlog_drain_workers = 0
+
+# Outer ctx timeout (seconds) bounding forwardShare's ENTIRE backend
+# SubmitShare call, INCLUDING legacytransport's own internal
+# retry-with-backoff loop when legacy_mode=true (see
+# legacy_block_retry_budget_seconds below for the sibling block-find
+# setting) -- must stay >= legacytransport.DefaultShareSubmitRetryBudget
+# (15s; always in effect, since there is no separate
+# legacy-share-retry-budget setting) or the retry loop gets cut short
+# by its own caller (real production incident, 2026-09-28:
+# leaf-direct-canary logs showed "giving up after 1-2 attempt(s)"/
+# "context deadline exceeded" during a backend blip, well short of the
+# ~5 attempts the 15s/3s retry budget should allow, because this used
+# to be a hardcoded 5s predating that retry loop). 0/unset uses the
+# documented default, 20 (DefaultShareSubmitRetryBudget + 5s slack).
+# (default: 0)
+share_forward_timeout_seconds = 0
+
 # How often the backend's GET /api/v1/leaf/address-flags endpoint is polled
 # for manual ban/forced-minimum-difficulty state, in seconds. (default: 30)
 address_flags_poll_interval_seconds = 30
