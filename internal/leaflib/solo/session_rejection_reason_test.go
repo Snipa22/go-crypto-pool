@@ -138,7 +138,7 @@ func TestSessionRejectionReason_StaleOrUnknownJob(t *testing.T) {
 func TestSessionRejectionReason_JobExpired(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, 30*time.Millisecond, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-job-expired")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	time.Sleep(60 * time.Millisecond)
 
@@ -177,7 +177,7 @@ func TestSessionRejectionReason_BannedAddress(t *testing.T) {
 		t.Fatalf("setup: expected login to succeed while unbanned, got status=%q", loginResp.Result.Status)
 	}
 	sessionID, xn := loginResp.Result.ID, loginResp.Result.Job.XN
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	src.set(addr, addressflags.Flags{Banned: true})
 	waitForCachePoll(t, cache, addr, true)
@@ -199,7 +199,7 @@ func TestSessionRejectionReason_BannedAddress(t *testing.T) {
 func TestSessionRejectionReason_InvalidXNonce(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, 0, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-invalid-xnonce")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	badNonce := flipFirstHexNibble(xnPrefixedNonceHex(xn, 1))
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
@@ -219,7 +219,7 @@ func TestSessionRejectionReason_InvalidXNonce(t *testing.T) {
 func TestSessionRejectionReason_MalformedNonce(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, 0, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-malformed-nonce")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	// SHA3X requires a full 8-byte (16 hex char) nonce; this is only
 	// 2 bytes, still correctly xn-prefixed, so the xn-prefix check
@@ -241,7 +241,7 @@ func TestSessionRejectionReason_MalformedNonce(t *testing.T) {
 func TestSessionRejectionReason_InvalidPowShape(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_C29, 1, 1<<62, 0, validator.Registry{poolpb.Algo_ALGO_C29: validator.NewC29Validator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-invalid-pow-shape")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: xnPrefixedNonceHexBigEndianForTest(xn, 1),
@@ -278,7 +278,7 @@ func xnPrefixedNonceHexBigEndianForTest(xn string, n uint64) string {
 func TestSessionRejectionReason_DuplicateNonce(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, 0, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-duplicate-nonce")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	nonce := xnPrefixedNonceHex(xn, 42)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
@@ -308,7 +308,7 @@ func TestSessionRejectionReason_DuplicateNonce(t *testing.T) {
 func TestSessionRejectionReason_MissingClaimedResult(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_RXM, 1, 1<<62, 0, validator.Registry{}, nil)
 	sessionID, xn := loginRXM(t, h.testHarness)
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: "00000001",
@@ -415,7 +415,7 @@ func TestSessionRejectionReason_BlockSubmitFailed(t *testing.T) {
 	// a genuine block-find candidate reaches SubmitBlock.
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1, 0, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, node)
 	sessionID, xn := login(t, h.testHarness, "rr-block-submit-failed")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: xnPrefixedNonceHex(xn, 1),
@@ -511,7 +511,7 @@ func TestServer_SetRandomXWorkerPoolSize_QueueSizeReachesPool(t *testing.T) {
 func TestSessionRejectionReason_InternalError(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, 0, validator.Registry{}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-internal-error")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: xnPrefixedNonceHex(xn, 1),

@@ -39,7 +39,7 @@ func TestServerStats_TotalEstimatedHashrateEqualsSumOfSessions(t *testing.T) {
 	// handleSubmit. Submitting 5 accepted shares against session A
 	// makes its real hashesAccumulated exactly 5.
 	const sharesA = 5
-	jobIDA := currentJobIDForXN(t, h, xnA)
+	jobIDA := currentJobIDForSession(t, h, xnA)
 	for i := 0; i < sharesA; i++ {
 		h.send(Request{ID: 10 + i, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			JobID: jobIDA,
@@ -61,7 +61,7 @@ func TestServerStats_TotalEstimatedHashrateEqualsSumOfSessions(t *testing.T) {
 	_, xnB := login(t, hB, "hashrate-test-addr-b")
 
 	const sharesB = 3
-	jobIDB := currentJobIDForXN(t, hB, xnB)
+	jobIDB := currentJobIDForSession(t, hB, xnB)
 	for i := 0; i < sharesB; i++ {
 		hB.send(Request{ID: 20 + i, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			JobID: jobIDB,
@@ -115,7 +115,7 @@ func TestServerStats_TotalEstimatedHashrateEqualsSumOfSessions(t *testing.T) {
 func TestStatsHTMLHandler_RendersGlobalHashrateCard(t *testing.T) {
 	h := newTestHarness(t, 1, 1<<62)
 	_, xn := login(t, h, "global-hashrate-fixture-addr")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		JobID: jobID,
 		Nonce: xnPrefixedNonceHex(xn, 12345),

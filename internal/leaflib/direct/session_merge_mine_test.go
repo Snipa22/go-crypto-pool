@@ -180,7 +180,7 @@ func newMergeMineHarness(t *testing.T, srv *httptest.Server, staticDiff uint64) 
 func submitRXMBlockFind(t *testing.T, h *directTestHarness, reqID int) {
 	t.Helper()
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 	h.send(solo.Request{ID: reqID, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,
 		JobID:  jobID,

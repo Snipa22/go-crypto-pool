@@ -140,7 +140,7 @@ func scrapeDirectMetrics(t *testing.T, s *Server) string {
 }
 
 // TestDirectSessionLoginRejectionReason_NoJobTemplate covers
-// fetchAndDeliverLoginJob's s.server.jobManager.JobForXNAtDifficulty
+// fetchAndDeliverLoginJob's s.server.jobManager.JobForSessionAtDifficulty
 // failure call site -- a real, valid, unbanned login that still
 // can't be issued a job because the node's GetBlockTemplate call
 // itself fails.

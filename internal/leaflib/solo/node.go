@@ -143,7 +143,7 @@ type NodeClient interface {
 	// content (job.TemplateData) into the wire bytes
 	// JobFromTemplateBytes can reconstruct from, for relay
 	// publishing/comparison (job.go's publishTemplateForJob and
-	// jobForXN's own tracked-best bookkeeping both call this).
+	// jobForSession's own tracked-best bookkeeping both call this).
 	// Returns (nil, nil) — never an error — if this specific job
 	// cannot be serialized for relay for a benign/expected reason;
 	// callers must never treat a failure here as a reason to fail
@@ -563,18 +563,20 @@ func tariPowAlgo(algo poolpb.Algo) (tari_generated.PowAlgo_PowAlgos, error) {
 // base node computes the actual reward split from this), instead of the
 // legacy per-miner multi-coinbase pool scheme.
 //
-// IMPORTANT for per-xn extranonce support (job.go's JobManager.JobForXN):
+// IMPORTANT for per-session template fetching (job.go's
+// JobManager.JobForSession):
 // this already appends a FRESH, cryptographically-independent random
 // 8-byte nonce buffer to the coinbase-extra field on EVERY call — see
 // nonceBuf below — mirroring the legacy GetBlockSha3's own
 // `binary.LittleEndian.PutUint64(buf, rand.Uint64())` coinbase-extra
 // randomization exactly. That random data flows into the coinbase
 // transaction, which changes the resulting block's MergeMiningHash, so
-// two calls to this method (e.g. for two different sessions' xn values)
+// two calls to this method (e.g. for two different sessions)
 // already produce genuinely distinct, non-overlapping hash pre-images
 // even at the same chain height — this method did NOT need any new
-// randomization logic added for per-xn support; JobManager only needed
-// to call it once per newly-seen xn and cache the result (see job.go).
+// randomization logic added for per-session support; JobManager only
+// needed to call it once per newly-seen session and cache the result
+// (see job.go).
 func (c *GRPCNodeClient) GetBlockTemplate(ctx context.Context, payoutAddress string, algo poolpb.Algo) (*Job, error) {
 	powAlgo, err := tariPowAlgo(algo)
 	if err != nil {

@@ -167,7 +167,7 @@ var AllRejectionReasons = []string{
 //     internal/leaflib/addressflags) -- the category this metric
 //     exists specifically to quantify against the others.
 //   - LoginRejectionReasonNoJobTemplate:
-//     s.server.jobManager.JobForXNAtDifficulty failed (no template
+//     s.server.jobManager.JobForSessionAtDifficulty failed (no template
 //     available yet) -- happens AFTER the address is already stored
 //     and loggedIn flipped true, a distinct infra/timing failure
 //     class rather than a client-side rejection, but the client still

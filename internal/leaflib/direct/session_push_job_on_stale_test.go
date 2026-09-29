@@ -28,11 +28,15 @@ import (
 // repush mechanism non-deterministically -- confirmed live while
 // developing this test (both orderings on the wire were observed
 // across repeated runs). RestampDifficulty touches only
-// solo.JobManager's own per-xn cache entry, never notify/Subscribe,
-// so it cannot trigger that unrelated path.
+// solo.JobManager's own per-session cache entry, never
+// notify/Subscribe, so it cannot trigger that unrelated path.
 //
-// RestampDifficulty (job.go) replaces the cached *Job for xn with a
-// NEW *Job value carrying the SAME job.ID but the new difficulty,
+// xn identifies WHICH live session to act on (see directSessionByXN);
+// the restamp itself is keyed by that session's OWN job-cache key
+// (Session.JobKey), never by its xn -- see leaflib.NewJobCacheKey.
+//
+// RestampDifficulty (job.go) replaces that session's cached *Job with
+// a NEW *Job value carrying the SAME job.ID but the new difficulty,
 // while copying CreatedAt from whatever was cached before -- so for
 // the job_expired variant of this fix (where the ORIGINAL job's
 // CreatedAt must already be artificially old to trigger the
@@ -45,9 +49,10 @@ import (
 // check the moment it is submitted back.
 func directForceDistinctCachedJob(t *testing.T, h *directTestHarness, xn string, newDifficulty uint64) *solo.Job {
 	t.Helper()
-	job, err := h.jm.RestampDifficulty(context.Background(), xn, newDifficulty)
+	sess := directSessionByXN(t, h, xn)
+	job, err := h.jm.RestampDifficulty(context.Background(), sess.JobKey(), newDifficulty)
 	if err != nil {
-		t.Fatalf("RestampDifficulty(%q, %d): %v", xn, newDifficulty, err)
+		t.Fatalf("RestampDifficulty(session %s, %d): %v", sess.sessionID, newDifficulty, err)
 	}
 	job.CreatedAt = time.Now()
 	return job
@@ -63,10 +68,10 @@ func directForceDistinctCachedJob(t *testing.T, h *directTestHarness, xn string,
 //
 // directForceDistinctCachedJob (see its own doc comment) is used
 // between login and the stale submit to give solo.JobManager's own
-// per-xn cache entry a genuinely different (StaticDifficulty, hence
+// per-session cache entry a genuinely different (StaticDifficulty, hence
 // Target) shape than whatever this session's own lastDeliveredJobID/
 // lastDeliveredDifficulty bookkeeping already recorded at login --
-// otherwise JobForXNAtDifficulty would simply hand back the exact
+// otherwise JobForSessionAtDifficulty would simply hand back the exact
 // same cached Job already delivered at login, and pushJob's own
 // alreadyDelivered dedup gate would (correctly, but unhelpfully for
 // this test) suppress the push entirely.
@@ -74,7 +79,7 @@ func TestDirectPushFreshJobOnStaleOrUnknownJob(t *testing.T) {
 	const loginDiff, freshDiff = 2, 1
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, loginDiff, 1<<62, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-push-stale-job"))
-	loginJobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	loginJobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	fresh := directForceDistinctCachedJob(t, h.directTestHarness, xn, freshDiff)
 	directSessionByID(t, h.directTestHarness, sessionID).currentDifficulty.Store(freshDiff)
@@ -140,7 +145,7 @@ func TestDirectPushFreshJobOnJobExpired(t *testing.T) {
 	const jobMaxAge = time.Minute
 	h := newRejectionReasonHarnessWithJobMaxAge(t, poolpb.Algo_ALGO_SHA3X, loginDiff, 1<<62, jobMaxAge, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()})
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-push-job-expired"))
-	oldJobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	oldJobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	oldJob, ok := h.jm.GetJob(oldJobID)
 	if !ok {
@@ -190,7 +195,7 @@ func TestDirectPushFreshJobOnDuplicateNonce(t *testing.T) {
 	const loginDiff, freshDiff = 1, 2
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, loginDiff, 1<<62, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-push-duplicate-nonce"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	nonce := directXNPrefixedNonceHex(xn, 42)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -201,7 +206,7 @@ func TestDirectPushFreshJobOnDuplicateNonce(t *testing.T) {
 	}
 	waitForShareCount(t, h.transport, 1)
 
-	// Give solo.JobManager's per-xn cache a genuinely different shape
+	// Give solo.JobManager's per-session cache a genuinely different shape
 	// than what this session was already handed, so the
 	// alreadyDelivered dedup gate does not (correctly, but unhelpfully
 	// for this test) suppress the push -- see
@@ -247,7 +252,7 @@ func TestDirectPushFreshJobOnDifficultyFloorMiss(t *testing.T) {
 	const staticDiff, freshDiff = 1000, 1
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_RXT, staticDiff, 1<<62, validator.Registry{poolpb.Algo_ALGO_RXT: &fakeControllableValidator{valid: true}}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-push-difficulty-floor-miss"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	fresh := directForceDistinctCachedJob(t, h.directTestHarness, xn, freshDiff)
 	directSessionByID(t, h.directTestHarness, sessionID).currentDifficulty.Store(freshDiff)
@@ -295,7 +300,7 @@ func TestDirectPushFreshJobDoesNotFireForUnrelatedRejection(t *testing.T) {
 	const loginDiff, freshDiff = 2, 1
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, loginDiff, 1<<62, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-push-not-unrelated"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	directForceDistinctCachedJob(t, h.directTestHarness, xn, freshDiff)
 	directSessionByID(t, h.directTestHarness, sessionID).currentDifficulty.Store(freshDiff)

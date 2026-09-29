@@ -39,7 +39,7 @@ func TestSessionRXTOrdinaryShareBelowStaticDifficultyFloorIsRejected(t *testing.
 	const staticDiff, networkTargetDiff = uint64(1000), uint64(1) << 62
 	h := newRXTTestHarness(t, staticDiff, networkTargetDiff, "http://127.0.0.1:1") // deliberately unreachable
 	sessionID, xn := login(t, h, "addr-rxt-floor-below")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	h.send(Request{ID: 40, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:     sessionID,
@@ -72,7 +72,7 @@ func TestSessionRXTOrdinaryShareAtStaticDifficultyFloorIsAccepted(t *testing.T) 
 	const staticDiff, networkTargetDiff = uint64(1), uint64(1) << 62
 	h := newRXTTestHarness(t, staticDiff, networkTargetDiff, "http://127.0.0.1:1") // deliberately unreachable
 	sessionID, xn := login(t, h, "addr-rxt-floor-at")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	h.send(Request{ID: 41, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:     sessionID,
@@ -209,7 +209,7 @@ func TestSessionRXTRepeatedFabricatedBlockFindClaimsGetDisconnected(t *testing.T
 	}
 
 	_, xn := login(t, h, "addr-rxt-dos")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	for i := 0; i < threshold; i++ {
 		nonce := make([]byte, 4)

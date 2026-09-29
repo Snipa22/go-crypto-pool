@@ -22,12 +22,17 @@ import (
 // race THIS test's own pushFreshJobOnStaleSubmit push against that
 // separate, pre-existing, unrelated repush mechanism exactly like it
 // does in the direct package). RestampDifficulty touches only
-// JobManager's own per-xn cache entry, never notify/Subscribe.
+// JobManager's own per-session cache entry, never notify/Subscribe.
+//
+// xn identifies WHICH live session to act on (see sessionByXN); the
+// restamp itself is keyed by that session's OWN job-cache key
+// (Session.JobKey), never by its xn -- see leaflib.NewJobCacheKey.
 func forceDistinctCachedJob(t *testing.T, h *testHarness, xn string, newDifficulty uint64) *Job {
 	t.Helper()
-	job, err := h.jm.RestampDifficulty(context.Background(), xn, newDifficulty)
+	sess := sessionByXN(t, h, xn)
+	job, err := h.jm.RestampDifficulty(context.Background(), sess.JobKey(), newDifficulty)
 	if err != nil {
-		t.Fatalf("RestampDifficulty(%q, %d): %v", xn, newDifficulty, err)
+		t.Fatalf("RestampDifficulty(session %s, %d): %v", sess.sessionID, newDifficulty, err)
 	}
 	job.CreatedAt = time.Now()
 	return job
@@ -43,7 +48,7 @@ func TestPushFreshJobOnStaleOrUnknownJob(t *testing.T) {
 	const loginDiff, freshDiff = 2, 1
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, loginDiff, 1<<62, 0, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-push-stale-job")
-	loginJobID := currentJobIDForXN(t, h.testHarness, xn)
+	loginJobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	fresh := forceDistinctCachedJob(t, h.testHarness, xn, freshDiff)
 	sessionByID(t, h.testHarness, sessionID).currentDifficulty.Store(freshDiff)
@@ -96,7 +101,7 @@ func TestPushFreshJobOnJobExpired(t *testing.T) {
 	const jobMaxAge = time.Minute
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, loginDiff, 1<<62, jobMaxAge, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-push-job-expired")
-	oldJobID := currentJobIDForXN(t, h.testHarness, xn)
+	oldJobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	oldJob, ok := h.jm.GetJob(oldJobID)
 	if !ok {
@@ -146,7 +151,7 @@ func TestPushFreshJobOnDuplicateNonce(t *testing.T) {
 	const loginDiff, freshDiff = 1, 2
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, loginDiff, 1<<62, 0, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-push-duplicate-nonce")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	nonce := xnPrefixedNonceHex(xn, 42)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
@@ -246,7 +251,7 @@ func TestPushFreshJobOnDifficultyFloorMiss(t *testing.T) {
 // has now deliberately moved INTO scope -- the assertion was updated
 // rather than left behind as a stale, now-incorrect expectation. The
 // forceDistinctCachedJob call below is what makes the "no push"
-// assertion meaningful: without it, JobForXNAtDifficulty would hand
+// assertion meaningful: without it, JobForSessionAtDifficulty would hand
 // back the exact job already delivered at login and pushJob's own
 // alreadyDelivered dedup gate would suppress the push regardless of
 // whether the reason is in scope, so the test would pass vacuously.
@@ -254,7 +259,7 @@ func TestPushFreshJobDoesNotFireForUnrelatedRejection(t *testing.T) {
 	const loginDiff, freshDiff = 2, 1
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, loginDiff, 1<<62, 0, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil)
 	sessionID, xn := login(t, h.testHarness, "rr-push-not-unrelated")
-	jobID := currentJobIDForXN(t, h.testHarness, xn)
+	jobID := currentJobIDForSession(t, h.testHarness, xn)
 
 	forceDistinctCachedJob(t, h.testHarness, xn, freshDiff)
 	sessionByID(t, h.testHarness, sessionID).currentDifficulty.Store(freshDiff)

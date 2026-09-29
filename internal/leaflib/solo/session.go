@@ -45,32 +45,58 @@ type Session struct {
 	// explicit getjob responses) carries this same value in
 	// JobPayload.XN, and every submit from this session must have its
 	// nonce hex-prefixed with it (handleSubmit below) or be rejected
-	// before any PoW validation runs. NOTE: xn is a SHA3X-specific
-	// nonce-composition convention, not the real security boundary —
-	// see jobList/jobLog below.
+	// before any PoW validation runs.
 	//
-	// BUG FIX (BRIEF_xn_relogin_fix.md): xn is ALSO the internal cache
-	// key handleLogin/handleGetJob/vardiff's maybeRetarget use to
-	// look up this session's *Job via
-	// JobManager.JobForXNAtDifficulty/RestampDifficulty — repeat calls
-	// with the same xn against the same cache generation return the
-	// SAME *Job, including that Job's own accumulated usedNonces
-	// history (job.go's MarkNonceUsed). handleLogin runs on EVERY
-	// "login" message, including a genuine re-login on an
-	// already-logged-in connection (xmrig-proxy's `simple`-mode
-	// `--reuse-timeout` connection reuse handing the same socket to a
-	// genuinely different downstream worker — see
-	// https://github.com/xmrig/xmrig-proxy/issues/118). Keeping xn
-	// fixed across a re-login would let a genuinely different miner
-	// inherit the PREVIOUS worker's partially-used nonce space on the
-	// still-cached job, causing a false "duplicate_nonce" rejection
-	// the first time it happened to pick a raw nonce the previous
-	// worker had already submitted. xn is therefore now MUTABLE
-	// (atomic.Value, not a plain string) so handleLogin can roll a
-	// fresh one on every re-login (see that method's own re-login
-	// block) — every read site must go through the XN() accessor
-	// below, never load this field directly.
-	xn       atomic.Value // string
+	// xn IS A WIRE-PROTOCOL VALUE ONLY — NOT AN IDENTITY, AND NO
+	// LONGER A CACHE KEY. It is a 2-byte draw (65,536 possible
+	// values), so two genuinely unrelated sessions drawing the same xn
+	// is an ordinary birthday-paradox event. That is harmless for what
+	// xn actually does (the SHA3X/C29 nonce-prefix partitioning check
+	// in handleSubmit), but it made xn categorically unfit as the
+	// JobManager job-cache key it used to also serve as: two colliding
+	// sessions were handed the SAME *Job by reference, including its
+	// accumulated usedNonces history, instead of each getting its own
+	// freshly minted job. See jobKey below and
+	// leaflib.NewJobCacheKey's doc comment for that fix; the xn-prefix
+	// wire check itself is completely unchanged.
+	//
+	// xn is MUTABLE (atomic.Value, not a plain string) so handleLogin
+	// can roll a fresh one on every re-login — an xmrig-proxy
+	// `simple`-mode `--reuse-timeout` connection reuse hands the same
+	// socket to a genuinely different downstream worker (see
+	// https://github.com/xmrig/xmrig-proxy/issues/118), which should
+	// get its own nonce-prefix partition rather than inheriting the
+	// previous worker's. Every read site must go through the XN()
+	// accessor below, never load this field directly.
+	xn atomic.Value // string
+
+	// jobKey is this session's own job-cache identity: the key
+	// JobManager.JobForSessionAtDifficulty/RestampDifficulty look this
+	// session's *Job up under (job.go). Minted by
+	// leaflib.NewJobCacheKey — see that function's doc comment for
+	// the real, maintainer-confirmed correctness bug this field exists
+	// to fix (this lookup used to be keyed by s.xn, above, whose
+	// 2-byte collisions silently made two unrelated sessions share one
+	// *Job, one template and one usedNonces map — producing spurious
+	// duplicate-nonce rejections of genuinely valid shares, most
+	// acutely for ALGO_RXM where the xn-prefix wire check is
+	// deliberately skipped).
+	//
+	// Unique BY CONSTRUCTION, not by probability: NewJobCacheKey is
+	// backed by a process-wide monotonic counter, so no two live
+	// sessions can ever hold the same jobKey at any session count.
+	//
+	// MUTABLE (atomic.Value, same shape as xn above) and ROLLED ON
+	// EVERY RE-LOGIN, for the exact reason xn is: the job-cache lookup
+	// after a re-login must be a guaranteed cache MISS, so a genuinely
+	// different downstream worker reusing this socket gets a fresh
+	// *Job with an EMPTY usedNonces map instead of inheriting the
+	// previous worker's partially-used nonce space (the false
+	// "duplicate_nonce" bug BRIEF_xn_relogin_fix.md closed —
+	// originally via the xn roll, now via this key, which is the
+	// value the cache is actually keyed by). Read via the JobKey()
+	// accessor below, never loaded directly.
+	jobKey   atomic.Value // string
 	loggedIn atomic.Bool
 
 	// identity is this session's ENTIRE miner-identity state
@@ -294,10 +320,11 @@ type Session struct {
 	// "target" field (jobPayload's diffToTargetHex(job.StaticDifficulty))
 	// does. A dedup keyed on job.ID alone would silently swallow a
 	// legitimate vardiff-driven difficulty/target update that happens
-	// to share the same job.ID as the last push (JobForXNAtDifficulty
-	// returns the SAME cached Job, unchanged, whenever the underlying
-	// per-xn template hasn't been invalidated — see job.go's
-	// jobForXN/RestampDifficulty doc comments) — a real target update
+	// to share the same job.ID as the last push
+	// (JobForSessionAtDifficulty returns the SAME cached Job,
+	// unchanged, whenever the underlying per-session template hasn't
+	// been invalidated — see job.go's
+	// jobForSession/RestampDifficulty doc comments) — a real target update
 	// the miner needs to receive.
 	lastDeliveredJobID      atomic.Value // string
 	lastDeliveredDifficulty atomic.Uint64
@@ -340,6 +367,18 @@ func (s *Session) Identity() *leaflib.MinerIdentity {
 func (s *Session) XN() string {
 	xn, _ := s.xn.Load().(string)
 	return xn
+}
+
+// JobKey is the single accessor every read site goes through instead
+// of loading the jobKey field directly — see that field's own doc
+// comment for what it is, why it is NOT s.xn, and why it is an
+// atomic.Value (rolled on every re-login) rather than a plain string.
+// Never returns an unset/wrong-type value in practice: newSession
+// always seeds it with a real key before this session is ever
+// reachable from another goroutine.
+func (s *Session) JobKey() string {
+	key, _ := s.jobKey.Load().(string)
+	return key
 }
 
 // alreadyDelivered reports whether job is identical (same job.ID AND
@@ -392,6 +431,12 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 	}
 	s := &Session{mc: mc, server: server, sessionID: id, connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*Job](defaultSessionJobHistorySize)}
 	s.xn.Store(xn)
+	// The job-cache identity this session's *Job is looked up under —
+	// deliberately NOT s.xn (see the jobKey field's own doc comment
+	// and leaflib.NewJobCacheKey). Unique by construction, so unlike
+	// the xn fallback above there is no error/collision path here at
+	// all.
+	s.jobKey.Store(leaflib.NewJobCacheKey(id))
 	s.identity.Store(&leaflib.MinerIdentity{})
 	s.loginHistory = leaflib.NewLoginHistory(defaultSessionJobHistorySize)
 	s.currentDifficulty.Store(startingDifficulty)
@@ -657,36 +702,45 @@ func (s *Session) handleLogin(req Request) {
 			oldIdentity.Address, oldIdentity.Worker, oldIdentity.Agent, oldIdentity.PaymentID, oldIdentity.LoggedInAt.Format(time.RFC3339),
 			newIdentity.Address, newIdentity.Worker, newIdentity.Agent, newIdentity.PaymentID)
 
-		// BUG FIX (BRIEF_xn_relogin_fix.md): roll a genuinely fresh xn
-		// on EVERY re-login, unconditionally -- not gated on proxy
-		// detection or reloginDetected's own value (the surrounding
+		// BUG FIX (BRIEF_xn_relogin_fix.md): roll a genuinely fresh
+		// job-cache key (AND a fresh xn) on EVERY re-login,
+		// unconditionally -- not gated on proxy detection or
+		// reloginDetected's own value (the surrounding
 		// `s.loggedIn.Load()` condition, "was this session already
 		// logged in", is exactly the same gate reloginDetected uses,
-		// so computing the new xn here is equivalent to gating on
-		// "this is a re-login" alone). See the xn field's own doc
-		// comment for the full false-duplicate_nonce root cause this
-		// closes: without this, the JobForXNAtDifficulty call below
-		// would be a cache HIT against the OLD xn's still-cached
-		// *Job, handing the new identity the previous identity's
-		// partially-used nonce history. Rolling a new xn here instead
-		// makes that lookup a guaranteed cache MISS, minting a fresh
-		// *Job with an empty usedNonces map. This applies uniformly
-		// to every algo this leaf serves, including RXM: xn is never
-		// sent on RXM's wire payload (see jobPayload below), but it
-		// is still the internal JobForXNAtDifficulty cache key for
-		// RXM sessions exactly like every other algo, so the same bug
-		// (and the same fix) applies there purely through that
-		// internal mechanism.
+		// so rolling here is equivalent to gating on "this is a
+		// re-login" alone). See the jobKey/xn fields' own doc comments
+		// for the full false-duplicate_nonce root cause this closes:
+		// without the jobKey roll, the JobForSessionAtDifficulty call
+		// below would be a cache HIT against this session's
+		// still-cached *Job, handing the new identity the previous
+		// identity's partially-used nonce history. Rolling a new key
+		// here instead makes that lookup a guaranteed cache MISS,
+		// minting a fresh *Job with an empty usedNonces map. This
+		// applies uniformly to every algo this leaf serves, including
+		// RXM: xn is never sent on RXM's wire payload (see jobPayload
+		// below), and the job cache is no longer keyed by xn for ANY
+		// algo, so the fix now rests entirely on this internal
+		// job-cache key.
 		//
-		// A crypto/rand read failure here is exceptionally rare (see
+		// leaflib.NewJobCacheKey cannot fail (monotonic counter, no
+		// crypto/rand involved), so unlike the xn roll below there is
+		// no fallback branch to reason about.
+		s.jobKey.Store(leaflib.NewJobCacheKey(s.sessionID))
+
+		// The xn roll is retained for its own, separate,
+		// still-genuine reason: xn is the SHA3X/C29 submit-time
+		// nonce-prefix partition this session's NEW downstream worker
+		// mines under, and it is published on the wire in this very
+		// login response's job payload (jobPayload below). A
+		// crypto/rand read failure here is exceptionally rare (see
 		// newSession's identical fallback) -- on error, the OLD xn is
 		// deliberately left in place (falling back to the fixed
 		// all-zeros "0000" mid-session, as newSession does at connect
-		// time, would risk actively colliding this session onto
-		// whatever OTHER session's cache entry already happens to be
-		// keyed "0000", which is worse than just keeping this
-		// session's own still-valid, already-unique xn for one more
-		// login cycle).
+		// time, would risk actively un-partitioning this session
+		// against whatever OTHER session also fell back to "0000",
+		// which is worse than just keeping this session's own
+		// still-valid xn for one more login cycle).
 		if newXN, err := newSessionXN(); err != nil {
 			s.server.logger.Printf("solo: session %s re-login: failed to roll a fresh xn, keeping previous xn %q: %v", s.sessionID, s.XN(), err)
 		} else {
@@ -779,9 +833,9 @@ func (s *Session) handleLogin(req Request) {
 		}
 	}
 
-	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.XN(), s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForSessionAtDifficulty(context.Background(), s.JobKey(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.XN(), err)
+		s.server.logger.Printf("solo: failed to get job for session %s (job_key %s): %v", s.sessionID, s.JobKey(), err)
 		s.server.recordLoginRejection(metrics.LoginRejectionReasonNoJobTemplate)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
@@ -804,9 +858,9 @@ func (s *Session) handleGetJob(req Request) {
 		s.writeGeneralResponse(req.ID, "login required before getjob", "")
 		return
 	}
-	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.XN(), s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForSessionAtDifficulty(context.Background(), s.JobKey(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.XN(), err)
+		s.server.logger.Printf("solo: failed to get job for session %s (job_key %s): %v", s.sessionID, s.JobKey(), err)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
 	}
@@ -864,7 +918,8 @@ func (s *Session) handleGetJob(req Request) {
 // Unlike leaf-direct's own identical fix, leaf-solo has no
 // jobFetchPool (that CLOSE-WAIT-incident worker-pool dispatch is a
 // leaf-direct-only fix -- see direct/server.go's jobFetchPool doc
-// comment); handleGetJob above already calls JobForXNAtDifficulty
+// comment); handleGetJob above already calls
+// JobForSessionAtDifficulty
 // inline on Session.Run's own read-loop goroutine, so this mirrors
 // that exact, already-established synchronous shape rather than
 // introducing new dispatch machinery leaf-solo has never used.
@@ -885,9 +940,9 @@ func (s *Session) handleGetJob(req Request) {
 // session, and already gates on s.loggedIn itself, so there is no
 // separate logged-in check needed here.
 func (s *Session) pushFreshJobOnStaleSubmit() {
-	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.XN(), s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForSessionAtDifficulty(context.Background(), s.JobKey(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("solo: failed to fetch fresh job for session %s (xn %s) after a stale-job-class submit rejection: %v", s.sessionID, s.XN(), err)
+		s.server.logger.Printf("solo: failed to fetch fresh job for session %s (job_key %s) after a stale-job-class submit rejection: %v", s.sessionID, s.JobKey(), err)
 		return
 	}
 	if s.alreadyDelivered(job) {
@@ -1649,7 +1704,8 @@ func (s *Session) handleSubmit(req Request) {
 		submitResult = metrics.ResultAccepted
 		s.writeShareResponse(req.ID, true, "")
 
-		// A block was found; every cached per-xn template is now stale
+		// A block was found; every cached per-session template is now
+		// stale
 		// (built against a tip that no longer exists). Invalidate the
 		// whole cache (this also fires JobManager's subscribers, which
 		// triggers Server.invalidateAndRepushJobs to regenerate+push fresh

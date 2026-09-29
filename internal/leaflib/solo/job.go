@@ -25,36 +25,50 @@ import (
 // meet to actually BE a full block (at which point SubmitBlock is
 // called for real).
 //
-// IMPORTANT (see this package's per-xn extranonce support, added after
-// a real production crash — the graxil GPU miner panicked on a missing
-// "xn" field, and the maintainer clarified that "solo" means "single
-// payout address", NOT "single miner": any number of miners can point
-// at a solo leaf). There is NOT one global Job shared by every
-// connected miner. Each connecting session is assigned its own random
-// 2-byte extranonce (xn) once, at connect time (see session.go's
-// newSession), and JobManager maintains one independently-generated Job
-// per xn (see JobManager.perXN below) so that miners with different xn
-// values search genuinely different, non-overlapping hash spaces —
-// ported from go-tari-sha3x-solo-stratum's
+// IMPORTANT (see this package's per-session extranonce (xn) support,
+// added after a real production crash — the graxil GPU miner panicked
+// on a missing "xn" field, and the maintainer clarified that "solo"
+// means "single payout address", NOT "single miner": any number of
+// miners can point at a solo leaf). There is NOT one global Job shared
+// by every connected miner. JobManager maintains one
+// independently-generated Job PER SESSION (see JobManager.perSession
+// below) so that miners search genuinely different, non-overlapping
+// hash spaces — ported from go-tari-sha3x-solo-stratum's
 // subsystems/blockTemplateCache/blockTemplate.go (GetBlockSha3 +
 // GetBlockWithXN) and subsystems/poolStratum/miner.go (needsXN/xn
 // assignment at connection-init, getJob/SendNewJob, the submit-time xn
 // prefix check).
+//
+// CACHE KEY: PER SESSION, NOT PER xn (real correctness fix,
+// maintainer-confirmed — see leaflib.NewJobCacheKey's doc comment for
+// the full root cause). The legacy reference keyed this cache off the
+// session's own 2-byte extranonce (xn), and so did this package until
+// that was found to be a genuine bug: xn is only 65,536 possible
+// values, so two UNRELATED sessions drawing the same xn were handed
+// the SAME *Job object by reference — same job.ID, same template
+// bytes, and the same usedNonces map — instead of each getting its
+// own freshly minted job. Every entry here is now keyed by a
+// per-session job-cache key that is unique BY CONSTRUCTION
+// (leaflib.NewJobCacheKey, a monotonic counter, not a random draw).
+// xn keeps its original — and only — wire-protocol role: the
+// SHA3X/C29 submit-time nonce-prefix check in session.go's
+// handleSubmit. It is no longer an identity or a cache key anywhere.
 //
 // This is NOT Bitcoin-style nonce-range slicing. It's a genuinely
 // distinct-block-template split: NodeClient.GetBlockTemplate (node.go)
 // already appends a fresh, randomly-generated 8-byte nonce buffer to
 // the coinbase-extra field on every call (mirroring the legacy
 // GetBlockSha3's `binary.LittleEndian.PutUint64(buf, rand.Uint64())`
-// coinbase-extra randomization), so calling it once per newly-seen xn
-// already yields a block whose MergeMiningHash pre-image genuinely
-// differs from every other xn's template, even at the same height —
-// see node.go's GetBlockTemplate doc comment. What JobManager adds here
-// is the per-xn CACHING/reuse behavior on top of that: a given xn keeps
-// getting served the SAME Job on repeat requests (consistent job_id
-// across getjob calls, matching the legacy GetBlockWithXN's "this xn
-// already claimed a cached template" behavior) until the whole cache is
-// invalidated by tip movement.
+// coinbase-extra randomization), so calling it once per newly-seen
+// session already yields a block whose MergeMiningHash pre-image
+// genuinely differs from every other session's template, even at the
+// same height — see node.go's GetBlockTemplate doc comment. What
+// JobManager adds here is the per-session CACHING/reuse behavior on
+// top of that: a given session keeps getting served the SAME Job on
+// repeat requests (consistent job_id across getjob calls, matching the
+// legacy GetBlockWithXN's "this requester already claimed a cached
+// template" behavior) until the whole cache is invalidated by tip
+// movement.
 type Job struct {
 	// ID is the real miner-facing job_id: a purely random, opaque
 	// wire token (see node.go's tariJobFromResult / monero_node.go's
@@ -227,11 +241,14 @@ type Job struct {
 	// nonceMu/usedNonces implement per-job used-nonce tracking, ported
 	// from go-tari-sha3x-solo-stratum's MinerJob.UsedNonces/NonceMutex
 	// (minerTracking/structs.go) — a miner replaying the same nonce
-	// twice must not be credited twice. Since every xn now gets its own
-	// distinct Job (see type doc comment), this is naturally per-xn
-	// too: two different miners with two different xns can legitimately
-	// use the "same" raw nonce value against their own independent
-	// templates without colliding.
+	// twice must not be credited twice. Since every SESSION now gets
+	// its own distinct Job (see type doc comment), this is naturally
+	// per-session too: two different miners can legitimately use the
+	// "same" raw nonce value against their own independent templates
+	// without colliding. That per-session guarantee is exactly what
+	// the former xn-keyed cache silently broke on an xn collision
+	// (two unrelated sessions sharing one Job, and therefore ONE
+	// usedNonces map) — see leaflib.NewJobCacheKey.
 	nonceMu    sync.Mutex
 	usedNonces map[uint64]struct{}
 }
@@ -292,8 +309,9 @@ const (
 // maxTrackedNoncesPerJob mirrors internal/leaflib/proxy/job.go's
 // identical constant exactly -- see that constant's own doc comment
 // for the full reasoning (Fix 11, DISPATCH_BRIEF.md 2026-09-10). The
-// same 100,000-entry bound applies here: leaf-solo's own per-xn Job
-// (see this type's doc comment: every xn gets its own distinct Job)
+// same 100,000-entry bound applies here: leaf-solo's own per-session Job
+// (see this type's doc comment: every SESSION gets its own distinct
+// Job)
 // has the exact same unbounded-map-growth exposure this fix closes
 // for leaf-proxy.
 const maxTrackedNoncesPerJob = 100_000
@@ -314,35 +332,36 @@ type JobManagerConfig struct {
 	// cmd/leaf-solo/main.go's LEAF_SOLO_ALGO doc comment for why a
 	// simpler single-algo flag was chosen over per-port algo selection
 	// for this pass); every Job it produces is stamped with this same
-	// Algo (see jobForXN below).
+	// Algo (see jobForSession below).
 	Algo poolpb.Algo
 
 	// PayoutAddress is where found-block coinbase rewards go (solo
 	// mode's only payout destination — see cmd/leaf-solo's doc comment).
 	PayoutAddress string
 
-	// StaticDifficulty is the DEFAULT/fallback difficulty JobForXN
+	// StaticDifficulty is the DEFAULT/fallback difficulty JobForSession
 	// stamps onto a newly-generated Job when no per-session difficulty
 	// override is supplied. In production, every real caller now goes
-	// through JobForXNAtDifficulty with the requesting session's own
+	// through JobForSessionAtDifficulty with the requesting session's own
 	// current vardiff difficulty (see session.go's handleLogin/
 	// handleGetJob and server.go's invalidateAndRepushJobs), so this
-	// field is effectively only exercised by JobForXN callers that
+	// field is effectively only exercised by JobForSession callers that
 	// don't care about a specific difficulty (tests, Probe-adjacent
 	// code paths). Vardiff (per-session adaptive retargeting) is
 	// implemented in vardiff.go; this field is NOT the "one true"
 	// difficulty for every session anymore.
 	StaticDifficulty uint64
 
-	// RefreshInterval is how often the ENTIRE per-xn job cache is
+	// RefreshInterval is how often the ENTIRE per-session job cache is
 	// unconditionally invalidated, regardless of tip movement, forcing
 	// a fresh template (with fresh randomized coinbase data) to be
-	// generated for every xn on its next request. Mirrors the legacy
+	// generated for every session on its next request. Mirrors the
+	// legacy
 	// UpdateBlockTemplateCache's periodic refresh.
 	RefreshInterval time.Duration
 
 	// TipPollInterval is how often the chain tip is polled so the
-	// per-xn cache can be invalidated immediately when someone else
+	// per-session cache can be invalidated immediately when someone else
 	// finds a block, instead of waiting out the full RefreshInterval on
 	// stale templates.
 	TipPollInterval time.Duration
@@ -405,32 +424,37 @@ type JobManagerConfig struct {
 
 	// Debug, if non-nil and enabled, adds verbose [DEBUG]-tagged
 	// logging for this JobManager's own template-fetch/tip-poll/
-	// invalidation lifecycle (see jobForXN/tipPollLoop/InvalidateAll)
+	// invalidation lifecycle (see jobForSession/tipPollLoop/InvalidateAll)
 	// -- see internal/leaflib/debuglog.go's doc comment. nil (the
 	// default for every pre-existing caller/test) is a complete
 	// no-op: Debugf is safe to call on a nil *leaflib.DebugLogger.
 	Debug *leaflib.DebugLogger
 }
 
-// JobManager maintains a per-xn cache of independently-generated block
+// JobManager maintains a per-session cache of independently-generated block
 // template Jobs (see Job's doc comment for why this replaced a single
 // global Job), refreshing/invalidating that cache on a timer and
 // immediately on tip movement, and notifies subscribers (Server) when
 // an invalidation happens so already-connected sessions can be handed
-// fresh, regenerated per-xn jobs instead of continuing to work a job
+// fresh, regenerated per-session jobs instead of continuing to work a job
 // for a tip that has already moved.
 type JobManager struct {
 	cfg JobManagerConfig
 
-	mu       sync.RWMutex
-	perXN    map[string]*Job // xn (hex string) -> that xn's current Job
-	jobsByID map[string]*Job // job.ID -> Job, spanning every xn's current entry, for submit-time lookup
+	mu sync.RWMutex
+	// perSession maps a session's own job-cache key
+	// (leaflib.NewJobCacheKey -- see that function's doc comment, and
+	// Job's, for why this is NOT keyed by the session's 2-byte xn)
+	// to the Job currently served to that session.
+	perSession map[string]*Job
+	jobsByID   map[string]*Job // job.ID -> Job, spanning every session's current entry, for submit-time lookup
 
 	// lastTipHeight is the most recently observed real chain-tip
 	// height (from NodeClient.GetTipInfo), used purely to detect tip
 	// movement in tipPollLoop. It is NOT the same thing as any
-	// individual Job.Height (each xn's Job is fetched independently and
-	// may observe a template at a very slightly different moment).
+	// individual Job.Height (each session's Job is fetched
+	// independently and may observe a template at a very slightly
+	// different moment).
 	lastTipHeight uint64
 	tipObserved   bool // false until tipPollLoop's first successful GetTipInfo, so that first poll seeds a baseline instead of being misread as tip movement from a zero-value default
 
@@ -442,7 +466,7 @@ type JobManager struct {
 	// relay) has ever been installed; see currentBestSnapshot/setBest.
 	// This is deliberately separate from lastTipHeight (which tracks
 	// THIS instance's own node's tip, regardless of what's actually
-	// being served) and from any individual cached Job (perXN/
+	// being served) and from any individual cached Job (perSession/
 	// jobsByID entries reflect what miners are actually being handed
 	// right now; bestHeight/bestSize reflect the best this JobManager
 	// has ever confirmed, which relay adoption may keep ahead of a
@@ -459,19 +483,19 @@ type JobManager struct {
 	// session's own per-session Job is DERIVED from, for the algos
 	// usesSharedTemplate covers -- see that method's doc comment for
 	// the exact per-algo scope and the real reasoning behind it, and
-	// jobForXNFromSharedTemplate for the derivation itself.
+	// jobForSessionFromSharedTemplate for the derivation itself.
 	//
 	// WHY THIS FIELD EXISTS (real, live-confirmed production
 	// incident, sxmr-phx-dump, ~13,500 simultaneously-reconnecting
-	// miners): jobForXN used to call GetBlockTemplate on ANY per-xn
-	// cache miss. genLocks (below) correctly collapsed concurrent
-	// first-requests for the SAME xn into one fetch, but every
-	// DIFFERENT xn still got its OWN independent daemon round trip --
-	// and since xn is assigned fresh per connection
-	// (leaflib.NewSessionXN, a random per-session identifier with
-	// ZERO cryptographic meaning to the underlying template), a mass
-	// reconnect meant one real daemon RPC per session for the exact
-	// same chain tip. The leaf logged the SAME height's "new block
+	// miners): jobForSession used to call GetBlockTemplate on ANY
+	// per-session cache miss. genLocks (below) correctly collapsed
+	// concurrent first-requests for the SAME session into one fetch,
+	// but every DIFFERENT session still got its OWN independent
+	// daemon round trip -- and since a session's job-cache key is
+	// minted fresh per connection (leaflib.NewJobCacheKey, an
+	// identifier with ZERO cryptographic meaning to the underlying
+	// template), a mass reconnect meant one real daemon RPC per
+	// session for the exact same chain tip. The leaf logged the SAME height's "new block
 	// template fetched" line 41,783 times in a 90-second window, the
 	// upstream minotari_merge_mining_proxy started returning
 	// `rpc error -32603: Internal error` under the load, and 21-40%
@@ -522,7 +546,7 @@ type JobManager struct {
 	// stratum logins against the SAME leaf at the SAME tip received
 	// BYTE-IDENTICAL mining blobs (only job_id/target differed),
 	// because jobFromSharedTemplate copied tpl.Header /
-	// tpl.RawTemplateBlob BY REFERENCE into every per-xn *Job and
+	// tpl.RawTemplateBlob BY REFERENCE into every per-session *Job and
 	// patched nothing. Every Monero-family miner on the leaf was
 	// therefore searching the exact same space as every other one.
 	// jobFromSharedTemplate now consumes the next value off this
@@ -555,29 +579,30 @@ type JobManager struct {
 
 	// templateFetchMu is the NEW, single, process-wide single-flight
 	// lock guarding "is there a shared template at all yet" --
-	// deliberately DISTINCT from genLocks below (which is per-xn).
+	// deliberately DISTINCT from genLocks below (which is per-session).
 	// This is what makes a cold-start stampede across MANY different
-	// xns collapse to ONE real GetBlockTemplate call instead of N:
-	// genLocks alone cannot do that, since by construction each
-	// stampeding session holds a DIFFERENT xn's lock. It mirrors
+	// sessions collapse to ONE real GetBlockTemplate call instead of
+	// N: genLocks alone cannot do that, since by construction each
+	// stampeding session holds a DIFFERENT session's lock. It mirrors
 	// genLocks' own established single-flight pattern, just applied
-	// at the shared-template level instead of the per-xn level.
+	// at the shared-template level instead of the per-session level.
 	// Never held across a notify/subscriber callback -- only across
 	// the one real GetBlockTemplate round trip and the snapshot/
 	// install of its result (see currentSharedTemplate).
 	templateFetchMu sync.Mutex
 
-	// genLocks holds one lazily-created *sync.Mutex per xn
-	// (map[string]*sync.Mutex, via sync.Map so lookups/creations don't
-	// need a separate lock of their own), serializing concurrent
-	// new-template generation ONLY for the SAME xn -- see jobForXN's
-	// own doc comment for the full rationale and the incident
-	// (brief2.md, second finding on the phx-dump.supportxmr.com
-	// leaf) that required narrowing this from a single global
-	// sync.Mutex (the original genMu) to per-xn granularity.
-	// Deliberately never pruned/removed as xns age out (InvalidateAll
-	// wipes perXN/jobsByID but leaves genLocks alone) -- a stray
-	// *sync.Mutex per distinct xn ever seen over this process's
+	// genLocks holds one lazily-created *sync.Mutex per session
+	// job-cache key (map[string]*sync.Mutex, via sync.Map so lookups/
+	// creations don't need a separate lock of their own), serializing
+	// concurrent new-template generation ONLY for the SAME session --
+	// see jobForSession's own doc comment for the full rationale and
+	// the incident (brief2.md, second finding on the
+	// phx-dump.supportxmr.com leaf) that required narrowing this from
+	// a single global sync.Mutex (the original genMu) to per-session
+	// granularity. Deliberately never pruned/removed as session keys
+	// age out (InvalidateAll wipes perSession/jobsByID but leaves
+	// genLocks alone) -- a stray *sync.Mutex per distinct session key
+	// ever seen over this process's
 	// lifetime is a few dozen bytes each, the same order of magnitude
 	// this package already accepts for jobsByID's own unbounded-by-ID
 	// growth, and pruning it safely (without racing a lock currently
@@ -593,8 +618,8 @@ type JobManager struct {
 }
 
 // NewJobManager constructs a JobManager. Call Start to begin the
-// refresh/tip-poll loops; call JobForXN directly (e.g. from tests) for
-// a single synchronous per-xn fetch.
+// refresh/tip-poll loops; call JobForSession directly (e.g. from tests) for
+// a single synchronous per-session fetch.
 func NewJobManager(cfg JobManagerConfig) *JobManager {
 	logger := cfg.Logger
 	if logger == nil {
@@ -616,11 +641,11 @@ func NewJobManager(cfg JobManagerConfig) *JobManager {
 		cfg.Algo = poolpb.Algo_ALGO_SHA3X
 	}
 	return &JobManager{
-		cfg:      cfg,
-		perXN:    make(map[string]*Job),
-		jobsByID: make(map[string]*Job),
-		subs:     make(map[uint64]func(source string)),
-		logger:   logger,
+		cfg:        cfg,
+		perSession: make(map[string]*Job),
+		jobsByID:   make(map[string]*Job),
+		subs:       make(map[uint64]func(source string)),
+		logger:     logger,
 	}
 }
 
@@ -653,96 +678,102 @@ func (jm *JobManager) LatestHeight() uint64 {
 	return jm.lastTipHeight
 }
 
-// JobForXN returns the current Job for the given per-session xn,
-// generating and caching a brand new, independently-randomized block
-// template the first time this xn is seen (or after the cache has been
-// invalidated by tip movement/periodic refresh) — ported from
-// go-tari-sha3x-solo-stratum's GetBlockWithXN. Repeat calls with the
-// same xn against the same cache generation return the SAME Job
+// JobForSession returns the current Job for the given session's own
+// job-cache key (leaflib.NewJobCacheKey -- NOT the session's 2-byte
+// xn; see Job's doc comment and leaflib.NewJobCacheKey for the real
+// correctness bug that distinction fixes), generating and caching a
+// brand new, independently-randomized block template the first time
+// this session is seen (or after the cache has been invalidated by tip
+// movement/periodic refresh) — ported from
+// go-tari-sha3x-solo-stratum's GetBlockWithXN. Repeat calls for the
+// SAME session against the same cache generation return the SAME Job
 // (consistent job_id across getjob calls), matching the legacy
-// behavior exactly. A newly-generated Job (first-time-seen xn, or the
-// first request after invalidation) is stamped with
+// behavior exactly. A newly-generated Job (first-time-seen session, or
+// the first request after invalidation) is stamped with
 // JobManagerConfig.StaticDifficulty; callers that want a specific
 // session's own current vardiff difficulty stamped instead should use
-// JobForXNAtDifficulty.
-func (jm *JobManager) JobForXN(ctx context.Context, xn string) (*Job, error) {
-	return jm.jobForXN(ctx, xn, jm.cfg.StaticDifficulty)
+// JobForSessionAtDifficulty.
+func (jm *JobManager) JobForSession(ctx context.Context, sessionKey string) (*Job, error) {
+	return jm.jobForSession(ctx, sessionKey, jm.cfg.StaticDifficulty)
 }
 
-// JobForXNAtDifficulty is JobForXN's per-session-vardiff-aware
-// counterpart: if xn is not yet cached (first request, or the first
-// request after an invalidation), the freshly-generated Job is stamped
-// with difficulty instead of JobManagerConfig.StaticDifficulty. If xn
-// is already cached, the EXISTING cached Job is returned as-is
-// (matching JobForXN's "repeat requests get the same Job" contract) —
-// this does NOT retroactively change an already-cached job's stamped
-// difficulty; that is RestampDifficulty's job, called explicitly by a
-// session's vardiff retarget (vardiff.go's maybeRetarget), not by every
+// JobForSessionAtDifficulty is JobForSession's
+// per-session-vardiff-aware counterpart: if sessionKey is not yet
+// cached (first request, or the first request after an invalidation),
+// the freshly-generated Job is stamped with difficulty instead of
+// JobManagerConfig.StaticDifficulty. If sessionKey is already cached,
+// the EXISTING cached Job is returned as-is (matching JobForSession's
+// "repeat requests get the same Job" contract) — this does NOT
+// retroactively change an already-cached job's stamped difficulty;
+// that is RestampDifficulty's job, called explicitly by a session's
+// vardiff retarget (vardiff.go's maybeRetarget), not by every
 // ordinary getjob/login call.
-func (jm *JobManager) JobForXNAtDifficulty(ctx context.Context, xn string, difficulty uint64) (*Job, error) {
-	return jm.jobForXN(ctx, xn, difficulty)
+func (jm *JobManager) JobForSessionAtDifficulty(ctx context.Context, sessionKey string, difficulty uint64) (*Job, error) {
+	return jm.jobForSession(ctx, sessionKey, difficulty)
 }
 
-func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64) (*Job, error) {
-	if job, ok := jm.lookupXN(xn); ok {
+func (jm *JobManager) jobForSession(ctx context.Context, sessionKey string, difficulty uint64) (*Job, error) {
+	if job, ok := jm.lookupSession(sessionKey); ok {
 		return job, nil
 	}
 
 	if jm.usesSharedTemplate() {
-		return jm.jobForXNFromSharedTemplate(ctx, xn, difficulty)
+		return jm.jobForSessionFromSharedTemplate(ctx, sessionKey, difficulty)
 	}
 
 	// NARROWED LOCK GRANULARITY (brief2.md, second finding, discovered
 	// while implementing that fix's own required regression test):
 	// this used to acquire a single, process-wide jm.genMu
 	// sync.Mutex here, serializing EVERY concurrent first-request
-	// across EVERY xn, not just concurrent first-requests for the
-	// SAME xn -- confirmed via a live experiment (20 concurrent
-	// JobForXNAtDifficulty calls for 20 DISTINCT xns against a mock
-	// GetBlockTemplate with an artificial 30ms delay took ~607ms
-	// total, i.e. fully serialized, not the ~30ms true concurrent
-	// execution would take). That mattered beyond raw throughput:
+	// across EVERY session, not just concurrent first-requests for
+	// the SAME session -- confirmed via a live experiment (20
+	// concurrent JobForSessionAtDifficulty calls for 20 DISTINCT
+	// sessions against a mock GetBlockTemplate with an artificial
+	// 30ms delay took ~607ms total, i.e. fully serialized, not the
+	// ~30ms true concurrent execution would take). That mattered
+	// beyond raw throughput:
 	// internal/leaflib/direct.Server.invalidateAndRepushJobs' own
 	// brief2.md fix bounds/parallelizes its per-session fan-out
-	// specifically so a mass cache invalidation (every session's xn
-	// missing at once) completes in time proportional to
+	// specifically so a mass cache invalidation (every session's
+	// entry missing at once) completes in time proportional to
 	// session_count/concurrency rather than session_count -- which
 	// the old single global genMu would have silently defeated
 	// entirely, since every one of those concurrent callers would
 	// still have funneled through the exact same single mutex one at
 	// a time regardless of how many goroutines Server dispatched.
 	// jm.genLocks (see that field's own doc comment) replaces genMu
-	// with one lazily-created *sync.Mutex PER xn instead, preserving
-	// the original, still-needed guarantee (concurrent first-
-	// requests for the SAME xn collapse to a single real fetch, all
-	// sharing its result -- see
-	// TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate)
-	// while letting genuinely different xns' real GetBlockTemplate
-	// calls run fully concurrently, exactly as
+	// with one lazily-created *sync.Mutex PER SESSION instead,
+	// preserving the original, still-needed guarantee (concurrent
+	// first-requests for the SAME session collapse to a single real
+	// fetch, all sharing its result -- see
+	// TestJobForSessionConcurrentFirstRequestsForSameSessionDoNotDuplicate)
+	// while letting genuinely different sessions' real
+	// GetBlockTemplate calls run fully concurrently, exactly as
 	// direct.Server.invalidateAndRepushJobs' own fan-out now expects.
-	genLockAny, _ := jm.genLocks.LoadOrStore(xn, &sync.Mutex{})
+	genLockAny, _ := jm.genLocks.LoadOrStore(sessionKey, &sync.Mutex{})
 	genLock := genLockAny.(*sync.Mutex)
 	genLock.Lock()
 	defer genLock.Unlock()
 
-	if job, ok := jm.lookupXN(xn); ok {
+	if job, ok := jm.lookupSession(sessionKey); ok {
 		return job, nil
 	}
 
-	jm.cfg.Debug.Debugf("solo: fetching block template for xn=%s at difficulty=%d", xn, difficulty)
+	jm.cfg.Debug.Debugf("solo: fetching block template for session=%s at difficulty=%d", sessionKey, difficulty)
 	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress, jm.cfg.Algo)
 	if err != nil {
-		jm.cfg.Debug.Debugf("solo: GetBlockTemplate for xn=%s failed: %v", xn, err)
-		return nil, fmt.Errorf("solo: GetBlockTemplate for xn %s: %w", xn, err)
+		jm.cfg.Debug.Debugf("solo: GetBlockTemplate for session=%s failed: %v", sessionKey, err)
+		return nil, fmt.Errorf("solo: GetBlockTemplate for session %s: %w", sessionKey, err)
 	}
 	if result == nil {
-		return nil, fmt.Errorf("solo: GetBlockTemplate returned a nil job for xn %s", xn)
+		return nil, fmt.Errorf("solo: GetBlockTemplate returned a nil job for session %s", sessionKey)
 	}
 	// Unconditional (always-on, non-Debug-gated) log line: a fresh
 	// block template was just fetched from the base node for a
-	// first-seen/cache-invalidated xn (this IS the "new block
-	// template" event -- a cache HIT for an already-cached xn returns
-	// early above, before this GetBlockTemplate call is ever made).
+	// first-seen/cache-invalidated session (this IS the "new block
+	// template" event -- a cache HIT for an already-cached session
+	// returns early above, before this GetBlockTemplate call is ever
+	// made).
 	// Added so real network target difficulty is visible in a leaf's
 	// normal logs by default, without needing to restart with debug
 	// logging enabled -- see this line's own feature brief for the
@@ -762,8 +793,9 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 	// start -- always adopt, exactly like today) OR it is genuinely
 	// better than what's already tracked (which may be relay-sourced
 	// and ahead of what THIS particular fetch just observed). This
-	// job is still cached/served for xn unconditionally either way —
-	// per-xn independent template fetching (this package's core
+	// job is still cached/served for this session unconditionally
+	// either way —
+	// per-session independent template fetching (this package's core
 	// design, see Job's own doc comment) is never short-circuited by
 	// this bookkeeping; only the shared best-tracker's own value is
 	// protected from regressing below a genuinely superior relayed
@@ -773,19 +805,19 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 	jm.recordBestIfBetter(job)
 
 	jm.mu.Lock()
-	jm.perXN[xn] = job
+	jm.perSession[sessionKey] = job
 	jm.jobsByID[job.ID] = job
 	jm.mu.Unlock()
 
-	jm.cfg.Debug.Debugf("solo: job created xn=%s job_id=%s height=%d static_difficulty=%d network_target_difficulty=%d", xn, job.ID, job.Height, job.StaticDifficulty, job.NetworkTargetDifficulty)
+	jm.cfg.Debug.Debugf("solo: job created session=%s job_id=%s height=%d static_difficulty=%d network_target_difficulty=%d", sessionKey, job.ID, job.Height, job.StaticDifficulty, job.NetworkTargetDifficulty)
 
 	return job, nil
 }
 
 // usesSharedTemplate reports whether this JobManager derives every
 // session's own per-session Job from ONE shared current template
-// (jm.sharedTemplate) instead of giving each xn its OWN independent
-// GetBlockTemplate daemon call.
+// (jm.sharedTemplate) instead of giving each session its OWN
+// independent GetBlockTemplate daemon call.
 //
 // SCOPE: Monero-family algos ONLY (IsMoneroFamilyAlgo -- ALGO_RXM
 // plus every coinprofile.ByAlgo-registered coin). This is a
@@ -793,7 +825,7 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 // implementation; it was arrived at by reading each algo's real
 // per-session non-collision mechanism in full:
 //
-//   - Monero-family (RXM/XMR/ARQ/XEQ/GRFT/SFX/ZEPH/SAL): per-xn
+//   - Monero-family (RXM/XMR/ARQ/XEQ/GRFT/SFX/ZEPH/SAL): per-session
 //     independent fetching provides NO per-session differentiation
 //     whatsoever, so it is pure wasted daemon load. monero_node.go's
 //     GetBlockTemplate requests reserve_size: 60 and records the
@@ -825,9 +857,10 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 //     fix's scope anyway: they are not the incident's algo, sharing
 //     buys them nothing they don't already have, and including them
 //     would require rewriting job_test.go's
-//     TestJobForXNGivesDifferentXNsDifferentJobs -- an existing,
-//     explicitly-documented Tari-path assertion ("2 independent
-//     GetBlockTemplate calls (one per new xn)"). Changing a live
+//     TestJobForSessionGivesDifferentSessionsDifferentJobs -- an
+//     existing, explicitly-documented Tari-path assertion ("2
+//     independent GetBlockTemplate calls (one per new session)").
+//     Changing a live
 //     Tari behavioral contract is out of scope for a fix whose
 //     entire purpose is removing redundant Monero-family RPCs.
 //
@@ -843,7 +876,7 @@ func (jm *JobManager) jobForXN(ctx context.Context, xn string, difficulty uint64
 //     76-byte mining blob (leaflib.CreateTariMiningBlob over the
 //     same job.Header/pow_data) with an identical nonce space, which
 //     is a real duplicate-work/duplicate-share regression, not just
-//     a cosmetic one. RXT keeps its existing per-xn independent
+//     a cosmetic one. RXT keeps its existing per-session independent
 //     fetch behavior untouched.
 func (jm *JobManager) usesSharedTemplate() bool {
 	return IsMoneroFamilyAlgo(jm.cfg.Algo)
@@ -1001,7 +1034,7 @@ func (jm *JobManager) currentSharedTemplate(ctx context.Context) (*Job, *sharedT
 		tpl.CreatedAt = time.Now()
 	}
 	// Same unconditional (non-Debug-gated) "new block template
-	// fetched" log line the per-xn path emits -- see jobForXN's own
+	// fetched" log line the per-session path emits -- see jobForSession's own
 	// comment on it. In shared-template mode this now fires ONCE per
 	// real template, which is exactly the 41,783-lines-per-height
 	// symptom this fix removes.
@@ -1025,10 +1058,10 @@ func (jm *JobManager) currentSharedTemplate(ctx context.Context) (*Job, *sharedT
 
 // recordBestIfBetter applies the tracked-best (height, size)
 // bookkeeping to tpl -- the EXACT same "only adopt if there's no
-// baseline yet or this is genuinely better" rule jobForXN's own
+// baseline yet or this is genuinely better" rule jobForSession's own
 // local-fetch path already applied inline (see the comment there and
 // isBetterCandidate's doc comment). Factored out rather than
-// duplicated so the shared-template fetch path and the per-xn fetch
+// duplicated so the shared-template fetch path and the per-session fetch
 // path can never drift on it.
 func (jm *JobManager) recordBestIfBetter(job *Job) {
 	size := jm.templateSizeForRelay(job)
@@ -1047,7 +1080,7 @@ func (jm *JobManager) recordBestIfBetter(job *Job) {
 // "clone into a new stamped copy" field-copying convention exactly
 // (see that method, directly below) -- same field list, same order --
 // just sourcing the clone FROM the shared template instead of from an
-// existing per-xn job.
+// existing per-session job.
 //
 // CRITICAL (see this fix's brief, "What NOT to change"): per-session
 // Job objects STAY. This never hands one literal shared *Job to
@@ -1336,30 +1369,31 @@ func (jm *JobManager) extraNonceStampedTemplate(tpl *Job, gen *sharedTemplateGen
 	}, true
 }
 
-// jobForXNFromSharedTemplate is jobForXN's cache-miss path for the
-// algos usesSharedTemplate covers. It NEVER calls
+// jobForSessionFromSharedTemplate is jobForSession's cache-miss path
+// for the algos usesSharedTemplate covers. It NEVER calls
 // jm.cfg.Node.GetBlockTemplate itself -- it goes through
 // currentSharedTemplate, which fetches at most once process-wide per
-// template generation -- and then derives THIS xn's own Job from that
-// shared template and caches it under perXN[xn]/jobsByID[job.ID]
-// exactly as the per-xn path always has.
+// template generation -- and then derives THIS session's own Job from
+// that shared template and caches it under
+// perSession[sessionKey]/jobsByID[job.ID] exactly as the per-session
+// path always has.
 //
-// The per-xn jm.genLocks single-flight is deliberately KEPT here (not
-// replaced by templateFetchMu): it still provides the original,
+// The per-session jm.genLocks single-flight is deliberately KEPT here
+// (not replaced by templateFetchMu): it still provides the original,
 // independently-needed guarantee that two concurrent first-requests
-// for the SAME xn collapse to ONE cached Job rather than two
-// (preserving JobForXN's documented "repeat requests for the same xn
-// get the SAME Job / consistent job_id" contract -- see
-// TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate). The
-// two locks are strictly nested, always in the same order (genLock
+// for the SAME session collapse to ONE cached Job rather than two
+// (preserving JobForSession's documented "repeat requests for the same
+// session get the SAME Job / consistent job_id" contract -- see
+// TestJobForSessionConcurrentFirstRequestsForSameSessionDoNotDuplicate).
+// The two locks are strictly nested, always in the same order (genLock
 // then templateFetchMu, never the reverse), so they cannot deadlock.
-func (jm *JobManager) jobForXNFromSharedTemplate(ctx context.Context, xn string, difficulty uint64) (*Job, error) {
-	genLockAny, _ := jm.genLocks.LoadOrStore(xn, &sync.Mutex{})
+func (jm *JobManager) jobForSessionFromSharedTemplate(ctx context.Context, sessionKey string, difficulty uint64) (*Job, error) {
+	genLockAny, _ := jm.genLocks.LoadOrStore(sessionKey, &sync.Mutex{})
 	genLock := genLockAny.(*sync.Mutex)
 	genLock.Lock()
 	defer genLock.Unlock()
 
-	if job, ok := jm.lookupXN(xn); ok {
+	if job, ok := jm.lookupSession(sessionKey); ok {
 		return job, nil
 	}
 
@@ -1374,42 +1408,44 @@ func (jm *JobManager) jobForXNFromSharedTemplate(ctx context.Context, xn string,
 	}
 
 	jm.mu.Lock()
-	jm.perXN[xn] = job
+	jm.perSession[sessionKey] = job
 	jm.jobsByID[job.ID] = job
 	jm.mu.Unlock()
 
-	jm.cfg.Debug.Debugf("solo: job derived from shared template xn=%s job_id=%s height=%d static_difficulty=%d network_target_difficulty=%d (no daemon call)", xn, job.ID, job.Height, job.StaticDifficulty, job.NetworkTargetDifficulty)
+	jm.cfg.Debug.Debugf("solo: job derived from shared template session=%s job_id=%s height=%d static_difficulty=%d network_target_difficulty=%d (no daemon call)", sessionKey, job.ID, job.Height, job.StaticDifficulty, job.NetworkTargetDifficulty)
 
 	return job, nil
 }
 
-// RestampDifficulty is vardiff.go's job-push mechanism: given that xn's
-// CURRENTLY cached Job (block template, height, header — all unchanged,
-// no new GRPC call needed), produce and cache a new *Job with the SAME
+// RestampDifficulty is vardiff.go's job-push mechanism: given that
+// session's CURRENTLY cached Job (block template, height, header — all
+// unchanged, no new GRPC call needed), produce and cache a new *Job
+// with the SAME
 // ID/Height/Header/BlockHash/NetworkTargetDifficulty/Result but a NEW
-// StaticDifficulty, replacing the old entry under both perXN[xn] and
-// jobsByID[id] — mirroring go-tari-sha3x-solo-stratum's getJob(), which
-// on every SendNewJob call constructs a brand new minerTracking.MinerJob
-// (with a fresh, empty UsedNonces set) under the SAME jobLog[blockHash]
-// key whenever the block hash/xn is unchanged, just with an updated
-// Target field. If xn has no cached Job yet (a retarget firing before
-// this session's first getjob/login, which in practice can't happen
-// since a session always logs in before its vardiff loop can start —
-// see vardiff.go's runVardiffLoop is only started after Run begins, and
+// StaticDifficulty, replacing the old entry under both
+// perSession[sessionKey] and jobsByID[id] — mirroring
+// go-tari-sha3x-solo-stratum's getJob(), which on every SendNewJob
+// call constructs a brand new minerTracking.MinerJob (with a fresh,
+// empty UsedNonces set) under the SAME jobLog[blockHash] key whenever
+// the block hash is unchanged, just with an updated Target field. If
+// sessionKey has no cached Job yet (a retarget firing before this
+// session's first getjob/login, which in practice can't happen since a
+// session always logs in before its vardiff loop can start — see
+// vardiff.go's runVardiffLoop is only started after Run begins, and
 // login is the first message any session sends), this falls back to
 // generating a brand new one at the requested difficulty, exactly like
-// JobForXNAtDifficulty would. If the cached Job's StaticDifficulty
+// JobForSessionAtDifficulty would. If the cached Job's StaticDifficulty
 // already equals difficulty, the existing Job is returned unchanged
 // (no-op, no new cache entry) — callers (vardiff.go's maybeRetarget)
 // are expected not to call this unless the retarget algorithm actually
 // decided the difficulty changed, but this guard makes RestampDifficulty
 // itself idempotent regardless.
-func (jm *JobManager) RestampDifficulty(ctx context.Context, xn string, difficulty uint64) (*Job, error) {
+func (jm *JobManager) RestampDifficulty(ctx context.Context, sessionKey string, difficulty uint64) (*Job, error) {
 	jm.mu.RLock()
-	existing, ok := jm.perXN[xn]
+	existing, ok := jm.perSession[sessionKey]
 	jm.mu.RUnlock()
 	if !ok {
-		return jm.jobForXN(ctx, xn, difficulty)
+		return jm.jobForSession(ctx, sessionKey, difficulty)
 	}
 	if existing.StaticDifficulty == difficulty {
 		return existing, nil
@@ -1432,22 +1468,22 @@ func (jm *JobManager) RestampDifficulty(ctx context.Context, xn string, difficul
 	}
 
 	jm.mu.Lock()
-	jm.perXN[xn] = restamped
+	jm.perSession[sessionKey] = restamped
 	jm.jobsByID[restamped.ID] = restamped
 	jm.mu.Unlock()
 
 	return restamped, nil
 }
 
-func (jm *JobManager) lookupXN(xn string) (*Job, bool) {
+func (jm *JobManager) lookupSession(sessionKey string) (*Job, bool) {
 	jm.mu.RLock()
 	defer jm.mu.RUnlock()
-	job, ok := jm.perXN[xn]
+	job, ok := jm.perSession[sessionKey]
 	return job, ok
 }
 
-// GetJob returns the job matching id, searching across every xn's
-// currently-cached entry.
+// GetJob returns the job matching id, searching across every
+// session's currently-cached entry.
 //
 // SECURITY NOTE: this is NOT, and must never be treated as, a
 // session-ownership/security boundary. It is a diagnostic/test
@@ -1459,7 +1495,7 @@ func (jm *JobManager) lookupXN(xn string) (*Job, bool) {
 // specific session (login, getjob, vardiff-driven push,
 // invalidation-driven repush) and checked by handleSubmit BEFORE any
 // other validation. Do not add a caller that uses GetJob to gate a
-// submit — a shared, all-xn-spanning map has no notion of "whose job
+// submit — a shared, all-session-spanning map has no notion of "whose job
 // this actually is", which used to be the real, exploitable gap this
 // fix closes (see this method's git history / the PR that introduced
 // Session-level ownership).
@@ -1479,11 +1515,11 @@ func (jm *JobManager) JobMaxAge() time.Duration {
 	return jm.cfg.JobMaxAge
 }
 
-// InvalidateAll drops every cached per-xn Job, forcing the next
-// JobForXN call for any xn to generate a brand new, independently
-// randomized template. Called on tip movement (a block was found,
-// possibly by an entirely different miner/xn — every previously-cached
-// template height is now stale) and on the unconditional periodic
+// InvalidateAll drops every cached per-session Job, forcing the next
+// JobForSession call for any session to generate a brand new,
+// independently randomized template. Called on tip movement (a block
+// was found, possibly by an entirely different miner — every
+// previously-cached template height is now stale) and on the unconditional periodic
 // refresh timer. Mirrors go-tari-sha3x-solo-stratum's GetBlockWithXN
 // discard-stale-entries-at-read-time behavior, but eagerly: rather than
 // filtering stale entries out one lookup at a time, the whole
@@ -1517,7 +1553,7 @@ func (jm *JobManager) InvalidateAll(source string) {
 // Seeding matters because of ordering: InvalidateAll's notify() is
 // what drives direct.Server.invalidateAndRepushJobs' per-session
 // fan-out (every connected session immediately calling
-// JobForXNAtDifficulty). If the shared template were merely CLEARED
+// JobForSessionAtDifficulty). If the shared template were merely CLEARED
 // before that notify, the first session to be repushed would trigger
 // a fresh single-flight fetch -- correct, but one wholly avoidable
 // daemon round trip when the caller (tipPollLoop) has ALREADY
@@ -1534,7 +1570,7 @@ func (jm *JobManager) invalidateAll(source string, seed *Job) {
 		seed = nil
 	}
 	jm.mu.Lock()
-	jm.perXN = make(map[string]*Job)
+	jm.perSession = make(map[string]*Job)
 	jm.jobsByID = make(map[string]*Job)
 	// Dropping the shared template here is what makes the NEXT
 	// per-session request establish a genuinely fresh one (exactly
@@ -1554,9 +1590,9 @@ func (jm *JobManager) invalidateAll(source string, seed *Job) {
 	jm.sharedTemplateGen = newSharedTemplateGeneration(seed)
 	jm.mu.Unlock()
 	if seed != nil {
-		jm.cfg.Debug.Debugf("solo: per-xn job cache invalidated and reseeded with an already-fetched shared template (job_id=%s height=%d) -- no per-session daemon calls needed", seed.ID, seed.Height)
+		jm.cfg.Debug.Debugf("solo: per-session job cache invalidated and reseeded with an already-fetched shared template (job_id=%s height=%d) -- no per-session daemon calls needed", seed.ID, seed.Height)
 	} else {
-		jm.cfg.Debug.Debugf("solo: per-xn job cache invalidated (all cached jobs dropped)")
+		jm.cfg.Debug.Debugf("solo: per-session job cache invalidated (all cached jobs dropped)")
 	}
 	jm.notify(source)
 }
@@ -1565,8 +1601,9 @@ func (jm *JobManager) invalidateAll(source string, seed *Job) {
 // fail fast at startup if the base node is unreachable/misconfigured,
 // mirroring main.go's previous "fetch initial block template" sanity
 // check. The result is discarded — it is deliberately NOT cached under
-// any xn, since with per-xn jobs there is no "the" initial job to seed;
-// each session's first JobForXN call generates its own.
+// any session, since with per-session jobs there is no "the" initial
+// job to seed; each session's first JobForSession call generates its
+// own.
 func (jm *JobManager) Probe(ctx context.Context) error {
 	result, err := jm.cfg.Node.GetBlockTemplate(ctx, jm.cfg.PayoutAddress, jm.cfg.Algo)
 	if err != nil {
@@ -1578,11 +1615,11 @@ func (jm *JobManager) Probe(ctx context.Context) error {
 	return nil
 }
 
-// Subscribe registers fn to be called every time the per-xn job cache
+// Subscribe registers fn to be called every time the per-session job cache
 // is invalidated (tip movement or periodic refresh), receiving the
 // real source (TemplateSourceLocal/TemplateSourceRelay) of that
 // invalidation -- see InvalidateAll's doc comment. Callers (Server)
-// use this to push freshly (re-)generated per-xn jobs out to every
+// use this to push freshly (re-)generated per-session jobs out to every
 // currently-connected, logged-in session. Returns an unsubscribe
 // function.
 func (jm *JobManager) Subscribe(fn func(source string)) (unsubscribe func()) {
@@ -1609,7 +1646,7 @@ func (jm *JobManager) notify(source string) {
 // Start launches the periodic refresh and tip-poll loops, and
 // subscribes this JobManager to its configured template relay (see
 // JobManagerConfig.Relay) so a sibling leaf instance's own tip-poll
-// finding a new height can invalidate THIS instance's per-xn job
+// finding a new height can invalidate THIS instance's per-session job
 // cache immediately, instead of waiting for this instance's own next
 // tipPollLoop tick — the real latency win this feature exists for.
 // It returns immediately; every launched loop/subscription runs until
@@ -1632,18 +1669,18 @@ func (jm *JobManager) Start(ctx context.Context) {
 //   - Not better: logged at Debug level and otherwise ignored --
 //     no cache wipe, no wasted local re-fetch (this is the exact bug
 //     this feature fixes: the old behavior unconditionally wiped and
-//     let the next JobForXN call re-invoke GetBlockTemplate against
+//     let the next JobForSession call re-invoke GetBlockTemplate against
 //     THIS instance's own possibly-lagging node on ANY relay message
 //     at all, regardless of whether it was actually better).
 //   - Better, and the real template content reconstructs successfully
 //     (NodeClient.JobFromTemplateBytes): adopted directly via
-//     adoptRelayedJob -- every currently-known xn is immediately
+//     adoptRelayedJob -- every currently-known session is immediately
 //     reseeded with the reconstructed job, with NO local
 //     GetBlockTemplate round-trip.
 //   - Better, but reconstruction fails (e.g. an empty/malformed
 //     TemplateData, or a pre-adoption-feature bare-height-only
 //     publisher): falls back to a plain InvalidateAll, matching this
-//     feature's pre-existing behavior exactly (the next per-xn
+//     feature's pre-existing behavior exactly (the next per-session
 //     request re-fetches locally).
 //
 // Safe to call unconditionally even when jm.cfg.Relay is nil or
@@ -1662,12 +1699,12 @@ func (jm *JobManager) startTemplateRelaySubscription(ctx context.Context) {
 		}
 		job, jerr := jm.cfg.Node.JobFromTemplateBytes(msg.TemplateData, jm.cfg.Algo)
 		if jerr != nil || job == nil {
-			jm.logger.Printf("solo: received a superior template relay message from another instance (height=%d size=%d algo=%s network=%s) but could not reconstruct a job from its bytes (%v) -- falling back to a plain per-xn job cache invalidation", msg.Height, msg.Size, msg.Algo, msg.Network, jerr)
+			jm.logger.Printf("solo: received a superior template relay message from another instance (height=%d size=%d algo=%s network=%s) but could not reconstruct a job from its bytes (%v) -- falling back to a plain per-session job cache invalidation", msg.Height, msg.Size, msg.Algo, msg.Network, jerr)
 			jm.setBest(msg.Height, msg.Size)
 			jm.InvalidateAll(TemplateSourceRelay)
 			return
 		}
-		jm.logger.Printf("solo: adopting superior relayed template from another instance (height=%d size=%d algo=%s network=%s), reseeding per-xn job cache without a local re-fetch", msg.Height, msg.Size, msg.Algo, msg.Network)
+		jm.logger.Printf("solo: adopting superior relayed template from another instance (height=%d size=%d algo=%s network=%s), reseeding per-session job cache without a local re-fetch", msg.Height, msg.Size, msg.Algo, msg.Network)
 		jm.setBest(job.Height, msg.Size)
 		jm.adoptRelayedJob(job)
 	})
@@ -1689,7 +1726,7 @@ func (jm *JobManager) refreshLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			jm.logger.Printf("solo: periodic per-xn job cache invalidation")
+			jm.logger.Printf("solo: periodic per-session job cache invalidation")
 			jm.InvalidateAll(TemplateSourceLocal)
 		}
 	}
@@ -1697,7 +1734,7 @@ func (jm *JobManager) refreshLoop(ctx context.Context) {
 
 // tipPollLoop polls the local node's chain tip and, on a genuine
 // height increase, decides whether to invalidate/replace the served
-// per-xn job cache. When jm.cfg.Relay is disabled/unconfigured, this
+// per-session job cache. When jm.cfg.Relay is disabled/unconfigured, this
 // preserves the exact original, pre-adoption-feature behavior: an
 // unconditional wipe on any genuine local tip increase, no extra
 // fetch/compare/publish overhead -- there is nothing to compare
@@ -1755,13 +1792,13 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 				// leaf-direct without one configured) -- nothing to
 				// compare against or publish to, so preserve the
 				// exact original behavior unchanged.
-				jm.logger.Printf("solo: new tip detected (height %d -> %d), invalidating per-xn job cache", last, height)
+				jm.logger.Printf("solo: new tip detected (height %d -> %d), invalidating per-session job cache", last, height)
 				// SHARED-TEMPLATE MODE ONLY: fetch the real new
 				// template ONCE here and seed the new cache
 				// generation with it, so the invalidation's own
 				// subscriber fan-out
 				// (direct.Server.invalidateAndRepushJobs, one
-				// JobForXNAtDifficulty call per connected session)
+				// JobForSessionAtDifficulty call per connected session)
 				// derives every session's job from it with ZERO
 				// daemon calls. Pre-fix, this exact path was the
 				// second half of the live incident: a genuine tip
@@ -1799,11 +1836,11 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 			size := len(data)
 			best := jm.currentBestSnapshot()
 			if best.set && !isBetterCandidate(best.height, job.Height, best.size, size) {
-				jm.cfg.Debug.Debugf("solo: local candidate template (height=%d size=%d) not better than tracked best (height=%d size=%d) -- keeping existing per-xn job cache, no publish", job.Height, size, best.height, best.size)
+				jm.cfg.Debug.Debugf("solo: local candidate template (height=%d size=%d) not better than tracked best (height=%d size=%d) -- keeping existing per-session job cache, no publish", job.Height, size, best.height, best.size)
 				continue
 			}
 
-			jm.logger.Printf("solo: new tip detected (height %d -> %d), invalidating per-xn job cache", last, height)
+			jm.logger.Printf("solo: new tip detected (height %d -> %d), invalidating per-session job cache", last, height)
 			jm.setBest(job.Height, size)
 			// Seed the new cache generation with the template this
 			// branch ALREADY fetched above for its own
@@ -1834,7 +1871,7 @@ func (jm *JobManager) tipPollLoop(ctx context.Context) {
 //     size) is NOT better -- the candidate must not be adopted.
 //
 // This is the SINGLE shared comparison both the relay-adoption path
-// (startTemplateRelaySubscription) and the local-fetch path (jobForXN,
+// (startTemplateRelaySubscription) and the local-fetch path (jobForSession,
 // tipPollLoop) call -- see this feature's brief: "The comparison
 // function should be a single shared piece of logic both paths call,
 // not duplicated."
@@ -1880,7 +1917,7 @@ func (jm *JobManager) CurrentBest() (height uint64, size int, ok bool) {
 
 // setBest records (height, size) as JobManager's new tracked best
 // template -- called whenever a job is (re)installed as the served
-// baseline by ANY path (local fetch in jobForXN/tipPollLoop, or a
+// baseline by ANY path (local fetch in jobForSession/tipPollLoop, or a
 // successfully-adopted relay template in
 // startTemplateRelaySubscription).
 func (jm *JobManager) setBest(height uint64, size int) {
@@ -1912,40 +1949,40 @@ func (jm *JobManager) templateSizeForRelay(job *Job) int {
 
 // adoptRelayedJob installs job (reconstructed from a superior relayed
 // template -- see startTemplateRelaySubscription) as the new baseline
-// for EVERY currently-known xn, replacing the whole perXN/jobsByID
-// cache -- the same "wipe" shape InvalidateAll already uses, but
-// seeded directly from the relayed content instead of clearing to
-// empty and waiting for the next per-xn GetBlockTemplate call (which
-// would just hit this instance's own, already-confirmed-lagging,
-// local node again -- defeating the entire point of adopting a
-// relayed template in the first place).
+// for EVERY currently-known session, replacing the whole
+// perSession/jobsByID cache -- the same "wipe" shape InvalidateAll
+// already uses, but seeded directly from the relayed content instead
+// of clearing to empty and waiting for the next per-session
+// GetBlockTemplate call (which would just hit this instance's own,
+// already-confirmed-lagging, local node again -- defeating the entire
+// point of adopting a relayed template in the first place).
 //
 // SHARED-TEMPLATE MODE (usesSharedTemplate): the relayed template is
-// ALSO installed as jm.sharedTemplate, and each already-known xn gets
-// its OWN derived *Job (via jobFromSharedTemplate) carrying that xn's
-// own previously-stamped difficulty. This closes two real gaps at
-// once:
+// ALSO installed as jm.sharedTemplate, and each already-known session
+// gets its OWN derived *Job (via jobFromSharedTemplate) carrying that
+// session's own previously-stamped difficulty. This closes two real
+// gaps at once:
 //
-//  1. Pre-fix, adoptRelayedJob only reseeded xns ALREADY present in
-//     perXN. A session connecting AFTER an adoption was a plain cache
-//     miss and therefore fired its own local GetBlockTemplate call
-//     against the lagging local node -- exactly the round trip
-//     adoption exists to avoid. Installing the shared template means
-//     those later arrivals derive from the relayed content too, with
-//     zero daemon calls.
-//  2. Pre-fix, every xn was handed the SAME literal *Job pointer,
+//  1. Pre-fix, adoptRelayedJob only reseeded sessions ALREADY present
+//     in perSession. A session connecting AFTER an adoption was a
+//     plain cache miss and therefore fired its own local
+//     GetBlockTemplate call against the lagging local node -- exactly
+//     the round trip adoption exists to avoid. Installing the shared
+//     template means those later arrivals derive from the relayed
+//     content too, with zero daemon calls.
+//  2. Pre-fix, every session was handed the SAME literal *Job pointer,
 //     which silently discarded each session's own vardiff difficulty
 //     (all sessions inherited the relayed job's single
 //     StaticDifficulty) and made one shared nonceMu/usedNonces set
-//     serve every session at once. Deriving per-xn restores the
+//     serve every session at once. Deriving per-session restores the
 //     per-session Job guarantee this codebase depends on for
 //     submit-time ownership/replay protection -- see
 //     jobFromSharedTemplate's doc comment.
 //
 // NON-SHARED (Tari) MODE: behavior is deliberately left EXACTLY as it
-// was -- every xn shares the one adopted *Job pointer. leaf-direct's
-// shared fleet-wide payout_address already means there's no
-// coinbase-mismatch concern across sibling instances, per this
+// was -- every session shares the one adopted *Job pointer.
+// leaf-direct's shared fleet-wide payout_address already means there's
+// no coinbase-mismatch concern across sibling instances, per this
 // feature's own brief.
 func (jm *JobManager) adoptRelayedJob(job *Job) {
 	if jm.usesSharedTemplate() {
@@ -1953,83 +1990,83 @@ func (jm *JobManager) adoptRelayedJob(job *Job) {
 		return
 	}
 	jm.mu.Lock()
-	newPerXN := make(map[string]*Job, len(jm.perXN))
-	for xn := range jm.perXN {
-		newPerXN[xn] = job
+	newPerSession := make(map[string]*Job, len(jm.perSession))
+	for sessionKey := range jm.perSession {
+		newPerSession[sessionKey] = job
 	}
-	jm.perXN = newPerXN
+	jm.perSession = newPerSession
 	jm.jobsByID = map[string]*Job{job.ID: job}
 	jm.mu.Unlock()
-	jm.cfg.Debug.Debugf("solo: per-xn job cache reseeded from adopted relay template (job_id=%s height=%d)", job.ID, job.Height)
+	jm.cfg.Debug.Debugf("solo: per-session job cache reseeded from adopted relay template (job_id=%s height=%d)", job.ID, job.Height)
 	jm.notify(TemplateSourceRelay)
 }
 
 // adoptRelayedJobShared is adoptRelayedJob's shared-template-mode
 // implementation -- see that method's doc comment for the full
-// rationale. The per-xn derivations are computed OUTSIDE jm.mu (each
-// needs a crypto/rand job ID) and then swapped in under a single
+// rationale. The per-session derivations are computed OUTSIDE jm.mu
+// (each needs a crypto/rand job ID) and then swapped in under a single
 // write lock, so this never holds the manager's lock across
 // randomness generation.
 func (jm *JobManager) adoptRelayedJobShared(job *Job) {
-	// Snapshot which xns are currently known, and each one's own
+	// Snapshot which sessions are currently known, and each one's own
 	// current difficulty, so it can be preserved across the adoption.
 	jm.mu.RLock()
-	difficulties := make(map[string]uint64, len(jm.perXN))
-	for xn, prev := range jm.perXN {
+	difficulties := make(map[string]uint64, len(jm.perSession))
+	for sessionKey, prev := range jm.perSession {
 		if prev != nil {
-			difficulties[xn] = prev.StaticDifficulty
+			difficulties[sessionKey] = prev.StaticDifficulty
 			continue
 		}
-		difficulties[xn] = job.StaticDifficulty
+		difficulties[sessionKey] = job.StaticDifficulty
 	}
 	jm.mu.RUnlock()
 
-	newPerXN := make(map[string]*Job, len(difficulties))
+	newPerSession := make(map[string]*Job, len(difficulties))
 	newJobsByID := make(map[string]*Job, len(difficulties))
 	// A newly-adopted relay template is a genuinely NEW template
 	// generation, so it gets its own FRESH extraNonce counter
-	// (restarting at 0) -- minted here, BEFORE the per-xn derivation
-	// loop below, and installed alongside the template itself under
-	// jm.mu further down. Minting it locally first (rather than
-	// installing the template and then reading the counter back) is
-	// what lets every xn reseeded by THIS adoption draw from the very
-	// same counter the later, lazily-arriving sessions will draw
-	// from, so no two sessions on this template generation can ever
-	// receive the same extraNonce. See
+	// (restarting at 0) -- minted here, BEFORE the per-session
+	// derivation loop below, and installed alongside the template
+	// itself under jm.mu further down. Minting it locally first
+	// (rather than installing the template and then reading the
+	// counter back) is what lets every session reseeded by THIS
+	// adoption draw from the very same counter the later, lazily-
+	// arriving sessions will draw from, so no two sessions on this
+	// template generation can ever receive the same extraNonce. See
 	// JobManager.sharedTemplateGen's doc comment.
 	gen := newSharedTemplateGeneration(job)
-	for xn, difficulty := range difficulties {
+	for sessionKey, difficulty := range difficulties {
 		derived, err := jm.jobFromSharedTemplate(job, gen, difficulty)
 		if err != nil {
-			// A failed job-ID mint for one xn must not abort the
-			// whole adoption: that xn simply ends up uncached and
-			// derives its own job (from the SAME shared template
+			// A failed job-ID mint for one session must not abort the
+			// whole adoption: that session simply ends up uncached
+			// and derives its own job (from the SAME shared template
 			// installed below, still with no daemon call) on its
 			// next request.
-			jm.logger.Printf("solo: could not derive a job for xn %s from the adopted relay template: %v (this xn will derive one on its next request instead)", xn, err)
+			jm.logger.Printf("solo: could not derive a job for session %s from the adopted relay template: %v (this session will derive one on its next request instead)", sessionKey, err)
 			continue
 		}
-		newPerXN[xn] = derived
+		newPerSession[sessionKey] = derived
 		newJobsByID[derived.ID] = derived
 	}
 
-	// Capture the reseeded count BEFORE publishing newPerXN into
-	// jm.perXN below. Once that assignment happens and jm.mu is
-	// released, newPerXN is no longer exclusively owned by this
-	// goroutine -- a concurrent jobForXNFromSharedTemplate can take
-	// jm.mu and write into that SAME map, so reading len(newPerXN)
-	// afterwards would be a genuine data race (confirmed by
-	// `go test -race`).
-	reseeded := len(newPerXN)
+	// Capture the reseeded count BEFORE publishing newPerSession into
+	// jm.perSession below. Once that assignment happens and jm.mu is
+	// released, newPerSession is no longer exclusively owned by this
+	// goroutine -- a concurrent jobForSessionFromSharedTemplate can
+	// take jm.mu and write into that SAME map, so reading
+	// len(newPerSession) afterwards would be a genuine data race
+	// (confirmed by `go test -race`).
+	reseeded := len(newPerSession)
 
 	jm.mu.Lock()
 	jm.sharedTemplate = job
 	jm.sharedTemplateGen = gen
-	jm.perXN = newPerXN
+	jm.perSession = newPerSession
 	jm.jobsByID = newJobsByID
 	jm.mu.Unlock()
 
-	jm.cfg.Debug.Debugf("solo: shared template adopted from relay (job_id=%s height=%d) and %d known xn(s) reseeded with their own derived jobs -- no local daemon call", job.ID, job.Height, reseeded)
+	jm.cfg.Debug.Debugf("solo: shared template adopted from relay (job_id=%s height=%d) and %d known session(s) reseeded with their own derived jobs -- no local daemon call", job.ID, job.Height, reseeded)
 	jm.notify(TemplateSourceRelay)
 }
 

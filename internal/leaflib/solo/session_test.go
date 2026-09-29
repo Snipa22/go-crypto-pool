@@ -449,7 +449,7 @@ func TestSessionSubmitValidBelowBlockDifficulty(t *testing.T) {
 	h := newTestHarness(t, 1, math.MaxUint64)
 	sessionID, xn := login(t, h, "addr-1")
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	h.send(Request{ID: 2, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -493,7 +493,7 @@ func TestSessionSubmitMeetingBlockDifficulty(t *testing.T) {
 	h := newTestHarness(t, 1, 1)
 	sessionID, xn := login(t, h, "addr-2")
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	h.send(Request{ID: 3, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -524,7 +524,7 @@ func TestSessionSubmitCryptographicallyInvalid(t *testing.T) {
 	h := newTestHarness(t, math.MaxUint64, math.MaxUint64)
 	sessionID, xn := login(t, h, "addr-3")
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	h.send(Request{ID: 4, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -576,7 +576,7 @@ func TestSessionSubmitDuplicateNonceIsRejected(t *testing.T) {
 	h := newTestHarness(t, 1, math.MaxUint64)
 	sessionID, xn := login(t, h, "addr-6")
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	submit := func() LegacyShareResponse {
 		h.send(Request{ID: 7, Method: "submit", Params: mustJSON(t, SubmitRequest{
 			ID:    sessionID,
@@ -625,7 +625,7 @@ func TestSessionSubmitWithWrongXNPrefixIsRejectedBeforeValidation(t *testing.T) 
 		wrongXN = "0000"
 	}
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 	h.send(Request{ID: 9, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:    sessionID,
 		JobID: jobID,
@@ -687,8 +687,8 @@ func TestTwoSessionsGetDifferentXNsAndDifferentJobs(t *testing.T) {
 		t.Fatalf("expected two independently-connected sessions to get different xn values, both got %q (collision probability is 1/65536 per pair — if this genuinely flakes, widen the assertion, but treat a repeat failure as a real bug)", xnA)
 	}
 
-	jobIDA := currentJobIDForXN(t, hA, xnA)
-	jobIDB := currentJobIDForXN(t, hB, xnB)
+	jobIDA := currentJobIDForSession(t, hA, xnA)
+	jobIDB := currentJobIDForSession(t, hB, xnB)
 	if jobIDA == jobIDB {
 		t.Fatalf("expected two different xns to be served two different job_ids at the same height, both got %q", jobIDA)
 	}
@@ -735,7 +735,7 @@ func TestSessionSubmitAgainstAnotherSessionsJobIsRejected(t *testing.T) {
 	}
 
 	// Session A's real, currently-issued job_id.
-	jobIDA := currentJobIDForXN(t, hA, xnA)
+	jobIDA := currentJobIDForSession(t, hA, xnA)
 
 	// Session B submits against session A's job_id, using session A's
 	// sessionID and a nonce prefixed with session A's OWN xn (xnA) —
@@ -793,7 +793,7 @@ func TestSessionSubmitAgainstExpiredJobIsRejected(t *testing.T) {
 	h := newTestHarnessWithJobMaxAge(t, 1, math.MaxUint64, time.Minute)
 	sessionID, xn := login(t, h, "addr-expiry")
 
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	// Directly age the real *Job past the configured max age. This is
 	// the SAME *Job pointer both JobManager's cache and the session's
@@ -848,7 +848,7 @@ func TestSessionJobHistoryIsBounded(t *testing.T) {
 	sessionID, xn := login(t, h, "addr-bounded")
 
 	// The login itself already issued one job; capture it as index 0.
-	jobIDs := []string{currentJobIDForXN(t, h, xn)}
+	jobIDs := []string{currentJobIDForSession(t, h, xn)}
 
 	// Force enough distinct new jobs (via real tip-triggered cache
 	// invalidation, matching production's actual invalidation path:
@@ -991,7 +991,7 @@ func TestSessionLoginJobPayloadStillIncludesXNForSHA3X(t *testing.T) {
 // xn is resolved via sessionXN (a direct lookup of the real Session's
 // internal xn field), NOT via the wire LoginResult.Job.XN field:
 // RXT/RXM sessions still carry an internal xn for job bookkeeping
-// (JobForXN et al) even though that xn is deliberately never sent
+// (JobForSession et al) even though that xn is deliberately never sent
 // over the wire for those two algos (see jobPayload's doc comment) --
 // reading it off the wire would silently return "" for RXT/RXM
 // harnesses and break every test that needs a real xn to construct
@@ -1012,10 +1012,13 @@ func login(t *testing.T, h *testHarness, address string) (sessionID, xn string) 
 
 // sessionXN looks up the real, live Session for sessionID on h.server
 // and returns its internal xn field directly -- this is the
-// session-bookkeeping xn (assigned once at connect time, used to key
-// JobForXN and to validate xn-prefixed nonces for SHA3X/C29), which is
-// independent of whether that xn is ever surfaced on the wire for the
-// session's algo (it deliberately is not, for RXT/RXM).
+// session-bookkeeping xn, assigned at connect time and used ONLY to
+// validate xn-prefixed nonces for SHA3X/C29 (it is explicitly NOT the
+// JobManager job-cache key any more -- see sessionByXN /
+// currentJobIDForSession below, Session.jobKey, and
+// leaflib.NewJobCacheKey). It is independent of whether that xn is
+// ever surfaced on the wire for the session's algo (it deliberately is
+// not, for RXT/RXM).
 func sessionXN(t *testing.T, h *testHarness, sessionID string) string {
 	t.Helper()
 	h.server.mu.RLock()
@@ -1029,16 +1032,68 @@ func sessionXN(t *testing.T, h *testHarness, sessionID string) string {
 	return ""
 }
 
-// currentJobIDForXN looks up the current job for a given already-issued
-// xn directly from the shared JobManager (mirroring what the session
-// itself would resolve via JobForXN).
-func currentJobIDForXN(t *testing.T, h *testHarness, xn string) string {
+// sessionByXN returns the single live Session on h.server whose xn is
+// xn, failing the test if there is no such session or more than one
+// (an ambiguous lookup -- two sessions CAN legitimately share an xn
+// now that xn is no longer an identity, so any test that deliberately
+// forces an xn collision must address its sessions some other way; see
+// job_cache_key_test.go).
+func sessionByXN(t *testing.T, h *testHarness, xn string) *Session {
 	t.Helper()
-	job, err := h.jm.JobForXN(context.Background(), xn)
+	h.server.mu.RLock()
+	defer h.server.mu.RUnlock()
+	var found []*Session
+	for _, s := range h.server.sessions {
+		if s.XN() == xn {
+			found = append(found, s)
+		}
+	}
+	if len(found) == 0 {
+		t.Fatalf("could not find a session with xn %q on server", xn)
+	}
+	if len(found) > 1 {
+		t.Fatalf("found %d sessions sharing xn %q on server -- this helper cannot disambiguate them (xn is not an identity)", len(found), xn)
+	}
+	return found[0]
+}
+
+// currentJobIDForSession returns the job_id of the job the live
+// Session identified by xn is currently being served, resolved exactly
+// the way that session's own handleGetJob would: through
+// JobForSessionAtDifficulty keyed by THAT SESSION'S OWN job-cache key
+// (Session.JobKey), not by its xn.
+//
+// This used to be currentJobIDForSession and used to pass xn straight to
+// JobForXN. That worked only because xn WAS the cache key -- which is
+// precisely the bug this branch fixes (two unrelated sessions drawing
+// the same 2-byte xn were served the same *Job; see
+// leaflib.NewJobCacheKey). Keyed by xn today it would mint a brand-new
+// job under a key no session owns, so every submit against the
+// returned job_id would be correctly rejected as an unknown job.
+func currentJobIDForSession(t *testing.T, h *testHarness, xn string) string {
+	t.Helper()
+	sess := sessionByXN(t, h, xn)
+	job, err := h.jm.JobForSessionAtDifficulty(context.Background(), sess.JobKey(), sess.currentDifficulty.Load())
 	if err != nil {
-		t.Fatalf("JobForXN(%q): %v", xn, err)
+		t.Fatalf("JobForSessionAtDifficulty(session %s, xn %q): %v", sess.sessionID, xn, err)
 	}
 	return job.ID
+}
+
+// currentJobForSession is currentJobIDForSession's whole-*Job
+// counterpart, for the tests that need the real template material
+// (algo/pow_data/header) rather than just the job_id. It MUST resolve
+// through the same per-session key, so the *Job it returns is
+// genuinely the one that session's own submits will be checked
+// against.
+func currentJobForSession(t *testing.T, h *testHarness, xn string) *Job {
+	t.Helper()
+	sess := sessionByXN(t, h, xn)
+	job, err := h.jm.JobForSessionAtDifficulty(context.Background(), sess.JobKey(), sess.currentDifficulty.Load())
+	if err != nil {
+		t.Fatalf("JobForSessionAtDifficulty(session %s, xn %q): %v", sess.sessionID, xn, err)
+	}
+	return job
 }
 
 // --- C29 algo-aware wiring tests ---
@@ -1061,10 +1116,7 @@ func currentJobIDForXN(t *testing.T, h *testHarness, xn string) string {
 func TestSessionC29JobPayloadLabelsAlgoCorrectly(t *testing.T) {
 	h := newC29TestHarness(t, 1000, 1<<62)
 	_, xn := login(t, h, "addr-c29-label")
-	job, err := h.jm.JobForXN(context.Background(), xn)
-	if err != nil {
-		t.Fatalf("JobForXN: %v", err)
-	}
+	job := currentJobForSession(t, h, xn)
 	if job.Algo != poolpb.Algo_ALGO_C29 {
 		t.Fatalf("job.Algo = %v, want ALGO_C29", job.Algo)
 	}
@@ -1084,7 +1136,7 @@ func TestSessionC29JobPayloadLabelsAlgoCorrectly(t *testing.T) {
 func TestSessionC29SubmitWithCorrectlyShapedCycleIsRejectedByRealValidator(t *testing.T) {
 	h := newC29TestHarness(t, 1, 1)
 	sessionID, xn := login(t, h, "addr-c29-1")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	cycle := make([]uint64, 42) // correctly-shaped (42 edges), not a real solved cycle
 	h.send(Request{ID: 10, Method: "submit", Params: mustJSON(t, SubmitRequest{
@@ -1114,7 +1166,7 @@ func TestSessionC29SubmitWithCorrectlyShapedCycleIsRejectedByRealValidator(t *te
 func TestSessionC29SubmitWrongCycleLengthIsRejected(t *testing.T) {
 	h := newC29TestHarness(t, 1, 1)
 	sessionID, xn := login(t, h, "addr-c29-2")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	shortCycle := make([]uint64, 41) // one short of the real 42-edge requirement
 	h.send(Request{ID: 11, Method: "submit", Params: mustJSON(t, SubmitRequest{
@@ -1150,7 +1202,7 @@ func TestSessionC29SubmitWrongCycleLengthIsRejected(t *testing.T) {
 func TestSessionC29NonceByteOrderIsBigEndianNotLittleEndian(t *testing.T) {
 	h := newC29TestHarness(t, 1, 1)
 	sessionID, xn := login(t, h, "addr-c29-endian")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	// A nonce value whose big-endian and little-endian 8-byte
 	// encodings are genuinely different hex strings (not a palindrome
@@ -1240,7 +1292,7 @@ func xnPrefixedNonceHex(xn string, n uint64) string {
 func TestSessionSHA3XSubmitWithoutXNPrefixIsRejected(t *testing.T) {
 	h := newTestHarness(t, 1, 1<<62)
 	sessionID, xn := login(t, h, "addr-sha3x-noxn")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	// Deliberately build a nonce hex string that does NOT start with
 	// this session's own xn (flip the first hex nibble to guarantee a
@@ -1268,7 +1320,7 @@ func TestSessionSHA3XSubmitWithoutXNPrefixIsRejected(t *testing.T) {
 func TestSessionC29SubmitWithoutXNPrefixIsRejected(t *testing.T) {
 	h := newC29TestHarness(t, 1, 1)
 	sessionID, xn := login(t, h, "addr-c29-noxn")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	badNonce := xnPrefixedNonceHex(xn, 1)
 	badNonce = flipFirstHexNibble(badNonce)
@@ -1305,7 +1357,7 @@ func TestSessionC29SubmitWithoutXNPrefixIsRejected(t *testing.T) {
 func TestSessionRXTSubmitWithoutXNPrefixIsNotRejectedByXNCheck(t *testing.T) {
 	h := newRXTTestHarness(t, 1, 1<<62, "http://127.0.0.1:1") // deliberately unreachable
 	sessionID, xn := login(t, h, "addr-rxt-noxn")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	badNonce := xnPrefixedNonceHex(xn, 0xdeadbeef)
 	badNonce = flipFirstHexNibble(badNonce)
@@ -1401,7 +1453,7 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 func TestSessionRXMAccepts4ByteNonce(t *testing.T) {
 	h := newRXMTestHarness(t, 1, 1<<62)
 	sessionID, xn := loginRXM(t, h)
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	const xmrigCaptureNonce = "818d1a00" // real capture: 4 bytes, 8 hex chars
 	h.send(Request{ID: 70, Method: "submit", Params: mustJSON(t, SubmitRequest{
@@ -1428,7 +1480,7 @@ func TestSessionRXMAccepts4ByteNonce(t *testing.T) {
 func TestSessionRXMAccepts8ByteNonceToo(t *testing.T) {
 	h := newRXMTestHarness(t, 1, 1<<62)
 	sessionID, xn := loginRXM(t, h)
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	h.send(Request{ID: 71, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:     sessionID,
@@ -1452,7 +1504,7 @@ func TestSessionRXMAccepts8ByteNonceToo(t *testing.T) {
 func TestSessionRXMRejectsBadLengthNonce(t *testing.T) {
 	h := newRXMTestHarness(t, 1, 1<<62)
 	sessionID, xn := loginRXM(t, h)
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	h.send(Request{ID: 72, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:     sessionID,
@@ -1478,7 +1530,7 @@ func TestSessionRXMRejectsBadLengthNonce(t *testing.T) {
 func TestSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
 	h := newTestHarness(t, 1, 1<<62)
 	sessionID, xn := login(t, h, "addr-sha3x-4byte")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	// A 4-byte (8 hex char) nonce, xn-prefixed so the xn check
 	// (which runs first) doesn't mask the length-gate result.
@@ -1501,7 +1553,7 @@ func TestSessionSHA3XStillRejects4ByteNonce(t *testing.T) {
 func TestSessionC29StillRejects4ByteNonce(t *testing.T) {
 	h := newC29TestHarness(t, 1, 1)
 	sessionID, xn := login(t, h, "addr-c29-4byte")
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	shortNonce := xn + strings.Repeat("0", 8-len(xn))
 	h.send(Request{ID: 74, Method: "submit", Params: mustJSON(t, SubmitRequest{
@@ -1692,7 +1744,7 @@ func TestHandleSubmitRXTNonceLengthAccepts4Bytes(t *testing.T) {
 	}
 }
 
-// currentJobIDForXNRXT mirrors currentJobIDForXN but resolves xn via
+// currentJobIDForXNRXT mirrors currentJobIDForSession but resolves xn via
 // sessionXN (RXT's xn is never surfaced on the wire -- see login's own
 // doc comment) using the FIRST live session found; used only by the
 // single-session nonce-length test above, which never needs to
@@ -1709,7 +1761,7 @@ func currentJobIDForXNRXT(t *testing.T, h *testHarness) string {
 	if xn == "" {
 		t.Fatalf("no live session found on server")
 	}
-	return currentJobIDForXN(t, h, xn)
+	return currentJobIDForSession(t, h, xn)
 }
 
 // sessionByID looks up the real, live *Session for sessionID on
@@ -1762,7 +1814,7 @@ func TestInvalidateAndRepushJobsSkipsDuplicatePush(t *testing.T) {
 	sessionID, _ := login(t, h, "dedup-addr-1")
 
 	// First invocation: the per-xn job cache was never invalidated
-	// since login, so JobForXNAtDifficulty returns the SAME cached Job
+	// since login, so JobForSessionAtDifficulty returns the SAME cached Job
 	// at the SAME difficulty already recorded by the login response's
 	// own jobPayload call -- this must be recognized as a duplicate
 	// and skipped.
@@ -1800,21 +1852,23 @@ func TestInvalidateAndRepushJobsStillPushesOnDifficultyChange(t *testing.T) {
 	h.server.invalidateAndRepushJobs()
 	expectNoJobPush(t, h)
 
-	baselineJobID := currentJobIDForXN(t, h, xn)
+	baselineJobID := currentJobIDForSession(t, h, xn)
 
 	// Simulate a real vardiff retarget between two invalidation ticks:
 	// vardiff.go's maybeRetarget updates currentDifficulty AND calls
 	// JobManager.RestampDifficulty (producing a new *Job with the
 	// SAME ID/Header/BlockHash but a NEW StaticDifficulty, replacing
-	// the cached entry for this xn) -- mutating currentDifficulty
-	// alone would NOT be enough here, since JobForXNAtDifficulty does
+	// the cached entry for this SESSION) -- mutating currentDifficulty
+	// alone would NOT be enough here, since JobForSessionAtDifficulty does
 	// not retroactively restamp an already-cached job (see job.go's
 	// doc comment); the cache entry itself must be restamped, exactly
-	// as the real retarget path does.
+	// as the real retarget path does, and therefore keyed by the same
+	// per-session job-cache key the real path uses (sess.JobKey(),
+	// never sess.XN() -- see leaflib.NewJobCacheKey).
 	sess := sessionByID(t, h, sessionID)
 	newDiff := sess.currentDifficulty.Load() * 2
 	sess.currentDifficulty.Store(newDiff)
-	if _, err := h.jm.RestampDifficulty(context.Background(), xn, newDiff); err != nil {
+	if _, err := h.jm.RestampDifficulty(context.Background(), sess.JobKey(), newDiff); err != nil {
 		t.Fatalf("RestampDifficulty: %v", err)
 	}
 

@@ -235,7 +235,7 @@ func (d *Daemon) publishTemplateForHeight(ctx context.Context, height uint64) er
 //   - Monero-family (RXM/XMR): delegates to
 //     node.TemplateBytesForRelay(job), the EXACT SAME
 //     solo.NodeClient method leaf-direct's own solo/job.go
-//     (publishTemplateForJob/jobForXN) calls, and whose
+//     (publishTemplateForJob/jobForSession) calls, and whose
 //     *solo.MoneroNodeClient implementation (monero_node.go) encodes
 //     the richer moneroRelayTemplateWire JSON struct (hashing_blob/
 //     template_blob/seed_hash/prev_hash/difficulty/height/

@@ -187,7 +187,7 @@ func (f *fakeNodeClient) JobFromTemplateBytes(data []byte, algo poolpb.Algo) (*J
 	return tariJobFromResult(&result, algo)
 }
 
-func TestJobForXNBuildsJobFromTemplate(t *testing.T) {
+func TestJobForSessionBuildsJobFromTemplate(t *testing.T) {
 	node := &fakeNodeClient{height: 100, targetDifficulty: 999999, mergeMiningHash: []byte{1, 2, 3}}
 	jm := NewJobManager(JobManagerConfig{
 		Node:             node,
@@ -195,9 +195,9 @@ func TestJobForXNBuildsJobFromTemplate(t *testing.T) {
 		StaticDifficulty: 5000,
 	})
 
-	job, err := jm.JobForXN(context.Background(), "aabb")
+	job, err := jm.JobForSession(context.Background(), "session-1/1")
 	if err != nil {
-		t.Fatalf("JobForXN returned error: %v", err)
+		t.Fatalf("JobForSession returned error: %v", err)
 	}
 	if job.Height != 100 {
 		t.Errorf("Height = %d, want 100", job.Height)
@@ -223,13 +223,13 @@ func TestJobForXNBuildsJobFromTemplate(t *testing.T) {
 	}
 }
 
-// TestJobForXNLogsNewBlockTemplateFetchUnconditionally confirms the
+// TestJobForSessionLogsNewBlockTemplateFetchUnconditionally confirms the
 // always-on (non-Debug-gated) "solo: new block template fetched" line
 // added alongside the existing jm.cfg.Debug.Debugf line: it must
 // appear on jm.logger even with debug logging disabled/unconfigured,
 // and must report the correct algo/height/network_target_difficulty
 // for the template that was actually just fetched.
-func TestJobForXNLogsNewBlockTemplateFetchUnconditionally(t *testing.T) {
+func TestJobForSessionLogsNewBlockTemplateFetchUnconditionally(t *testing.T) {
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
 
@@ -242,9 +242,9 @@ func TestJobForXNLogsNewBlockTemplateFetchUnconditionally(t *testing.T) {
 		// must not depend on debug logging being enabled.
 	})
 
-	job, err := jm.JobForXN(context.Background(), "aabb")
+	job, err := jm.JobForSession(context.Background(), "session-1/1")
 	if err != nil {
-		t.Fatalf("JobForXN returned error: %v", err)
+		t.Fatalf("JobForSession returned error: %v", err)
 	}
 
 	got := buf.String()
@@ -256,91 +256,100 @@ func TestJobForXNLogsNewBlockTemplateFetchUnconditionally(t *testing.T) {
 		t.Errorf("NetworkTargetDifficulty = %d, want 456789", job.NetworkTargetDifficulty)
 	}
 
-	// A repeat JobForXN call for the same (already-cached) xn must
-	// NOT log another "new block template fetched" line -- this is a
-	// cache hit, not a new fetch.
+	// A repeat JobForSession call for the same (already-cached)
+	// session must NOT log another "new block template fetched" line
+	// -- this is a cache hit, not a new fetch.
 	buf.Reset()
-	if _, err := jm.JobForXN(context.Background(), "aabb"); err != nil {
-		t.Fatalf("JobForXN (repeat): %v", err)
+	if _, err := jm.JobForSession(context.Background(), "session-1/1"); err != nil {
+		t.Fatalf("JobForSession (repeat): %v", err)
 	}
 	if got := buf.String(); strings.Contains(got, "new block template fetched") {
 		t.Errorf("expected no new-template-fetched log line on a cache hit, got:\n%s", got)
 	}
 }
 
-func TestJobForXNPropagatesError(t *testing.T) {
+func TestJobForSessionPropagatesError(t *testing.T) {
 	node := &fakeNodeClient{getBlockTemplateErr: errors.New("node unreachable")}
 	jm := NewJobManager(JobManagerConfig{Node: node})
 
-	if _, err := jm.JobForXN(context.Background(), "aabb"); err == nil {
-		t.Fatal("expected JobForXN to propagate the node error")
+	if _, err := jm.JobForSession(context.Background(), "session-1/1"); err == nil {
+		t.Fatal("expected JobForSession to propagate the node error")
 	}
 }
 
-// TestJobForXNGivesDifferentXNsDifferentJobs is the core per-xn
-// requirement: two different sessions (different xn values) must get
-// two different jobs (different job_id / different header material) at
-// the SAME height, mirroring go-tari-sha3x-solo-stratum's
-// GetBlockWithXN — a genuinely non-overlapping search space per xn,
-// not a shared global job.
-func TestJobForXNGivesDifferentXNsDifferentJobs(t *testing.T) {
+// TestJobForSessionGivesDifferentSessionsDifferentJobs is the core
+// per-session requirement: two different sessions must get two
+// different jobs (different job_id / different header material) at the
+// SAME height, mirroring go-tari-sha3x-solo-stratum's GetBlockWithXN
+// — a genuinely non-overlapping search space per session, not a shared
+// global job.
+//
+// NOTE ON THE CACHE KEY: the two keys below are per-SESSION job-cache
+// keys (leaflib.NewJobCacheKey shape), NOT xn values. This used to be
+// keyed by xn, which is exactly the bug this branch fixes — see
+// job_cache_key_test.go for the decisive regression test proving two
+// sessions that draw the SAME xn still get different jobs.
+func TestJobForSessionGivesDifferentSessionsDifferentJobs(t *testing.T) {
 	node := &fakeNodeClient{height: 42, mergeMiningHash: []byte("shared-height-merge-hash-32byte")}
 	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-address"})
 
-	jobA, err := jm.JobForXN(context.Background(), "aaaa")
+	jobA, err := jm.JobForSession(context.Background(), "session-a/1")
 	if err != nil {
-		t.Fatalf("JobForXN(aaaa): %v", err)
+		t.Fatalf("JobForSession(session-a/1): %v", err)
 	}
-	jobB, err := jm.JobForXN(context.Background(), "bbbb")
+	jobB, err := jm.JobForSession(context.Background(), "session-b/2")
 	if err != nil {
-		t.Fatalf("JobForXN(bbbb): %v", err)
+		t.Fatalf("JobForSession(session-b/2): %v", err)
 	}
 
 	if jobA.ID == jobB.ID {
-		t.Errorf("expected different xns to get different job ids, both got %q", jobA.ID)
+		t.Errorf("expected different sessions to get different job ids, both got %q", jobA.ID)
 	}
 	if jobA == jobB {
-		t.Error("expected different xns to get distinct *Job pointers")
+		t.Error("expected different sessions to get distinct *Job pointers")
 	}
 	if node.templateCalls.Load() != 2 {
-		t.Errorf("expected 2 independent GetBlockTemplate calls (one per new xn), got %d", node.templateCalls.Load())
+		t.Errorf("expected 2 independent GetBlockTemplate calls (one per new session), got %d", node.templateCalls.Load())
 	}
 }
 
-// TestJobForXNIsStableForSameXNUntilInvalidated: the SAME xn requesting
-// a job twice in a row (e.g. two getjob calls) must get the SAME cached
-// Job — not a freshly-regenerated one — until the cache is invalidated
-// by tip movement, mirroring GetBlockWithXN's "already claimed" reuse
-// behavior.
-func TestJobForXNIsStableForSameXNUntilInvalidated(t *testing.T) {
+// TestJobForSessionIsStableForSameSessionUntilInvalidated: the SAME
+// SESSION requesting a job twice in a row (e.g. two getjob calls) must
+// get the SAME cached Job — not a freshly-regenerated one — until the
+// cache is invalidated by tip movement, mirroring GetBlockWithXN's
+// "already claimed" reuse behavior. This per-session reuse contract is
+// deliberately PRESERVED by the xn -> session-key re-keying (only the
+// key changed, never the caching behavior itself).
+func TestJobForSessionIsStableForSameSessionUntilInvalidated(t *testing.T) {
 	node := &fakeNodeClient{height: 7}
 	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-test-address"})
 
-	first, err := jm.JobForXN(context.Background(), "cccc")
+	const sessionKey = "session-stable/1"
+	first, err := jm.JobForSession(context.Background(), sessionKey)
 	if err != nil {
-		t.Fatalf("JobForXN: %v", err)
+		t.Fatalf("JobForSession: %v", err)
 	}
-	second, err := jm.JobForXN(context.Background(), "cccc")
+	second, err := jm.JobForSession(context.Background(), sessionKey)
 	if err != nil {
-		t.Fatalf("JobForXN (repeat): %v", err)
+		t.Fatalf("JobForSession (repeat): %v", err)
 	}
 	if first != second {
-		t.Error("expected repeat JobForXN calls with the same xn to return the SAME cached Job")
+		t.Error("expected repeat JobForSession calls for the same session to return the SAME cached Job")
 	}
 	if node.templateCalls.Load() != 1 {
-		t.Errorf("expected exactly 1 template call across two repeat requests for the same xn, got %d", node.templateCalls.Load())
+		t.Errorf("expected exactly 1 template call across two repeat requests for the same session, got %d", node.templateCalls.Load())
 	}
 
-	// Tip moves -> cache invalidated -> the same xn must now get a
-	// brand new, regenerated Job.
+	// Tip moves -> cache invalidated -> the same session must now get
+	// a brand new, regenerated Job.
 	jm.InvalidateAll(TemplateSourceLocal)
 
-	third, err := jm.JobForXN(context.Background(), "cccc")
+	third, err := jm.JobForSession(context.Background(), sessionKey)
 	if err != nil {
-		t.Fatalf("JobForXN (post-invalidate): %v", err)
+		t.Fatalf("JobForSession (post-invalidate): %v", err)
 	}
 	if third == first {
-		t.Error("expected a new Job to be generated for the same xn after cache invalidation")
+		t.Error("expected a new Job to be generated for the same session after cache invalidation")
 	}
 	if node.templateCalls.Load() != 2 {
 		t.Errorf("expected a second template call after invalidation, got %d", node.templateCalls.Load())
@@ -465,9 +474,9 @@ func TestJobManagerStartInvalidatesOnTimerAndTipMovement(t *testing.T) {
 		TipPollInterval: 10 * time.Millisecond,
 	})
 
-	job, err := jm.JobForXN(context.Background(), "dddd")
+	job, err := jm.JobForSession(context.Background(), "session-tip/1")
 	if err != nil {
-		t.Fatalf("initial JobForXN: %v", err)
+		t.Fatalf("initial JobForSession: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -475,7 +484,7 @@ func TestJobManagerStartInvalidatesOnTimerAndTipMovement(t *testing.T) {
 	jm.Start(ctx)
 
 	// No tip movement yet: give the poll loop a couple of ticks and
-	// confirm the cached job for "dddd" is still being served (not
+	// confirm the cached job for that session is still being served (not
 	// regenerated) — i.e. no unnecessary invalidation without tip
 	// movement.
 	time.Sleep(50 * time.Millisecond)
@@ -496,12 +505,12 @@ func TestJobManagerStartInvalidatesOnTimerAndTipMovement(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if _, ok := jm.GetJob(job.ID); ok {
-		t.Fatal("expected tip movement to invalidate the per-xn job cache")
+		t.Fatal("expected tip movement to invalidate the per-session job cache")
 	}
 
-	newJob, err := jm.JobForXN(context.Background(), "dddd")
+	newJob, err := jm.JobForSession(context.Background(), "session-tip/1")
 	if err != nil {
-		t.Fatalf("JobForXN after tip-triggered invalidation: %v", err)
+		t.Fatalf("JobForSession after tip-triggered invalidation: %v", err)
 	}
 	if newJob.Height != 2 {
 		t.Errorf("newJob.Height = %d, want 2 after tip-triggered invalidation", newJob.Height)
@@ -515,7 +524,7 @@ func TestJobManagerProbe(t *testing.T) {
 	if err := jm.Probe(context.Background()); err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
-	// Probe must not cache anything under any xn.
+	// Probe must not cache anything under any session key.
 	if _, ok := jm.GetJob(""); ok {
 		t.Error("Probe must not populate the job cache")
 	}
@@ -534,8 +543,8 @@ func TestJobManagerProbePropagatesError(t *testing.T) {
 // tracking ported from go-tari-sha3x-solo-stratum's
 // MinerJob.UsedNonces/NonceMutex (minerTracking/structs.go) — required
 // to prevent a miner from being credited twice for resubmitting the
-// same nonce against the same job. Since jobs are now per-xn, this
-// dedup set is naturally per-xn too.
+// same nonce against the same job. Since jobs are per-SESSION, this
+// dedup set is naturally per-session too.
 func TestJobMarkNonceUsedRejectsReplay(t *testing.T) {
 	job := &Job{ID: "deadbeefdeadbeef"}
 
@@ -608,11 +617,16 @@ func TestJobMarkNonceUsedCapsDistinctNonceGrowth(t *testing.T) {
 	}
 }
 
-// TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate confirms
-// the genMu double-check-locking pattern: many goroutines racing to be
-// the FIRST requester of a brand new xn must all observe the same
-// resulting Job, and only one real template fetch should occur.
-func TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate(t *testing.T) {
+// TestJobForSessionConcurrentFirstRequestsForSameSessionDoNotDuplicate
+// confirms the genLocks double-check-locking pattern: many goroutines
+// racing to be the FIRST requester for a brand new SESSION must all
+// observe the same resulting Job, and only one real template fetch
+// should occur. This single-flight/collapsing contract is referenced
+// by name from job.go's jobForSession and
+// jobForSessionFromSharedTemplate doc comments; re-keying the cache
+// from xn to a per-session key deliberately moved genLocks onto the
+// same new key, preserving it exactly.
+func TestJobForSessionConcurrentFirstRequestsForSameSessionDoNotDuplicate(t *testing.T) {
 	node := &fakeNodeClient{height: 9}
 	jm := NewJobManager(JobManagerConfig{Node: node, PayoutAddress: "solo-test-address"})
 
@@ -623,9 +637,9 @@ func TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			job, err := jm.JobForXN(context.Background(), "eeee")
+			job, err := jm.JobForSession(context.Background(), "session-concurrent/1")
 			if err != nil {
-				t.Errorf("JobForXN: %v", err)
+				t.Errorf("JobForSession: %v", err)
 				return
 			}
 			results[idx] = job
@@ -635,7 +649,7 @@ func TestJobForXNConcurrentFirstRequestsForSameXNDoNotDuplicate(t *testing.T) {
 
 	for i := 1; i < n; i++ {
 		if results[i] != results[0] {
-			t.Fatalf("expected all concurrent first-requesters of the same xn to get the same Job, index %d differed", i)
+			t.Fatalf("expected all concurrent first-requesters for the same session to get the same Job, index %d differed", i)
 		}
 	}
 	if node.templateCalls.Load() != 1 {

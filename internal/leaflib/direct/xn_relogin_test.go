@@ -218,8 +218,10 @@ func directRxmReloginTestLogin(t *testing.T, h *directTestHarness, id int, pass 
 
 // TestDirectSessionRXMReloginPreventsFalseDuplicateNonce is required
 // test #5: RXM is covered by the same fix via the internal
-// JobForXNAtDifficulty cache key, even though its wire job payload
-// never carries an "xn" field. Uses the REAL solo.MoneroNodeClient
+// per-session job-cache key (Session.jobKey, rolled on every re-login
+// -- see solo/xn_relogin_test.go's header comment for why the fix now
+// rests on that value rather than on the xn roll), even though its
+// wire job payload never carries an "xn" field. Uses the REAL solo.MoneroNodeClient
 // against a mock monerod daemon (newDirectRXMBlockFindHarness,
 // session_rxm_blockhash_test.go) rather than the XNP-only fixture
 // double (fakeDirectMoneroXNPNodeClient): unlike leaf-solo, leaf-direct

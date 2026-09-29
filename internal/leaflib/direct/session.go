@@ -60,11 +60,23 @@ type Session struct {
 
 	// xn mirrors solo.Session's identical field exactly -- see that
 	// field's own doc comment (internal/leaflib/solo/session.go) for
-	// the full false-duplicate_nonce-on-re-login root cause and why
-	// it must be an atomic.Value (mutable across a re-login), not a
-	// plain string. Every read site must go through the XN()
-	// accessor below, never load this field directly.
-	xn       atomic.Value // string
+	// why xn is a WIRE-PROTOCOL value only (the SHA3X/C29 submit-time
+	// nonce-prefix check) and explicitly NOT an identity or a job-
+	// cache key, and why it must be an atomic.Value (mutable across a
+	// re-login), not a plain string. Every read site must go through
+	// the XN() accessor below, never load this field directly.
+	xn atomic.Value // string
+
+	// jobKey mirrors solo.Session's identical field exactly -- see
+	// that field's own doc comment (internal/leaflib/solo/session.go)
+	// and leaflib.NewJobCacheKey's for the real,
+	// maintainer-confirmed correctness bug it exists to fix (the
+	// JobManager job cache used to be keyed by the session's 2-byte
+	// xn, whose ordinary birthday-paradox collisions silently made
+	// two unrelated sessions share ONE *Job, template and usedNonces
+	// map). Rolled on every re-login, exactly like solo's. Read via
+	// the JobKey() accessor below, never loaded directly.
+	jobKey   atomic.Value // string
 	loggedIn atomic.Bool
 
 	// identity is this session's ENTIRE miner-identity state
@@ -174,6 +186,13 @@ func (s *Session) XN() string {
 	return xn
 }
 
+// JobKey mirrors solo.Session.JobKey's own identical accessor exactly
+// -- see that method's (and the jobKey field's) doc comment.
+func (s *Session) JobKey() string {
+	key, _ := s.jobKey.Load().(string)
+	return key
+}
+
 // sharePaymentID renders this session's own captured Monero payment ID
 // (see the paymentID field's doc comment) as the optional
 // poolpb.Share.PaymentId this leaf stamps on every forwarded share:
@@ -224,6 +243,10 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*solo.Job](defaultSessionJobHistorySize),
 	}
 	s.xn.Store(xn)
+	// The job-cache identity this session's *Job is looked up under --
+	// deliberately NOT s.xn; mirrors solo.newSession exactly (see the
+	// jobKey field's doc comment and leaflib.NewJobCacheKey).
+	s.jobKey.Store(leaflib.NewJobCacheKey(id))
 	s.identity.Store(&leaflib.MinerIdentity{})
 	s.loginHistory = leaflib.NewLoginHistory(defaultSessionJobHistorySize)
 	s.currentDifficulty.Store(startingDifficulty)
@@ -290,7 +313,7 @@ func (s *Session) handleLine(line string) {
 // read-loop goroutine -- CLOSE-WAIT production-incident fix
 // (phx-dump.supportxmr.com; see Server.jobFetchPool's own doc comment
 // in server.go for the full root-cause explanation: a per-xn
-// cache-miss job fetch (solo.JobManager.jobForXN, job.go ~line
+// cache-miss job fetch (solo.JobManager.jobForSession, job.go ~line
 // 553-622) can block for an effectively unbounded time on a
 // process-wide (as of a later, related fix: per-xn -- see solo/job.go's
 // genLocks field doc comment), context-cancellation-immune sync.Mutex
@@ -298,7 +321,7 @@ func (s *Session) handleLine(line string) {
 // call). Everything up through the point where a job is actually
 // needed (address validation, ban/forced-floor enforcement,
 // s.loggedIn/s.address/s.worker/s.agent bookkeeping) stays exactly as
-// synchronous as before -- ONLY the JobForXNAtDifficulty call and the
+// synchronous as before -- ONLY the JobForSessionAtDifficulty call and the
 // response it produces move onto s.server.jobFetchPool, via the same
 // TrySubmit-non-blocking-dispatch pattern already used for
 // forwardShare (s.server.forwardPool) and RandomX-family
@@ -425,21 +448,24 @@ func (s *Session) handleLogin(req solo.Request) {
 			oldIdentity.Address, oldIdentity.Worker, oldIdentity.Agent, oldIdentity.PaymentID, oldIdentity.LoggedInAt.Format(time.RFC3339),
 			newIdentity.Address, newIdentity.Worker, newIdentity.Agent, newIdentity.PaymentID)
 
-		// BUG FIX (BRIEF_xn_relogin_fix.md): roll a genuinely fresh xn
-		// on EVERY re-login, unconditionally -- mirrors
-		// solo.Session.handleLogin's identical block exactly, see
-		// that method's doc comment for the full false-
-		// duplicate_nonce root cause this closes and why the fix is
-		// unconditional on proxy detection. Stored BEFORE
-		// fetchAndDeliverLoginJob's JobForXNAtDifficulty call below
-		// (that call happens on a LATER jobFetchPool worker goroutine
-		// dispatch, but always strictly after this Store, since
-		// TrySubmit is only issued after this whole handler body
-		// returns) so that lookup is a guaranteed cache miss against
-		// the new xn, minting a fresh *Job with an empty usedNonces
-		// map instead of inheriting the previous identity's
-		// partially-used nonce space on the old xn's still-cached
-		// job.
+		// BUG FIX (BRIEF_xn_relogin_fix.md): roll a genuinely fresh
+		// job-cache key (AND a fresh xn) on EVERY re-login,
+		// unconditionally -- mirrors solo.Session.handleLogin's
+		// identical block exactly, see that method's doc comment for
+		// the full false-duplicate_nonce root cause this closes and
+		// why the fix is unconditional on proxy detection. Stored
+		// BEFORE fetchAndDeliverLoginJob's
+		// JobForSessionAtDifficulty call below (that call happens on
+		// a LATER jobFetchPool worker goroutine dispatch, but always
+		// strictly after this Store, since TrySubmit is only issued
+		// after this whole handler body returns) so that lookup is a
+		// guaranteed cache miss, minting a fresh *Job with an empty
+		// usedNonces map instead of inheriting the previous
+		// identity's partially-used nonce space on this session's
+		// still-cached job. leaflib.NewJobCacheKey cannot fail, so
+		// unlike the xn roll below there is no fallback branch.
+		s.jobKey.Store(leaflib.NewJobCacheKey(s.sessionID))
+
 		if newXN, err := newSessionXN(); err != nil {
 			s.server.logger.Printf("direct: session %s re-login: failed to roll a fresh xn, keeping previous xn %q: %v", s.sessionID, s.XN(), err)
 		} else {
@@ -528,7 +554,7 @@ func (s *Session) handleLogin(req solo.Request) {
 
 // fetchAndDeliverLoginJob runs ON s.server.jobFetchPool's own worker
 // goroutine (see handleLogin's dispatch above), NEVER on Session.Run's
-// own read-loop goroutine. The actual JobForXNAtDifficulty call and
+// own read-loop goroutine. The actual JobForSessionAtDifficulty call and
 // the response it produces are otherwise UNCHANGED from handleLogin's
 // pre-fix inline body -- this is a pure "move this code onto a
 // different goroutine via TrySubmit" refactor, not a logic rewrite.
@@ -536,7 +562,8 @@ func (s *Session) fetchAndDeliverLoginJob(reqID int) {
 	// BELT-AND-SUSPENDERS (server.go's jobFetchPool doc comment; does
 	// NOT by itself fix the read-loop-blocking bug -- that is fixed by
 	// handleLogin's TrySubmit dispatch above): a bare sync.Mutex.Lock()
-	// (the per-xn generation lock inside solo.JobManager's jobForXN --
+	// (the per-session generation lock inside solo.JobManager's
+	// jobForSession --
 	// originally a single process-wide genMu, narrowed to per-xn by a
 	// later, related fix; see solo/job.go's genLocks doc comment)
 	// cannot be interrupted by context cancellation under any
@@ -551,9 +578,9 @@ func (s *Session) fetchAndDeliverLoginJob(reqID int) {
 	// timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.XN(), s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForSessionAtDifficulty(ctx, s.JobKey(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("direct: failed to get job for session %s (xn %s): %v", s.sessionID, s.XN(), err)
+		s.server.logger.Printf("direct: failed to get job for session %s (job_key %s): %v", s.sessionID, s.JobKey(), err)
 		s.server.recordLoginRejection(directmetrics.LoginRejectionReasonNoJobTemplate)
 		s.writeGeneralResponse(reqID, "no job template available yet, retry shortly", "")
 		return
@@ -587,9 +614,9 @@ func (s *Session) handleGetJob(req solo.Request) {
 func (s *Session) fetchAndDeliverGetJob(reqID int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.XN(), s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForSessionAtDifficulty(ctx, s.JobKey(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("direct: failed to get job for session %s (xn %s): %v", s.sessionID, s.XN(), err)
+		s.server.logger.Printf("direct: failed to get job for session %s (job_key %s): %v", s.sessionID, s.JobKey(), err)
 		s.writeGeneralResponse(reqID, "no job template available yet, retry shortly", "")
 		return
 	}
@@ -635,7 +662,7 @@ func (s *Session) fetchAndDeliverGetJob(reqID int) {
 // Dispatched onto s.server.jobFetchPool (the same CLOSE-WAIT-incident
 // worker pool handleLogin/handleGetJob's own fetchAndDeliverLoginJob/
 // fetchAndDeliverGetJob already use -- see jobFetchPool's own doc
-// comment in server.go) rather than calling JobForXNAtDifficulty
+// comment in server.go) rather than calling JobForSessionAtDifficulty
 // inline here, so a slow/blocked job-template fetch can never stall
 // handleSubmit's own caller, Session.Run's read loop, for this or any
 // other in-flight message from this session. That dispatch is also
@@ -653,7 +680,7 @@ func (s *Session) pushFreshJobOnStaleSubmit() {
 // above), never on Session.Run's own read-loop goroutine. Fetches a
 // fresh job at this session's OWN current difficulty
 // (s.currentDifficulty.Load() -- never any other value), exactly the
-// same JobForXNAtDifficulty call fetchAndDeliverGetJob/
+// same JobForSessionAtDifficulty call fetchAndDeliverGetJob/
 // fetchAndDeliverLoginJob already make for this same session.
 //
 // Gated through s.alreadyDelivered (see that method's doc comment):
@@ -676,9 +703,9 @@ func (s *Session) pushFreshJobOnStaleSubmit() {
 func (s *Session) fetchAndPushFreshJobOnStaleSubmit() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.XN(), s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForSessionAtDifficulty(ctx, s.JobKey(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("direct: failed to fetch fresh job for session %s (xn %s) after a stale-job-class submit rejection: %v", s.sessionID, s.XN(), err)
+		s.server.logger.Printf("direct: failed to fetch fresh job for session %s (job_key %s) after a stale-job-class submit rejection: %v", s.sessionID, s.JobKey(), err)
 		return
 	}
 	if s.alreadyDelivered(job) {

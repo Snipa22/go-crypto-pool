@@ -102,7 +102,7 @@ func TestSessionSubmit_RejectsAddressBannedMidSession(t *testing.T) {
 		t.Fatalf("setup: expected login to succeed while unbanned, got status=%q", loginResp.Result.Status)
 	}
 	sessionID, xn := loginResp.Result.ID, loginResp.Result.Job.XN
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	// A real operator action bans this address while the session is
 	// already connected -- update the fake source; the Cache's own

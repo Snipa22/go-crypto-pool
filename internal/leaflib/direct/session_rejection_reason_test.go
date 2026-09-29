@@ -180,7 +180,7 @@ func TestDirectSessionRejectionReason_StaleOrUnknownJob(t *testing.T) {
 func TestDirectSessionRejectionReason_JobExpired(t *testing.T) {
 	h := newRejectionReasonHarnessWithJobMaxAge(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, 30*time.Millisecond, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()})
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-job-expired"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	time.Sleep(60 * time.Millisecond)
 
@@ -199,7 +199,7 @@ func TestDirectSessionRejectionReason_JobExpired(t *testing.T) {
 func TestDirectSessionRejectionReason_InvalidXNonce(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-invalid-xnonce"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	badNonce := flipFirstHexNibble(directXNPrefixedNonceHex(xn, 1))
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -217,7 +217,7 @@ func TestDirectSessionRejectionReason_InvalidXNonce(t *testing.T) {
 func TestDirectSessionRejectionReason_MalformedNonce(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-malformed-nonce"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: xn, // too short: SHA3X needs a full 8-byte nonce
@@ -234,7 +234,7 @@ func TestDirectSessionRejectionReason_MalformedNonce(t *testing.T) {
 func TestDirectSessionRejectionReason_InvalidPowShape(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_C29, 1, 1<<62, validator.Registry{poolpb.Algo_ALGO_C29: validator.NewC29Validator()}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-invalid-pow-shape"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: directXNPrefixedNonceHexBigEndian(xn, 1),
@@ -252,7 +252,7 @@ func TestDirectSessionRejectionReason_InvalidPowShape(t *testing.T) {
 func TestDirectSessionRejectionReason_DuplicateNonce(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-duplicate-nonce"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	nonce := directXNPrefixedNonceHex(xn, 42)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -279,7 +279,7 @@ func TestDirectSessionRejectionReason_DuplicateNonce(t *testing.T) {
 func TestDirectSessionRejectionReason_MissingClaimedResult(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_RXM, 1, 1<<62, validator.Registry{}, nil, nil)
 	sessionID, xn := directLoginRXM(t, h.directTestHarness)
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: "00000001",
@@ -310,7 +310,7 @@ func TestDirectSessionRejectionReason_DifficultyFloorMiss(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_RXT, staticDiff, 1<<62, validator.Registry{poolpb.Algo_ALGO_RXT: &fakeControllableValidator{valid: true}}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-difficulty-floor-miss"))
 	_ = xn
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: classificationRXTNonceHex(1),
@@ -328,7 +328,7 @@ func TestDirectSessionRejectionReason_DifficultyFloorMiss(t *testing.T) {
 func TestDirectSessionRejectionReason_ClaimedDifficultyOrCryptoInvalid(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_RXT, 1, 1<<62, validator.Registry{poolpb.Algo_ALGO_RXT: &fakeControllableValidator{valid: true}}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-claimed-diff-invalid"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	zeroHash := make([]byte, 32)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -381,7 +381,7 @@ func TestDirectSessionRejectionReason_BlockSubmitFailed(t *testing.T) {
 	rejecting := &fakeRejectingBlockClient{}
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1, validator.Registry{poolpb.Algo_ALGO_SHA3X: validator.NewSHA3XValidator()}, nil, rejecting)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-block-submit-failed"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: directXNPrefixedNonceHex(xn, 1),
@@ -414,7 +414,7 @@ func (f *fakeRejectingBlockClient) Close() error { return nil }
 func TestDirectSessionRejectionReason_PoolSaturated(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_RXT, 1, 1<<62, validator.Registry{poolpb.Algo_ALGO_RXT: &fakeControllableValidator{valid: true}}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-pool-saturated"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.server.SetRandomXWorkerPoolSize(1, 1)
 
@@ -475,7 +475,7 @@ func TestServer_SetRandomXWorkerPoolSize_QueueSizeReachesPool(t *testing.T) {
 func TestDirectSessionRejectionReason_InternalError(t *testing.T) {
 	h := newRejectionReasonHarness(t, poolpb.Algo_ALGO_SHA3X, 1, 1<<62, validator.Registry{}, nil, nil)
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("drr-internal-error"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID, Nonce: directXNPrefixedNonceHex(xn, 1),
@@ -503,7 +503,7 @@ func TestDirectSessionRejectionReason_BannedAddress(t *testing.T) {
 	h.server.EnableAddressFlags(cache)
 
 	sessionID, xn := directLogin(t, h.directTestHarness, addr)
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	src.set(addr, addressflags.Flags{Banned: true})
 	waitForDirectRejectionCachePoll(t, cache, addr, true)

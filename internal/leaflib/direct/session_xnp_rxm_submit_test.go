@@ -221,7 +221,7 @@ func TestDirectSessionRXMXNPSubmitPatchesWorkerAndPoolNonce(t *testing.T) {
 	h := newDirectRXMXNPTestHarness(t, 1, 1<<62, node)
 
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	workerNonce := uint32(9)
 	poolNonce := uint32(9)

@@ -149,7 +149,7 @@ func TestDirectSessionRXTClassification_Validated(t *testing.T) {
 	h.fakeValidator.setValid(true)
 
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("addr-classification-validated"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 10, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID,
@@ -181,7 +181,7 @@ func TestDirectSessionRXTClassification_Invalid(t *testing.T) {
 	h.fakeValidator.setValid(false)
 
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("addr-classification-invalid"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.send(solo.Request{ID: 11, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID: sessionID, JobID: jobID,
@@ -224,7 +224,7 @@ func TestDirectSessionRXTClassification_Trusted(t *testing.T) {
 	h.fakeValidator.setValid(true)
 
 	sessionID, xn := directLogin(t, h.directTestHarness, realTariTestAddress("addr-classification-trusted"))
-	jobID := directCurrentJobIDForXN(t, h.directTestHarness, xn)
+	jobID := directCurrentJobIDForSession(t, h.directTestHarness, xn)
 
 	h.server.mu.RLock()
 	var sess *Session

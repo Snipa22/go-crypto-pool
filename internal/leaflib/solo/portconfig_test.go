@@ -32,8 +32,8 @@ func newMultiPortTestServer(t *testing.T) (*Server, *JobManager, *fakeNodeClient
 		Node:          node,
 		PayoutAddress: "solo-test-address",
 		// Deliberately NOT set to either port's difficulty below —
-		// this field is only the JobForXN fallback default; every
-		// session in these tests goes through JobForXNAtDifficulty
+		// this field is only the JobForSession fallback default; every
+		// session in these tests goes through JobForSessionAtDifficulty
 		// with its OWN port's difficulty, so a mismatched/zero
 		// default here proves the per-port value actually drove the
 		// session, not this fallback.
@@ -63,6 +63,10 @@ func dialAndLoginAtDifficulty(t *testing.T, server *Server, startingDifficulty u
 	h := &testHarness{
 		t:      t,
 		server: server,
+		// jm is genuinely needed here (not just cosmetic harness
+		// completeness): currentJobForSession below resolves the
+		// session's job through it.
+		jm:     server.jobManager,
 		client: clientConn,
 		reader: bufio.NewReader(clientConn),
 		writer: bufio.NewWriter(clientConn),
@@ -71,12 +75,11 @@ func dialAndLoginAtDifficulty(t *testing.T, server *Server, startingDifficulty u
 
 	// Re-fetch the login response's job to decode its target back to
 	// a difficulty (login() only returns id/xn) — read the session's
-	// own current difficulty directly via the JobManager, matching
-	// what the wire "target" field was derived from at login time.
-	job, err := server.jobManager.JobForXN(context.Background(), xn)
-	if err != nil {
-		t.Fatalf("JobForXN(%q): %v", xn, err)
-	}
+	// own current difficulty directly via the JobManager, keyed by
+	// THAT SESSION'S OWN job-cache key (Session.JobKey, never its xn
+	// -- see leaflib.NewJobCacheKey), matching what the wire "target"
+	// field was derived from at login time.
+	job := currentJobForSession(t, h, xn)
 	return xn, job.StaticDifficulty
 }
 
@@ -150,13 +153,13 @@ func TestMultiplePortsShareSameJobManager(t *testing.T) {
 	if server.jobManager != jm {
 		t.Fatalf("server.jobManager pointer changed unexpectedly across port tiers")
 	}
-	jobA, err := jm.JobForXN(context.Background(), xnA)
+	jobA, err := jm.JobForSession(context.Background(), xnA)
 	if err != nil {
-		t.Fatalf("JobForXN(%q): %v", xnA, err)
+		t.Fatalf("JobForSession(%q): %v", xnA, err)
 	}
-	jobB, err := jm.JobForXN(context.Background(), xnB)
+	jobB, err := jm.JobForSession(context.Background(), xnB)
 	if err != nil {
-		t.Fatalf("JobForXN(%q): %v", xnB, err)
+		t.Fatalf("JobForSession(%q): %v", xnB, err)
 	}
 	if jobA.ID == jobB.ID {
 		t.Fatalf("expected two different-port-tier sessions to get different job_ids from the shared JobManager, both got %q", jobA.ID)

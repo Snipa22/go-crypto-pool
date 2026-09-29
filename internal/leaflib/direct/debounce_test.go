@@ -112,7 +112,7 @@ func newDebounceTestServer(t *testing.T) (*solo.JobManager, *Server, *debounceFa
 		PayoutAddress: "debounce-test-address",
 		Algo:          poolpb.Algo_ALGO_SHA3X,
 		// Long refresh/poll intervals: these tests drive
-		// InvalidateAll/JobForXN directly rather than relying on
+		// InvalidateAll/JobForSession directly rather than relying on
 		// Start's background loops, except for the one test
 		// (TestDebounceRelayPublishUnaffectedByServerDebounceState)
 		// that explicitly needs tipPollLoop's real timing.
@@ -208,17 +208,17 @@ func waitForRepushCount(t *testing.T, server *Server, want int, timeout time.Dur
 }
 
 // seedBest performs one real fetch (via a fresh, never-before-seen
-// xn, so JobForXN can't just return a cache hit) at height/size,
+// xn, so JobForSession can't just return a cache hit) at height/size,
 // installing it as jm's own tracked best (solo.JobManager.CurrentBest)
-// -- the same real bookkeeping jobForXN already performs in
-// production on every fetch (job.go's jobForXN: "size := ...; if
+// -- the same real bookkeeping jobForSession already performs in
+// production on every fetch (job.go's jobForSession: "size := ...; if
 // !best.set || isBetterCandidate(...) { jm.setBest(...) }").
 func seedBest(t *testing.T, jm *solo.JobManager, node *debounceFakeNode, xn string, height uint64, size int) {
 	t.Helper()
 	node.setHeight(height)
 	node.setSize(size)
-	if _, err := jm.JobForXN(context.Background(), xn); err != nil {
-		t.Fatalf("seedBest: JobForXN(%s): %v", xn, err)
+	if _, err := jm.JobForSession(context.Background(), xn); err != nil {
+		t.Fatalf("seedBest: JobForSession(%s): %v", xn, err)
 	}
 }
 
@@ -352,7 +352,7 @@ func TestDebounceHeightIncreaseAppliesImmediatelyAndDiscardsPending(t *testing.T
 }
 
 // TestDebounceSoloJobManagerStateUnaffectedByServerBuffering is
-// BRIEF.md test 4: solo.JobManager's OWN behavior (per-xn cache
+// BRIEF.md test 4: solo.JobManager's OWN behavior (per-session cache
 // content, CurrentBest tracking) is completely unaffected by
 // Server's debounce -- the underlying JobManager state updates
 // immediately on every genuinely better candidate regardless of
@@ -389,18 +389,18 @@ func TestDebounceSoloJobManagerStateUnaffectedByServerBuffering(t *testing.T) {
 		t.Fatalf("solo.JobManager.CurrentBest() after the buffered notification = (height=%d size=%d ok=%v), want (20, 200, true) unchanged by Server's own buffering decision", height, size, ok)
 	}
 
-	// The per-xn cache itself: InvalidateAll always wipes it
+	// The per-session cache itself: InvalidateAll always wipes it
 	// immediately and unconditionally (job.go's own, pre-existing
 	// behavior, untouched by this feature) -- a fresh xn request
 	// right now must generate a brand-new Job reflecting the CURRENT
 	// node height/state, not something withheld pending Server's own
 	// repush decision.
-	job, err := jm.JobForXN(context.Background(), "xn-3")
+	job, err := jm.JobForSession(context.Background(), "session-3/3")
 	if err != nil {
-		t.Fatalf("JobForXN(xn-3) after buffered notification: %v", err)
+		t.Fatalf("JobForSession(session-3/3) after buffered notification: %v", err)
 	}
 	if job.Height != 20 {
-		t.Fatalf("JobForXN(xn-3).Height = %d, want 20 (JobManager's per-xn cache/generation is unaffected by Server's own buffering)", job.Height)
+		t.Fatalf("JobForSession(session-3/3).Height = %d, want 20 (JobManager's per-session cache/generation is unaffected by Server's own buffering)", job.Height)
 	}
 }
 

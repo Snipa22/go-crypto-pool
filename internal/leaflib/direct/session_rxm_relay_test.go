@@ -158,7 +158,7 @@ func TestDirectSessionRXMBlockFindPublishesToRelay(t *testing.T) {
 	h := newDirectRXMBlockFindHarnessWithRelay(t, srv, 1, publisherRelay)
 
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 60, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,
@@ -254,7 +254,7 @@ func TestDirectSessionRXMBlockFindMissingBlockIDDoesNotPublishToRelay(t *testing
 	h := newDirectRXMBlockFindHarnessWithRelay(t, srv, 1, publisherRelay)
 
 	sessionID, xn := directLoginRXM(t, h)
-	jobID := directCurrentJobIDForXN(t, h, xn)
+	jobID := directCurrentJobIDForSession(t, h, xn)
 
 	h.send(solo.Request{ID: 61, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
 		ID:     sessionID,

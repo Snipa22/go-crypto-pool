@@ -192,11 +192,11 @@ func TestJobManagerReceivingTemplateInvalidatesCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Seed a cached job for xn "aaaa" BEFORE starting/subscribing, so
+	// Seed a cached job for one session BEFORE starting/subscribing, so
 	// there's something real to observe being invalidated.
-	firstJob, err := jm.JobForXN(context.Background(), "aaaa")
+	firstJob, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (seed): %v", err)
+		t.Fatalf("JobForSession (seed): %v", err)
 	}
 	if node.templateCalls.Load() != 1 {
 		t.Fatalf("expected exactly 1 template call after seeding, got %d", node.templateCalls.Load())
@@ -215,7 +215,7 @@ func TestJobManagerReceivingTemplateInvalidatesCache(t *testing.T) {
 
 	// Poll for the real, observable effect: the pre-existing cached
 	// job for "aaaa" must be gone (InvalidateAll actually ran), and a
-	// fresh JobForXN call for the SAME xn must trigger a genuinely NEW
+	// fresh JobForSession call for the SAME session must trigger a genuinely NEW
 	// GetBlockTemplate call (not just return the same cached job).
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -225,15 +225,15 @@ func TestJobManagerReceivingTemplateInvalidatesCache(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if _, ok := jm.GetJob(firstJob.ID); ok {
-		t.Fatal("expected the externally-received template message to invalidate the per-xn job cache (pre-existing job id still resolvable)")
+		t.Fatal("expected the externally-received template message to invalidate the per-session job cache (pre-existing job id still resolvable)")
 	}
 
-	secondJob, err := jm.JobForXN(context.Background(), "aaaa")
+	secondJob, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (post-invalidate): %v", err)
+		t.Fatalf("JobForSession (post-invalidate): %v", err)
 	}
 	if secondJob.ID == firstJob.ID {
-		t.Error("expected a freshly-generated job (different ID) for the same xn after relay-triggered invalidation")
+		t.Error("expected a freshly-generated job (different ID) for the same sessionKey after relay-triggered invalidation")
 	}
 	if node.templateCalls.Load() != 2 {
 		t.Errorf("expected a genuinely NEW GetBlockTemplate call after relay-triggered invalidation (templateCalls=2), got %d", node.templateCalls.Load())
@@ -247,7 +247,7 @@ func TestJobManagerReceivingTemplateInvalidatesCache(t *testing.T) {
 // GetBlockTemplate call being made -- asserted by the fake
 // NodeClient's own call counter never incrementing beyond the single
 // seed fetch, even after the adopted job is subsequently re-served to
-// the SAME xn.
+// the SAME session.
 func TestJobManagerAdoptsSuperiorRelayTemplateWithoutLocalFetch(t *testing.T) {
 	url, shutdown := startEmbeddedNATSServerForJobTest(t)
 	defer shutdown()
@@ -269,13 +269,13 @@ func TestJobManagerAdoptsSuperiorRelayTemplateWithoutLocalFetch(t *testing.T) {
 		Relay:           jmRelay,
 	})
 
-	// Seed a cached job for xn "aaaa" BEFORE the relay message arrives
-	// -- this is the pre-existing xn that must be reseeded directly
+	// Seed a cached job for one session BEFORE the relay message arrives
+	// -- this is the pre-existing session that must be reseeded directly
 	// from the relayed content (no local re-fetch) once a superior
 	// template is adopted.
-	firstJob, err := jm.JobForXN(context.Background(), "aaaa")
+	firstJob, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (seed): %v", err)
+		t.Fatalf("JobForSession (seed): %v", err)
 	}
 	if node.templateCalls.Load() != 1 {
 		t.Fatalf("expected exactly 1 template call after seeding, got %d", node.templateCalls.Load())
@@ -311,12 +311,12 @@ func TestJobManagerAdoptsSuperiorRelayTemplateWithoutLocalFetch(t *testing.T) {
 		t.Fatal("expected the superior relayed template to replace the pre-existing job (old job id still resolvable)")
 	}
 
-	// The SAME xn's next request must be served the reconstructed
+	// The SAME session's next request must be served the reconstructed
 	// relayed job directly (a cache HIT against the reseeded entry),
 	// with NO additional local GetBlockTemplate call.
-	secondJob, err := jm.JobForXN(context.Background(), "aaaa")
+	secondJob, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (post-adopt): %v", err)
+		t.Fatalf("JobForSession (post-adopt): %v", err)
 	}
 	if secondJob.Height != 51 {
 		t.Errorf("secondJob.Height = %d, want 51 (the adopted relayed template's height)", secondJob.Height)
@@ -329,7 +329,7 @@ func TestJobManagerAdoptsSuperiorRelayTemplateWithoutLocalFetch(t *testing.T) {
 // TestJobManagerDoesNotAdoptEqualHeightSmallerRelayTemplate proves
 // requirement (b): a relay message with equal height but SMALLER
 // serialized size than the currently tracked best does NOT get
-// adopted and does NOT wipe the existing per-xn job cache.
+// adopted and does NOT wipe the existing per-session job cache.
 func TestJobManagerDoesNotAdoptEqualHeightSmallerRelayTemplate(t *testing.T) {
 	url, shutdown := startEmbeddedNATSServerForJobTest(t)
 	defer shutdown()
@@ -354,9 +354,9 @@ func TestJobManagerDoesNotAdoptEqualHeightSmallerRelayTemplate(t *testing.T) {
 		Relay:           jmRelay,
 	})
 
-	firstJob, err := jm.JobForXN(context.Background(), "aaaa")
+	firstJob, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (seed): %v", err)
+		t.Fatalf("JobForSession (seed): %v", err)
 	}
 	firstSize := jm.templateSizeForRelay(firstJob)
 	if firstSize == 0 {
@@ -389,12 +389,12 @@ func TestJobManagerDoesNotAdoptEqualHeightSmallerRelayTemplate(t *testing.T) {
 	if _, ok := jm.GetJob(firstJob.ID); !ok {
 		t.Fatal("expected the equal-height-smaller relay template to be REJECTED -- the pre-existing job must still be resolvable (cache must not have been wiped)")
 	}
-	sameJob, err := jm.JobForXN(context.Background(), "aaaa")
+	sameJob, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (after rejected relay message): %v", err)
+		t.Fatalf("JobForSession (after rejected relay message): %v", err)
 	}
 	if sameJob.ID != firstJob.ID {
-		t.Errorf("expected the SAME job (id=%s) to still be served for xn 'aaaa' after a rejected relay message, got a different job (id=%s)", firstJob.ID, sameJob.ID)
+		t.Errorf("expected the SAME job (id=%s) to still be served for sessionKey 'aaaa' after a rejected relay message, got a different job (id=%s)", firstJob.ID, sameJob.ID)
 	}
 	if node.templateCalls.Load() != 1 {
 		t.Errorf("expected no additional local GetBlockTemplate call after a rejected relay message, got %d calls", node.templateCalls.Load())
@@ -429,9 +429,9 @@ func TestJobManagerLocalTipPollDoesNotClobberSuperiorAdoptedRelayJob(t *testing.
 		Relay:           jmRelay,
 	})
 
-	firstJob, err := jm.JobForXN(context.Background(), "aaaa")
+	firstJob, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (seed): %v", err)
+		t.Fatalf("JobForSession (seed): %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -454,9 +454,9 @@ func TestJobManagerLocalTipPollDoesNotClobberSuperiorAdoptedRelayJob(t *testing.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, ok := jm.GetJob(firstJob.ID); !ok {
-			adoptedJob, err = jm.JobForXN(context.Background(), "aaaa")
+			adoptedJob, err = jm.JobForSession(context.Background(), "aaaa")
 			if err != nil {
-				t.Fatalf("JobForXN (post-adopt): %v", err)
+				t.Fatalf("JobForSession (post-adopt): %v", err)
 			}
 			if adoptedJob.Height == 60 {
 				break
@@ -477,9 +477,9 @@ func TestJobManagerLocalTipPollDoesNotClobberSuperiorAdoptedRelayJob(t *testing.
 
 	time.Sleep(300 * time.Millisecond) // several tip-poll ticks
 
-	stillAdopted, err := jm.JobForXN(context.Background(), "aaaa")
+	stillAdopted, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (after inferior local tip bump): %v", err)
+		t.Fatalf("JobForSession (after inferior local tip bump): %v", err)
 	}
 	if stillAdopted.ID != adoptedJob.ID {
 		t.Errorf("expected the previously-adopted relay job (id=%s height=60) to still be served after an inferior local tip increase (height 55), got a different job (id=%s height=%d)",
@@ -516,9 +516,9 @@ func TestJobManagerLocalTipPollReplacesAdoptedRelayJobWhenGenuinelyAhead(t *test
 		Relay:           jmRelay,
 	})
 
-	firstJob, err := jm.JobForXN(context.Background(), "aaaa")
+	firstJob, err := jm.JobForSession(context.Background(), "aaaa")
 	if err != nil {
-		t.Fatalf("JobForXN (seed): %v", err)
+		t.Fatalf("JobForSession (seed): %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -554,9 +554,9 @@ func TestJobManagerLocalTipPollReplacesAdoptedRelayJobWhenGenuinelyAhead(t *test
 	deadline = time.Now().Add(5 * time.Second)
 	var winner *Job
 	for time.Now().Before(deadline) {
-		job, err := jm.JobForXN(context.Background(), "aaaa")
+		job, err := jm.JobForSession(context.Background(), "aaaa")
 		if err != nil {
-			t.Fatalf("JobForXN (post local-ahead): %v", err)
+			t.Fatalf("JobForSession (post local-ahead): %v", err)
 		}
 		if job.Height == 65 {
 			winner = job

@@ -218,7 +218,7 @@ func TestSessionRXMXNPSubmitPatchesWorkerAndPoolNonce(t *testing.T) {
 	h := newRXMXNPTestHarness(t, 1, 1<<62, node)
 
 	sessionID, xn := loginRXM(t, h)
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	workerNonce := uint32(9)
 	poolNonce := uint32(9)
@@ -267,7 +267,7 @@ func TestSessionRXMOrdinarySubmitStillUsesNonXNPPath(t *testing.T) {
 	h := newRXMXNPTestHarness(t, 1, 1<<62, node)
 
 	sessionID, xn := loginRXM(t, h)
-	jobID := currentJobIDForXN(t, h, xn)
+	jobID := currentJobIDForSession(t, h, xn)
 
 	h.send(Request{ID: 91, Method: "submit", Params: mustJSON(t, SubmitRequest{
 		ID:     sessionID,

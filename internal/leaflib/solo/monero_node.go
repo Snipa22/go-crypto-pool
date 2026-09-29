@@ -900,7 +900,8 @@ func (c *MoneroNodeClient) JobFromTemplateBytes(data []byte, algo poolpb.Algo) (
 // prev_hash JobFromTemplateBytes needs to rebuild Job.BlockHash) into
 // the moneroRelayTemplateWire bytes JobFromTemplateBytes reconstructs
 // from, for relay publishing/comparison (job.go's
-// publishTemplateForJob and jobForXN's own tracked-best bookkeeping).
+// publishTemplateForJob and jobForSession's own tracked-best
+// bookkeeping).
 //
 // Returns (nil, nil) -- never an error -- if job is nil or
 // job.TemplateData does not hold the expected real *moneroTemplateData
