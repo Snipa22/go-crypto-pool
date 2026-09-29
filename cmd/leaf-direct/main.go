@@ -45,6 +45,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/solo"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/transport"
+	"github.com/Snipa22/go-crypto-pool/internal/leaflib/transport/backlog"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	legacypb "github.com/Snipa22/go-crypto-pool/internal/legacyproto"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
@@ -181,6 +182,21 @@ type config struct {
 	backendAuthValue    string
 	backendShareTimeout time.Duration
 	backendBlockTimeout time.Duration
+
+	// backlogDir/backlogMaxBytes/backlogDrainWorkers configure the
+	// OPT-IN disk-backed durable retry backlog
+	// (internal/leaflib/transport/backlog) wrapping backendTransport
+	// -- see DISPATCH_BRIEF.md (share/block submit backlog). This
+	// exists for the class of outage the SHORT-lived retry already
+	// inside legacytransport.LegacyTransport's postWithRetry (15s
+	// shares / 5min blocks) cannot cover: a backend down for 10-15+
+	// minutes. backlogDir unset (the default) means the feature is
+	// completely disabled -- byte-for-byte the pre-existing
+	// log-and-drop behavior, unchanged for every already-deployed
+	// leaf until an operator explicitly configures a dir.
+	backlogDir          string
+	backlogMaxBytes     uint64
+	backlogDrainWorkers int
 
 	// legacyMode / legacyBackendURL / legacyAuthKey / legacyPoolType /
 	// legacyPoolID configure the opt-in, default-off legacy
@@ -421,6 +437,9 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.backendAuthValue, "backend-auth-value", envOr("LEAF_DIRECT_BACKEND_AUTH_VALUE", ""), "value for -backend-auth-header. Env: LEAF_DIRECT_BACKEND_AUTH_VALUE")
 	flag.DurationVar(&cfg.backendShareTimeout, "backend-share-timeout", envOrDuration("LEAF_DIRECT_BACKEND_SHARE_TIMEOUT", 5*time.Second), "per-call timeout forwarding a share to the backend. Env: LEAF_DIRECT_BACKEND_SHARE_TIMEOUT")
 	flag.DurationVar(&cfg.backendBlockTimeout, "backend-block-timeout", envOrDuration("LEAF_DIRECT_BACKEND_BLOCK_TIMEOUT", 10*time.Second), "per-call timeout reporting a found block to the backend. Env: LEAF_DIRECT_BACKEND_BLOCK_TIMEOUT")
+	flag.StringVar(&cfg.backlogDir, "backlog-dir", envOr("LEAF_DIRECT_BACKLOG_DIR", ""), "opt-in disk-backed durable retry backlog for shares/blocks that fail to reach the backend (see internal/leaflib/transport/backlog) -- for outages LONGER than legacytransport's own short-lived retry budget (15s shares / 5min blocks) can absorb. Unset (the default) disables this feature entirely: byte-for-byte the pre-existing log-and-drop behavior. MUST be a real, persistent disk directory -- NEVER a tmpfs/ephemeral path like /tmp (the whole point is surviving a leaf process crash/restart mid-outage). Env: LEAF_DIRECT_BACKLOG_DIR")
+	flag.Uint64Var(&cfg.backlogMaxBytes, "backlog-max-bytes", envOrUint64("LEAF_DIRECT_BACKLOG_MAX_BYTES", backlog.DefaultMaxBytes), fmt.Sprintf("total on-disk byte cap (not entry count) for -backlog-dir's queue, across shares and blocks combined -- once reached, further failed shares/blocks fall back to the pre-backlog log-and-drop behavior instead of silently evicting older queued entries. Validated safe up to at least 100 GiB by the operator; this default is a conservative starting point to explicitly raise for a real fleet's expected outage-window sizing. Ignored when -backlog-dir is unset. 0 uses the documented default, %d (5 GiB). Env: LEAF_DIRECT_BACKLOG_MAX_BYTES", backlog.DefaultMaxBytes))
+	flag.IntVar(&cfg.backlogDrainWorkers, "backlog-drain-workers", envOrInt("LEAF_DIRECT_BACKLOG_DRAIN_WORKERS", 0), fmt.Sprintf("background worker pool size continuously retrying -backlog-dir's queued entries against the backend, indefinitely (no time budget, only -backlog-max-bytes bounds how long this can absorb). Ignored when -backlog-dir is unset. 0/unset uses the documented default, %d. Env: LEAF_DIRECT_BACKLOG_DRAIN_WORKERS", backlog.DefaultDrainWorkers))
 	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_DIRECT_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often the backend's GET /api/v1/leaf/address-flags endpoint is polled for manual ban/forced-minimum-difficulty state (see internal/leaflib/addressflags). Env: LEAF_DIRECT_ADDRESS_FLAGS_POLL_INTERVAL")
 
 	flag.BoolVar(&cfg.legacyMode, "legacy-mode", envOr("LEAF_DIRECT_LEGACY_MODE", "false") == "true", "opt-in, default-off legacy nodejs-pool-sxmr /leafApi wire-protocol mode: when true, leaf-direct forwards validated shares/blocks to a legacy nodejs-pool-sxmr backend (internal/leaflib/legacytransport) instead of the normal HTTP+Protobuf backend transport. Requires -legacy-backend-url/-legacy-auth-key/-legacy-pool-type/-legacy-pool-id to all be set. Disabled by default -- zero behavior change for existing deployments. Env: LEAF_DIRECT_LEGACY_MODE (\"true\" to enable)")
@@ -525,6 +544,10 @@ type fileConfig struct {
 	BackendAuthValue           *string `toml:"backend_auth_value"`
 	BackendShareTimeoutSeconds *int    `toml:"backend_share_timeout_seconds"`
 	BackendBlockTimeoutSeconds *int    `toml:"backend_block_timeout_seconds"`
+
+	BacklogDir          *string `toml:"backlog_dir"`
+	BacklogMaxBytes     *uint64 `toml:"backlog_max_bytes"`
+	BacklogDrainWorkers *int    `toml:"backlog_drain_workers"`
 
 	AddressFlagsPollIntervalSeconds *int `toml:"address_flags_poll_interval_seconds"`
 
@@ -652,6 +675,10 @@ func applyConfigFile(cfg *config) error {
 		d := time.Duration(*fc.BackendBlockTimeoutSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.backendBlockTimeout, &d, visited, "backend-block-timeout", "LEAF_DIRECT_BACKEND_BLOCK_TIMEOUT")
 	}
+
+	cfgfile.ApplyString(&cfg.backlogDir, fc.BacklogDir, visited, "backlog-dir", "LEAF_DIRECT_BACKLOG_DIR")
+	cfgfile.ApplyUint64(&cfg.backlogMaxBytes, fc.BacklogMaxBytes, visited, "backlog-max-bytes", "LEAF_DIRECT_BACKLOG_MAX_BYTES")
+	cfgfile.ApplyInt(&cfg.backlogDrainWorkers, fc.BacklogDrainWorkers, visited, "backlog-drain-workers", "LEAF_DIRECT_BACKLOG_DRAIN_WORKERS")
 
 	if fc.AddressFlagsPollIntervalSeconds != nil {
 		d := time.Duration(*fc.AddressFlagsPollIntervalSeconds) * time.Second
@@ -1345,6 +1372,27 @@ func main() {
 		}
 		backendTransport = httpTr
 		logger.Printf("forwarding validated shares/blocks to backend at %s", cfg.backendBaseURL)
+	}
+
+	// OPT-IN disk-backed durable retry backlog (DISPATCH_BRIEF.md:
+	// share/block submit backlog) -- wraps whichever concrete
+	// backendTransport was just constructed above, completely
+	// unconditionally on -legacy-mode (both branches produce a plain
+	// transport.ShareTransport, and this decorator only depends on
+	// that interface). Disabled by default (-backlog-dir unset):
+	// byte-for-byte the pre-existing log-and-drop behavior, zero
+	// change for any already-deployed leaf until an operator
+	// explicitly opts in.
+	if cfg.backlogDir != "" {
+		wrapped, err := backlog.New(backendTransport, backlog.Config{
+			Dir: cfg.backlogDir, MaxBytes: cfg.backlogMaxBytes, DrainWorkers: cfg.backlogDrainWorkers,
+			Logger: logger,
+		})
+		if err != nil {
+			logger.Fatalf("failed to construct disk-backed backlog transport at -backlog-dir=%s: %v", cfg.backlogDir, err)
+		}
+		backendTransport = wrapped
+		logger.Printf("DURABLE BACKLOG ENABLED: shares/blocks that fail to reach the backend are now durably queued to disk at %s (max %d bytes, %d drain workers) and retried indefinitely instead of being dropped -- see internal/leaflib/transport/backlog", cfg.backlogDir, cfg.backlogMaxBytes, cfg.backlogDrainWorkers)
 	}
 	defer func() { _ = backendTransport.Close() }()
 
