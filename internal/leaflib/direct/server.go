@@ -1364,9 +1364,9 @@ func (s *Server) invalidateAndRepushJobs(source string) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			job, err := s.jobManager.JobForXNAtDifficulty(context.Background(), sess.xn, sess.currentDifficulty.Load())
+			job, err := s.jobManager.JobForXNAtDifficulty(context.Background(), sess.XN(), sess.currentDifficulty.Load())
 			if err != nil {
-				s.logger.Printf("direct: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.xn, err)
+				s.logger.Printf("direct: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.XN(), err)
 				return
 			}
 			// BUG FIX (Alex, live production report: "we're sending

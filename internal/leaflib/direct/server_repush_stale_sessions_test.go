@@ -138,7 +138,7 @@ func addSyntheticLoggedInSession(t *testing.T, cm *leaflib.ConnectionManager, ct
 		// a strict "node.callCount() == numSessions" assertion
 		// flaky). Overriding with a caller-supplied, guaranteed-
 		// distinct value keeps this test fully deterministic.
-		sess.xn = uniqueXN
+		sess.xn.Store(uniqueXN)
 	}
 
 	server.mu.Lock()
@@ -204,7 +204,7 @@ func TestServerInvalidateAndRepushJobs_ParallelizesPerSessionFanoutAndRecordsMet
 	for _, sess := range sessions {
 		lastID, _ := sess.lastDeliveredJobID.Load().(string)
 		if lastID == "" {
-			t.Fatalf("session %s (xn %s) was never delivered a job by invalidateAndRepushJobs", sess.sessionID, sess.xn)
+			t.Fatalf("session %s (xn %s) was never delivered a job by invalidateAndRepushJobs", sess.sessionID, sess.XN())
 		}
 	}
 

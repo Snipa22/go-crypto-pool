@@ -38,17 +38,39 @@ type Session struct {
 
 	sessionID string
 	// xn is this session's own randomly-assigned 2-byte extranonce
-	// (job.go's newSessionXN), assigned exactly once, at connect time
-	// (here, in newSession below) — mirroring go-tari-sha3x-solo-stratum's
-	// miner.go connection-init timing exactly, NOT re-rolled per job or
-	// per login. Every job payload sent to this session (login
-	// response's nested job, unsolicited pushes, explicit getjob
-	// responses) carries this same value in JobPayload.XN, and every
-	// submit from this session must have its nonce hex-prefixed with
-	// it (handleSubmit below) or be rejected before any PoW validation
-	// runs. NOTE: xn is a SHA3X-specific nonce-composition convention,
-	// not the real security boundary — see jobList/jobLog below.
-	xn       string
+	// (job.go's newSessionXN), seeded once at connect time (here, in
+	// newSession below) — mirroring go-tari-sha3x-solo-stratum's
+	// miner.go connection-init timing. Every job payload sent to this
+	// session (login response's nested job, unsolicited pushes,
+	// explicit getjob responses) carries this same value in
+	// JobPayload.XN, and every submit from this session must have its
+	// nonce hex-prefixed with it (handleSubmit below) or be rejected
+	// before any PoW validation runs. NOTE: xn is a SHA3X-specific
+	// nonce-composition convention, not the real security boundary —
+	// see jobList/jobLog below.
+	//
+	// BUG FIX (BRIEF_xn_relogin_fix.md): xn is ALSO the internal cache
+	// key handleLogin/handleGetJob/vardiff's maybeRetarget use to
+	// look up this session's *Job via
+	// JobManager.JobForXNAtDifficulty/RestampDifficulty — repeat calls
+	// with the same xn against the same cache generation return the
+	// SAME *Job, including that Job's own accumulated usedNonces
+	// history (job.go's MarkNonceUsed). handleLogin runs on EVERY
+	// "login" message, including a genuine re-login on an
+	// already-logged-in connection (xmrig-proxy's `simple`-mode
+	// `--reuse-timeout` connection reuse handing the same socket to a
+	// genuinely different downstream worker — see
+	// https://github.com/xmrig/xmrig-proxy/issues/118). Keeping xn
+	// fixed across a re-login would let a genuinely different miner
+	// inherit the PREVIOUS worker's partially-used nonce space on the
+	// still-cached job, causing a false "duplicate_nonce" rejection
+	// the first time it happened to pick a raw nonce the previous
+	// worker had already submitted. xn is therefore now MUTABLE
+	// (atomic.Value, not a plain string) so handleLogin can roll a
+	// fresh one on every re-login (see that method's own re-login
+	// block) — every read site must go through the XN() accessor
+	// below, never load this field directly.
+	xn       atomic.Value // string
 	loggedIn atomic.Bool
 
 	// identity is this session's ENTIRE miner-identity state
@@ -309,6 +331,17 @@ func (s *Session) Identity() *leaflib.MinerIdentity {
 	return ident
 }
 
+// XN is the single accessor every read site now goes through instead
+// of loading the xn field directly — see that field's own doc comment
+// for why it is an atomic.Value (mutable across a re-login) rather
+// than a plain string. Never returns an unset/wrong-type value in
+// practice: newSession always seeds it with a real string before this
+// session is ever reachable from another goroutine.
+func (s *Session) XN() string {
+	xn, _ := s.xn.Load().(string)
+	return xn
+}
+
 // alreadyDelivered reports whether job is identical (same job.ID AND
 // same StaticDifficulty) to the last job actually delivered to this
 // session via jobPayload — see lastDeliveredJobID's doc comment. Used
@@ -357,7 +390,8 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		xn = "0000"
 		server.logger.Printf("solo: failed to generate session xn, falling back to %q: %v", xn, err)
 	}
-	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*Job](defaultSessionJobHistorySize)}
+	s := &Session{mc: mc, server: server, sessionID: id, connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*Job](defaultSessionJobHistorySize)}
+	s.xn.Store(xn)
 	s.identity.Store(&leaflib.MinerIdentity{})
 	s.loginHistory = leaflib.NewLoginHistory(defaultSessionJobHistorySize)
 	s.currentDifficulty.Store(startingDifficulty)
@@ -622,6 +656,42 @@ func (s *Session) handleLogin(req Request) {
 			s.sessionID,
 			oldIdentity.Address, oldIdentity.Worker, oldIdentity.Agent, oldIdentity.PaymentID, oldIdentity.LoggedInAt.Format(time.RFC3339),
 			newIdentity.Address, newIdentity.Worker, newIdentity.Agent, newIdentity.PaymentID)
+
+		// BUG FIX (BRIEF_xn_relogin_fix.md): roll a genuinely fresh xn
+		// on EVERY re-login, unconditionally -- not gated on proxy
+		// detection or reloginDetected's own value (the surrounding
+		// `s.loggedIn.Load()` condition, "was this session already
+		// logged in", is exactly the same gate reloginDetected uses,
+		// so computing the new xn here is equivalent to gating on
+		// "this is a re-login" alone). See the xn field's own doc
+		// comment for the full false-duplicate_nonce root cause this
+		// closes: without this, the JobForXNAtDifficulty call below
+		// would be a cache HIT against the OLD xn's still-cached
+		// *Job, handing the new identity the previous identity's
+		// partially-used nonce history. Rolling a new xn here instead
+		// makes that lookup a guaranteed cache MISS, minting a fresh
+		// *Job with an empty usedNonces map. This applies uniformly
+		// to every algo this leaf serves, including RXM: xn is never
+		// sent on RXM's wire payload (see jobPayload below), but it
+		// is still the internal JobForXNAtDifficulty cache key for
+		// RXM sessions exactly like every other algo, so the same bug
+		// (and the same fix) applies there purely through that
+		// internal mechanism.
+		//
+		// A crypto/rand read failure here is exceptionally rare (see
+		// newSession's identical fallback) -- on error, the OLD xn is
+		// deliberately left in place (falling back to the fixed
+		// all-zeros "0000" mid-session, as newSession does at connect
+		// time, would risk actively colliding this session onto
+		// whatever OTHER session's cache entry already happens to be
+		// keyed "0000", which is worse than just keeping this
+		// session's own still-valid, already-unique xn for one more
+		// login cycle).
+		if newXN, err := newSessionXN(); err != nil {
+			s.server.logger.Printf("solo: session %s re-login: failed to roll a fresh xn, keeping previous xn %q: %v", s.sessionID, s.XN(), err)
+		} else {
+			s.xn.Store(newXN)
+		}
 	}
 
 	s.identity.Store(newIdentity)
@@ -709,9 +779,9 @@ func (s *Session) handleLogin(req Request) {
 		}
 	}
 
-	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.XN(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
+		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.XN(), err)
 		s.server.recordLoginRejection(metrics.LoginRejectionReasonNoJobTemplate)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
@@ -734,9 +804,9 @@ func (s *Session) handleGetJob(req Request) {
 		s.writeGeneralResponse(req.ID, "login required before getjob", "")
 		return
 	}
-	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.XN(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
+		s.server.logger.Printf("solo: failed to get job for session %s (xn %s): %v", s.sessionID, s.XN(), err)
 		s.writeGeneralResponse(req.ID, "no job template available yet, retry shortly", "")
 		return
 	}
@@ -815,9 +885,9 @@ func (s *Session) handleGetJob(req Request) {
 // session, and already gates on s.loggedIn itself, so there is no
 // separate logged-in check needed here.
 func (s *Session) pushFreshJobOnStaleSubmit() {
-	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.xn, s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForXNAtDifficulty(context.Background(), s.XN(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("solo: failed to fetch fresh job for session %s (xn %s) after a stale-job-class submit rejection: %v", s.sessionID, s.xn, err)
+		s.server.logger.Printf("solo: failed to fetch fresh job for session %s (xn %s) after a stale-job-class submit rejection: %v", s.sessionID, s.XN(), err)
 		return
 	}
 	if s.alreadyDelivered(job) {
@@ -1070,7 +1140,7 @@ func (s *Session) handleSubmit(req Request) {
 	// one opaque value it controls end-to-end, with no xn hex-prefix
 	// partitioning convention on this leaf's wire protocol.
 	if !IsRandomXFamily(job.Algo) {
-		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
+		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.XN()) {
 			s.rejectShare(req.ID, metrics.RejectionReasonInvalidXNonce, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 			return
 		}
@@ -1890,7 +1960,7 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	// `json:"xn,omitempty"` tag then omits the field from the wire
 	// JSON entirely for those two algos, rather than sending `"xn":""`.
 	if !IsRandomXFamily(job.Algo) {
-		payload.XN = s.xn
+		payload.XN = s.XN()
 	}
 	// RXT-only: surface the real RandomX seed/key (job.go's Job.VmKey,
 	// taken directly from GetNewBlockResult.VmKey) as the wire

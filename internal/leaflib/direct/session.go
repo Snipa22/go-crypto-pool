@@ -57,8 +57,15 @@ type Session struct {
 	server *Server
 
 	sessionID string
-	xn        string
-	loggedIn  atomic.Bool
+
+	// xn mirrors solo.Session's identical field exactly -- see that
+	// field's own doc comment (internal/leaflib/solo/session.go) for
+	// the full false-duplicate_nonce-on-re-login root cause and why
+	// it must be an atomic.Value (mutable across a re-login), not a
+	// plain string. Every read site must go through the XN()
+	// accessor below, never load this field directly.
+	xn       atomic.Value // string
+	loggedIn atomic.Bool
 
 	// identity is this session's ENTIRE miner-identity state
 	// (address/worker/agent/paymentID), held as a single
@@ -160,6 +167,13 @@ func (s *Session) Identity() *leaflib.MinerIdentity {
 	return ident
 }
 
+// XN mirrors solo.Session.XN's own identical accessor exactly -- see
+// that method's doc comment.
+func (s *Session) XN() string {
+	xn, _ := s.xn.Load().(string)
+	return xn
+}
+
 // sharePaymentID renders this session's own captured Monero payment ID
 // (see the paymentID field's doc comment) as the optional
 // poolpb.Share.PaymentId this leaf stamps on every forwarded share:
@@ -187,17 +201,29 @@ func (s *Session) alreadyDelivered(job *solo.Job) bool {
 	return leaflib.AlreadyDelivered(job.ID, job.StaticDifficulty, lastID, s.lastDeliveredDifficulty.Load())
 }
 
+// newSessionXN is a package-level func-var (not a plain call directly
+// to leaflib.NewSessionXN) purely so tests can substitute a
+// deterministic/instrumented replacement -- mirrors solo package's
+// identical newSessionXN seam (solo/job.go) and this repo's existing
+// test-injectable-randomness convention generally (see solo/vardiff.go's
+// vardiffJitterFunc doc comment). Production code always calls
+// through this var; its default value is the real leaflib.NewSessionXN.
+var newSessionXN = func() (string, error) {
+	return leaflib.NewSessionXN()
+}
+
 func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficulty uint64) *Session {
 	id, _ := leaflib.NewRandomHexID()
-	xn, err := leaflib.NewSessionXN()
+	xn, err := newSessionXN()
 	if err != nil {
 		xn = "0000"
 		server.logger.Printf("direct: failed to generate session xn, falling back to %q: %v", xn, err)
 	}
 	s := &Session{
-		mc: mc, server: server, sessionID: id, xn: xn,
+		mc: mc, server: server, sessionID: id,
 		connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*solo.Job](defaultSessionJobHistorySize),
 	}
+	s.xn.Store(xn)
 	s.identity.Store(&leaflib.MinerIdentity{})
 	s.loginHistory = leaflib.NewLoginHistory(defaultSessionJobHistorySize)
 	s.currentDifficulty.Store(startingDifficulty)
@@ -398,6 +424,27 @@ func (s *Session) handleLogin(req solo.Request) {
 			s.sessionID,
 			oldIdentity.Address, oldIdentity.Worker, oldIdentity.Agent, oldIdentity.PaymentID, oldIdentity.LoggedInAt.Format(time.RFC3339),
 			newIdentity.Address, newIdentity.Worker, newIdentity.Agent, newIdentity.PaymentID)
+
+		// BUG FIX (BRIEF_xn_relogin_fix.md): roll a genuinely fresh xn
+		// on EVERY re-login, unconditionally -- mirrors
+		// solo.Session.handleLogin's identical block exactly, see
+		// that method's doc comment for the full false-
+		// duplicate_nonce root cause this closes and why the fix is
+		// unconditional on proxy detection. Stored BEFORE
+		// fetchAndDeliverLoginJob's JobForXNAtDifficulty call below
+		// (that call happens on a LATER jobFetchPool worker goroutine
+		// dispatch, but always strictly after this Store, since
+		// TrySubmit is only issued after this whole handler body
+		// returns) so that lookup is a guaranteed cache miss against
+		// the new xn, minting a fresh *Job with an empty usedNonces
+		// map instead of inheriting the previous identity's
+		// partially-used nonce space on the old xn's still-cached
+		// job.
+		if newXN, err := newSessionXN(); err != nil {
+			s.server.logger.Printf("direct: session %s re-login: failed to roll a fresh xn, keeping previous xn %q: %v", s.sessionID, s.XN(), err)
+		} else {
+			s.xn.Store(newXN)
+		}
 	}
 	s.identity.Store(newIdentity)
 	s.loggedIn.Store(true)
@@ -504,9 +551,9 @@ func (s *Session) fetchAndDeliverLoginJob(reqID int) {
 	// timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.xn, s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.XN(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("direct: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
+		s.server.logger.Printf("direct: failed to get job for session %s (xn %s): %v", s.sessionID, s.XN(), err)
 		s.server.recordLoginRejection(directmetrics.LoginRejectionReasonNoJobTemplate)
 		s.writeGeneralResponse(reqID, "no job template available yet, retry shortly", "")
 		return
@@ -540,9 +587,9 @@ func (s *Session) handleGetJob(req solo.Request) {
 func (s *Session) fetchAndDeliverGetJob(reqID int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.xn, s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.XN(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("direct: failed to get job for session %s (xn %s): %v", s.sessionID, s.xn, err)
+		s.server.logger.Printf("direct: failed to get job for session %s (xn %s): %v", s.sessionID, s.XN(), err)
 		s.writeGeneralResponse(reqID, "no job template available yet, retry shortly", "")
 		return
 	}
@@ -629,9 +676,9 @@ func (s *Session) pushFreshJobOnStaleSubmit() {
 func (s *Session) fetchAndPushFreshJobOnStaleSubmit() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.xn, s.currentDifficulty.Load())
+	job, err := s.server.jobManager.JobForXNAtDifficulty(ctx, s.XN(), s.currentDifficulty.Load())
 	if err != nil {
-		s.server.logger.Printf("direct: failed to fetch fresh job for session %s (xn %s) after a stale-job-class submit rejection: %v", s.sessionID, s.xn, err)
+		s.server.logger.Printf("direct: failed to fetch fresh job for session %s (xn %s) after a stale-job-class submit rejection: %v", s.sessionID, s.XN(), err)
 		return
 	}
 	if s.alreadyDelivered(job) {
@@ -710,7 +757,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// comment): a real Monero-family miner treats the full nonce field
 	// as one opaque value it controls end-to-end.
 	if !solo.IsRandomXFamily(job.Algo) {
-		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.xn) {
+		if !strings.HasPrefix(strings.ToLower(submit.Nonce), s.XN()) {
 			s.rejectShare(req.ID, directmetrics.RejectionReasonInvalidXNonce, fmt.Sprintf("Invalid XNonce %v", submit.Nonce))
 			return
 		}
@@ -1654,7 +1701,7 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	// `json:"xn,omitempty"` tag then omits the field from the wire
 	// JSON entirely for those two algos, rather than sending `"xn":""`.
 	if !solo.IsRandomXFamily(job.Algo) {
-		payload.XN = s.xn
+		payload.XN = s.XN()
 	}
 	if solo.IsRandomXFamily(job.Algo) && len(job.VmKey) > 0 {
 		payload.SeedHash = hex.EncodeToString(job.VmKey)

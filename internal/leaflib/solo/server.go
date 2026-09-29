@@ -647,9 +647,9 @@ func (s *Server) invalidateAndRepushJobs() {
 		if !sess.loggedIn.Load() {
 			continue
 		}
-		job, err := s.jobManager.JobForXNAtDifficulty(context.Background(), sess.xn, sess.currentDifficulty.Load())
+		job, err := s.jobManager.JobForXNAtDifficulty(context.Background(), sess.XN(), sess.currentDifficulty.Load())
 		if err != nil {
-			s.logger.Printf("solo: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.xn, err)
+			s.logger.Printf("solo: failed to regenerate job for session %s (xn %s) after cache invalidation: %v", sess.sessionID, sess.XN(), err)
 			continue
 		}
 		// BUG FIX (Alex, live production report: "we're sending

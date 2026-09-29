@@ -477,7 +477,7 @@ func directSessionXN(t *testing.T, h *directTestHarness, sessionID string) strin
 	defer h.server.mu.RUnlock()
 	for _, s := range h.server.sessions {
 		if s.sessionID == sessionID {
-			return s.xn
+			return s.XN()
 		}
 	}
 	t.Fatalf("could not find session %q on server", sessionID)
