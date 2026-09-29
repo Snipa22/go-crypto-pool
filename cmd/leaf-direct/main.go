@@ -49,6 +49,7 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/validator"
 	legacypb "github.com/Snipa22/go-crypto-pool/internal/legacyproto"
 	poolpb "github.com/Snipa22/go-crypto-pool/internal/proto"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // version is a build-time-overridable identifier — override via
@@ -1348,6 +1349,27 @@ func main() {
 	// concrete type) so either real implementation can be constructed
 	// here without changing any downstream call site (direct.ServerConfig
 	// .Transport is already declared as this same interface type).
+	// metricsRegistry is created HERE, up front, rather than inside the
+	// -metrics-listen-address block below (where server.EnableMetrics
+	// used to construct its own private registry) -- because
+	// backendTransport's OPT-IN backlog wrap (backlog.Config.Registry,
+	// just below) happens well before direct.NewServer/EnableMetrics
+	// even run, and ServerConfig.Transport must already be the FINAL
+	// (possibly backlog-wrapped) transport.ShareTransport at
+	// direct.NewServer construction time -- Transport is read once at
+	// construction and stored in an unexported field, with no
+	// after-the-fact setter, so the backlog wrap can never be applied
+	// "later" once the Server already exists. A single shared registry
+	// created here and threaded into both backlog.Config.Registry and
+	// server.EnableMetricsWithRegistry below is what lets
+	// leaf_backlog_* land on the SAME registry leaf_direct_*'s /metrics
+	// endpoint serves, instead of an orphaned registry nothing ever
+	// scrapes (see DISPATCH_BRIEF.md). Created unconditionally (even
+	// when -metrics-listen-address is later found empty) since it's
+	// cheap and keeps this ordering simple -- an unserved registry is
+	// harmless.
+	metricsRegistry := prometheus.NewRegistry()
+
 	var backendTransport transport.ShareTransport
 	if cfg.legacyMode {
 		legacyTr, err := legacytransport.New(legacytransport.Config{
@@ -1386,7 +1408,7 @@ func main() {
 	if cfg.backlogDir != "" {
 		wrapped, err := backlog.New(backendTransport, backlog.Config{
 			Dir: cfg.backlogDir, MaxBytes: cfg.backlogMaxBytes, DrainWorkers: cfg.backlogDrainWorkers,
-			Logger: logger,
+			Logger: logger, Registry: metricsRegistry,
 		})
 		if err != nil {
 			logger.Fatalf("failed to construct disk-backed backlog transport at -backlog-dir=%s: %v", cfg.backlogDir, err)
@@ -1585,7 +1607,7 @@ func main() {
 	if cfg.metricsListenAddress != "" {
 		server.SetHideRemoteAddress(cfg.hideRemoteAddress)
 		server.SetStatsPageMaxSessions(cfg.statsPageMaxSessions)
-		server.EnableMetrics(version, cfg.maxAddressLabels)
+		server.EnableMetricsWithRegistry(metricsRegistry, version, cfg.maxAddressLabels)
 		server.EnableChainHeightMetrics()
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", server.MetricsHandler())

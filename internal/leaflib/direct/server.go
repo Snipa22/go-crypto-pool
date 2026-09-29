@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/Snipa22/go-tari-grpc-lib/v3/tari_generated"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
@@ -748,10 +749,31 @@ func NewServer(cfg ServerConfig) *Server {
 // exact conventions (private registry, cardinality-bounded per-address
 // counts).
 func (s *Server) EnableMetrics(version string, maxAddressLabels int) *directmetrics.Metrics {
+	return s.enableMetrics(nil, version, maxAddressLabels)
+}
+
+// EnableMetricsWithRegistry is EnableMetrics' variant for a caller
+// (cmd/leaf-direct/main.go) that needs this Server's own
+// *directmetrics.Metrics collectors registered onto a CALLER-SUPPLIED
+// *prometheus.Registry rather than a fresh private one -- this is
+// what lets a decorator constructed BEFORE this Server even exists
+// (e.g. internal/leaflib/transport/backlog, wrapping ServerConfig.
+// Transport) land its own metrics on the exact same registry this
+// Server's /metrics handler ends up serving, instead of an orphaned
+// registry nothing ever scrapes (see DISPATCH_BRIEF.md: "wire backlog
+// metrics into the leaf's real /metrics endpoint"). A nil reg behaves
+// identically to EnableMetrics (fresh private registry).
+func (s *Server) EnableMetricsWithRegistry(reg *prometheus.Registry, version string, maxAddressLabels int) *directmetrics.Metrics {
+	return s.enableMetrics(reg, version, maxAddressLabels)
+}
+
+// enableMetrics is EnableMetrics/EnableMetricsWithRegistry's shared
+// implementation.
+func (s *Server) enableMetrics(reg *prometheus.Registry, version string, maxAddressLabels int) *directmetrics.Metrics {
 	if maxAddressLabels <= 0 {
 		maxAddressLabels = directmetrics.DefaultMaxAddressLabels
 	}
-	m := directmetrics.New(version, maxAddressLabels)
+	m := directmetrics.NewWithRegistry(reg, version, maxAddressLabels)
 	m.SetSnapshotSource(s.sessionSnapshots)
 	// Fix 9 (DISPATCH_BRIEF.md 2026-09-10): mirrors
 	// solo.Server.EnableMetrics' identical async-pool wiring exactly

@@ -478,15 +478,40 @@ type Metrics struct {
 
 // New constructs a Metrics using a fresh, private *prometheus.Registry.
 func New(version string, maxAddressLabels int) *Metrics {
+	return NewWithRegistry(nil, version, maxAddressLabels)
+}
+
+// NewWithRegistry is New's variant for a caller (cmd/leaf-direct/
+// main.go) that wants this Metrics' collectors registered onto a
+// CALLER-SUPPLIED *prometheus.Registry instead of always constructing
+// a brand-new private one -- this is what lets e.g. the disk-backed
+// backlog decorator's own metrics (internal/leaflib/transport/
+// backlog) land on the SAME registry this Metrics' own /metrics
+// handler serves, so both show up on one real HTTP endpoint rather
+// than the backlog metrics being stranded on an orphaned registry
+// nothing ever scrapes (see DISPATCH_BRIEF.md). A nil reg gets a
+// fresh private one instead, exactly matching New's own pre-existing
+// behavior (and mirroring internal/leaflib/transport/backlog's own
+// identical Config.Registry "nil means private" convention) -- never
+// prometheus.DefaultRegisterer, a library package must not silently
+// mutate global process state.
+func NewWithRegistry(reg *prometheus.Registry, version string, maxAddressLabels int) *Metrics {
 	if maxAddressLabels <= 0 {
 		maxAddressLabels = DefaultMaxAddressLabels
 	}
-	reg := prometheus.NewRegistry()
+	if reg == nil {
+		reg = prometheus.NewRegistry()
+	}
 	// Standard Go runtime/process collectors -- see
 	// internal/leaflib/solo/metrics.New's identical registration for
 	// the full rationale (private registry, not the global default
 	// one client_golang auto-registers these onto). MustRegister:
-	// only ever registered once per New() call.
+	// only ever registered once per NewWithRegistry() call -- safe
+	// even when reg is a CALLER-SUPPLIED shared registry (see this
+	// func's own doc comment) because no other package registered
+	// onto that shared registry (cmd/leaf-direct/main.go's
+	// metricsRegistry) also registers a Go/Process collector; a
+	// caller that DID would need to dedupe itself.
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m := &Metrics{registry: reg, maxAddressLabels: maxAddressLabels}
@@ -654,6 +679,14 @@ func (m *Metrics) SetTariChainHeightSource(fn ChainHeightFunc) {
 
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// Registry returns m's own private *prometheus.Registry, for a caller (main.go) that
+// wants to merge additional collectors (e.g. a decorator package's own metrics) onto
+// the SAME registry this Metrics' own /metrics handler serves, rather than exposing a
+// second, separate metrics endpoint.
+func (m *Metrics) Registry() *prometheus.Registry {
+	return m.registry
 }
 
 // IncShareResult increments SharesTotal for result (see ResultLabel)
