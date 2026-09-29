@@ -160,7 +160,6 @@ func AlgoMetricLabel(algo poolpb.Algo) string {
 	}
 }
 
-
 // DiffToTargetHex encodes a session difficulty into the wire "target"
 // field, in two stages.
 //

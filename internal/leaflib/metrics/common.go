@@ -187,3 +187,40 @@ func RegisterGauge(reg *prometheus.Registry, opts prometheus.GaugeOpts) promethe
 	}
 	return g
 }
+
+// RegisterHistogramVec is RegisterCounterVec's labeled HistogramVec
+// counterpart (used for e.g. leaf-proxy's submit-processing-latency
+// histogram).
+func RegisterHistogramVec(reg *prometheus.Registry, opts prometheus.HistogramOpts, labels []string) *prometheus.HistogramVec {
+	hv := prometheus.NewHistogramVec(opts, labels)
+	if err := reg.Register(hv); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
+				return existing
+			}
+		}
+		log.Printf("metrics: failed to register histogram vec %s: %v", opts.Name, err)
+	}
+	return hv
+}
+
+// RegisterHistogram is RegisterHistogramVec's unlabeled counterpart
+// (used for e.g. leaf-proxy's submit-validation-latency histogram,
+// which has no meaningful per-algo label dimension -- leaf-proxy is a
+// single, fixed pure-Go RandomX upstream-forwarding proxy with no
+// job.Algo concept at all, unlike leaf-solo/leaf-direct's own
+// identically-named, algo-labeled metric).
+func RegisterHistogram(reg *prometheus.Registry, opts prometheus.HistogramOpts) prometheus.Histogram {
+	h := prometheus.NewHistogram(opts)
+	if err := reg.Register(h); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(prometheus.Histogram); ok {
+				return existing
+			}
+		}
+		log.Printf("metrics: failed to register histogram %s: %v", opts.Name, err)
+	}
+	return h
+}

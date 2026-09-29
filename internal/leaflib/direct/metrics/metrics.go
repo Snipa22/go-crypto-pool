@@ -394,6 +394,31 @@ type Metrics struct {
 	// ReloginTotal exactly -- see that field's own doc comment.
 	ReloginTotal prometheus.Counter
 
+	// SubmitProcessingSeconds mirrors internal/leaflib/solo/metrics's
+	// identical field exactly (see that field's own doc comment for
+	// the full "why a defer alone isn't enough" rationale) -- the one
+	// real difference here: leaf-direct's own dispatch decision (see
+	// session.go's handleSubmit) sends EVERY RXT/RXM claim that
+	// clears the cheap pre-dispatch floor through finishSubmit on
+	// s.server.randomxPool asynchronously, not just genuine
+	// block-find candidates (leaf-direct forwards every validated
+	// share to the backend, not just block-level finds -- see
+	// handleSubmit's own "GENUINE DIFFERENCE FROM leaf-solo" doc
+	// comment) -- so the same start-time-threaded-into-finishSubmit
+	// technique matters for a much larger share of this leaf's real
+	// RXT/RXM traffic than it does for leaf-solo's.
+	SubmitProcessingSeconds *prometheus.HistogramVec
+
+	// SubmitValidationSeconds mirrors internal/leaflib/solo/metrics's
+	// identical field exactly, labeled by algo (see
+	// leaflib.AlgoMetricLabel). Deliberately NOT observed for the
+	// trusted-miner validation-skip branch (Server.EnableTrust,
+	// s.trust.ShouldSkipValidation -- UNLIKE solo, leaf-direct still
+	// wires this mechanism -- see finishSubmit's own doc comment):
+	// that path genuinely does zero validation work, so a near-zero
+	// sample there would be misleading noise, not a real signal.
+	SubmitValidationSeconds *prometheus.HistogramVec
+
 	// TemplateDistributionDuration observes the real wall-clock time
 	// (seconds) Server.invalidateAndRepushJobs spends iterating every
 	// connected session and pushing a freshly regenerated job, labeled
@@ -520,6 +545,35 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Name: "leaf_relogin_total",
 		Help: "Total number of real re-login events detected in session.go's handleLogin: a session receiving a second (or Nth) login message on an already-logged-in connection (e.g. an xmrig-proxy --reuse-timeout connection-reuse slot rotation). Incremented once per re-login event, not once per login overall.",
 	})
+
+	// leaf_direct_submit_processing_seconds' bucket boundaries:
+	// prometheus.DefBuckets (5ms..10s). This tail is genuinely more
+	// likely to be exercised here than on leaf-solo's identically-
+	// bucketed metric (see SubmitProcessingSeconds' own doc comment):
+	// EVERY RXT/RXM submit that clears the cheap pre-dispatch floor
+	// -- not just genuine block finds -- pays the real
+	// randomx-service HTTP round-trip (~4ms+, see asyncvalidation.go)
+	// plus, on the block-find path, the further multi-node GRPC
+	// submit/NATS relay publish span. DefBuckets' 10s ceiling still
+	// comfortably covers this in normal operation; kept rather than a
+	// bespoke set, matching TemplateDistributionDuration's own
+	// precedent.
+	m.SubmitProcessingSeconds = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "leaf_direct_submit_processing_seconds",
+		Help:    "Real, end-to-end wall-clock seconds of session.go's handleSubmit, from entry to the point the response is written to the miner, by result (accepted/rejected). Includes early-exit rejections (e.g. login required before submit). Buckets: prometheus.DefBuckets.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"result"})
+
+	// leaf_direct_submit_validation_seconds' bucket boundaries: also
+	// prometheus.DefBuckets -- see SubmitProcessingSeconds' own doc
+	// comment above; this metric's real observed values are a strict
+	// subset of that one's (only the v.Validate call itself), so the
+	// same ceiling applies with even more headroom.
+	m.SubmitValidationSeconds = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "leaf_direct_submit_validation_seconds",
+		Help:    "Real wall-clock seconds spent specifically inside the real PoW validator call (v.Validate) in session.go's finishSubmit, by algo (sha3x/c29/rxt/rxm -- see leaflib.AlgoMetricLabel). Never observed for the trusted-miner validation-skip branch (Server.EnableTrust) -- that path genuinely does zero validation work. Buckets: prometheus.DefBuckets.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"algo"})
 
 	// leaf_direct_template_distribution_seconds' bucket boundaries:
 	// prometheus.DefBuckets (5ms..10s) tops out at 10s, which is

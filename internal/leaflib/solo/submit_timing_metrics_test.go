@@ -62,7 +62,6 @@ func waitForHistogramSampleCountAtLeast(t *testing.T, hv *prometheus.HistogramVe
 	}
 }
 
-
 // TestSubmitProcessingSeconds_AcceptedAndRejected_HaveNonZeroObservations
 // covers both required cases for metric #1 (leaf_solo_submit_processing_
 // seconds): a real, ordinary accepted submit round-trip and a real
