@@ -59,35 +59,40 @@ type Session struct {
 	sessionID string
 	xn        string
 	loggedIn  atomic.Bool
-	address   atomic.Value // string
-	worker    atomic.Value // string
-	// agent mirrors solo.Session's own agent field exactly: the real
-	// miner software/version string self-reported at login
-	// (solo.LoginRequest.Agent), stored verbatim and unvalidated,
-	// diagnostic-only.
-	agent atomic.Value // string
 
-	// paymentID mirrors solo.Session's own identical field: the
-	// genuine Monero payment ID the miner supplied as a
-	// 64-lowercase-hex second dot-segment of its login field
-	// (solo.ParseLoginFields / solo.LoginFields.PaymentID),
-	// Monero-family algos only.
+	// identity is this session's ENTIRE miner-identity state
+	// (address/worker/agent/paymentID), held as a single
+	// atomic.Value of *leaflib.MinerIdentity and swapped with ONE
+	// Store call in handleLogin -- mirrors solo.Session's identical
+	// field exactly. See leaflib.MinerIdentity's own doc comment for
+	// the torn-read rationale this replaces. Read via the Identity()
+	// accessor below, never loaded directly. Never nil after
+	// newSession.
 	//
 	// UNLIKE leaf-solo (which has no share table/backend/payout
-	// accounting at all, and documents that as a known gap on its own
-	// copy of this field), leaf-direct forwards EVERY validated share
-	// to the real backend -- so this field is genuinely wired through
-	// to payout accounting here, stamped onto poolpb.Share.PaymentId
-	// (see sharePaymentID below and handleSubmit's four real Share
-	// constructions). That is pre-existing, complete, real plumbing,
-	// not new machinery invented for this fix:
-	// internal/backend/api's own ingestion handler already reads
+	// accounting at all), leaf-direct forwards EVERY validated share
+	// to the real backend, so Identity().PaymentID is genuinely wired
+	// through to payout accounting here, stamped onto
+	// poolpb.Share.PaymentId (see sharePaymentID below and
+	// handleSubmit's four real Share constructions) -- pre-existing,
+	// complete, real plumbing, not new machinery invented for this
+	// fix: internal/backend/api's own ingestion handler already reads
 	// Share.PaymentId into db.Share.PaymentID (api.go), which
 	// internal/backend/db keys both the `balance` and
 	// `miner_identifiers` rows on (COALESCE(payment_id, '')), and
-	// internal/leaflib/legacytransport already maps it onto the legacy
-	// SXMR wire share too (legacytransport.go).
-	paymentID atomic.Value // string
+	// internal/leaflib/legacytransport already maps it onto the
+	// legacy SXMR wire share too (legacytransport.go).
+	identity atomic.Value // *leaflib.MinerIdentity
+
+	// loginHistory is the bounded, oldest-evicted-first ring of this
+	// session's own past MinerIdentity values -- mirrors
+	// solo.Session's identical field exactly.
+	loginHistory *leaflib.LoginHistory
+
+	// reloginDetected is set true the FIRST time handleLogin runs on
+	// an already-logged-in session -- mirrors solo.Session's
+	// identical field exactly. Sticky for the connection's life.
+	reloginDetected atomic.Bool
 
 	// fixedDiff mirrors solo.Session's own identical field exactly --
 	// see that field's doc comment for the full rationale, the
@@ -127,7 +132,14 @@ type Session struct {
 	// forcedMinDifficulty mirrors solo.Session's own field exactly --
 	// see that field's doc comment.
 	forcedMinDifficulty atomic.Uint64
-	hashesAccumulated   atomic.Uint64
+	// forcedTargetTime mirrors solo.Session's identical field exactly
+	// -- see that field's own doc comment (internal/leaflib/solo/
+	// session.go) for the full rationale. 0 = unset; once set (by
+	// handleLogin, on proxy detection), unconditional and sticky for
+	// the rest of the connection's life; consulted by maybeRetarget
+	// (vardiff.go) BEFORE calling leaflib.ComputeRetarget.
+	forcedTargetTime  atomic.Uint64
+	hashesAccumulated atomic.Uint64
 
 	// lastDeliveredJobID/lastDeliveredDifficulty mirror solo.Session's
 	// own identical fields exactly -- see that type's doc comment for
@@ -136,6 +148,16 @@ type Session struct {
 	// server.go's invalidateAndRepushJobs via alreadyDelivered.
 	lastDeliveredJobID      atomic.Value // string
 	lastDeliveredDifficulty atomic.Uint64
+}
+
+// Identity mirrors solo.Session.Identity's own identical accessor
+// exactly -- see that method's doc comment. Never returns nil.
+func (s *Session) Identity() *leaflib.MinerIdentity {
+	ident, _ := s.identity.Load().(*leaflib.MinerIdentity)
+	if ident == nil {
+		return &leaflib.MinerIdentity{}
+	}
+	return ident
 }
 
 // sharePaymentID renders this session's own captured Monero payment ID
@@ -148,7 +170,7 @@ type Session struct {
 // miner_identifiers rows on COALESCE(payment_id, ”)), or a pointer to
 // the real 64-hex value the miner actually sent.
 func (s *Session) sharePaymentID() *string {
-	pid, _ := s.paymentID.Load().(string)
+	pid := s.Identity().PaymentID
 	if pid == "" {
 		return nil
 	}
@@ -176,10 +198,8 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		mc: mc, server: server, sessionID: id, xn: xn,
 		connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*solo.Job](defaultSessionJobHistorySize),
 	}
-	s.address.Store("")
-	s.worker.Store("")
-	s.agent.Store("")
-	s.paymentID.Store("")
+	s.identity.Store(&leaflib.MinerIdentity{})
+	s.loginHistory = leaflib.NewLoginHistory(defaultSessionJobHistorySize)
 	s.currentDifficulty.Store(startingDifficulty)
 	if server.trustConfig.Enabled {
 		s.trust = solo.NewMinerTrust(server.trustConfig)
@@ -359,11 +379,43 @@ func (s *Session) handleLogin(req solo.Request) {
 		worker = loginFields.Identifier
 	}
 
-	s.address.Store(loginFields.Address)
-	s.worker.Store(worker)
-	s.agent.Store(login.Agent)
-	s.paymentID.Store(loginFields.PaymentID)
+	// BRIEF.md "decouple TCP/miner-identity": the new identity is
+	// built as ONE value and swapped with a single Store call below
+	// -- mirrors solo.Session.handleLogin's identical block exactly.
+	newIdentity := &leaflib.MinerIdentity{
+		Address:    loginFields.Address,
+		Worker:     worker,
+		Agent:      login.Agent,
+		PaymentID:  loginFields.PaymentID,
+		LoggedInAt: time.Now(),
+	}
+	if s.loggedIn.Load() {
+		oldIdentity := s.Identity()
+		s.loginHistory.Append(*oldIdentity)
+		s.server.recordRelogin()
+		s.reloginDetected.Store(true)
+		s.server.logger.Printf("direct: session %s re-logged in: old identity address=%q worker=%q agent=%q payment_id=%q logged_in_at=%s -> new identity address=%q worker=%q agent=%q payment_id=%q",
+			s.sessionID,
+			oldIdentity.Address, oldIdentity.Worker, oldIdentity.Agent, oldIdentity.PaymentID, oldIdentity.LoggedInAt.Format(time.RFC3339),
+			newIdentity.Address, newIdentity.Worker, newIdentity.Agent, newIdentity.PaymentID)
+	}
+	s.identity.Store(newIdentity)
 	s.loggedIn.Store(true)
+
+	// BRIEF.md "proxy-aware vardiff target time": a session detected
+	// as a proxy -- by EITHER the pre-existing agent-string signal
+	// (solo.IsXNPProxyAgent/solo.IsGenericProxyAgent) OR the new
+	// behavioral signal above (reloginDetected) -- has its vardiff
+	// share target time forced to proxyForcedTargetTimeSeconds
+	// (vardiff.go), unconditionally, for the rest of the connection's
+	// life. See solo.Session.handleLogin's identical block for the
+	// full "unconditional, sticky" rationale of the
+	// forcedTargetTime.Load() == 0 guard below.
+	if solo.IsXNPProxyAgent(login.Agent) || solo.IsGenericProxyAgent(login.Agent) || s.reloginDetected.Load() {
+		if s.forcedTargetTime.Load() == 0 {
+			s.forcedTargetTime.Store(proxyForcedTargetTimeSeconds)
+		}
+	}
 
 	// A miner-requested (or NiceHash-assigned) FIXED difficulty
 	// becomes this session's STARTING difficulty and pins it for the
@@ -639,8 +691,8 @@ func (s *Session) handleSubmit(req solo.Request) {
 	// banned mid-session; login-time-only enforcement would let an
 	// already-connected botnet keep submitting shares indefinitely).
 	if s.server.addressFlags != nil {
-		if flags := s.server.addressFlags.Get(s.address.Load().(string)); flags.Banned {
-			s.server.logger.Printf("direct: rejecting submit for now-banned address %s (session %s)", s.address.Load(), s.sessionID)
+		if flags := s.server.addressFlags.Get(s.Identity().Address); flags.Banned {
+			s.server.logger.Printf("direct: rejecting submit for now-banned address %s (session %s)", s.Identity().Address, s.sessionID)
 			s.rejectShare(req.ID, directmetrics.RejectionReasonBannedAddress, "this address is banned from this pool")
 			return
 		}
@@ -754,7 +806,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			// on its own Share.block_diff field, without disturbing
 			// BlockDiff's existing normal-path meaning above.
 			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
-			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string), PaymentId: s.sharePaymentID(),
+			PaymentAddress: s.Identity().Address, Identifier: s.Identity().Worker, PaymentId: s.sharePaymentID(),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
 				Blob: blob, SeedHash: job.VmKey, ResultHex: submit.Result,
@@ -770,7 +822,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_C29, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
-			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string), PaymentId: s.sharePaymentID(),
+			PaymentAddress: s.Identity().Address, Identifier: s.Identity().Worker, PaymentId: s.sharePaymentID(),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_C29Proof{C29Proof: &poolpb.C29Proof{
 				EdgeBits: c29SubmitEdgeBits, Cycle: submit.POW, Header: job.Header, Nonce: nonce,
@@ -806,7 +858,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_RXT, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
-			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string), PaymentId: s.sharePaymentID(),
+			PaymentAddress: s.Identity().Address, Identifier: s.Identity().Worker, PaymentId: s.sharePaymentID(),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_RandomxProof{RandomxProof: &poolpb.RandomXProof{
 				Blob: blob, SeedHash: job.VmKey, ResultHex: submit.Result,
@@ -818,7 +870,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			Algo: poolpb.Algo_ALGO_SHA3X, Network: s.server.network, PoolType: s.server.poolType, PoolId: s.server.poolID,
 			BlockDiff: leaflib.SafeInt64(job.StaticDifficulty), Shares: leaflib.SafeInt64(job.StaticDifficulty), BlockHeight: int64(job.Height),
 			NetworkDiff:    leaflib.SafeInt64(job.NetworkTargetDifficulty),
-			PaymentAddress: s.address.Load().(string), Identifier: s.worker.Load().(string), PaymentId: s.sharePaymentID(),
+			PaymentAddress: s.Identity().Address, Identifier: s.Identity().Worker, PaymentId: s.sharePaymentID(),
 			Timestamp: time.Now().Unix(),
 			RawProof: &poolpb.Share_Sha3XProof{Sha3XProof: &poolpb.SHA3XProof{
 				Header: job.Header, Nonce: nonce,
@@ -903,7 +955,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			}
 			s.rejectShare(req.ID, directmetrics.RejectionReasonClaimedDifficultyOrCryptoInvalid, "share does not meet configured difficulty or is cryptographically invalid")
 			if disconnect {
-				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
+				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.Identity().Address)
 				s.mc.Close("exceeded consecutive invalid-share threshold")
 			}
 			return
@@ -951,7 +1003,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 			s.rejectShare(req.ID, directmetrics.RejectionReasonDifficultyFloorMiss, "share does not meet the job's configured difficulty")
 			s.pushFreshJobOnStaleSubmit()
 			if disconnect {
-				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
+				s.server.logger.Printf("direct: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.Identity().Address)
 				s.mc.Close("exceeded consecutive invalid-share threshold")
 			}
 			return
@@ -1246,7 +1298,7 @@ func (s *Session) handleSubmit(req solo.Request) {
 		}
 
 		s.blockCount.Add(1)
-		s.server.logger.Printf("direct: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.address.Load(), job.Height, job.ID, diff, blockHashHex)
+		s.server.logger.Printf("direct: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.Identity().Address, job.Height, job.ID, diff, blockHashHex)
 		s.server.recordBlock(true)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
 
@@ -1631,7 +1683,7 @@ func (s *Session) jobPayload(job *solo.Job) solo.JobPayload {
 	// session_xnp_test.go for real marshaled-JSON byte-diffs proving
 	// this. The same holds for the three difficulty fields set at the
 	// top of the block below.
-	if solo.IsXNPProxyAgent(s.agent.Load().(string)) {
+	if solo.IsXNPProxyAgent(s.Identity().Agent) {
 		// DIFFICULTY HALF of the real proxy-class job shape — mirrors
 		// solo.Session.jobPayload's identical addition exactly; see
 		// that function and solo/protocol.go's Difficulty/TargetDiff/

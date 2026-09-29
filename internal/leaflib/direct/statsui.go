@@ -34,6 +34,10 @@ type SessionStat struct {
 	// SessionStat.EstimatedHashrate exactly (see
 	// leaflib.EstimateHashrateHz's doc comment for the formula).
 	EstimatedHashrate float64
+	// Relogins is this session's own real re-login count -- mirrors
+	// internal/leaflib/solo/server.go's identical
+	// SessionStat.Relogins exactly.
+	Relogins int
 }
 
 // AddressCount is one entry in Stats.MinersByAddress: a mining/payout
@@ -116,9 +120,9 @@ func (s *Server) Stats() Stats {
 		st.TotalShares += sess.shareCount.Load()
 		st.TotalBlocks += sess.blockCount.Load()
 
-		addr, _ := sess.address.Load().(string)
-		worker, _ := sess.worker.Load().(string)
-		agent, _ := sess.agent.Load().(string)
+		addr := sess.Identity().Address
+		worker := sess.Identity().Worker
+		agent := sess.Identity().Agent
 		remoteIP := directmetrics.RemoteIPOf(sess.mc.RemoteAddr())
 		diff := sess.currentDifficulty.Load()
 
@@ -146,6 +150,7 @@ func (s *Server) Stats() Stats {
 			ShareCount:        sess.shareCount.Load(),
 			BlockCount:        sess.blockCount.Load(),
 			EstimatedHashrate: hashrate,
+			Relogins:          sess.loginHistory.Len(),
 		})
 		st.TotalEstimatedHashrate += hashrate
 	}
@@ -376,7 +381,7 @@ const statsPageHTML = `<!DOCTYPE html>
   <h2>Connected sessions{{if .SessionsCapped}} (showing {{len .ShownSessions}} of {{.Stats.ActiveSessions}}, capped to {{.StatsPageMaxSessions}}){{end}}</h2>
   {{if .ShownSessions}}
   <table>
-    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Agent</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Blocks</th></tr>
+    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Agent</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Blocks</th><th>Relogins</th></tr>
     {{range .ShownSessions}}
     <tr>
       <td>{{.SessionID}}</td>
@@ -390,6 +395,7 @@ const statsPageHTML = `<!DOCTYPE html>
       <td>{{formatHashrate .EstimatedHashrate}}</td>
       <td>{{.ShareCount}}</td>
       <td>{{.BlockCount}}</td>
+      <td>{{.Relogins}}</td>
     </tr>
     {{end}}
   </table>

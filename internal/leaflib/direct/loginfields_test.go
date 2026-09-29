@@ -117,7 +117,7 @@ func TestDirectLoginFixedDifficultySuffixIsHonoredAndVardiffIsSkipped(t *testing
 		t.Fatal("login with a +fixed-difficulty suffix was rejected")
 	}
 
-	if got := sess.address.Load().(string); got != addr {
+	if got := sess.Identity().Address; got != addr {
 		t.Errorf("session address = %q, want the STRIPPED address %q (never the raw login string)", got, addr)
 	}
 	if got := sess.currentDifficulty.Load(); got != 50000 {
@@ -221,7 +221,9 @@ func TestDirectLoginPaymentIDIsStampedOnForwardedShares(t *testing.T) {
 	// fakeDirectNodeClient cannot produce.
 	sessionID, xn := directLogin(t, h, realTariTestAddress("direct-login-payment-id"))
 	sess := directSessionByID(t, h, sessionID)
-	sess.paymentID.Store(paymentID)
+	updated := *sess.Identity()
+	updated.PaymentID = paymentID
+	sess.identity.Store(&updated)
 
 	jobID := directCurrentJobIDForXN(t, h, xn)
 	h.send(solo.Request{ID: 2, Method: "submit", Params: mustDirectJSON(t, solo.SubmitRequest{
@@ -283,13 +285,13 @@ func TestDirectLoginDotIdentifierFeedsWorkerWithLegacyPrecedence(t *testing.T) {
 			if sess == nil {
 				t.Fatal("login with a .identifier suffix was rejected")
 			}
-			if got := sess.address.Load().(string); got != realDirectXMRMainnetAddr {
+			if got := sess.Identity().Address; got != realDirectXMRMainnetAddr {
 				t.Errorf("session address = %q, want the STRIPPED address %q", got, realDirectXMRMainnetAddr)
 			}
-			if got := sess.worker.Load().(string); got != tc.wantWorker {
+			if got := sess.Identity().Worker; got != tc.wantWorker {
 				t.Errorf("session worker = %q, want %q", got, tc.wantWorker)
 			}
-			if got := sess.paymentID.Load().(string); got != "" {
+			if got := sess.Identity().PaymentID; got != "" {
 				t.Errorf("session paymentID = %q, want empty (a non-64-hex segment is a worker name)", got)
 			}
 		})
@@ -341,13 +343,13 @@ func TestDirectLoginOrdinaryAddressIsByteForByteUnchanged(t *testing.T) {
 	if sess == nil {
 		t.Fatal("ordinary login was rejected")
 	}
-	if got := sess.address.Load().(string); got != addr {
+	if got := sess.Identity().Address; got != addr {
 		t.Errorf("session address = %q, want %q", got, addr)
 	}
-	if got := sess.worker.Load().(string); got != "rig1" {
+	if got := sess.Identity().Worker; got != "rig1" {
 		t.Errorf("session worker = %q, want %q", got, "rig1")
 	}
-	if got := sess.paymentID.Load().(string); got != "" {
+	if got := sess.Identity().PaymentID; got != "" {
 		t.Errorf("session paymentID = %q, want empty", got)
 	}
 	if sess.fixedDiff.Load() {
