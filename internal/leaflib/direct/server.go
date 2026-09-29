@@ -979,6 +979,25 @@ func (s *Server) recordConnectionError(category string) {
 	s.metrics.ConnectionErrorsTotal.WithLabelValues(category).Inc()
 }
 
+// recordSubmitProcessing/recordSubmitValidation are session.go's
+// handleSubmit/finishSubmit's own nil-safe hooks for
+// metrics.SubmitProcessingSeconds/SubmitValidationSeconds -- see
+// those fields' own doc comments for the full rationale. Mirror
+// recordShare/recordBlock's identical nil-safety convention above.
+func (s *Server) recordSubmitProcessing(result string, seconds float64) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.SubmitProcessingSeconds.WithLabelValues(result).Observe(seconds)
+}
+
+func (s *Server) recordSubmitValidation(algo string, seconds float64) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.SubmitValidationSeconds.WithLabelValues(algo).Observe(seconds)
+}
+
 // connErrorNoShareTimeout is this feature's own connection-error
 // category, recorded via recordConnectionError (reusing the existing
 // leaf_direct_connection_errors_total metric with a new category
