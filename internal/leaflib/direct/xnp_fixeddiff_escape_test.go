@@ -50,7 +50,7 @@ func TestDirectLoginXNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *te
 		t.Fatal("XNP-proxy login with a +fixed-difficulty suffix was rejected")
 	}
 
-	if got := sess.address.Load().(string); got != addr {
+	if got := sess.Identity().Address; got != addr {
 		t.Errorf("session address = %q, want the STRIPPED address %q", got, addr)
 	}
 	// The operator's requested value IS the starting difficulty --
@@ -62,8 +62,14 @@ func TestDirectLoginXNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *te
 		t.Fatal("BUG: an XNP-proxy session was permanently pinned by its login-time +diff suffix -- legacy's proxyAddressList clause exists precisely so an aggregating proxy keeps getting retargeted")
 	}
 
-	// The real proof: (600000/90)*30 = 199980, clamped by the 1.5x
-	// step limit to 50000*1.5 = 75000.
+	// The real proof: BRIEF.md "proxy-aware vardiff target time"
+	// forces this XNP-agent-detected session's target time to
+	// proxyForcedTargetTimeSeconds (10), unconditionally overriding
+	// the harness's configured cfg.TargetTime (30):
+	// (600000/90)*10 = 66660, which does not hit the 1.5x step
+	// limit (50000*1.5 = 75000) at all, unlike the pre-this-brief
+	// 30s-target-time math this test used to assert (199980, clamped
+	// to 75000).
 	sess.connectedAt = time.Now().Add(-90 * time.Second)
 	sess.hashesAccumulated.Store(600_000)
 	done := make(chan struct{})
@@ -73,10 +79,10 @@ func TestDirectLoginXNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *te
 	}()
 	push := h.recvJobPush()
 	<-done
-	if got := sess.currentDifficulty.Load(); got != 75000 {
-		t.Fatalf("currentDifficulty = %d, want 75000 -- vardiff must remain fully live for an XNP-proxy session", got)
+	if got := sess.currentDifficulty.Load(); got != 66660 {
+		t.Fatalf("currentDifficulty = %d, want 66660 (10s forced target time) -- vardiff must remain fully live for an XNP-proxy session", got)
 	}
-	if want := leaflib.DiffToTargetHex(75000); push.Params.Target != want {
+	if want := leaflib.DiffToTargetHex(66660); push.Params.Target != want {
 		t.Errorf("pushed job target = %q, want %q", push.Params.Target, want)
 	}
 }
@@ -97,7 +103,7 @@ func TestDirectLoginXNPProxyExemptionIsAlgoAgnostic(t *testing.T) {
 	if sess == nil {
 		t.Fatal("XNP-proxy RXM login with a +fixed-difficulty suffix was rejected")
 	}
-	if got := sess.address.Load().(string); got != realDirectXMRMainnetAddr {
+	if got := sess.Identity().Address; got != realDirectXMRMainnetAddr {
 		t.Errorf("session address = %q, want the miner's own real address %q", got, realDirectXMRMainnetAddr)
 	}
 	if got := sess.currentDifficulty.Load(); got != 50000 {
@@ -131,7 +137,7 @@ func TestDirectLoginGenericProxyFixedDiffSuffixStartsThereButStaysRetargetable(t
 		t.Fatal("generic-proxy login with a +fixed-difficulty suffix was rejected")
 	}
 
-	if got := sess.address.Load().(string); got != addr {
+	if got := sess.Identity().Address; got != addr {
 		t.Errorf("session address = %q, want the STRIPPED address %q", got, addr)
 	}
 	// The operator's requested value IS the starting difficulty --
@@ -143,8 +149,11 @@ func TestDirectLoginGenericProxyFixedDiffSuffixStartsThereButStaysRetargetable(t
 		t.Fatal("BUG: a generic-proxy-claiming session was permanently pinned by its login-time +diff suffix -- the generic carve-out exists precisely so it keeps getting retargeted, same as XNP")
 	}
 
-	// The real proof: (600000/90)*30 = 199980, clamped by the 1.5x
-	// step limit to 50000*1.5 = 75000.
+	// The real proof: same math as the XNP case -- BRIEF.md
+	// "proxy-aware vardiff target time" forces this generic-proxy-
+	// detected session's target time to proxyForcedTargetTimeSeconds
+	// (10) too: (600000/90)*10 = 66660, which does not hit the 1.5x
+	// step limit (50000*1.5 = 75000) at all.
 	sess.connectedAt = time.Now().Add(-90 * time.Second)
 	sess.hashesAccumulated.Store(600_000)
 	done := make(chan struct{})
@@ -154,10 +163,10 @@ func TestDirectLoginGenericProxyFixedDiffSuffixStartsThereButStaysRetargetable(t
 	}()
 	push := h.recvJobPush()
 	<-done
-	if got := sess.currentDifficulty.Load(); got != 75000 {
-		t.Fatalf("currentDifficulty = %d, want 75000 -- vardiff must remain fully live for a generic-proxy-claiming session", got)
+	if got := sess.currentDifficulty.Load(); got != 66660 {
+		t.Fatalf("currentDifficulty = %d, want 66660 (10s forced target time) -- vardiff must remain fully live for a generic-proxy-claiming session", got)
 	}
-	if want := leaflib.DiffToTargetHex(75000); push.Params.Target != want {
+	if want := leaflib.DiffToTargetHex(66660); push.Params.Target != want {
 		t.Errorf("pushed job target = %q, want %q", push.Params.Target, want)
 	}
 }

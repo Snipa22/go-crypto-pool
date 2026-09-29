@@ -131,7 +131,7 @@ func assertXNPDifficultyFields(t *testing.T, got solo.JobPayload, wantDifficulty
 // solo package's own identical helper (protocol_xnp_test.go).
 func newXNPTestSession(agent string, xn string) *Session {
 	s := &Session{xn: xn, jobs: leaflib.NewJobHistory[*solo.Job](0)}
-	s.agent.Store(agent)
+	s.identity.Store(&leaflib.MinerIdentity{Agent: agent})
 	return s
 }
 

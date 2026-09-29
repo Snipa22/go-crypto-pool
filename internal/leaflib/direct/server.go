@@ -944,8 +944,8 @@ func (s *Server) sessionSnapshots() []directmetrics.SessionSnapshot {
 	defer s.mu.RUnlock()
 	out := make([]directmetrics.SessionSnapshot, 0, len(s.sessions))
 	for _, sess := range s.sessions {
-		addr, _ := sess.address.Load().(string)
-		agent, _ := sess.agent.Load().(string)
+		addr := sess.Identity().Address
+		agent := sess.Identity().Agent
 		out = append(out, directmetrics.SessionSnapshot{
 			Address: addr, RemoteIP: directmetrics.RemoteIPOf(sess.mc.RemoteAddr()),
 			Difficulty: sess.currentDifficulty.Load(),
@@ -1084,7 +1084,7 @@ func (s *Server) sweepNoShareSessions() {
 	s.mu.RUnlock()
 
 	for _, sess := range stale {
-		addr, _ := sess.address.Load().(string)
+		addr := sess.Identity().Address
 		s.logger.Printf("direct: disconnecting session %s (address %s): no share submitted within %s of connecting", sess.sessionID, addr, s.noShareTimeout)
 		_ = sess.mc.Close(fmt.Sprintf("no share submitted within %s of connecting", s.noShareTimeout))
 		s.recordConnectionError(connErrorNoShareTimeout)
@@ -1150,6 +1150,18 @@ func (s *Server) recordLoginRejection(reason string) {
 		return
 	}
 	s.metrics.IncLoginRejectionReason(reason)
+}
+
+// recordRelogin bumps the real leaf_relogin_total counter (see
+// directmetrics.Metrics.ReloginTotal's doc comment) -- called from
+// session.go's handleLogin at the exact point a re-login is
+// detected, mirroring recordLoginRejection's identical nil-checked
+// convention above.
+func (s *Server) recordRelogin() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.IncRelogin()
 }
 
 // recordTransportError tracks backend-forwarding failures (share/

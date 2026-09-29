@@ -389,6 +389,10 @@ type Metrics struct {
 	// kind.
 	LoginRejectionsTotal *prometheus.CounterVec
 
+	// ReloginTotal mirrors internal/leaflib/solo/metrics's identical
+	// ReloginTotal exactly -- see that field's own doc comment.
+	ReloginTotal prometheus.Counter
+
 	// TemplateDistributionDuration observes the real wall-clock time
 	// (seconds) Server.invalidateAndRepushJobs spends iterating every
 	// connected session and pushing a freshly regenerated job, labeled
@@ -503,6 +507,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Name: "leaf_direct_login_rejections_total",
 		Help: "Real, per-category breakdown of every login-time rejection in session.go's handleLogin/fetchAndDeliverLoginJob (see this package's LoginRejectionReason* consts for the full, closed enum and the exact call site each one maps to) -- previously every one of these rejection points was log-only, with no counter of any kind.",
 	}, []string{"reason"})
+
+	m.ReloginTotal = registerCounter(reg, prometheus.CounterOpts{
+		Name: "leaf_relogin_total",
+		Help: "Total number of real re-login events detected in session.go's handleLogin: a session receiving a second (or Nth) login message on an already-logged-in connection (e.g. an xmrig-proxy --reuse-timeout connection-reuse slot rotation). Incremented once per re-login event, not once per login overall.",
+	})
 
 	// leaf_direct_template_distribution_seconds' bucket boundaries:
 	// prometheus.DefBuckets (5ms..10s) tops out at 10s, which is
@@ -633,6 +642,12 @@ func (m *Metrics) IncShareRejectionReason(reason string) {
 // (see that package's doc comment for the rationale).
 func (m *Metrics) IncLoginRejectionReason(reason string) {
 	m.LoginRejectionsTotal.WithLabelValues(reason).Inc()
+}
+
+// IncRelogin mirrors internal/leaflib/solo/metrics's identical
+// IncRelogin exactly.
+func (m *Metrics) IncRelogin() {
+	m.ReloginTotal.Inc()
 }
 
 // Stop releases the background ticker goroutines backing
