@@ -253,7 +253,7 @@ func (h *vardiffHarness) sessionByXN(xn string) *Session {
 	h.server.mu.RLock()
 	defer h.server.mu.RUnlock()
 	for _, sess := range h.server.sessions {
-		if sess.xn == xn {
+		if sess.XN() == xn {
 			return sess
 		}
 	}
@@ -445,8 +445,8 @@ func TestTwoSessionsRetargetIndependently(t *testing.T) {
 	clientA, sessA := h.connectAndLogin("addr-multi-a")
 	clientB, sessB := h.connectAndLogin("addr-multi-b")
 
-	if sessA.xn == sessB.xn {
-		t.Fatalf("expected two independently-connected sessions to get different xn values, both got %q", sessA.xn)
+	if sessA.XN() == sessB.XN() {
+		t.Fatalf("expected two independently-connected sessions to get different xn values, both got %q", sessA.XN())
 	}
 
 	// Session A: high accept rate -> difficulty goes UP.
@@ -492,11 +492,11 @@ func TestTwoSessionsRetargetIndependently(t *testing.T) {
 	}
 
 	// Neither session's job push carries the other's xn.
-	if pushA.Params.XN != sessA.xn {
-		t.Errorf("session A's pushed job carries xn %q, want %q", pushA.Params.XN, sessA.xn)
+	if pushA.Params.XN != sessA.XN() {
+		t.Errorf("session A's pushed job carries xn %q, want %q", pushA.Params.XN, sessA.XN())
 	}
-	if pushB.Params.XN != sessB.xn {
-		t.Errorf("session B's pushed job carries xn %q, want %q", pushB.Params.XN, sessB.xn)
+	if pushB.Params.XN != sessB.XN() {
+		t.Errorf("session B's pushed job carries xn %q, want %q", pushB.Params.XN, sessB.XN())
 	}
 }
 
@@ -527,7 +527,7 @@ func TestRetargetOnlyPushesAffectedSessionNotOthers(t *testing.T) {
 
 	// Affected session gets its job push.
 	push := clientAffected.recvJobPush()
-	if push.Params.XN != sessAffected.xn {
+	if push.Params.XN != sessAffected.XN() {
 		t.Errorf("expected the pushed job's xn to belong to the affected session")
 	}
 

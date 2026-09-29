@@ -162,7 +162,8 @@ func assertXNPDifficultyFields(t *testing.T, got JobPayload, wantDifficulty uint
 // s.Identity().Agent). agent mirrors what handleLogin already stores
 // via s.identity.Store(...) at real login time.
 func newXNPTestSession(agent string, xn string) *Session {
-	s := &Session{xn: xn, jobs: leaflib.NewJobHistory[*Job](0)}
+	s := &Session{jobs: leaflib.NewJobHistory[*Job](0)}
+	s.xn.Store(xn)
 	s.identity.Store(&leaflib.MinerIdentity{Agent: agent})
 	return s
 }

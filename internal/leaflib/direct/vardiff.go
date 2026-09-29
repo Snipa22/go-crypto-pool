@@ -120,18 +120,18 @@ func (s *Session) maybeRetarget() {
 	}
 
 	newDiff, changed := leaflib.ComputeRetarget(curDiff, hashes, connSeconds, targetTime, minDiff, cfg.MaxDifficulty)
-	s.server.debugLogger.Debugf("direct: vardiff check: session=%s xn=%s cur_diff=%d hashes=%d conn_seconds=%d changed=%v", s.sessionID, s.xn, curDiff, hashes, connSeconds, changed)
+	s.server.debugLogger.Debugf("direct: vardiff check: session=%s xn=%s cur_diff=%d hashes=%d conn_seconds=%d changed=%v", s.sessionID, s.XN(), curDiff, hashes, connSeconds, changed)
 	if !changed {
 		return
 	}
 
 	s.currentDifficulty.Store(newDiff)
 
-	job, err := s.server.jobManager.RestampDifficulty(context.Background(), s.xn, newDiff)
+	job, err := s.server.jobManager.RestampDifficulty(context.Background(), s.XN(), newDiff)
 	if err != nil {
-		s.server.logger.Printf("direct: vardiff retarget for session %s (xn %s) failed to restamp job: %v", s.sessionID, s.xn, err)
+		s.server.logger.Printf("direct: vardiff retarget for session %s (xn %s) failed to restamp job: %v", s.sessionID, s.XN(), err)
 		return
 	}
-	s.server.logger.Printf("direct: vardiff retarget for session %s (xn %s): %d -> %d (hashes=%d, connSeconds=%d)", s.sessionID, s.xn, curDiff, newDiff, hashes, connSeconds)
+	s.server.logger.Printf("direct: vardiff retarget for session %s (xn %s): %d -> %d (hashes=%d, connSeconds=%d)", s.sessionID, s.XN(), curDiff, newDiff, hashes, connSeconds)
 	s.pushJob(job)
 }

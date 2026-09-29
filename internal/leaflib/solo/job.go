@@ -2099,6 +2099,12 @@ func newRandomHexID() (string, error) {
 	return leaflib.NewRandomHexID()
 }
 
-func newSessionXN() (string, error) {
+// newSessionXN is a package-level func-var (not a plain func) purely
+// so tests can substitute a deterministic/instrumented replacement —
+// mirrors this repo's existing test-injectable-randomness convention
+// (vardiff.go's vardiffJitterFunc doc comment cites the same pattern
+// elsewhere in this codebase). Production code always calls through
+// this var; its default value is the real leaflib.NewSessionXN.
+var newSessionXN = func() (string, error) {
 	return leaflib.NewSessionXN()
 }
