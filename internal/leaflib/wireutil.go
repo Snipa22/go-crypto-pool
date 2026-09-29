@@ -122,6 +122,45 @@ func AlgoWireName(algo poolpb.Algo) string {
 	}
 }
 
+// AlgoMetricLabel maps a Job's stamped poolpb.Algo onto the small,
+// fixed "algo" label value used by the submit-latency-family metrics
+// (leaf_{solo,direct}_submit_validation_seconds) -- DELIBERATELY
+// DISTINCT from AlgoWireName above: that helper exists to match what
+// real miner client software expects on the wire (where RXT/RXM and
+// every other monerod-family coin genuinely collapse onto the same
+// "rx/0" algo name, since a RandomX-aware miner has no other concept
+// to select on), whereas this helper exists to let an operator tell
+// a validator regression/slowdown for ONE specific RandomX-family
+// algo apart from another on a dashboard/alert -- collapsing RXT and
+// RXM onto the same label value here would defeat that exact purpose
+// for the two algos most likely to actually diverge (RXT talks to a
+// companion randomx-service HTTP daemon; RXM's real Monero-family
+// coin variants -- ALGO_XMR and every internal/coinprofile.Registry
+// entry below it -- share RXM's own RandomX proof shape and
+// validator call path, so they are all reported under the single
+// "rxm" bucket rather than one label value per coin, keeping this
+// label's cardinality small and fixed exactly like AlgoWireName's).
+// ALGO_UNSPECIFIED falls back to "sha3x", mirroring AlgoWireName's
+// own defensive backward-compatible default.
+func AlgoMetricLabel(algo poolpb.Algo) string {
+	switch algo {
+	case poolpb.Algo_ALGO_SHA3X:
+		return "sha3x"
+	case poolpb.Algo_ALGO_C29:
+		return "c29"
+	case poolpb.Algo_ALGO_RXT:
+		return "rxt"
+	case poolpb.Algo_ALGO_RXM:
+		return "rxm"
+	default:
+		if _, ok := coinprofile.ByAlgo(algo); ok {
+			return "rxm"
+		}
+		return "sha3x"
+	}
+}
+
+
 // DiffToTargetHex encodes a session difficulty into the wire "target"
 // field, in two stages.
 //

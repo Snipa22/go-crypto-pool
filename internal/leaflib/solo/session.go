@@ -1070,6 +1070,30 @@ func ClaimedRandomXFamilyDifficulty(algo poolpb.Algo, resultHex string) (uint64,
 // every otherwise-valid RXT submit with "Invalid XNonce". The check
 // below is now algo-conditional and skipped for ALGO_RXT.
 func (s *Session) handleSubmit(req Request) {
+	// SubmitProcessingSeconds: real, end-to-end wall-clock latency of
+	// this whole method, from entry to the point the response is
+	// actually written (accept or reject) -- see that metric's own
+	// doc comment (metrics.go). finishSubmitEntered guards against
+	// double-observing: whenever finishSubmit is actually entered
+	// (inline below, or successfully dispatched onto
+	// s.server.randomxPool), IT records this same start time from
+	// its own defer once it completes -- on whichever goroutine
+	// actually runs it -- instead of this top-level defer, so a
+	// genuine block-find candidate's real, possibly-async
+	// randomx-service round-trip is correctly included rather than
+	// just the cheap synchronous dispatch call. result defaults to
+	// rejected (every early-exit path below this point is a
+	// rejection) except the one ordinary-RXT/RXM-claim accept path
+	// far below, which explicitly overrides it.
+	start := time.Now()
+	result := metrics.ResultRejected
+	finishSubmitEntered := false
+	defer func() {
+		if !finishSubmitEntered {
+			s.server.recordSubmitProcessing(result, time.Since(start).Seconds())
+		}
+	}()
+
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before submit", "")
 		return
@@ -1459,6 +1483,22 @@ func (s *Session) handleSubmit(req Request) {
 	// it was already race-safe by construction, just previously
 	// single-threaded by the caller.
 	finishSubmit := func() {
+		// SubmitProcessingSeconds: this closure is where the response
+		// is actually written for every path finishSubmit is reached
+		// through (see this method's own top-level defer/doc comment
+		// above) -- observing from HERE, using the SAME start captured
+		// at handleSubmit's entry, is what makes this metric correct
+		// even when finishSubmit runs asynchronously on a
+		// s.server.randomxPool worker goroutine rather than inline.
+		// submitResult defaults to rejected (every finishSubmit exit
+		// point below is a rejection except the two explicit
+		// overrides -- the ordinary, below-block-difficulty accept,
+		// and the genuine block-find accept at the very end).
+		submitResult := metrics.ResultRejected
+		defer func() {
+			s.server.recordSubmitProcessing(submitResult, time.Since(start).Seconds())
+		}()
+
 		v, err := s.server.validators.Get(job.Algo)
 		if err != nil {
 			s.rejectShare(req.ID, metrics.RejectionReasonInternalError, fmt.Sprintf("no validator configured for this leaf's algo %v: %v", job.Algo, err))
@@ -1475,7 +1515,15 @@ func (s *Session) handleSubmit(req Request) {
 		// (see that same doc comment), so it always runs the real,
 		// daemon-backed v.Validate call unconditionally — there is no
 		// skip path left to gate.
+		//
+		// SubmitValidationSeconds: real wall-clock time inside this
+		// v.Validate call specifically, labeled by algo -- see that
+		// metric's own doc comment. Always observed here (no skip
+		// branch to exclude for solo -- see the field's own doc
+		// comment on why that differs from leaf-direct).
+		validateStart := time.Now()
 		valid, err := v.Validate(context.Background(), share)
+		s.server.recordSubmitValidation(leaflib.AlgoMetricLabel(job.Algo), time.Since(validateStart).Seconds())
 		s.server.debugLogger.Debugf("solo: validation attempt: session=%s job_id=%s algo=%v valid=%v err=%v", s.sessionID, job.ID, job.Algo, valid, err)
 		if err != nil && err != validator.ErrWrongProofType {
 			s.rejectShare(req.ID, metrics.RejectionReasonInternalError, fmt.Sprintf("validation error: %v", err))
@@ -1533,6 +1581,7 @@ func (s *Session) handleSubmit(req Request) {
 			// job's stamped difficulty, i.e. this session's current
 			// vardiff value at the moment this share was accepted.
 			s.hashesAccumulated.Add(job.StaticDifficulty)
+			submitResult = metrics.ResultAccepted
 			s.writeShareResponse(req.ID, true, "")
 			return
 		}
@@ -1597,6 +1646,7 @@ func (s *Session) handleSubmit(req Request) {
 		}
 		s.server.recordBlock(true)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
+		submitResult = metrics.ResultAccepted
 		s.writeShareResponse(req.ID, true, "")
 
 		// A block was found; every cached per-xn template is now stale
@@ -1755,6 +1805,13 @@ func (s *Session) handleSubmit(req Request) {
 			}
 			s.shareCount.Add(1)
 			s.hashesAccumulated.Add(job.StaticDifficulty)
+			// This path never enters finishSubmit (see this block's
+			// own doc comment above: ordinary sub-block RXT/RXM
+			// claims skip the real validator entirely) -- override
+			// the top-level defer's default rejected result so this
+			// genuine accept is recorded correctly on
+			// SubmitProcessingSeconds.
+			result = metrics.ResultAccepted
 			s.writeShareResponse(req.ID, true, "")
 			return
 		}
@@ -1792,9 +1849,18 @@ func (s *Session) handleSubmit(req Request) {
 			// stopped) will process normally once room/a fresh
 			// instance is available.
 			s.rejectShare(req.ID, metrics.RejectionReasonPoolSaturated, "validation pool is saturated or shutting down, please retry")
+		} else {
+			// finishSubmit was genuinely accepted by the pool and
+			// WILL run (on one of its worker goroutines) -- it owns
+			// recording SubmitProcessingSeconds itself once it
+			// actually completes (see finishSubmit's own doc
+			// comment); suppress this method's own top-level
+			// fallback defer so this submit is never double-counted.
+			finishSubmitEntered = true
 		}
 		return
 	}
+	finishSubmitEntered = true
 	finishSubmit()
 }
 
