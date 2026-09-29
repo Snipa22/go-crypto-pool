@@ -649,6 +649,28 @@ func (s *Server) recordBlock(accepted bool) {
 	s.metrics.BlocksTotal.WithLabelValues(resultLabel(accepted)).Inc()
 }
 
+// recordSubmitProcessing/recordSubmitValidation are session.go's
+// handleSubmit/finishSubmit's own nil-safe hooks for
+// metrics.SubmitProcessingSeconds/SubmitValidationSeconds -- mirror
+// solo.Server.recordSubmitProcessing/recordSubmitValidation's
+// identical nil-safety convention exactly. recordSubmitValidation has
+// no label parameter, unlike solo/direct's identically-named
+// method -- see metrics.SubmitValidationSeconds' own doc comment for
+// why leaf-proxy's histogram is deliberately unlabeled.
+func (s *Server) recordSubmitProcessing(result string, seconds float64) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.SubmitProcessingSeconds.WithLabelValues(result).Observe(seconds)
+}
+
+func (s *Server) recordSubmitValidation(seconds float64) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.SubmitValidationSeconds.Observe(seconds)
+}
+
 // Serve accepts downstream miner connections on ln until ctx is
 // cancelled or ln is closed, stamping every session accepted on ln
 // with port.Difficulty as its starting difficulty -- mirroring

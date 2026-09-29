@@ -265,6 +265,36 @@ type Metrics struct {
 	// ReloginTotal exactly -- see that field's own doc comment.
 	ReloginTotal prometheus.Counter
 
+	// SubmitProcessingSeconds mirrors internal/leaflib/solo/metrics's
+	// and internal/leaflib/direct/metrics's identically-named,
+	// identically-shaped field exactly (see solo's own doc comment
+	// for the full "why a defer alone isn't enough" rationale) --
+	// leaf-proxy's own session.go's handleSubmit dispatches its own
+	// finishSubmit closure onto s.server.randomxPool asynchronously
+	// via the exact same TrySubmit pattern for every genuine
+	// upstream-forward candidate (claimed diff >= the real upstream
+	// pool's own requested share difficulty), so the same
+	// start-time-threaded-into-finishSubmit technique is used here
+	// too.
+	SubmitProcessingSeconds *prometheus.HistogramVec
+
+	// SubmitValidationSeconds observes the real wall-clock time spent
+	// specifically inside the real RandomX re-validation call
+	// (s.server.validator.ValidateBlobSeedResult) in session.go's
+	// finishSubmit closure. DELIBERATELY UNLABELED (no "algo" label,
+	// unlike solo/direct's identically-named metric): leaf-proxy is
+	// read in full (session.go's handleSubmit) and confirmed to have
+	// no job.Algo/poolpb.Algo concept anywhere -- it is a single,
+	// fixed pure-Go RandomX (XNP-style) upstream-forwarding proxy
+	// with exactly one validator and one proof shape, so an "algo"
+	// label here would always carry the same single constant value
+	// -- a real, concrete reason not to invent a differently-shaped
+	// (but pointlessly-labeled) metric just to force-match solo/
+	// direct's shape. The metric NAME is kept identical
+	// (leaf_proxy_submit_validation_seconds) for cross-mode
+	// dashboarding, per this task's own instruction.
+	SubmitValidationSeconds prometheus.Histogram
+
 	// UpstreamConnected is 1 when the single upstream pool
 	// connection is currently up, 0 when it is down/reconnecting.
 	UpstreamConnected prometheus.Gauge
@@ -351,6 +381,29 @@ func New(version string, maxAddressLabels int) *Metrics {
 	m.ReloginTotal = shared.RegisterCounter(reg, prometheus.CounterOpts{
 		Name: "leaf_relogin_total",
 		Help: "Total number of real re-login events detected in session.go's handleLogin: a session receiving a second (or Nth) login message on an already-logged-in connection (e.g. an xmrig-proxy --reuse-timeout connection-reuse slot rotation). Incremented once per re-login event, not once per login overall.",
+	})
+
+	// leaf_proxy_submit_processing_seconds' bucket boundaries:
+	// prometheus.DefBuckets (5ms..10s). This leaf's own genuine
+	// upstream-forward candidate path pays a real ~258ms pure-Go
+	// RandomX re-validation call PLUS a real upstream submit RPC --
+	// see finishSubmit's own doc comment -- both comfortably within
+	// DefBuckets' 10s ceiling in normal operation. Kept rather than a
+	// bespoke set, matching solo/direct's identically-named metric.
+	m.SubmitProcessingSeconds = shared.RegisterHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "leaf_proxy_submit_processing_seconds",
+		Help:    "Real, end-to-end wall-clock seconds of session.go's handleSubmit, from entry to the point the response is written to the downstream miner, by result (accepted/rejected). Includes early-exit rejections (e.g. login required before submit). Buckets: prometheus.DefBuckets.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"result"})
+
+	// leaf_proxy_submit_validation_seconds' bucket boundaries: also
+	// prometheus.DefBuckets -- see SubmitValidationSeconds' own doc
+	// comment for why this metric is deliberately unlabeled (no
+	// per-algo dimension exists for leaf-proxy).
+	m.SubmitValidationSeconds = shared.RegisterHistogram(reg, prometheus.HistogramOpts{
+		Name:    "leaf_proxy_submit_validation_seconds",
+		Help:    "Real wall-clock seconds spent specifically inside the real RandomX re-validation call (s.server.validator.ValidateBlobSeedResult) in session.go's finishSubmit. Unlabeled: leaf-proxy has exactly one validator/proof shape, no per-job algo dimension (unlike solo/direct's identically-named, algo-labeled metric). Buckets: prometheus.DefBuckets.",
+		Buckets: prometheus.DefBuckets,
 	})
 
 	m.UpstreamConnected = shared.RegisterGauge(reg, prometheus.GaugeOpts{

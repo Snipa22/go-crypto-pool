@@ -969,6 +969,33 @@ func (s *Session) handleGetJob(req Request) {
 //     re-validation is genuinely suspect and is never silently
 //     downgraded to a local-only credit.
 func (s *Session) handleSubmit(req Request) {
+	// SubmitProcessingSeconds: real, end-to-end wall-clock latency of
+	// this whole method, from entry to the point the response is
+	// actually written (accept or reject) -- see that metric's own
+	// doc comment (metrics.go) and internal/leaflib/solo/metrics's
+	// identically-named field's doc comment for the full "why a
+	// defer alone isn't enough" rationale. finishSubmitEntered guards
+	// against double-observing: whenever finishSubmit is actually
+	// entered (dispatched onto s.server.randomxPool -- leaf-proxy has
+	// no inline-call variant at all, unlike solo/direct's SHA3X/C29
+	// path), IT records this same start time from its own defer once
+	// it completes -- on whichever goroutine actually runs it -- so
+	// the real, possibly-async ~258ms pure-Go RandomX re-validation
+	// plus upstream forward round-trip is correctly included rather
+	// than just the cheap synchronous dispatch call. result defaults
+	// to rejected, except the one local-credit-only accept path far
+	// below (below the upstream pool's own requested share
+	// difficulty, never validated at all), which explicitly overrides
+	// it.
+	start := time.Now()
+	result := metrics.ResultRejected
+	finishSubmitEntered := false
+	defer func() {
+		if !finishSubmitEntered {
+			s.server.recordSubmitProcessing(result, time.Since(start).Seconds())
+		}
+	}()
+
 	if !s.loggedIn.Load() {
 		s.writeGeneralResponse(req.ID, "login required before submit", "")
 		return
@@ -1143,6 +1170,12 @@ func (s *Session) handleSubmit(req Request) {
 		s.shareCount.Add(1)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
 		s.server.recordShareDecision(false)
+		// This path never enters finishSubmit (see this block's own
+		// doc comment above: below-upstream-share-diff claims skip
+		// the real RandomX re-validation entirely) -- override the
+		// top-level defer's default rejected result so this genuine
+		// accept is recorded correctly on SubmitProcessingSeconds.
+		result = metrics.ResultAccepted
 		s.writeShareResponse(req.ID, true, "")
 		return
 	}
@@ -1194,7 +1227,31 @@ func (s *Session) handleSubmit(req Request) {
 	// synchronized onto the connection's single writer goroutine
 	// (connection.go). Nothing here needed a NEW lock.
 	finishSubmit := func() {
+		// SubmitProcessingSeconds: this closure is where the response
+		// is actually written for every path finishSubmit is reached
+		// through -- observing from HERE, using the SAME start
+		// captured at handleSubmit's entry, is what makes this metric
+		// correct given finishSubmit always runs asynchronously on a
+		// s.server.randomxPool worker goroutine, never inline.
+		// submitResult defaults to rejected: every finishSubmit exit
+		// point below is a rejection except the one explicit override
+		// -- the real, upstream-confirmed accept at the very end.
+		submitResult := metrics.ResultRejected
+		defer func() {
+			s.server.recordSubmitProcessing(submitResult, time.Since(start).Seconds())
+		}()
+
+		// SubmitValidationSeconds: real wall-clock time inside this
+		// ValidateBlobSeedResult call specifically -- see that
+		// metric's own doc comment (unlabeled: leaf-proxy has no
+		// per-job algo dimension at all, unlike solo/direct's
+		// identically-named, algo-labeled metric). Always observed
+		// here -- unlike solo/direct, leaf-proxy has no
+		// trusted-miner-skip branch to exclude; every finishSubmit
+		// invocation reaches this real validator call.
+		validateStart := time.Now()
 		valid, err := s.server.validator.ValidateBlobSeedResult(context.Background(), fullBlob, job.SeedHash, submit.Result)
+		s.server.recordSubmitValidation(time.Since(validateStart).Seconds())
 		s.server.debugLogger.Debugf("proxy: validation attempt: session=%s job_id=%s valid=%v err=%v", s.sessionID, job.ID, valid, err)
 		if err != nil {
 			s.writeShareResponse(req.ID, false, fmt.Sprintf("validation error: %v", err))
@@ -1276,6 +1333,7 @@ func (s *Session) handleSubmit(req Request) {
 		s.blockCount.Add(1)
 		s.server.logger.Printf("proxy: share forwarded upstream by session %s (address %s) at height %d, upstream job %s, diff %d, accepted=%v", s.sessionID, s.Identity().Address, job.Height, job.UpstreamJobID, diff, accepted)
 		s.server.recordBlock(true)
+		submitResult = metrics.ResultAccepted
 		s.writeShareResponse(req.ID, true, "")
 	}
 
@@ -1296,6 +1354,14 @@ func (s *Session) handleSubmit(req Request) {
 		// for room (mirrors solo.Session's/direct.Session's identical
 		// dispatch-failure handling exactly).
 		s.writeShareResponse(req.ID, false, "validation pool is saturated or shutting down, please retry")
+	} else {
+		// finishSubmit was genuinely accepted by the pool and WILL
+		// run (on one of its worker goroutines) -- it owns recording
+		// SubmitProcessingSeconds itself once it actually completes
+		// (see finishSubmit's own doc comment); suppress this
+		// method's own top-level fallback defer so this submit is
+		// never double-counted.
+		finishSubmitEntered = true
 	}
 }
 
