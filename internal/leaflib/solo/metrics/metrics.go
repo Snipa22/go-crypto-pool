@@ -341,6 +341,39 @@ type Metrics struct {
 	// convention above rather than the busier per-reason metrics.
 	ReloginTotal prometheus.Counter
 
+	// SubmitProcessingSeconds observes the real, end-to-end wall-
+	// clock latency of session.go's handleSubmit -- from entry to
+	// the point the response is actually written to the miner
+	// (accept or reject), labeled by result (accepted/rejected) so
+	// the two latency profiles can be told apart. An early-exit
+	// rejection (e.g. "login required before submit") is still
+	// timed and counted -- it's real latency the miner experiences
+	// too, not skipped as a special case. For a genuine RXT/RXM
+	// block-find candidate (the one case where finishSubmit is
+	// dispatched onto s.server.randomxPool rather than run inline --
+	// see handleSubmit's own dispatch-decision doc comment), the
+	// SAME start timestamp taken at handleSubmit's entry is threaded
+	// into finishSubmit and observed from INSIDE it once it actually
+	// completes on whichever goroutine runs it, so this metric
+	// genuinely reflects the full latency through the real
+	// randomx-service round-trip and response write, not merely the
+	// cheap synchronous dispatch call.
+	SubmitProcessingSeconds *prometheus.HistogramVec
+
+	// SubmitValidationSeconds observes the real wall-clock time spent
+	// specifically inside the real PoW validator call (v.Validate) in
+	// session.go's finishSubmit closure, labeled by algo (see
+	// leaflib.AlgoMetricLabel) so a validator regression/slowdown for
+	// ONE algo is visible without averaging across every algo this
+	// leaf might serve. Deliberately NOT observed at all (no
+	// zero/garbage sample) for solo's own real-validator-call
+	// dispatch decision that never even reaches finishSubmit (an
+	// ordinary, sub-block-difficulty RXT/RXM claim, per
+	// DISPATCH_BRIEF.md 2026-09-10 Fix 4 -- that path never calls
+	// v.Validate at all) -- a near-zero sample there would be
+	// misleading noise, not a real signal.
+	SubmitValidationSeconds *prometheus.HistogramVec
+
 	BuildInfo *prometheus.GaugeVec
 
 	// sharesRate/blocksRate/rejectionReasonRate back
@@ -424,6 +457,37 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Name: "leaf_relogin_total",
 		Help: "Total number of real re-login events detected in session.go's handleLogin: a session receiving a second (or Nth) login message on an already-logged-in connection (e.g. an xmrig-proxy --reuse-timeout connection-reuse slot rotation). Incremented once per re-login event, not once per login overall.",
 	})
+
+	// leaf_solo_submit_processing_seconds' bucket boundaries:
+	// prometheus.DefBuckets (5ms..10s). This metric's tail can, in
+	// the rare RXT/RXM block-find-candidate case, include a real
+	// synchronous randomx-service HTTP round-trip (see
+	// SubmitProcessingSeconds' own doc comment) -- but that call site
+	// is (by construction, per DISPATCH_BRIEF.md 2026-09-10 Fix 4)
+	// the rare, block-level-only path, not the typical hot-path
+	// submit, and the underlying real round-trip is itself already
+	// only ~4ms+ (see asyncvalidation.go's own doc comment), well
+	// within DefBuckets' 10s ceiling. DefBuckets is kept, matching
+	// TemplateDistributionDuration's own precedent, rather than a
+	// bespoke set.
+	m.SubmitProcessingSeconds = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "leaf_solo_submit_processing_seconds",
+		Help:    "Real, end-to-end wall-clock seconds of session.go's handleSubmit, from entry to the point the response is written to the miner, by result (accepted/rejected). Includes early-exit rejections (e.g. login required before submit). Buckets: prometheus.DefBuckets.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"result"})
+
+	// leaf_solo_submit_validation_seconds' bucket boundaries: also
+	// prometheus.DefBuckets. This is narrower in scope than
+	// SubmitProcessingSeconds above (only the v.Validate call itself,
+	// not the surrounding handleSubmit/finishSubmit work), so its
+	// real observed values are a strict subset of that metric's own
+	// -- the same DefBuckets ceiling applies with even more headroom
+	// here.
+	m.SubmitValidationSeconds = registerHistogramVec(reg, prometheus.HistogramOpts{
+		Name:    "leaf_solo_submit_validation_seconds",
+		Help:    "Real wall-clock seconds spent specifically inside the real PoW validator call (v.Validate) in session.go's finishSubmit, by algo (sha3x/c29/rxt/rxm -- see leaflib.AlgoMetricLabel). Never observed for the trusted/validation-skip case (there is none for solo -- see this field's own doc comment) or for an ordinary, sub-block-difficulty RXT/RXM claim that never reaches v.Validate at all. Buckets: prometheus.DefBuckets.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"algo"})
 
 	m.BuildInfo = registerGaugeVec(reg, prometheus.GaugeOpts{
 		Name: "leaf_solo_build_info",
@@ -879,6 +943,23 @@ func registerGaugeVec(reg *prometheus.Registry, opts prometheus.GaugeOpts, label
 		log.Printf("metrics: failed to register gauge vec %s: %v", opts.Name, err)
 	}
 	return gv
+}
+
+// registerHistogramVec mirrors registerCounterVec/registerGaugeVec's
+// exact same AlreadyRegisteredError-tolerant pattern, for a labeled
+// *prometheus.HistogramVec.
+func registerHistogramVec(reg *prometheus.Registry, opts prometheus.HistogramOpts, labels []string) *prometheus.HistogramVec {
+	hv := prometheus.NewHistogramVec(opts, labels)
+	if err := reg.Register(hv); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
+				return existing
+			}
+		}
+		log.Printf("metrics: failed to register histogram vec %s: %v", opts.Name, err)
+	}
+	return hv
 }
 
 // registerCounter mirrors registerCounterVec/registerGaugeVec's
