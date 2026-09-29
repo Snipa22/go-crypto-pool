@@ -50,38 +50,47 @@ type Session struct {
 	// not the real security boundary — see jobList/jobLog below.
 	xn       string
 	loggedIn atomic.Bool
-	address  atomic.Value // string
-	worker   atomic.Value // string
-	// agent is the real miner software/version string the miner
-	// self-reported at login (LoginRequest.Agent — e.g.
-	// "XMRig/6.21.0"), stored verbatim and unvalidated (miner-
-	// controlled, diagnostic-only; never used in any accept/reject
-	// decision). Empty for a session that has not logged in yet, or
-	// whose miner sent no "agent" field.
-	agent atomic.Value // string
 
-	// paymentID is the genuine Monero payment ID this session's miner
-	// supplied as a 64-lowercase-hex second dot-segment of its login
-	// field (loginfields.go's ParseLoginFields / LoginFields.PaymentID)
-	// -- Monero-family algos only, empty otherwise and empty whenever
-	// the miner supplied none.
-	//
-	// KNOWN, DELIBERATE GAP (leaf-solo only): solo mode has no share
-	// table, no backend to forward to, and no payout accounting at all
-	// (see cmd/leaf-solo's own doc comment and shareCount's below) --
-	// a share only matters here as a hashrate-estimation signal. There
-	// is therefore NO real downstream path in THIS leaf mode to carry
-	// a payment ID to, so this field is captured and stored for
-	// diagnostic/parity purposes and nothing more, rather than
-	// half-wiring new payout plumbing solo mode does not have.
-	// leaf-direct, which genuinely does forward every share to the
-	// backend, stamps its own identical field onto
-	// poolpb.Share.PaymentId for real (see direct/session.go) -- that
-	// is where the real end-to-end payment-ID plumbing
-	// (backend/api.go -> db.Share.PaymentID -> balance/
-	// miner_identifiers, plus legacytransport's own legacy-wire
-	// mapping) actually lives.
-	paymentID atomic.Value // string
+	// identity is this session's ENTIRE miner-identity state
+	// (address/worker/agent/paymentID), held as a single
+	// atomic.Value of *leaflib.MinerIdentity and swapped with ONE
+	// Store call in handleLogin -- replaces four SEPARATE
+	// atomic.Value fields (address/worker/agent/paymentID) this type
+	// used to carry, which were mutated sequentially, not as one
+	// atomic unit: a concurrent reader (the periodic Stats()/
+	// Prometheus snapshot ticker, which reads these same fields)
+	// could observe a TORN READ mid-relogin -- e.g. address already
+	// updated to a new login's value while worker/agent still held
+	// the previous login's values. See leaflib.MinerIdentity's own
+	// doc comment for the full rationale. Read via the Identity()
+	// accessor below, never loaded directly. Never nil after
+	// newSession (seeded with an empty *MinerIdentity), so
+	// Identity() never needs a nil check at any call site.
+	identity atomic.Value // *leaflib.MinerIdentity
+
+	// loginHistory is the bounded, oldest-evicted-first ring of this
+	// session's own past MinerIdentity values -- appended to in
+	// handleLogin exactly when a re-login occurs (i.e.
+	// s.loggedIn.Load() was already true), recording the OLD
+	// identity being replaced. See leaflib.LoginHistory's own doc
+	// comment for the full rationale and the "why not JobHistory"
+	// deviation note. nil-safe would not be needed in practice (set
+	// unconditionally in newSession) but every call site still goes
+	// through this field directly since it is never nil once
+	// constructed.
+	loginHistory *leaflib.LoginHistory
+
+	// reloginDetected is set true the FIRST time handleLogin runs on
+	// an already-logged-in session (i.e. a second, third, ... login
+	// on the same TCP connection -- see this type's own doc comment
+	// on xn for the real xmrig-proxy `--reuse-timeout` behavior this
+	// is intentionally observing, not blocking). Sticky for the
+	// connection's life: never reset back to false on any subsequent
+	// login. This is the "behavioral" proxy-detection signal
+	// forcedTargetTime below consults, additive to the pre-existing
+	// agent-string-based IsXNPProxyAgent/IsGenericProxyAgent
+	// detection.
+	reloginDetected atomic.Bool
 
 	// fixedDiff reports whether this session requested (or was
 	// assigned) a FIXED difficulty at login -- legacy's
@@ -198,6 +207,29 @@ type Session struct {
 	// operator's explicit forced minimum.
 	forcedMinDifficulty atomic.Uint64
 
+	// forcedTargetTime is this session's own operator-forced vardiff
+	// share TARGET TIME override in seconds (0 = none), set exactly
+	// once, in handleLogin, the first time this session is detected
+	// as a proxy -- by EITHER the pre-existing agent-string signal
+	// (IsXNPProxyAgent/IsGenericProxyAgent) OR the new behavioral
+	// signal above (reloginDetected). Once set, it is UNCONDITIONAL
+	// and STICKY for the rest of the connection's life: it always
+	// wins over the port tier's configured cfg.TargetTime with no
+	// further gating, and is never un-set/changed again (see
+	// vardiff.go's maybeRetarget, which reads this BEFORE calling
+	// computeRetarget and substitutes it in place of cfg.TargetTime
+	// whenever non-zero). Mirrors forcedMinDifficulty's own
+	// atomic.Uint64 style exactly (matching field, matching
+	// "0 = unset" convention) per BRIEF.md's own explicit direction.
+	//
+	// Rationale (BRIEF.md "Problem 2"): a proxy aggregates many real
+	// miners' hashrate behind one session; the server's ordinary
+	// 30s-default target time assumes a single physical miner's own
+	// hashrate, so a detected-proxy session is forced to the much
+	// shorter proxyForcedTargetTimeSeconds (vardiff.go) instead, so
+	// vardiff actually tracks its aggregate hashrate responsively.
+	forcedTargetTime atomic.Uint64
+
 	// hashesAccumulated is the difficulty-weighted accept-history
 	// accumulator (go-tari-sha3x-solo-stratum's minerStruct.hashes):
 	// incremented by the job's current StaticDifficulty on every
@@ -261,6 +293,22 @@ type Session struct {
 	invalidShareGuard *leaflib.InvalidShareGuard
 }
 
+// Identity is the single accessor every read site now goes through
+// instead of the four separate atomic.Value fields (address/worker/
+// agent/paymentID) this type used to carry directly -- see the
+// identity field's own doc comment for the full torn-read rationale.
+// Never returns nil: newSession seeds identity with an empty
+// *leaflib.MinerIdentity before this session is ever reachable from
+// another goroutine, so every caller can dereference the result
+// directly (e.g. s.Identity().Address) with no nil check.
+func (s *Session) Identity() *leaflib.MinerIdentity {
+	ident, _ := s.identity.Load().(*leaflib.MinerIdentity)
+	if ident == nil {
+		return &leaflib.MinerIdentity{}
+	}
+	return ident
+}
+
 // alreadyDelivered reports whether job is identical (same job.ID AND
 // same StaticDifficulty) to the last job actually delivered to this
 // session via jobPayload — see lastDeliveredJobID's doc comment. Used
@@ -310,10 +358,8 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 		server.logger.Printf("solo: failed to generate session xn, falling back to %q: %v", xn, err)
 	}
 	s := &Session{mc: mc, server: server, sessionID: id, xn: xn, connectedAt: time.Now(), jobs: leaflib.NewJobHistory[*Job](defaultSessionJobHistorySize)}
-	s.address.Store("")
-	s.worker.Store("")
-	s.agent.Store("")
-	s.paymentID.Store("")
+	s.identity.Store(&leaflib.MinerIdentity{})
+	s.loginHistory = leaflib.NewLoginHistory(defaultSessionJobHistorySize)
 	s.currentDifficulty.Store(startingDifficulty)
 	s.invalidShareGuard = leaflib.NewInvalidShareGuard(server.invalidShareGuardConfig)
 	return s
@@ -529,11 +575,76 @@ func (s *Session) handleLogin(req Request) {
 		worker = loginFields.Identifier
 	}
 
-	s.address.Store(loginFields.Address)
-	s.worker.Store(worker)
-	s.agent.Store(login.Agent)
-	s.paymentID.Store(loginFields.PaymentID)
+	// Part A (BRIEF.md, "decouple TCP/miner-identity"): the new
+	// identity is built as ONE value and swapped with a single
+	// Store call below, replacing the four separate
+	// address/worker/agent/paymentID Store calls this handler used
+	// to make sequentially -- see the identity field's own doc
+	// comment for the torn-read this fixes.
+	newIdentity := &leaflib.MinerIdentity{
+		Address:    loginFields.Address,
+		Worker:     worker,
+		Agent:      login.Agent,
+		PaymentID:  loginFields.PaymentID,
+		LoggedInAt: time.Now(),
+	}
+
+	// RE-LOGIN DETECTION: handleLogin runs on EVERY "login" message
+	// this session receives, with NO guard against a second (or Nth)
+	// login on an already-logged-in session -- that is intentional,
+	// pre-existing, legacy-matched behavior (mirrors go-tari-sha3x-
+	// solo-stratum's own `case 'login': miner.Login(...)`, and is a
+	// real, documented xmrig-proxy behavior: in `simple` mode,
+	// xmrig-proxy can reuse one already-open upstream TCP connection
+	// across multiple downstream workers via its `--reuse-timeout`
+	// flag, sending a fresh "login" on the SAME socket each time a
+	// new downstream worker rotates into that reused slot -- see
+	// https://github.com/xmrig/xmrig-proxy/issues/118). This block
+	// only makes that pre-existing behavior OBSERVABLE: it neither
+	// blocks nor alters the re-login itself.
+	//
+	// s.loggedIn.Load() here still reflects the PREVIOUS login (not
+	// yet overwritten below), so this is true exactly when this
+	// handleLogin call is a genuine re-login on an already-logged-in
+	// session.
+	if s.loggedIn.Load() {
+		oldIdentity := s.Identity()
+		s.loginHistory.Append(*oldIdentity)
+		s.server.recordRelogin()
+		// Sticky for the connection's life -- see reloginDetected's
+		// own doc comment. Storing true again on a THIRD+ re-login is
+		// a harmless no-op; this is deliberately NOT guarded by
+		// `!s.reloginDetected.Load()` since the metric above must
+		// still increment on every re-login event, not just the
+		// first.
+		s.reloginDetected.Store(true)
+		s.server.logger.Printf("solo: session %s re-logged in: old identity address=%q worker=%q agent=%q payment_id=%q logged_in_at=%s -> new identity address=%q worker=%q agent=%q payment_id=%q",
+			s.sessionID,
+			oldIdentity.Address, oldIdentity.Worker, oldIdentity.Agent, oldIdentity.PaymentID, oldIdentity.LoggedInAt.Format(time.RFC3339),
+			newIdentity.Address, newIdentity.Worker, newIdentity.Agent, newIdentity.PaymentID)
+	}
+
+	s.identity.Store(newIdentity)
 	s.loggedIn.Store(true)
+
+	// Part B (BRIEF.md, "proxy-aware vardiff target time"): a session
+	// detected as a proxy -- by EITHER the pre-existing agent-string
+	// signal (IsXNPProxyAgent/IsGenericProxyAgent) OR the new
+	// behavioral signal above (reloginDetected, just possibly set
+	// true for the first time on THIS very call) -- has its vardiff
+	// share target time forced to proxyForcedTargetTimeSeconds
+	// (vardiff.go), unconditionally, for the rest of the connection's
+	// life. The `forcedTargetTime.Load() == 0` guard makes the
+	// "unconditional, sticky" semantics explicit and avoids a
+	// redundant re-store on every subsequent re-login of an
+	// already-flagged session -- it is not a gate on WHETHER this
+	// session gets forced, only on not re-doing the store once it
+	// already has been.
+	if IsXNPProxyAgent(login.Agent) || IsGenericProxyAgent(login.Agent) || s.reloginDetected.Load() {
+		if s.forcedTargetTime.Load() == 0 {
+			s.forcedTargetTime.Store(proxyForcedTargetTimeSeconds)
+		}
+	}
 
 	// A miner-requested (or NiceHash-assigned) FIXED difficulty
 	// becomes this session's STARTING difficulty instead of the port
@@ -940,8 +1051,8 @@ func (s *Session) handleSubmit(req Request) {
 	// any real PoW validation work, so a banned miner's shares are
 	// rejected as early as the job-ownership/expiry checks above.
 	if s.server.addressFlags != nil {
-		if flags := s.server.addressFlags.Get(s.address.Load().(string)); flags.Banned {
-			s.server.logger.Printf("solo: rejecting submit for now-banned address %s (session %s)", s.address.Load(), s.sessionID)
+		if flags := s.server.addressFlags.Get(s.Identity().Address); flags.Banned {
+			s.server.logger.Printf("solo: rejecting submit for now-banned address %s (session %s)", s.Identity().Address, s.sessionID)
 			s.rejectShare(req.ID, metrics.RejectionReasonBannedAddress, "this address is banned from this pool")
 			return
 		}
@@ -1073,8 +1184,8 @@ func (s *Session) handleSubmit(req Request) {
 			Network:        s.server.network,
 			BlockDiff:      safeInt64(job.StaticDifficulty),
 			BlockHeight:    int64(job.Height),
-			PaymentAddress: s.address.Load().(string),
-			Identifier:     s.worker.Load().(string),
+			PaymentAddress: s.Identity().Address,
+			Identifier:     s.Identity().Worker,
 			RawProof: &poolpb.Share_RandomxProof{
 				RandomxProof: &poolpb.RandomXProof{
 					Blob:      blob,
@@ -1101,8 +1212,8 @@ func (s *Session) handleSubmit(req Request) {
 			Network:        s.server.network,
 			BlockDiff:      safeInt64(job.StaticDifficulty),
 			BlockHeight:    int64(job.Height),
-			PaymentAddress: s.address.Load().(string),
-			Identifier:     s.worker.Load().(string),
+			PaymentAddress: s.Identity().Address,
+			Identifier:     s.Identity().Worker,
 			RawProof: &poolpb.Share_C29Proof{
 				C29Proof: &poolpb.C29Proof{
 					EdgeBits: c29SubmitEdgeBits,
@@ -1164,8 +1275,8 @@ func (s *Session) handleSubmit(req Request) {
 			Network:        s.server.network,
 			BlockDiff:      safeInt64(job.StaticDifficulty),
 			BlockHeight:    int64(job.Height),
-			PaymentAddress: s.address.Load().(string),
-			Identifier:     s.worker.Load().(string),
+			PaymentAddress: s.Identity().Address,
+			Identifier:     s.Identity().Worker,
 			RawProof: &poolpb.Share_RandomxProof{
 				RandomxProof: &poolpb.RandomXProof{
 					Blob:      blob,
@@ -1185,8 +1296,8 @@ func (s *Session) handleSubmit(req Request) {
 			Network:        s.server.network,
 			BlockDiff:      safeInt64(job.StaticDifficulty),
 			BlockHeight:    int64(job.Height),
-			PaymentAddress: s.address.Load().(string),
-			Identifier:     s.worker.Load().(string),
+			PaymentAddress: s.Identity().Address,
+			Identifier:     s.Identity().Worker,
 			RawProof: &poolpb.Share_Sha3XProof{
 				Sha3XProof: &poolpb.SHA3XProof{
 					Header: job.Header,
@@ -1319,7 +1430,7 @@ func (s *Session) handleSubmit(req Request) {
 			disconnect := s.invalidShareGuard.RecordOutcome(false)
 			s.rejectShare(req.ID, metrics.RejectionReasonClaimedDifficultyOrCryptoInvalid, "share does not meet configured difficulty or is cryptographically invalid")
 			if disconnect {
-				s.server.logger.Printf("solo: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.address.Load())
+				s.server.logger.Printf("solo: disconnecting session %s (address %s): exceeded consecutive invalid-share threshold", s.sessionID, s.Identity().Address)
 				s.mc.Close("exceeded consecutive invalid-share threshold")
 			}
 			return
@@ -1410,9 +1521,9 @@ func (s *Session) handleSubmit(req Request) {
 
 		s.blockCount.Add(1)
 		if realBlockID != "" {
-			s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.address.Load(), job.Height, job.ID, diff, realBlockID)
+			s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d, hash=%s", s.sessionID, s.Identity().Address, job.Height, job.ID, diff, realBlockID)
 		} else {
-			s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.address.Load(), job.Height, job.ID, diff)
+			s.server.logger.Printf("solo: BLOCK FOUND by session %s (address %s) at height %d, job %s, diff %d", s.sessionID, s.Identity().Address, job.Height, job.ID, diff)
 		}
 		s.server.recordBlock(true)
 		s.hashesAccumulated.Add(job.StaticDifficulty)
@@ -1815,7 +1926,7 @@ func (s *Session) jobPayload(job *Job) JobPayload {
 	// difficulty fields set at the top of the block below
 	// (Difficulty/TargetDiff/TargetDiffHex): a non-proxy agent never
 	// reaches them at all.
-	if IsXNPProxyAgent(s.agent.Load().(string)) {
+	if IsXNPProxyAgent(s.Identity().Agent) {
 		// DIFFICULTY HALF of the real proxy-class job shape — the fix
 		// for a confirmed production incident: a MoneroOcean-fork
 		// xmr-node-proxy user reported "getting a job difficulty of

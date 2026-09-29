@@ -423,8 +423,8 @@ func (s *Server) sessionSnapshots() []metrics.SessionSnapshot {
 	defer s.mu.RUnlock()
 	out := make([]metrics.SessionSnapshot, 0, len(s.sessions))
 	for _, sess := range s.sessions {
-		addr, _ := sess.address.Load().(string)
-		agent, _ := sess.agent.Load().(string)
+		addr := sess.Identity().Address
+		agent := sess.Identity().Agent
 		out = append(out, metrics.SessionSnapshot{
 			Address:    addr,
 			Agent:      agent,
@@ -555,7 +555,7 @@ func (s *Server) sweepNoShareSessions() {
 	s.mu.RUnlock()
 
 	for _, sess := range stale {
-		addr, _ := sess.address.Load().(string)
+		addr := sess.Identity().Address
 		s.logger.Printf("solo: disconnecting session %s (address %s): no share submitted within %s of connecting", sess.sessionID, addr, s.noShareTimeout)
 		_ = sess.mc.Close(fmt.Sprintf("no share submitted within %s of connecting", s.noShareTimeout))
 		s.recordConnectionError(metrics.ConnErrorNoShareTimeout)
@@ -605,6 +605,18 @@ func (s *Server) recordLoginRejection(reason string) {
 		return
 	}
 	s.metrics.IncLoginRejectionReason(reason)
+}
+
+// recordRelogin bumps the real leaf_relogin_total counter (see
+// metrics.Metrics.ReloginTotal's doc comment) -- called from
+// session.go's handleLogin at the exact point a re-login is detected,
+// mirroring recordLoginRejection's identical nil-checked convention
+// above (BRIEF.md "decouple TCP/miner-identity").
+func (s *Server) recordRelogin() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.IncRelogin()
 }
 
 func resultLabel(accepted bool) string {
@@ -804,6 +816,14 @@ type SessionStat struct {
 	// behavior; see that function's own doc comment for the fix
 	// history — FIX_BRIEF.md, finding #20).
 	EstimatedHashrate float64
+	// Relogins is this session's own real re-login count -- the
+	// live length of its bounded login-history ring
+	// (Session.loginHistory, see leaflib.LoginHistory's doc comment)
+	// at snapshot time. 0 for the overwhelmingly common case of a
+	// session that has only ever logged in once. BRIEF.md's own
+	// minimum bar for stats-surface visibility ("full identity-
+	// history detail can wait; the count is the minimum bar").
+	Relogins int
 }
 
 // AddressCount is one entry in Stats.MinersByAddress: a mining/payout
@@ -858,9 +878,9 @@ func (s *Server) Stats() Stats {
 		st.TotalShares += sess.shareCount.Load()
 		st.TotalBlocks += sess.blockCount.Load()
 
-		addr, _ := sess.address.Load().(string)
-		worker, _ := sess.worker.Load().(string)
-		agent, _ := sess.agent.Load().(string)
+		addr := sess.Identity().Address
+		worker := sess.Identity().Worker
+		agent := sess.Identity().Agent
 		remoteIP := metrics.RemoteIPOf(sess.mc.RemoteAddr())
 		diff := sess.currentDifficulty.Load()
 
@@ -888,6 +908,7 @@ func (s *Server) Stats() Stats {
 			ShareCount:        sess.shareCount.Load(),
 			BlockCount:        sess.blockCount.Load(),
 			EstimatedHashrate: hashrate,
+			Relogins:          sess.loginHistory.Len(),
 		})
 		st.TotalEstimatedHashrate += hashrate
 	}
