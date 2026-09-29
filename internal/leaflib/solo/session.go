@@ -340,6 +340,37 @@ type Session struct {
 	// InvalidShareGuard.RecordOutcome) so this field is never nil in
 	// practice but would be harmless if it somehow were.
 	invalidShareGuard *leaflib.InvalidShareGuard
+
+	// lastFreshJobPushUnixNano is the unix-nanosecond timestamp
+	// (0 = never) of the last time pushFreshJobOnStaleSubmit ACTUALLY
+	// pushed a fresh job for this session, as opposed to being
+	// throttled by freshJobOnStaleSubmitMinInterval below -- see that
+	// constant's doc comment for the job-push-storm rationale this
+	// exists to mitigate (DISPATCH_BRIEF.md, "throttle
+	// pushFreshJobOnStaleSubmit", fix/throttle-fresh-job-push-rxm).
+	//
+	// atomic.Int64, following this file's own established
+	// per-session-atomic-timestamp convention (see
+	// lastDeliveredJobID/lastDeliveredDifficulty's doc comment above
+	// for the identical concurrency need): handleSubmit's four
+	// pushFreshJobOnStaleSubmit call sites can run concurrently for
+	// the SAME session, since handleSubmit itself may already be
+	// running on one of several randomxPool/forwardPool worker
+	// goroutines dispatching finishSubmit closures for this session
+	// rather than solely on Session.Run's own read-loop goroutine.
+	// Updated via CompareAndSwap (see pushFreshJobOnStaleSubmit
+	// below), never a plain read-then-write, so two concurrent calls
+	// landing on the throttle boundary at the same instant cannot
+	// both slip through.
+	lastFreshJobPushUnixNano atomic.Int64
+
+	// pushFreshJobOnStaleSubmitNow is a test-only clock seam (mirrors
+	// Server's own noShareSweepNow / MoneroNodeClient's own nowFunc
+	// convention exactly -- see server.go/monero_node.go): nil in
+	// production, so pushFreshJobOnStaleSubmit always calls
+	// time.Now(); overridden by this package's own throttle tests so
+	// they never real-sleep past freshJobOnStaleSubmitMinInterval.
+	pushFreshJobOnStaleSubmitNow func() time.Time
 }
 
 // Identity is the single accessor every read site now goes through
@@ -873,6 +904,24 @@ func (s *Session) handleGetJob(req Request) {
 	s.pushJob(job)
 }
 
+// freshJobOnStaleSubmitMinInterval is the minimum spacing
+// pushFreshJobOnStaleSubmit enforces, per session, between two of its
+// own ACTUAL fresh-job pushes -- job-push-storm mitigation
+// (DISPATCH_BRIEF.md, "throttle pushFreshJobOnStaleSubmit to at most
+// once every 10s per session", fix/throttle-fresh-job-push-rxm):
+// production has observed bursts of duplicate-nonce (and other
+// stale-class) share rejections against the SAME session in a tight
+// loop, and every one of those rejections used to trigger its own
+// immediate pushFreshJobOnStaleSubmit call, turning a rejection burst
+// into a job-push storm against that one session. A call arriving
+// within this interval of this session's last actual push is a
+// no-op: it does not fetch or push anything, it just returns (see
+// pushFreshJobOnStaleSubmit's own doc comment). The burst's own root
+// cause (why the rejections themselves are happening) is a separate,
+// out-of-scope investigation -- this constant only bounds how often
+// THIS side effect of a rejection can fire.
+const freshJobOnStaleSubmitMinInterval = 10 * time.Second
+
 // pushFreshJobOnStaleSubmit is handleSubmit's own dedicated fix for
 // the real, live-confirmed production rejection-reason breakdown
 // (brief_push_job_on_stale.md: stale_or_unknown_job was 715/1550,
@@ -939,7 +988,38 @@ func (s *Session) handleGetJob(req Request) {
 // freshly pushed job becomes immediately submittable against by this
 // session, and already gates on s.loggedIn itself, so there is no
 // separate logged-in check needed here.
+//
+// THROTTLED to at most once every freshJobOnStaleSubmitMinInterval
+// per session (job-push-storm mitigation, see that constant's doc
+// comment): a call landing within the window of this session's own
+// last ACTUAL push is a no-op -- it returns before even fetching a
+// job, exactly matching this doc comment's "no-op" language for the
+// alreadyDelivered dedup gate above. The throttle check is a single
+// CompareAndSwap on lastFreshJobPushUnixNano, not a plain
+// read-then-write, so two concurrent calls (see that field's own doc
+// comment on why this can happen for one session) landing on the
+// window boundary at the same instant cannot both slip through: only
+// the call that wins the CAS proceeds to fetch/push, every other
+// concurrent (or later, still-inside-the-window) call returns
+// immediately.
 func (s *Session) pushFreshJobOnStaleSubmit() {
+	now := time.Now
+	if s.pushFreshJobOnStaleSubmitNow != nil {
+		now = s.pushFreshJobOnStaleSubmitNow
+	}
+	nowNanos := now().UnixNano()
+	if last := s.lastFreshJobPushUnixNano.Load(); nowNanos-last < int64(freshJobOnStaleSubmitMinInterval) {
+		return
+	} else if !s.lastFreshJobPushUnixNano.CompareAndSwap(last, nowNanos) {
+		// Lost the race to another concurrent call for this same
+		// session -- that call is the one that gets to actually push
+		// (or itself lost to a still-newer one); this call is a
+		// no-op rather than retrying, which is exactly the "no more
+		// than once per window" property this throttle exists to
+		// enforce.
+		return
+	}
+
 	job, err := s.server.jobManager.JobForSessionAtDifficulty(context.Background(), s.JobKey(), s.currentDifficulty.Load())
 	if err != nil {
 		s.server.logger.Printf("solo: failed to fetch fresh job for session %s (job_key %s) after a stale-job-class submit rejection: %v", s.sessionID, s.JobKey(), err)
