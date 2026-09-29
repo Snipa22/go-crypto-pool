@@ -13,15 +13,19 @@ import (
 
 // fakeRepo is an in-memory Repository test double.
 type fakeRepo struct {
-	balances    []BalanceRecord
-	shareStats  ShareStatsRecord
-	workerStats WorkerShareStatsResultRecord
-	poolSources PoolSourceShareStatsResultRecord
-	err         error
+	balances          []BalanceRecord
+	shareStats        ShareStatsRecord
+	workerStats       WorkerShareStatsResultRecord
+	poolSources       PoolSourceShareStatsResultRecord
+	hashSamples       []HashSampleRecord
+	difficultySamples []DifficultySampleRecord
+	err               error
 
 	gotAlgo, gotNetwork, gotAddr string
 	gotPaymentID                 *string
 	gotSince                     int64
+	gotWorker                    *string
+	gotPoolType                  string
 }
 
 func (f *fakeRepo) MinerBalances(_ context.Context, paymentAddress, algo, network string, paymentID *string) ([]BalanceRecord, error) {
@@ -54,6 +58,30 @@ func (f *fakeRepo) PoolSourceShareStatsSince(_ context.Context, algo, network, p
 	}
 	f.gotAlgo, f.gotNetwork, f.gotAddr, f.gotPaymentID, f.gotSince = algo, network, paymentAddress, paymentID, sinceUnix
 	return f.poolSources, nil
+}
+
+func (f *fakeRepo) PoolTypeHashHistory(_ context.Context, algo, network, poolType string, sinceUnix int64) ([]HashSampleRecord, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.gotAlgo, f.gotNetwork, f.gotPoolType, f.gotSince = algo, network, poolType, sinceUnix
+	return f.hashSamples, nil
+}
+
+func (f *fakeRepo) MinerHashHistory(_ context.Context, algo, network, paymentAddress string, paymentID, worker *string, sinceUnix int64) ([]HashSampleRecord, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.gotAlgo, f.gotNetwork, f.gotAddr, f.gotPaymentID, f.gotWorker, f.gotSince = algo, network, paymentAddress, paymentID, worker, sinceUnix
+	return f.hashSamples, nil
+}
+
+func (f *fakeRepo) NetworkDifficultyHistory(_ context.Context, algo, network string, sinceUnix int64) ([]DifficultySampleRecord, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.gotAlgo, f.gotNetwork, f.gotSince = algo, network, sinceUnix
+	return f.difficultySamples, nil
 }
 
 func doGet(t *testing.T, mux *http.ServeMux, target string) *httptest.ResponseRecorder {
@@ -377,5 +405,229 @@ func TestRepositoryErrorMapsToInternalServerError(t *testing.T) {
 	}
 	if rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate?payment_address=addr-1&algo=RXT&network=TESTNET"); rr.Code != http.StatusInternalServerError {
 		t.Errorf("hashrate: status = %d, want 500", rr.Code)
+	}
+}
+
+// --- /hashrate/history ---
+
+func TestHandleHashrateHistory_OK(t *testing.T) {
+	repo := &fakeRepo{hashSamples: []HashSampleRecord{
+		{HashrateHS: 1.5, SampleTime: time.Unix(1000, 0)},
+		{HashrateHS: 2.5, SampleTime: time.Unix(1060, 0)},
+	}}
+	h := NewHandler(repo, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?payment_address=addr-1&algo=RXT&network=TESTNET")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if repo.gotWorker != nil {
+		t.Errorf("expected nil worker (miner-level) when omitted, got %v", repo.gotWorker)
+	}
+	var resp struct {
+		Samples []hashHistorySampleRow `json:"samples"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Samples) != 2 || resp.Samples[0].HashrateHS != 1.5 || resp.Samples[1].HashrateHS != 2.5 {
+		t.Errorf("unexpected samples: %+v", resp.Samples)
+	}
+}
+
+func TestHandleHashrateHistory_EmptyWhenNoHistoryYet(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?payment_address=addr-1&algo=RXT&network=TESTNET")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Samples []hashHistorySampleRow `json:"samples"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Samples == nil || len(resp.Samples) != 0 {
+		t.Errorf("expected an empty (non-nil) samples array, got %+v", resp.Samples)
+	}
+}
+
+func TestHandleHashrateHistory_WorkerScoped(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{})
+	doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?payment_address=addr-1&algo=RXT&network=TESTNET&worker=rig-1")
+	if repo.gotWorker == nil || *repo.gotWorker != "rig-1" {
+		t.Errorf("expected worker=rig-1, got %v", repo.gotWorker)
+	}
+}
+
+func TestHandleHashrateHistory_MissingAddress(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?algo=RXT&network=TESTNET")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandleHashrateHistory_InvalidAlgo(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?payment_address=addr-1&algo=BOGUS&network=TESTNET")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandleHashrateHistory_InvalidNetwork(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?payment_address=addr-1&algo=RXT")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (network required with no configured default)", rr.Code)
+	}
+}
+
+func TestHandleHashrateHistory_WindowHoursCappedByRetention(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{HashHistoryRetention: 2 * time.Hour})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?payment_address=addr-1&algo=RXT&network=TESTNET&window_hours=100")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (clamped, not rejected); body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		WindowHours float64 `json:"window_hours"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.WindowHours != 2 {
+		t.Errorf("window_hours = %v, want 2 (clamped to configured retention)", resp.WindowHours)
+	}
+}
+
+func TestHandleHashrateHistory_InvalidWindowHours(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?payment_address=addr-1&algo=RXT&network=TESTNET&window_hours=-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+// --- /pool/history ---
+
+func TestHandlePoolHistory_DefaultsToGlobal(t *testing.T) {
+	repo := &fakeRepo{hashSamples: []HashSampleRecord{{HashrateHS: 42, SampleTime: time.Unix(1000, 0)}}}
+	h := NewHandler(repo, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/pool/history?algo=RXT&network=TESTNET")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if repo.gotPoolType != "GLOBAL" {
+		t.Errorf("pool_type = %q, want GLOBAL (default)", repo.gotPoolType)
+	}
+	var resp struct {
+		PoolType string                 `json:"pool_type"`
+		Samples  []hashHistorySampleRow `json:"samples"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.PoolType != "GLOBAL" || len(resp.Samples) != 1 || resp.Samples[0].HashrateHS != 42 {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+}
+
+func TestHandlePoolHistory_ExplicitPoolType(t *testing.T) {
+	repo := &fakeRepo{}
+	h := NewHandler(repo, Config{})
+	doGet(t, h.Mux(), "/api/v1/stats/pool/history?algo=RXT&network=TESTNET&pool_type=PPLNS")
+	if repo.gotPoolType != "PPLNS" {
+		t.Errorf("pool_type = %q, want PPLNS", repo.gotPoolType)
+	}
+}
+
+func TestHandlePoolHistory_InvalidPoolType(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/pool/history?algo=RXT&network=TESTNET&pool_type=BOGUS")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandlePoolHistory_MissingAlgo(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/pool/history?network=TESTNET")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+// --- /network/history ---
+
+func TestHandleNetworkHistory_OK(t *testing.T) {
+	repo := &fakeRepo{difficultySamples: []DifficultySampleRecord{
+		{Difficulty: 123.5, SampleTime: time.Unix(1000, 0)},
+	}}
+	h := NewHandler(repo, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/network/history?algo=RXT&network=TESTNET")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Samples []difficultyHistorySampleRow `json:"samples"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Samples) != 1 || resp.Samples[0].Difficulty != 123.5 {
+		t.Errorf("unexpected samples: %+v", resp.Samples)
+	}
+}
+
+func TestHandleNetworkHistory_EmptyWhenNoHistoryYet(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/network/history?algo=RXT&network=TESTNET")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Samples []difficultyHistorySampleRow `json:"samples"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Samples == nil || len(resp.Samples) != 0 {
+		t.Errorf("expected an empty (non-nil) samples array, got %+v", resp.Samples)
+	}
+}
+
+func TestHandleNetworkHistory_InvalidAlgo(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/network/history?algo=BOGUS&network=TESTNET")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandleNetworkHistory_MissingNetworkNoConfigRejected(t *testing.T) {
+	h := NewHandler(&fakeRepo{}, Config{})
+	rr := doGet(t, h.Mux(), "/api/v1/stats/network/history?algo=RXT")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (network required with no configured default)", rr.Code)
+	}
+}
+
+func TestHistoryEndpoints_RepositoryErrorMapsToInternalServerError(t *testing.T) {
+	repo := &fakeRepo{err: context.DeadlineExceeded}
+	h := NewHandler(repo, Config{})
+
+	if rr := doGet(t, h.Mux(), "/api/v1/stats/hashrate/history?payment_address=addr-1&algo=RXT&network=TESTNET"); rr.Code != http.StatusInternalServerError {
+		t.Errorf("hashrate/history: status = %d, want 500", rr.Code)
+	}
+	if rr := doGet(t, h.Mux(), "/api/v1/stats/pool/history?algo=RXT&network=TESTNET"); rr.Code != http.StatusInternalServerError {
+		t.Errorf("pool/history: status = %d, want 500", rr.Code)
+	}
+	if rr := doGet(t, h.Mux(), "/api/v1/stats/network/history?algo=RXT&network=TESTNET"); rr.Code != http.StatusInternalServerError {
+		t.Errorf("network/history: status = %d, want 500", rr.Code)
 	}
 }

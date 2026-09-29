@@ -531,6 +531,19 @@ type config struct {
 
 	walletStatsPollInterval time.Duration
 
+	// hashHistoryInterval/hashHistoryMaxPoints configure
+	// runHashHistoryPoller (see that function's doc comment):
+	// hashHistoryInterval is both the poll cadence AND the bounded
+	// time series' per-sample-point spacing (legacy worker.js's own
+	// 60s LPUSH cadence, see DISPATCH_BRIEF.md); hashHistoryMaxPoints
+	// is the retention window expressed as a POINT COUNT (legacy's
+	// real statsBufferLength=480 config value), not a duration --
+	// the actual retention duration this poller prunes to is always
+	// hashHistoryMaxPoints * hashHistoryInterval (480*60s = 8h at the
+	// defaults below).
+	hashHistoryInterval  time.Duration
+	hashHistoryMaxPoints int
+
 	// jwtSecret is the HMAC-SHA256 signing secret for
 	// internal/backend/authapi's JWTs (also reused as its password-
 	// hashing key -- see that package's doc comment). Required --
@@ -657,6 +670,9 @@ func loadConfig() (config, error) {
 
 	flag.DurationVar(&cfg.walletStatsPollInterval, "wallet-stats-poll-interval", envOrDuration("GCPOOL_WALLET_STATS_POLL_INTERVAL", defaultWalletStatsPollInterval), "how often the wallet-stats poller calls GetBalance on every configured wallet. Only consulted if at least one wallet RPC is configured. Env: GCPOOL_WALLET_STATS_POLL_INTERVAL")
 
+	flag.DurationVar(&cfg.hashHistoryInterval, "hash-history-interval", envOrDuration("GCPOOL_HASH_HISTORY_INTERVAL", defaultHashHistoryInterval), "how often the hash-history poller samples pool-wide/miner/worker hashrate and network difficulty into the bounded hash_history table -- this is both the poll cadence and the per-sample-point spacing of the resulting time series (mirrors legacy worker.js's own 60s LPUSH cadence). Env: GCPOOL_HASH_HISTORY_INTERVAL")
+	flag.IntVar(&cfg.hashHistoryMaxPoints, "hash-history-max-points", envOrInt("GCPOOL_HASH_HISTORY_MAX_POINTS", defaultHashHistoryMaxPoints), "the retention window for hash_history, expressed as a POINT COUNT (mirrors legacy's real statsBufferLength=480 config value), not a duration -- the actual retention duration the poller prunes to is always this value times -hash-history-interval (480*60s = 8h at the defaults). Env: GCPOOL_HASH_HISTORY_MAX_POINTS")
+
 	flag.StringVar(&cfg.jwtSecret, "jwt-secret", envOr("GCPOOL_JWT_SECRET", ""), "(required) HMAC-SHA256 signing secret for internal/backend/authapi's JWTs (also reused as its password-hashing key -- see that package's doc comment). Env: GCPOOL_JWT_SECRET")
 
 	flag.StringVar(&cfg.configFile, "config", envOr("BACKEND_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below not explicitly set via CLI flag or environment variable. See backend.example.toml. Env: BACKEND_CONFIG_FILE")
@@ -748,6 +764,9 @@ type fileConfig struct {
 	TariWalletFeePerGram *uint64 `toml:"tari_wallet_fee_per_gram"`
 
 	WalletStatsPollIntervalSeconds *int `toml:"wallet_stats_poll_interval_seconds"`
+
+	HashHistoryIntervalSeconds *int `toml:"hash_history_interval_seconds"`
+	HashHistoryMaxPoints       *int `toml:"hash_history_max_points"`
 
 	JWTSecret *string `toml:"jwt_secret"`
 
@@ -843,6 +862,12 @@ func applyConfigFile(cfg *config) error {
 		d := time.Duration(*fc.WalletStatsPollIntervalSeconds) * time.Second
 		cfgfile.ApplyDuration(&cfg.walletStatsPollInterval, &d, visited, "wallet-stats-poll-interval", "GCPOOL_WALLET_STATS_POLL_INTERVAL")
 	}
+
+	if fc.HashHistoryIntervalSeconds != nil {
+		d := time.Duration(*fc.HashHistoryIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.hashHistoryInterval, &d, visited, "hash-history-interval", "GCPOOL_HASH_HISTORY_INTERVAL")
+	}
+	cfgfile.ApplyInt(&cfg.hashHistoryMaxPoints, fc.HashHistoryMaxPoints, visited, "hash-history-max-points", "GCPOOL_HASH_HISTORY_MAX_POINTS")
 
 	cfgfile.ApplyString(&cfg.jwtSecret, fc.JWTSecret, visited, "jwt-secret", "GCPOOL_JWT_SECRET")
 
@@ -1116,6 +1141,54 @@ func (a statsRepositoryAdapter) PoolSourceShareStatsSince(ctx context.Context, a
 			ShareCount:  result.Other.ShareCount,
 			PoolIDCount: result.Other.PoolIDCount,
 		}
+	}
+	return out, nil
+}
+
+// PoolTypeHashHistory adapts *db.Repository's PoolTypeHashHistory
+// (which operates on db.HashSample) to statsapi.Repository's
+// PoolTypeHashHistory (which operates on statsapi.HashSampleRecord),
+// mirroring WorkerShareStatsSince's adapter above.
+func (a statsRepositoryAdapter) PoolTypeHashHistory(ctx context.Context, algo, network, poolType string, sinceUnix int64) ([]statsapi.HashSampleRecord, error) {
+	rows, err := a.repo.PoolTypeHashHistory(ctx, algo, network, poolType, sinceUnix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]statsapi.HashSampleRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, statsapi.HashSampleRecord{HashrateHS: r.HashrateHS, SampleTime: r.SampleTime})
+	}
+	return out, nil
+}
+
+// MinerHashHistory adapts *db.Repository's MinerHashHistory to
+// statsapi.Repository's MinerHashHistory, mirroring
+// PoolTypeHashHistory's adapter above.
+func (a statsRepositoryAdapter) MinerHashHistory(ctx context.Context, algo, network, paymentAddress string, paymentID, worker *string, sinceUnix int64) ([]statsapi.HashSampleRecord, error) {
+	rows, err := a.repo.MinerHashHistory(ctx, algo, network, paymentAddress, paymentID, worker, sinceUnix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]statsapi.HashSampleRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, statsapi.HashSampleRecord{HashrateHS: r.HashrateHS, SampleTime: r.SampleTime})
+	}
+	return out, nil
+}
+
+// NetworkDifficultyHistory adapts *db.Repository's
+// NetworkDifficultyHistory (which operates on db.DifficultySample) to
+// statsapi.Repository's NetworkDifficultyHistory (which operates on
+// statsapi.DifficultySampleRecord), mirroring PoolTypeHashHistory's
+// adapter above.
+func (a statsRepositoryAdapter) NetworkDifficultyHistory(ctx context.Context, algo, network string, sinceUnix int64) ([]statsapi.DifficultySampleRecord, error) {
+	rows, err := a.repo.NetworkDifficultyHistory(ctx, algo, network, sinceUnix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]statsapi.DifficultySampleRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, statsapi.DifficultySampleRecord{Difficulty: r.Difficulty, SampleTime: r.SampleTime})
 	}
 	return out, nil
 }
@@ -2086,6 +2159,16 @@ const (
 	defaultWalletStatsPollInterval         = 1 * time.Minute
 	defaultDisburseMaxDestinationsPerBatch = 15
 
+	// defaultHashHistoryInterval/defaultHashHistoryMaxPoints are
+	// runHashHistoryPoller's defaults -- 60s/480 points, matching
+	// legacy worker.js's own real 60s LPUSH cadence and real
+	// statsBufferLength=480 config value exactly (see
+	// DISPATCH_BRIEF.md), giving the same real-world 8-hour trailing
+	// window (480 * 60s = 28800s = 8h) legacy's own deployment
+	// actually ran with.
+	defaultHashHistoryInterval  = 60 * time.Second
+	defaultHashHistoryMaxPoints = 480
+
 	// defaultWalletRPCTimeout is the default for
 	// GCPOOL_WALLET_RPC_TIMEOUT / -wallet-rpc-timeout, matching
 	// wallet.DefaultTimeout.
@@ -2714,6 +2797,231 @@ func runPendingBalancePoller(ctx context.Context, repo *db.Repository, m *metric
 	}
 }
 
+// hashHistoryTarget names one (algo, network) pair
+// runHashHistoryPoller should snapshot on every tick.
+type hashHistoryTarget struct {
+	algo    string
+	network string
+}
+
+// hashHistoryRepository is the narrow persistence surface
+// runHashHistoryPoller depends on -- satisfied by *db.Repository (see
+// internal/backend/db/hashhistory.go and db/network.go's
+// CurrentNetworkDifficulty), mirroring retention.Repository/
+// unlocker.Repository's role elsewhere in this file. Declared as an
+// interface (rather than depending on *db.Repository directly, unlike
+// runPendingBalancePoller above) specifically so this poller's own
+// tests can inject a fake and assert exactly which inserts/prune calls
+// one tick makes, without a real Postgres.
+type hashHistoryRepository interface {
+	PoolTypeShareStatsSince(ctx context.Context, algo, network string, sinceUnix int64) ([]db.PoolTypeShareStats, error)
+	CurrentNetworkDifficulty(ctx context.Context, algo, network string) (*float64, error)
+	ActiveMinerHashrates(ctx context.Context, algo, network string, sinceUnix int64) ([]db.MinerHashSample, error)
+	InsertPoolTypeHashSample(ctx context.Context, algo, network, poolType string, hashrateHS float64, ts time.Time) error
+	InsertNetworkDifficultySample(ctx context.Context, algo, network string, difficulty *float64, ts time.Time) error
+	InsertMinerHashSamples(ctx context.Context, samples []db.MinerHashSample) error
+	PruneHashHistory(ctx context.Context, olderThan time.Time) (int64, error)
+}
+
+// hashHistoryAggregationWindowSeconds is the trailing window every
+// hash-history sample aggregates `shares` rows over -- fixed at
+// statsapi.DefaultWindowSeconds (600s / 10 minutes), mirroring legacy
+// worker.js's own updateShareStats() aggregation window EXACTLY (see
+// DISPATCH_BRIEF.md) and this backend's own /api/v1/stats/hashrate
+// endpoint's identical default. This is deliberately NOT the same
+// knob as the poll interval (-hash-history-interval): the interval
+// controls how often a new sample POINT is appended to the bounded
+// time series (legacy's 60s LPUSH cadence), while this window
+// controls how much history each individual point SUMMARIZES --
+// legacy decoupled these two exactly the same way (a 10s current-value
+// refresh internally aggregating a 10-minute window, only LPUSHing
+// every 6th call/60s -- this backend has no separate current-value
+// refresh at all, per DISPATCH_BRIEF.md, since statsapi.
+// EstimateHashrateHS already computes that on demand).
+const hashHistoryAggregationWindowSeconds = statsapi.DefaultWindowSeconds
+
+// buildMinerHashSampleBatch converts active (ActiveMinerHashrates'
+// per-(address,payment_id,worker) result, already capped at
+// db.DefaultShareStatsCardinalityCap rows -- see that function's own
+// doc comment) into the full batch InsertMinerHashSamples should
+// write for one poll tick: one HashHistoryScopeWorker row per active
+// tuple PLUS one HashHistoryScopeMiner row per distinct
+// (algo, network, payment_address, payment_id) summing SharesSum
+// across every one of that miner's active workers -- legacy's own
+// "one entry per unique miner... and one per unique miner+worker"
+// dual-bucket shape (DISPATCH_BRIEF.md), derived here from the SAME
+// capped query rather than a second, separately-capped query.
+//
+// Deterministic output order (sorted by algo, network, address,
+// payment_id) purely so this function's own tests can assert exact
+// output without depending on Go's randomized map iteration order --
+// InsertMinerHashSamples itself doesn't care about row order.
+func buildMinerHashSampleBatch(active []db.MinerHashSample, now time.Time) []db.MinerHashSample {
+	out := make([]db.MinerHashSample, 0, len(active)*2)
+
+	type minerKey struct {
+		algo, network, address, paymentID string
+	}
+	minerSums := make(map[minerKey]int64, len(active))
+	minerPID := make(map[minerKey]*string, len(active))
+
+	for _, s := range active {
+		out = append(out, db.MinerHashSample{
+			Algo:           s.Algo,
+			Network:        s.Network,
+			PaymentAddress: s.PaymentAddress,
+			PaymentID:      s.PaymentID,
+			Worker:         s.Worker,
+			SharesSum:      s.SharesSum,
+			ShareCount:     s.ShareCount,
+			HashrateHS:     statsapi.EstimateHashrateHS(s.SharesSum, hashHistoryAggregationWindowSeconds),
+			SampleTime:     now,
+		})
+
+		pidStr := ""
+		if s.PaymentID != nil {
+			pidStr = *s.PaymentID
+		}
+		key := minerKey{s.Algo, s.Network, s.PaymentAddress, pidStr}
+		minerSums[key] += s.SharesSum
+		minerPID[key] = s.PaymentID
+	}
+
+	keys := make([]minerKey, 0, len(minerSums))
+	for k := range minerSums {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].algo != keys[j].algo {
+			return keys[i].algo < keys[j].algo
+		}
+		if keys[i].network != keys[j].network {
+			return keys[i].network < keys[j].network
+		}
+		if keys[i].address != keys[j].address {
+			return keys[i].address < keys[j].address
+		}
+		return keys[i].paymentID < keys[j].paymentID
+	})
+	for _, k := range keys {
+		sum := minerSums[k]
+		out = append(out, db.MinerHashSample{
+			Algo:           k.algo,
+			Network:        k.network,
+			PaymentAddress: k.address,
+			PaymentID:      minerPID[k],
+			HashrateHS:     statsapi.EstimateHashrateHS(sum, hashHistoryAggregationWindowSeconds),
+			SampleTime:     now,
+		})
+	}
+	return out
+}
+
+// runHashHistoryPoller periodically snapshots pool-wide (per
+// pool_type + GLOBAL), per-miner, per-worker hashrate and the real
+// network difficulty into the bounded `hash_history` table (see
+// internal/backend/db/hashhistory.go), then prunes rows older than
+// maxPoints*interval -- this backend's replacement for legacy
+// worker.js's hash-history feature (see DISPATCH_BRIEF.md), with a
+// REAL upper bound on both retained row count (the prune below) and
+// per-tick miner/worker cardinality (ActiveMinerHashrates' own
+// db.DefaultShareStatsCardinalityCap), unlike legacy's unbounded
+// in-process maps.
+//
+// Ticker pattern mirrors runWalletStatsPoller/runPendingBalancePoller
+// above EXACTLY: pollOnce() runs once immediately, then on every
+// ticker.C tick, until ctx is canceled.
+func runHashHistoryPoller(ctx context.Context, repo hashHistoryRepository, m *metrics.Metrics, targets []hashHistoryTarget, interval time.Duration, maxPoints int) {
+	if interval <= 0 {
+		log.Print("backend: hash-history poller: interval <= 0, not starting")
+		return
+	}
+	if maxPoints <= 0 {
+		log.Print("backend: hash-history poller: max-points <= 0, not starting")
+		return
+	}
+	retentionWindow := time.Duration(maxPoints) * interval
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	pollOnce := func() {
+		now := time.Now()
+		since := now.Add(-hashHistoryAggregationWindowSeconds * time.Second).Unix()
+		var written, errs int
+
+		for _, target := range targets {
+			ptStats, err := repo.PoolTypeShareStatsSince(ctx, target.algo, target.network, since)
+			if err != nil {
+				errs++
+				m.HashHistoryPollErrorsTotal.WithLabelValues(target.algo, target.network).Inc()
+				log.Printf("backend: hash-history poller: %s/%s: PoolTypeShareStatsSince: %v", target.algo, target.network, err)
+			} else {
+				for _, s := range ptStats {
+					hr := statsapi.EstimateHashrateHS(s.SharesSum, hashHistoryAggregationWindowSeconds)
+					if err := repo.InsertPoolTypeHashSample(ctx, target.algo, target.network, s.PoolType, hr, now); err != nil {
+						errs++
+						m.HashHistoryPollErrorsTotal.WithLabelValues(target.algo, target.network).Inc()
+						log.Printf("backend: hash-history poller: %s/%s: InsertPoolTypeHashSample(%s): %v", target.algo, target.network, s.PoolType, err)
+						continue
+					}
+					written++
+				}
+			}
+
+			diff, err := repo.CurrentNetworkDifficulty(ctx, target.algo, target.network)
+			if err != nil {
+				errs++
+				m.HashHistoryPollErrorsTotal.WithLabelValues(target.algo, target.network).Inc()
+				log.Printf("backend: hash-history poller: %s/%s: CurrentNetworkDifficulty: %v", target.algo, target.network, err)
+			} else if diff != nil {
+				if err := repo.InsertNetworkDifficultySample(ctx, target.algo, target.network, diff, now); err != nil {
+					errs++
+					m.HashHistoryPollErrorsTotal.WithLabelValues(target.algo, target.network).Inc()
+					log.Printf("backend: hash-history poller: %s/%s: InsertNetworkDifficultySample: %v", target.algo, target.network, err)
+				} else {
+					written++
+				}
+			}
+
+			active, err := repo.ActiveMinerHashrates(ctx, target.algo, target.network, since)
+			if err != nil {
+				errs++
+				m.HashHistoryPollErrorsTotal.WithLabelValues(target.algo, target.network).Inc()
+				log.Printf("backend: hash-history poller: %s/%s: ActiveMinerHashrates: %v", target.algo, target.network, err)
+			} else if len(active) > 0 {
+				batch := buildMinerHashSampleBatch(active, now)
+				if err := repo.InsertMinerHashSamples(ctx, batch); err != nil {
+					errs++
+					m.HashHistoryPollErrorsTotal.WithLabelValues(target.algo, target.network).Inc()
+					log.Printf("backend: hash-history poller: %s/%s: InsertMinerHashSamples: %v", target.algo, target.network, err)
+				} else {
+					written += len(batch)
+				}
+			}
+		}
+
+		pruned, err := repo.PruneHashHistory(ctx, now.Add(-retentionWindow))
+		if err != nil {
+			errs++
+			log.Printf("backend: hash-history poller: PruneHashHistory: %v", err)
+		}
+
+		m.HashHistoryLastPollTimestamp.Set(float64(now.Unix()))
+		log.Printf("backend: hash-history poller: tick complete: %d sample(s) written, %d row(s) pruned, %d error(s)", written, pruned, errs)
+	}
+
+	pollOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pollOnce()
+		}
+	}
+}
+
 // validateIngestionAuthConfig enforces that the share/block ingestion
 // endpoints (POST /api/v1/share, POST /api/v1/block) are never started
 // unauthenticated by default. internal/backend/api.Handler's own
@@ -2816,6 +3124,20 @@ func run(cfg config) error {
 		IngestionRateBurst: cfg.ingestionRateBurst,
 	})
 
+	// hashHistoryRetention is the real retention window
+	// runHashHistoryPoller (started below, once walletStatsTargets'
+	// enabled-algo set is known) is configured to keep -- computed
+	// here, before statsHandler is constructed, purely because
+	// statsHandler needs it to cap /hashrate/history, /pool/history,
+	// and /network/history's window_hours query parameter (see
+	// statsapi.Config.HashHistoryRetention's doc comment). Zero
+	// (either knob configured non-positive) means "no known cap,"
+	// mirroring that field's own zero-value convention.
+	var hashHistoryRetention time.Duration
+	if cfg.hashHistoryInterval > 0 && cfg.hashHistoryMaxPoints > 0 {
+		hashHistoryRetention = cfg.hashHistoryInterval * time.Duration(cfg.hashHistoryMaxPoints)
+	}
+
 	// statsHandler serves the read-only, unauthenticated miner stats
 	// API (GET /api/v1/stats/*) on the same listener as the
 	// ingestion API above — see internal/backend/statsapi's package
@@ -2823,8 +3145,9 @@ func run(cfg config) error {
 	// trust-boundary rather than new routes bolted onto handler
 	// itself.
 	statsHandler := statsapi.NewHandler(statsRepositoryAdapter{repo: repo}, statsapi.Config{
-		Network: network,
-		Metrics: m,
+		Network:              network,
+		Metrics:              m,
+		HashHistoryRetention: hashHistoryRetention,
 	})
 
 	// addressMapHandler serves the SXMR merge-mining system's real
@@ -3081,6 +3404,31 @@ func run(cfg config) error {
 		go runWalletStatsPoller(ctx, m, walletStatsTargets, walletStatsInterval)
 	} else {
 		log.Print("backend: wallet-stats poller disabled (no wallet RPC configured for either coin)")
+	}
+
+	// hashHistoryTargets reuses walletStatsTargets' own enabled-algo
+	// enumeration exactly (built above from moneroWalletClient/
+	// tariWalletClient/coinWalletClients -- see DISPATCH_BRIEF.md's
+	// explicit instruction to reuse this same enumeration rather than
+	// inventing a new one), deduped down to one hashHistoryTarget per
+	// distinct algo -- walletStatsTargets can carry more than one
+	// entry for the same algo across different currencies (e.g. RXM's
+	// XMR and XTM legs), which would otherwise double-snapshot that
+	// algo every tick.
+	seenHashHistoryAlgo := make(map[string]bool, len(walletStatsTargets))
+	var hashHistoryTargets []hashHistoryTarget
+	for _, t := range walletStatsTargets {
+		if seenHashHistoryAlgo[t.algo] {
+			continue
+		}
+		seenHashHistoryAlgo[t.algo] = true
+		hashHistoryTargets = append(hashHistoryTargets, hashHistoryTarget{algo: t.algo, network: t.network})
+	}
+	if len(hashHistoryTargets) > 0 {
+		log.Printf("backend: hash-history poller enabled, polling every %s for %d algo(s), retaining %d points (%s window)", cfg.hashHistoryInterval, len(hashHistoryTargets), cfg.hashHistoryMaxPoints, hashHistoryRetention)
+		go runHashHistoryPoller(ctx, repo, m, hashHistoryTargets, cfg.hashHistoryInterval, cfg.hashHistoryMaxPoints)
+	} else {
+		log.Print("backend: hash-history poller disabled (no wallet RPC configured for any coin, so no algo has an enabled hash-history target -- see walletStatsTargets' own enumeration above)")
 	}
 
 	// pending-balance poller: unconditional, unlike every other

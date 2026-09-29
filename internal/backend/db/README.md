@@ -61,6 +61,38 @@ This is a mechanism only — nothing in this package calls it on a
 schedule. Wiring it into an actual periodic job (cron/ticker in
 `cmd/backend`) is future work.
 
+## Retention model for `hash_history`
+
+`hash_history` (migration `0018_hash_history`) is the bounded,
+Postgres-backed replacement for legacy `worker.js`'s hash-history
+feature — periodic pool-wide/miner/worker hashrate and network-
+difficulty samples, written by `cmd/backend`'s `runHashHistoryPoller`
+(see `hashhistory.go`'s own package doc comment for the full design
+writeup and `DISPATCH_BRIEF.md` for the legacy ground truth this
+replaces).
+
+Unlike `shares`' whole-partition-drop retention above, `hash_history`
+retention (`Repository.PruneHashHistory`) is a **plain row-level
+`DELETE ... WHERE sample_time < $1`**, backed by
+`idx_hash_history_sample_time`. This is a deliberately different
+mechanism from `shares`' partition-drop approach, not an oversight:
+`hash_history` is small and low-cardinality by construction (at most a
+few hundred `pool_type`/`network_difficulty` rows plus
+`DefaultShareStatsCardinalityCap`-many (worker + miner-level) rows per
+poll tick, retained for a bounded number of ticks — see
+`ActiveMinerHashrates`' own cardinality cap), so a plain indexed
+`DELETE` is fast enough that partition-drop's extra DDL-management
+complexity buys nothing here, unlike `shares`, which is genuinely
+large enough to need it.
+
+The retention WINDOW itself is expressed as a **point count**
+(`-hash-history-max-points` / `GCPOOL_HASH_HISTORY_MAX_POINTS`,
+default 480 — mirroring legacy's own real `statsBufferLength=480`
+config value), not a duration; `cmd/backend` computes the actual
+duration passed to `PruneHashHistory` as
+`maxPoints * -hash-history-interval` (480 * 60s = 8h at the defaults),
+recomputed fresh on every poll tick rather than baked into the schema.
+
 ## Go package layout
 
 - `db.go` — `Config`/`Open` (pgx pool setup), `HeightPartitionBucketSize`,
@@ -70,6 +102,16 @@ schedule. Wiring it into an actual periodic job (cron/ticker in
 - `repository.go` — `Repository` with `InsertShare`/`InsertBlock`. This is
   intentionally minimal (not a full CRUD surface) — schema + plumbing
   only, per the task scope.
+- `stats.go` — the read-only, miner-facing query surface backing
+  `internal/backend/statsapi` (hashrate-right-now, not history).
+- `hashhistory.go` — the bounded hash-history feature's own
+  read+write surface (see "Retention model for `hash_history`" above)
+  — `PoolTypeShareStatsSince`/`ActiveMinerHashrates` (reads over
+  `shares`), `InsertPoolTypeHashSample`/`InsertNetworkDifficultySample`/
+  `InsertMinerHashSamples`/`PruneHashHistory` (writes to
+  `hash_history`), and `PoolTypeHashHistory`/`MinerHashHistory`/
+  `NetworkDifficultyHistory` (reads over `hash_history`, backing
+  `internal/backend/statsapi`'s history endpoints).
 - `migrate.go` — `ApplyMigrations`, a tiny embedded-FS migration runner
   (no version-tracking table yet; only safe against a fresh database).
   Fine for bootstrap/tests today; a real migration tool (golang-migrate

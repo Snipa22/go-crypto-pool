@@ -240,6 +240,20 @@ tari_wallet_fee_per_gram = 0
 # configured. (default: 60)
 wallet_stats_poll_interval_seconds = 60
 
+# How often the hash-history poller samples pool-wide/miner/worker
+# hashrate and network difficulty into the bounded hash_history table, in
+# seconds -- this is both the poll cadence and the per-sample-point
+# spacing of the resulting time series (mirrors legacy worker.js's own
+# 60s LPUSH cadence). (default: 60)
+hash_history_interval_seconds = 60
+
+# The retention window for hash_history, expressed as a POINT COUNT
+# (mirrors legacy's real statsBufferLength=480 config value), not a
+# duration -- the actual retention duration the poller prunes to is
+# always this value times hash_history_interval_seconds (480*60s = 8h at
+# the defaults). (default: 480)
+hash_history_max_points = 480
+
 # (required) HMAC-SHA256 signing secret for internal/backend/authapi's JWTs
 # (also reused as its password-hashing key -- see that package's doc
 # comment). No default -- startup fails fast if this is unset.
