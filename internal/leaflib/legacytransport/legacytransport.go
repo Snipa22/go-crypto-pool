@@ -139,7 +139,7 @@ const (
 // Config configures LegacyTransport.
 type Config struct {
 	// BackendBaseURL is the legacy backend's base URL (scheme+host+port),
-	// e.g. "https://schwifty37.snipanet.com:4443". LegacyTransport
+	// e.g. "https://legacy-backend.example.com:4443". LegacyTransport
 	// appends leafAPIPath ("/leafApi") itself. No scheme is assumed or
 	// hardcoded -- the real target very likely terminates TLS externally
 	// in front of the Node process's plain app.listen(8000), so https is

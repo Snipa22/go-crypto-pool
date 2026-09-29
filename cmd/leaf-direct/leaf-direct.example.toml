@@ -306,7 +306,7 @@ monero_zmq_url = ""
 legacy_mode = false
 
 # Legacy nodejs-pool-sxmr backend base URL (e.g.
-# "https://schwifty37.snipanet.com:4443") -- the transport appends /leafApi
+# "https://legacy-backend.example.com:4443") -- the transport appends /leafApi
 # itself. No scheme is assumed; the real target very likely terminates TLS
 # externally in front of the Node process's plain app.listen(8000), so https
 # is the expected common case. REQUIRED when legacy_mode=true, ignored
