@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	shared "github.com/Snipa22/go-crypto-pool/internal/leaflib/metrics"
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib/relay"
 )
@@ -502,4 +504,34 @@ func TestPerSecondRateMetrics_IntegrationAcrossSimulatedTicks(t *testing.T) {
 			t.Errorf("%s{%s=%q} = %v, want %v", tc.name, tc.labels[0], tc.labels[1], got, tc.want)
 		}
 	}
+}
+
+// TestNew_RegistersGoAndProcessCollectors mirrors
+// internal/leaflib/solo/metrics's identical test exactly -- see that
+// package's doc comment on the same test name for the full rationale
+// (go_goroutines used as the real-Go-collector probe metric).
+func TestNew_RegistersGoAndProcessCollectors(t *testing.T) {
+	m := New("dev", 0)
+	mfs, err := m.registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "go_goroutines" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected go_goroutines metric family in Gather() output, proving the Go runtime collector is genuinely registered -- got families: %v", metricFamilyNames(mfs))
+	}
+}
+
+func metricFamilyNames(mfs []*dto.MetricFamily) []string {
+	names := make([]string, 0, len(mfs))
+	for _, mf := range mfs {
+		names = append(names, mf.GetName())
+	}
+	return names
 }
