@@ -328,6 +328,18 @@ type Metrics struct {
 	// rejection points was log-only, with no counter of any kind.
 	LoginRejectionsTotal *prometheus.CounterVec
 
+	// ReloginTotal counts every real re-login event detected in
+	// session.go's handleLogin (BRIEF.md "decouple TCP/miner-
+	// identity"): a session receiving a SECOND (or Nth) "login"
+	// message on an already-logged-in connection (e.g. an
+	// xmrig-proxy `--reuse-timeout` connection-reuse slot rotation).
+	// Incremented exactly once per re-login EVENT, not once per
+	// login overall -- a session's first, ordinary login never
+	// increments this. Unlabeled: a plain counter, mirroring
+	// XNPReservationUnavailableTotal's identical unlabeled-Counter
+	// convention above rather than the busier per-reason metrics.
+	ReloginTotal prometheus.Counter
+
 	BuildInfo *prometheus.GaugeVec
 
 	// sharesRate/blocksRate/rejectionReasonRate back
@@ -393,6 +405,11 @@ func New(version string, maxAddressLabels int) *Metrics {
 		Name: "leaf_solo_login_rejections_total",
 		Help: "Real, per-category breakdown of every login-time rejection in session.go's handleLogin (see this package's LoginRejectionReason* consts for the full, closed enum and the exact handleLogin call site each one maps to) -- previously every one of these rejection points was log-only, with no counter of any kind.",
 	}, []string{"reason"})
+
+	m.ReloginTotal = registerCounter(reg, prometheus.CounterOpts{
+		Name: "leaf_relogin_total",
+		Help: "Total number of real re-login events detected in session.go's handleLogin: a session receiving a second (or Nth) login message on an already-logged-in connection (e.g. an xmrig-proxy --reuse-timeout connection-reuse slot rotation). Incremented once per re-login event, not once per login overall.",
+	})
 
 	m.BuildInfo = registerGaugeVec(reg, prometheus.GaugeOpts{
 		Name: "leaf_solo_build_info",
@@ -487,6 +504,15 @@ func (m *Metrics) IncShareRejectionReason(reason string) {
 // BanRejectionsTotal convention, not the busier submit-path metrics.
 func (m *Metrics) IncLoginRejectionReason(reason string) {
 	m.LoginRejectionsTotal.WithLabelValues(reason).Inc()
+}
+
+// IncRelogin bumps ReloginTotal by one -- callers (server.go's
+// recordRelogin, itself called from session.go's handleLogin at the
+// exact point a re-login is detected) must call this INSTEAD OF
+// touching ReloginTotal directly, mirroring
+// IncLoginRejectionReason's identical single-choke-point convention.
+func (m *Metrics) IncRelogin() {
+	m.ReloginTotal.Inc()
 }
 
 // Stop releases the background ticker goroutines backing

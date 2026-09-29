@@ -9,6 +9,21 @@ import (
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
 
+// proxyForcedTargetTimeSeconds is the hardcoded, UNCONDITIONAL vardiff
+// share target time (seconds) forced onto any session detected as a
+// proxy -- by agent string (IsXNPProxyAgent/IsGenericProxyAgent) or by
+// the behavioral re-login signal (Session.reloginDetected) -- per
+// BRIEF.md "Problem 2": a proxy aggregates many real miners' hashrate
+// behind one session, so the server's ordinary single-miner-oriented
+// default target time (VardiffConfig.TargetTime, default 30s) under-
+// adjusts for it; 10s lets vardiff actually track a proxy's much
+// larger, changing aggregate hashrate responsively. Deliberately NOT
+// a config knob (Alex: "unconditionally") -- see session.go's
+// handleLogin (the single call site that stores it onto
+// Session.forcedTargetTime) and vardiff.go's maybeRetarget (the
+// single call site that reads it in place of cfg.TargetTime).
+const proxyForcedTargetTimeSeconds = 10
+
 // VardiffConfig and computeRetarget/defaultVardiffConfig are now thin
 // aliases/wrappers over internal/leaflib.VardiffConfig/ComputeRetarget/
 // DefaultVardiffConfig (EXTRACTED there so leaf-proxy, mode 3, can
@@ -166,7 +181,21 @@ func (s *Session) maybeRetarget() {
 		minDiff = floor
 	}
 
-	newDiff, changed := computeRetarget(curDiff, hashes, connSeconds, cfg.TargetTime, minDiff, cfg.MaxDifficulty)
+	// BRIEF.md "proxy-aware vardiff target time": a detected-proxy
+	// session's forcedTargetTime (session.go's handleLogin, 0 when
+	// unset) always wins over the port tier's configured
+	// cfg.TargetTime, unconditionally -- read BEFORE calling
+	// computeRetarget so it feeds the SAME targetTime parameter
+	// cfg.TargetTime would otherwise supply. This applies regardless
+	// of cfg.MinDifficulty/cfg.MaxDifficulty/forcedMinDifficulty --
+	// those clamps (immediately above/below) are completely
+	// untouched; only the targetTime argument changes.
+	targetTime := cfg.TargetTime
+	if forced := s.forcedTargetTime.Load(); forced != 0 {
+		targetTime = int(forced)
+	}
+
+	newDiff, changed := computeRetarget(curDiff, hashes, connSeconds, targetTime, minDiff, cfg.MaxDifficulty)
 	s.server.debugLogger.Debugf("solo: vardiff check: session=%s xn=%s cur_diff=%d hashes=%d conn_seconds=%d changed=%v", s.sessionID, s.xn, curDiff, hashes, connSeconds, changed)
 	if !changed {
 		return

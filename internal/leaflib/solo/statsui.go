@@ -120,7 +120,7 @@ const statsPageHTML = `<!DOCTYPE html>
   <h2>Connected sessions{{if .SessionsCapped}} (showing {{len .ShownSessions}} of {{.Stats.ActiveSessions}}, capped to {{.StatsPageMaxSessions}}){{end}}</h2>
   {{if .ShownSessions}}
   <table>
-    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Agent</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Blocks</th></tr>
+    <tr><th>Session ID</th><th>Address</th><th>Worker</th><th>Agent</th>{{if not $.HideRemoteAddress}}<th>Remote address</th>{{end}}<th>Connected</th><th>Uptime</th><th>Difficulty</th><th>Est. hashrate</th><th>Shares</th><th>Blocks</th><th>Relogins</th></tr>
     {{range .ShownSessions}}
     <tr>
       <td>{{.SessionID}}</td>
@@ -134,6 +134,7 @@ const statsPageHTML = `<!DOCTYPE html>
       <td>{{formatHashrate .EstimatedHashrate}}</td>
       <td>{{.ShareCount}}</td>
       <td>{{.BlockCount}}</td>
+      <td>{{.Relogins}}</td>
     </tr>
     {{end}}
   </table>

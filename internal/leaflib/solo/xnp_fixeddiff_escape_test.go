@@ -309,7 +309,7 @@ func TestLoginXNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *testing.
 		t.Fatalf("XNP-proxy login with a +fixed-difficulty suffix was rejected: %#v", resp)
 	}
 
-	if got := sess.address.Load().(string); got != addr {
+	if got := sess.Identity().Address; got != addr {
 		t.Errorf("session address = %q, want the STRIPPED address %q", got, addr)
 	}
 	// The operator's requested value IS the starting difficulty --
@@ -326,9 +326,16 @@ func TestLoginXNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *testing.
 
 	// And now the real proof: a genuine vardiff retarget tick MUST
 	// move this session's difficulty. Same accept-history/age setup
-	// the fixed-diff tests prove is ignored for a pinned session:
-	// (600000/90)*30 = 199980, clamped by the 1.5x step limit to
-	// 50000*1.5 = 75000.
+	// the fixed-diff tests prove is ignored for a pinned session.
+	//
+	// BRIEF.md "proxy-aware vardiff target time": this session is
+	// XNP-agent-detected, so handleLogin has ALSO forced its target
+	// time to proxyForcedTargetTimeSeconds (10), unconditionally
+	// overriding the harness's configured cfg.TargetTime (30) --
+	// (600000/90)*10 = 66660, which does not hit the 1.5x step-limit
+	// clamp (50000*1.5 = 75000) at all, unlike the pre-this-brief
+	// 30s-target-time math this test used to assert (199980, clamped
+	// to 75000).
 	sess.connectedAt = time.Now().Add(-90 * time.Second)
 	sess.hashesAccumulated.Store(600_000)
 	done := make(chan struct{})
@@ -338,10 +345,10 @@ func TestLoginXNPProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *testing.
 	}()
 	push := c.recvJobPush()
 	<-done
-	if got := sess.currentDifficulty.Load(); got != 75000 {
-		t.Fatalf("currentDifficulty = %d, want 75000 -- vardiff must remain fully live for an XNP-proxy session", got)
+	if got := sess.currentDifficulty.Load(); got != 66660 {
+		t.Fatalf("currentDifficulty = %d, want 66660 (10s forced target time) -- vardiff must remain fully live for an XNP-proxy session", got)
 	}
-	if want := leaflib.DiffToTargetHex(75000); push.Params.Target != want {
+	if want := leaflib.DiffToTargetHex(66660); push.Params.Target != want {
 		t.Errorf("pushed job target = %q, want %q", push.Params.Target, want)
 	}
 }
@@ -393,7 +400,7 @@ func TestLoginGenericProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *test
 		t.Fatalf("generic-proxy login with a +fixed-difficulty suffix was rejected: %#v", resp)
 	}
 
-	if got := sess.address.Load().(string); got != addr {
+	if got := sess.Identity().Address; got != addr {
 		t.Errorf("session address = %q, want the STRIPPED address %q", got, addr)
 	}
 	// The operator's requested value IS the starting difficulty --
@@ -409,9 +416,12 @@ func TestLoginGenericProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *test
 	}
 
 	// And now the real proof: a genuine vardiff retarget tick MUST
-	// move this session's difficulty, same math as the XNP case:
-	// (600000/90)*30 = 199980, clamped by the 1.5x step limit to
-	// 50000*1.5 = 75000.
+	// move this session's difficulty, same math as the XNP case
+	// (BRIEF.md "proxy-aware vardiff target time" forces this
+	// generic-proxy-detected session's target time to
+	// proxyForcedTargetTimeSeconds (10) too):
+	// (600000/90)*10 = 66660, which does not hit the 1.5x step-limit
+	// clamp (50000*1.5 = 75000).
 	sess.connectedAt = time.Now().Add(-90 * time.Second)
 	sess.hashesAccumulated.Store(600_000)
 	done := make(chan struct{})
@@ -421,10 +431,10 @@ func TestLoginGenericProxyFixedDiffSuffixStartsThereButStaysRetargetable(t *test
 	}()
 	push := c.recvJobPush()
 	<-done
-	if got := sess.currentDifficulty.Load(); got != 75000 {
-		t.Fatalf("currentDifficulty = %d, want 75000 -- vardiff must remain fully live for a generic-proxy-claiming session", got)
+	if got := sess.currentDifficulty.Load(); got != 66660 {
+		t.Fatalf("currentDifficulty = %d, want 66660 (10s forced target time) -- vardiff must remain fully live for a generic-proxy-claiming session", got)
 	}
-	if want := leaflib.DiffToTargetHex(75000); push.Params.Target != want {
+	if want := leaflib.DiffToTargetHex(66660); push.Params.Target != want {
 		t.Errorf("pushed job target = %q, want %q", push.Params.Target, want)
 	}
 }

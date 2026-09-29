@@ -392,7 +392,7 @@ func TestLoginFixedDifficultySuffixIsHonoredAndVardiffIsSkipped(t *testing.T) {
 		t.Fatalf("login with a +fixed-difficulty suffix was rejected: %#v", resp)
 	}
 
-	if got := sess.address.Load().(string); got != addr {
+	if got := sess.Identity().Address; got != addr {
 		t.Errorf("session address = %q, want the STRIPPED address %q (never the raw login string)", got, addr)
 	}
 	if got := sess.currentDifficulty.Load(); got != 50000 {
@@ -516,15 +516,15 @@ func TestLoginPaymentIDIsCapturedForMoneroFamily(t *testing.T) {
 	if sess == nil {
 		t.Fatalf("login with a .paymentID suffix was rejected: %#v", resp)
 	}
-	if got := sess.address.Load().(string); got != realXMRMainnetAddr {
+	if got := sess.Identity().Address; got != realXMRMainnetAddr {
 		t.Errorf("session address = %q, want the STRIPPED address %q", got, realXMRMainnetAddr)
 	}
-	if got := sess.paymentID.Load().(string); got != paymentID {
+	if got := sess.Identity().PaymentID; got != paymentID {
 		t.Errorf("session paymentID = %q, want %q", got, paymentID)
 	}
 	// A 64-hex segment is a payment ID, never a worker name -- the
 	// password field still supplies the worker.
-	if got := sess.worker.Load().(string); got != "x" {
+	if got := sess.Identity().Worker; got != "x" {
 		t.Errorf("session worker = %q, want the password-supplied %q", got, "x")
 	}
 }
@@ -550,13 +550,13 @@ func TestLoginDotIdentifierFeedsWorkerWithLegacyPrecedence(t *testing.T) {
 			if sess == nil {
 				t.Fatalf("login with a .identifier suffix was rejected: %#v", resp)
 			}
-			if got := sess.address.Load().(string); got != realXMRMainnetAddr {
+			if got := sess.Identity().Address; got != realXMRMainnetAddr {
 				t.Errorf("session address = %q, want the STRIPPED address %q", got, realXMRMainnetAddr)
 			}
-			if got := sess.worker.Load().(string); got != tc.wantWorker {
+			if got := sess.Identity().Worker; got != tc.wantWorker {
 				t.Errorf("session worker = %q, want %q", got, tc.wantWorker)
 			}
-			if got := sess.paymentID.Load().(string); got != "" {
+			if got := sess.Identity().PaymentID; got != "" {
 				t.Errorf("session paymentID = %q, want empty (a non-64-hex segment is a worker name)", got)
 			}
 		})
@@ -610,13 +610,13 @@ func TestLoginOrdinaryAddressIsByteForByteUnchanged(t *testing.T) {
 	if sess == nil {
 		t.Fatalf("ordinary login was rejected: %#v", resp)
 	}
-	if got := sess.address.Load().(string); got != addr {
+	if got := sess.Identity().Address; got != addr {
 		t.Errorf("session address = %q, want %q", got, addr)
 	}
-	if got := sess.worker.Load().(string); got != "rig1" {
+	if got := sess.Identity().Worker; got != "rig1" {
 		t.Errorf("session worker = %q, want %q", got, "rig1")
 	}
-	if got := sess.paymentID.Load().(string); got != "" {
+	if got := sess.Identity().PaymentID; got != "" {
 		t.Errorf("session paymentID = %q, want empty", got)
 	}
 	if sess.fixedDiff.Load() {
