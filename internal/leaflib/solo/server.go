@@ -373,8 +373,10 @@ func (s *Server) SetDebugLogger(d *leaflib.DebugLogger) {
 // startNoShareSweep), so a Server that never calls this method (or
 // calls it with a non-positive value) costs not even one extra
 // goroutine. Set from cmd/leaf-solo's own -no-share-timeout/
-// LEAF_SOLO_NO_SHARE_TIMEOUT flag (default 3m, matching Alex's
-// stated "2-3 minutes" upper bound). Must be called before Serve
+// LEAF_SOLO_NO_SHARE_TIMEOUT flag (default 5m, widened from the
+// original 3m -- Alex's originally-stated "2-3 minutes" upper bound
+// -- to cut down on false disconnects for legitimately slow-to-first-
+// share miners). Must be called before Serve
 // begins accepting connections, mirroring every other opt-in
 // Set*/Enable* method's convention on this type.
 //
