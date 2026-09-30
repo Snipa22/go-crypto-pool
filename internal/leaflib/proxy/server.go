@@ -421,60 +421,104 @@ func (s *Server) upstreamForRoute(route UpstreamRoute) UpstreamSubmitter {
 // EnableMetrics has been called, or a handler that responds 404
 // otherwise (rather than panicking a caller that wires it
 // unconditionally).
+//
+// The returned handler synchronously calls refreshUpstreamHealth
+// BEFORE delegating to the real promhttp handler (which triggers
+// Registry.Gather). This closes a genuine race (PR #150 CI failure,
+// "expected leaf_proxy_upstream_reconnects_total 2, got ...0..."):
+// Gather collects every registered collector CONCURRENTLY with no
+// ordering guarantee between them. UpstreamReconnectsTotal/
+// DevFeeUpstreamReconnectsTotal are real, separately-registered
+// prometheus.Counters (see metrics.go's New), while the ONLY place
+// that ever mutates them (the .Add(delta) calls below) previously
+// lived inside sessionSnapshots, itself only ever invoked as a side
+// effect of a DIFFERENT collector's Collect() (m's own, wired via
+// SetSnapshotSource) -- so a scrape could serialize
+// UpstreamReconnectsTotal's Collect() (a trivial read of its current
+// value) before m.Collect() got around to calling sessionSnapshots
+// and doing the Add(), silently serializing the stale pre-update
+// value. Calling refreshUpstreamHealth once here, synchronously and
+// strictly before Gather is ever invoked for this request, guarantees
+// the Add() happens-before every Collect() call Gather makes for this
+// scrape -- ordinary single-goroutine sequential execution, not
+// merely a memory-model near-guarantee. sessionSnapshots (called
+// again from inside m.Collect() itself, via the wired SnapshotFunc)
+// still calls refreshUpstreamHealth a second time per scrape, but
+// that second call is a harmless no-op: lastReconnectCount/
+// lastDevFeeReconnectCount were already swapped to the current value
+// by the first call, so its computed delta is 0.
 func (s *Server) MetricsHandler() http.Handler {
 	if s.metrics == nil {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "metrics not enabled", http.StatusNotFound)
 		})
 	}
-	return s.metrics.Handler()
+	inner := s.metrics.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.refreshUpstreamHealth()
+		inner.ServeHTTP(w, r)
+	})
+}
+
+// refreshUpstreamHealth refreshes the UpstreamConnected/
+// UpstreamReconnectsTotal and DevFeeUpstreamConnected/
+// DevFeeUpstreamReconnectsTotal collectors from the primary/dev-fee
+// upstream's real UpstreamHealth capability (via a type-assertion on
+// s.upstream/s.devFeeUpstream -- see that interface's doc comment for
+// why this is a graceful, optional capability check rather than a
+// hard interface requirement). Safe to call more than once per
+// scrape (see MetricsHandler's doc comment): UpstreamReconnectsTotal/
+// DevFeeUpstreamReconnectsTotal are monotonic counters updated via
+// Add(delta-since-last-call), so a redundant call simply computes and
+// adds a delta of 0.
+func (s *Server) refreshUpstreamHealth() {
+	if s.metrics == nil {
+		return
+	}
+	if health, ok := s.upstream.(UpstreamHealth); ok {
+		if health.Connected() {
+			s.metrics.UpstreamConnected.Set(1)
+		} else {
+			s.metrics.UpstreamConnected.Set(0)
+		}
+		// UpstreamReconnectsTotal is a monotonic counter; Add the
+		// delta since the last scrape rather than Set, since
+		// prometheus.Counter has no Set.
+		current := health.ReconnectCount()
+		delta := current - s.lastReconnectCount.Swap(current)
+		if delta > 0 && current >= delta {
+			s.metrics.UpstreamReconnectsTotal.Add(float64(delta))
+		}
+	}
+	// Dev-fee connection health mirrors the primary's exact same
+	// pattern above, on its own gauge/counter pair -- see
+	// EnableDevFeeUpstream's doc comment. s.devFeeUpstream is nil
+	// (this whole block a no-op) unless the dev-fee mechanism was
+	// actually enabled.
+	if s.devFeeUpstream != nil {
+		if health, ok := s.devFeeUpstream.(UpstreamHealth); ok {
+			if health.Connected() {
+				s.metrics.DevFeeUpstreamConnected.Set(1)
+			} else {
+				s.metrics.DevFeeUpstreamConnected.Set(0)
+			}
+			current := health.ReconnectCount()
+			delta := current - s.lastDevFeeReconnectCount.Swap(current)
+			if delta > 0 && current >= delta {
+				s.metrics.DevFeeUpstreamReconnectsTotal.Add(float64(delta))
+			}
+		}
+	}
 }
 
 // sessionSnapshots implements metrics.SnapshotFunc against this
 // Server's real, live session map, AND (since this is called
 // synchronously on every /metrics scrape — see metrics.SnapshotFunc's
-// doc comment) is also where the single upstream connection's real
-// health is refreshed into the UpstreamConnected/UpstreamReconnectsTotal
-// collectors, via an UpstreamHealth type-assertion on s.upstream (see
-// that interface's doc comment for why this is a graceful, optional
-// capability check rather than a hard interface requirement).
+// doc comment, and MetricsHandler's doc comment for why this is now
+// ALSO called once earlier, before Gather) refreshes the single
+// upstream connection's real health via refreshUpstreamHealth.
 func (s *Server) sessionSnapshots() []metrics.SessionSnapshot {
-	if s.metrics != nil {
-		if health, ok := s.upstream.(UpstreamHealth); ok {
-			if health.Connected() {
-				s.metrics.UpstreamConnected.Set(1)
-			} else {
-				s.metrics.UpstreamConnected.Set(0)
-			}
-			// UpstreamReconnectsTotal is a monotonic counter; Add the
-			// delta since the last scrape rather than Set, since
-			// prometheus.Counter has no Set.
-			current := health.ReconnectCount()
-			delta := current - s.lastReconnectCount.Swap(current)
-			if delta > 0 && current >= delta {
-				s.metrics.UpstreamReconnectsTotal.Add(float64(delta))
-			}
-		}
-		// Dev-fee connection health mirrors the primary's exact same
-		// pattern above, on its own gauge/counter pair -- see
-		// EnableDevFeeUpstream's doc comment. s.devFeeUpstream is nil
-		// (this whole block a no-op) unless the dev-fee mechanism was
-		// actually enabled.
-		if s.devFeeUpstream != nil {
-			if health, ok := s.devFeeUpstream.(UpstreamHealth); ok {
-				if health.Connected() {
-					s.metrics.DevFeeUpstreamConnected.Set(1)
-				} else {
-					s.metrics.DevFeeUpstreamConnected.Set(0)
-				}
-				current := health.ReconnectCount()
-				delta := current - s.lastDevFeeReconnectCount.Swap(current)
-				if delta > 0 && current >= delta {
-					s.metrics.DevFeeUpstreamReconnectsTotal.Add(float64(delta))
-				}
-			}
-		}
-	}
+	s.refreshUpstreamHealth()
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
