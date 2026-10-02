@@ -72,12 +72,26 @@ var statsPageTemplate = template.Must(template.New("proxy-stats").Funcs(template
 const statsPageHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" http-equiv="refresh" content="10">
+<meta charset="utf-8">
 <title>leaf-proxy stats</title>
+<script>
+  // Applied as early as possible (before first paint) to avoid a
+  // light-then-dark flash on reload -- see DISPATCH_BRIEF_ADDENDUM_
+  // DARKMODE.md section 1. Default (no stored preference yet) stays
+  // the existing light palette -- opt-in only, never a surprise
+  // behavior change for an operator who never touches the toggle.
+  (function() {
+    if (localStorage.getItem('leaf-proxy-stats-theme') === 'dark') {
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  })();
+</script>
 <style>
   body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; color: #1a1a1a; background: #fafafa; }
   h1 { margin-bottom: 0.25rem; }
   .generated { color: #666; font-size: 0.85rem; margin-bottom: 1.5rem; }
+  .controls { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; font-size: 0.85rem; }
+  .controls label { color: #666; }
   .cards { display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
   .card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 1rem 1.5rem; min-width: 160px; }
   .card .value { font-size: 1.8rem; font-weight: 600; }
@@ -91,11 +105,93 @@ const statsPageHTML = `<!DOCTYPE html>
   .empty { color: #999; font-style: italic; }
   .other { color: #999; }
   h2 { margin-top: 2rem; }
+
+  html[data-theme="dark"] body { color: #e0e0e0; background: #121212; }
+  html[data-theme="dark"] .generated { color: #aaa; }
+  html[data-theme="dark"] .controls label { color: #aaa; }
+  html[data-theme="dark"] .card { background: #1a1a1a; border-color: #444; }
+  html[data-theme="dark"] .card .label { color: #aaa; }
+  html[data-theme="dark"] .card.up .value { color: #4caf50; }
+  html[data-theme="dark"] .card.down .value { color: #ff5c5c; }
+  html[data-theme="dark"] table { background: #1a1a1a; }
+  html[data-theme="dark"] th, html[data-theme="dark"] td { border-color: #444; }
+  html[data-theme="dark"] th { background: #262626; }
+  html[data-theme="dark"] tr:nth-child(even) { background: #202020; }
+  html[data-theme="dark"] .empty { color: #888; }
+  html[data-theme="dark"] .other { color: #888; }
+  html[data-theme="dark"] select, html[data-theme="dark"] button { background: #1a1a1a; color: #e0e0e0; border: 1px solid #444; }
 </style>
 </head>
 <body>
   <h1>leaf-proxy stats</h1>
   <div class="generated">generated {{.GeneratedAt}}</div>
+
+  <div class="controls">
+    <button type="button" id="theme-toggle" onclick="leafProxyToggleTheme()">Toggle dark mode</button>
+    <label for="refresh-select">Auto-refresh:
+      <select id="refresh-select" onchange="leafProxySetRefresh(this.value)">
+        <option value="0">Off</option>
+        <option value="5000">5s</option>
+        <option value="10000">10s</option>
+        <option value="30000">30s</option>
+        <option value="60000">60s</option>
+      </select>
+    </label>
+  </div>
+
+  <script>
+    function leafProxyToggleTheme() {
+      var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+      if (isDark) {
+        document.documentElement.removeAttribute('data-theme');
+        localStorage.setItem('leaf-proxy-stats-theme', 'light');
+      } else {
+        document.documentElement.setAttribute('data-theme', 'dark');
+        localStorage.setItem('leaf-proxy-stats-theme', 'dark');
+      }
+    }
+
+    function leafProxySetRefresh(ms) {
+      localStorage.setItem('leaf-proxy-stats-refresh-ms', ms);
+    }
+
+    (function() {
+      // Default (10000ms / 10s) matches today's existing hardcoded
+      // <meta http-equiv="refresh" content="10"> behavior exactly
+      // when an operator has never touched the control -- see
+      // DISPATCH_BRIEF_ADDENDUM_DARKMODE.md section 2.
+      var stored = localStorage.getItem('leaf-proxy-stats-refresh-ms');
+      var intervalMs = stored === null ? 10000 : parseInt(stored, 10);
+      if (isNaN(intervalMs)) {
+        intervalMs = 10000;
+      }
+      var select = document.getElementById('refresh-select');
+      if (select) {
+        select.value = String(intervalMs);
+      }
+      scheduleRefresh();
+
+      function scheduleRefresh() {
+        // Re-read the stored value at schedule-time (not only once
+        // at the top of this script) so selecting "Off" on THIS page
+        // load correctly prevents the already-scheduled timer, per
+        // the addendum's explicit requirement.
+        var current = localStorage.getItem('leaf-proxy-stats-refresh-ms');
+        var ms = current === null ? 10000 : parseInt(current, 10);
+        if (isNaN(ms) || ms <= 0) {
+          return;
+        }
+        setTimeout(function() {
+          var latest = localStorage.getItem('leaf-proxy-stats-refresh-ms');
+          var latestMs = latest === null ? 10000 : parseInt(latest, 10);
+          if (isNaN(latestMs) || latestMs <= 0) {
+            return;
+          }
+          location.reload();
+        }, ms);
+      }
+    })();
+  </script>
 
   <div class="cards">
     <div class="card {{if .Stats.UpstreamConnected}}up{{else}}down{{end}}"><div class="value">{{if .Stats.UpstreamConnected}}UP{{else}}DOWN{{end}}</div><div class="label">Upstream pool connection</div></div>
