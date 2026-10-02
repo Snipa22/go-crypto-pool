@@ -142,6 +142,17 @@ const (
 	ConnErrorProtocolError  = "protocol-error"
 	ConnErrorRejectedByGate = "rejected-by-gate"
 	ConnErrorOther          = "other"
+
+	// ConnErrorHTTPConnectProbe categorizes a downstream connection
+	// closed because the FIRST thing it ever sent was a literal HTTP
+	// CONNECT request line (see leaflib.IsHTTPConnectProbe's doc
+	// comment) rather than a stratum message -- a port
+	// scanner/open-proxy probe hitting this leaf's 80/443 listener,
+	// not a genuine mining client. Recorded at the exact same
+	// session.go handleLine call site that immediately closes the
+	// connection via s.mc.Close, right alongside every other
+	// defensive-disconnect category above.
+	ConnErrorHTTPConnectProbe = "http-connect-probe"
 )
 
 // OtherAddressLabel/DefaultMaxAddressLabels/CapAddressCounts/RemoteIPOf
