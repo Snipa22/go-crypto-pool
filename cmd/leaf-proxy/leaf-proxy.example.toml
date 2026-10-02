@@ -71,7 +71,18 @@ tls_listen_address = ""
 # added as a second, TLS-enabled tier exactly as before this key existed --
 # fully backward-compatible, zero behavior change for any deployment that
 # doesn't set this. Setting BOTH ports and tls_listen_address is a fatal
-# startup misconfiguration. (default: "")
+# startup misconfiguration.
+#
+# IPv6 is supported: an IPv6 literal host MUST be bracketed, RFC-3986-URL
+# style, e.g. "[::1]:5555:20000" (loopback) or "[::]:5556:20000:v6-tier"
+# (wildcard, with a desc). A tier mixing both families looks like:
+#   ports = "0.0.0.0:5555:20000:v4-tier,[::]:5556:20000:v6-tier"
+# OPERATOR CAVEAT: on Linux, binding "[::]:PORT" typically ALSO accepts
+# IPv4 connections (dual-stack), unless the kernel's
+# net.ipv6.bindv6only sysctl has been set to 1 on this host -- check that
+# sysctl yourself before also adding a redundant "0.0.0.0:PORT" tier on the
+# SAME port number, which would otherwise fail to bind (address already in
+# use) on a dual-stack-enabled host. (default: "")
 ports = ""
 
 # Optional PEM-encoded TLS certificate file for the shared, process-wide
@@ -195,6 +206,44 @@ address_flags_poll_interval_seconds = 30
 # (default: false)
 debug = false
 
+# Leveled logging (DISPATCH_BRIEF.md "leaf-proxy ... log levels", Alex's
+# ask: "error level 0 / 1 / 2 something like that to avoid useless errors
+# in foreground mode"). 0=quiet (suppress routine per-connection noise,
+# e.g. a bad/buggy client's unparseable-message line, or an
+# oversized-login-string rejection -- both are the kind of noise a port
+# scanner or misconfigured client floods a foreground/systemd-journal
+# output with), 1=normal (today's existing un-leveled output -- the
+# default), 2=verbose (folds debug's own [DEBUG]-tagged output in too,
+# even if debug above is left false). Startup/shutdown/fatal logs are
+# NEVER suppressed at any level. Leaving this key UNSET entirely falls
+# back to 1, UNLESS debug=true is also set with this key ALSO left unset,
+# in which case it behaves as 2 -- so an existing debug-only deployment
+# keeps its current verbose behavior without needing to also set this
+# key. An explicitly-set value here always wins over that fallback.
+# (default: 1, or 2 if debug=true and this key is left unset)
+log_level = 1
+
+# How often to log one xmrig-proxy/xnp-style foreground hashrate summary
+# line (total hashrate, active sessions, shares, upstream-forwarded
+# count) via the existing logger, at log_level >= 1, in seconds
+# (DISPATCH_BRIEF.md "leaf-proxy ... foreground hashrate", Alex's ask:
+# "hashrate shows in proxy side foreground mode like xmrig-proxy or
+# xnp"). 0 disables the feature entirely -- no ticker is ever started.
+# (default: 60)
+hashrate_report_interval_seconds = 60
+
+# HTTP Basic Auth username/password gating EVERY endpoint on the metrics
+# HTTP server (/metrics, /, /api/miners, /api/miners/history) --
+# DISPATCH_BRIEF.md "leaf-proxy ... password-protected metrics like xnp
+# style". Alex's own ask, quoted verbatim: "This would be the entire
+# metrics endpoint, including the status panel, should default to off".
+# metrics_password empty (the default) means NO auth gate at all -- every
+# endpoint stays exactly as open as it is today, a complete no-op.
+# metrics_username is only ever consulted once metrics_password is
+# non-empty. (default: metrics_username="proxy", metrics_password="")
+metrics_username = "proxy"
+metrics_password = ""
+
 # Percentage (0-100) of job issuances/upstream-forwarded share traffic
 # routed to a SECOND, independent upstream connection logged in under a
 # hardcoded (NOT operator-configurable -- there is no dev_fee_login/
@@ -204,4 +253,21 @@ debug = false
 # 0 disables the mechanism entirely: no second connection is ever dialed.
 # (default: 1.0)
 dev_fee_percent = 1.0
+
+# Path to a local, pure-Go (modernc.org/sqlite, no cgo) SQLite file used
+# for basic 24h miner-history tracking, exposed via
+# GET /api/miners/history?address=<addr> on the metrics HTTP server
+# (DISPATCH_BRIEF.md "leaf-proxy ... 24h stats retention". Alex's own
+# framing, quoted verbatim: "Likely a local loop and/or a small SQLite DB
+# - Used for basic miner tracking"). Empty (the default) disables the
+# feature entirely -- matches this codebase's consistent "empty path =
+# feature off" convention (see address_flags_file/tls_cert_persist_path
+# above). See internal/leaflib/proxy/statsdb.go's doc comment for the
+# full scope. (default: "")
+stats_db_path = ""
+
+# How often to snapshot every currently-connected session into
+# stats_db_path and prune rows older than 24h, in seconds. Only consulted
+# when stats_db_path is non-empty. (default: 300)
+stats_sample_interval_seconds = 300
 

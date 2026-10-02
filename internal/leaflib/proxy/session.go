@@ -449,7 +449,18 @@ func classifyCloseError(err error) string {
 func (s *Session) handleLine(line string) {
 	var req Request
 	if err := json.Unmarshal([]byte(line), &req); err != nil {
-		s.server.logger.Printf("proxy: session %s sent unparseable message, dropping: %v", s.sessionID, err)
+		// DISPATCH_BRIEF.md "log levels (0/1/2) to quiet
+		// unparsable-client-message noise in foreground mode": this
+		// is Alex's explicitly-cited offender -- under real-world
+		// conditions (bad/buggy miner clients, port scanners hitting
+		// the stratum port) this fires constantly and floods
+		// foreground/systemd-journal output with noise that isn't
+		// actionable. Gated at level 1 (Logf(1, ...) -- fires at the
+		// default level and above, suppressed only at -log-level=0)
+		// via leaflib.DebugLogger.Logf, so the DEFAULT behavior
+		// (level 1, "normal") remains byte-identical to this line's
+		// pre-existing, un-leveled s.server.logger.Printf call.
+		s.server.debugLogger.Logf(1, "proxy: session %s sent unparseable message, dropping: %v", s.sessionID, err)
 		return
 	}
 	switch req.Method {
@@ -511,7 +522,14 @@ func (s *Session) handleLogin(req Request) {
 	// the empty-stripped-address check below bounds the parse's
 	// OUTPUT.
 	if len(login.Login) > maxProxyLoginLen {
-		s.server.logger.Printf("proxy: rejecting login with an oversized login string (%d bytes, max %d) from session %s", len(login.Login), maxProxyLoginLen, s.sessionID)
+		// DISPATCH_BRIEF.md "log levels": same "expected,
+		// non-actionable, attacker/misconfig-triggerable" shape as
+		// handleLine's unparseable-message line above -- an
+		// oversized login string is exactly the kind of
+		// mis-configured-or-hostile-client noise -log-level=0 exists
+		// to quiet. Gated identically (Logf(1, ...)) for the same
+		// "byte-identical at the default level" reason.
+		s.server.debugLogger.Logf(1, "proxy: rejecting login with an oversized login string (%d bytes, max %d) from session %s", len(login.Login), maxProxyLoginLen, s.sessionID)
 		s.server.recordLoginRejection(metrics.LoginRejectionReasonOversizedLogin)
 		s.writeGeneralResponse(req.ID, "invalid address provided: too long", "")
 		return
