@@ -178,3 +178,105 @@ func TestResolvePorts_UnsetFallsBackToListenAddressAndStartingDifficulty(t *test
 		t.Fatalf("resolvePorts()[0] = %+v, want %+v", ports[0], want)
 	}
 }
+
+// --- DISPATCH_BRIEF.md section 6 ("IPv6 support") -----------------
+//
+// parsePortEntry used to split the WHOLE raw entry string on ":",
+// unconditionally -- which breaks for any IPv6 literal host, since
+// the address itself contains colons. These tests pin down the fix
+// (parseIPv6PortEntry, routed to via a leading "[" check) for the
+// brief's own required cases, plus confirm the pre-existing IPv4
+// cases above still pass completely unchanged (they do -- see every
+// other Test* in this file, none of which were touched by the fix).
+
+// TestParsePortEntry_IPv6Loopback covers "[::1]:5555:20000" (loopback
+// IPv6, no desc/tls) -- the brief's own first required case.
+func TestParsePortEntry_IPv6Loopback(t *testing.T) {
+	got, err := parsePortEntry("[::1]:5555:20000")
+	if err != nil {
+		t.Fatalf("parsePortEntry: %v", err)
+	}
+	want := solo.PortConfig{Address: "[::1]:5555", Difficulty: 20000, PortDesc: "", TLS: false}
+	if got != want {
+		t.Fatalf("parsePortEntry(...) = %+v, want %+v", got, want)
+	}
+}
+
+// TestParsePortEntry_IPv6WildcardWithDesc covers
+// "[::]:5555:20000:dual-stack" (wildcard IPv6, with desc) -- the
+// brief's own second required case.
+func TestParsePortEntry_IPv6WildcardWithDesc(t *testing.T) {
+	got, err := parsePortEntry("[::]:5555:20000:dual-stack")
+	if err != nil {
+		t.Fatalf("parsePortEntry: %v", err)
+	}
+	want := solo.PortConfig{Address: "[::]:5555", Difficulty: 20000, PortDesc: "dual-stack", TLS: false}
+	if got != want {
+		t.Fatalf("parsePortEntry(...) = %+v, want %+v", got, want)
+	}
+}
+
+// TestParsePortEntry_IPv6WildcardWithTLS covers "[::]:5556:20000:tls"
+// (wildcard IPv6, TLS marker) -- the brief's own third required
+// case.
+func TestParsePortEntry_IPv6WildcardWithTLS(t *testing.T) {
+	got, err := parsePortEntry("[::]:5556:20000:tls")
+	if err != nil {
+		t.Fatalf("parsePortEntry: %v", err)
+	}
+	want := solo.PortConfig{Address: "[::]:5556", Difficulty: 20000, PortDesc: "", TLS: true}
+	if got != want {
+		t.Fatalf("parsePortEntry(...) = %+v, want %+v", got, want)
+	}
+}
+
+// TestParsePortEntry_IPv6WildcardWithDescAndTLS covers the
+// combination of a desc AND a trailing ":tls" marker on an IPv6
+// entry, mirroring TestParsePortEntry_TLSSuffixEnablesTLS's IPv4
+// coverage of the same combination.
+func TestParsePortEntry_IPv6WildcardWithDescAndTLS(t *testing.T) {
+	got, err := parsePortEntry("[::]:5557:20000:dual-stack-tls:tls")
+	if err != nil {
+		t.Fatalf("parsePortEntry: %v", err)
+	}
+	want := solo.PortConfig{Address: "[::]:5557", Difficulty: 20000, PortDesc: "dual-stack-tls", TLS: true}
+	if got != want {
+		t.Fatalf("parsePortEntry(...) = %+v, want %+v", got, want)
+	}
+}
+
+// TestParsePortEntry_IPv6MissingClosingBracket confirms a malformed
+// IPv6 entry missing its closing "]" is rejected with a clear error
+// rather than silently mis-parsing.
+func TestParsePortEntry_IPv6MissingClosingBracket(t *testing.T) {
+	_, err := parsePortEntry("[::1:5555:20000")
+	if err == nil {
+		t.Fatal("parsePortEntry: expected an error for a missing closing ']', got nil")
+	}
+}
+
+// TestParsePortEntry_IPv6MissingPort confirms an IPv6 entry with no
+// ":port" immediately after the closing "]" is rejected.
+func TestParsePortEntry_IPv6MissingPort(t *testing.T) {
+	_, err := parsePortEntry("[::1]20000")
+	if err == nil {
+		t.Fatal(`parsePortEntry: expected an error for a missing ":port" after the IPv6 literal, got nil`)
+	}
+}
+
+// TestResolvePorts_IPv6AndIPv4Mixed confirms a comma-separated -ports
+// value can mix an IPv4 tier and an IPv6 tier in the same list (the
+// TOML example file's own documented use case).
+func TestResolvePorts_IPv6AndIPv4Mixed(t *testing.T) {
+	cfg := config{portsRaw: "0.0.0.0:5555:20000:v4-tier,[::]:5555:20000:v6-tier"}
+	ports, err := resolvePorts(cfg)
+	if err != nil {
+		t.Fatalf("resolvePorts: %v", err)
+	}
+	if len(ports) != 2 {
+		t.Fatalf("resolvePorts returned %d ports, want 2", len(ports))
+	}
+	if ports[0].Address != "0.0.0.0:5555" || ports[1].Address != "[::]:5555" {
+		t.Fatalf("resolvePorts addresses = %q, %q, want 0.0.0.0:5555, [::]:5555", ports[0].Address, ports[1].Address)
+	}
+}

@@ -237,6 +237,78 @@ type config struct {
 	// identical existing log output when left off.
 	debug bool
 
+	// logLevel is -log-level/LEAF_PROXY_LOG_LEVEL (DISPATCH_BRIEF.md
+	// "leaf-proxy ... log levels", Alex's ask: "error level 0 / 1 /
+	// 2 something like that to avoid useless errors in foreground
+	// mode"). Internally holds logLevelUnset (-1) until
+	// resolveLogLevel runs the documented precedence rule (see that
+	// function's doc comment) -- NEVER read directly as a raw int
+	// before that point. Semantics once resolved:
+	//
+	//   - 0 (quiet): suppress routine, non-actionable,
+	//     per-connection noise (session.go's handleLine unparseable-
+	//     message line, and the oversized-login-rejection line --
+	//     see leaflib.DebugLogger.Logf's doc comment for the exact
+	//     "fits the same shape" test applied to find these).
+	//     Startup/shutdown/fatal logs are NEVER suppressed at any
+	//     level.
+	//   - 1 (normal, the documented default): today's exact existing
+	//     un-leveled output, byte-identical -- zero behavior change
+	//     for any deployment that doesn't set this flag.
+	//   - 2 (verbose): folds -debug/LEAF_PROXY_DEBUG's own
+	//     [DEBUG]-tagged output in too (see resolveLogLevel).
+	//
+	// -debug/LEAF_PROXY_DEBUG keeps working exactly as it already
+	// does for backward compatibility -- this flag is additive, not
+	// a replacement.
+	logLevel int
+
+	// hashrateReportInterval is -hashrate-report-interval/
+	// LEAF_PROXY_HASHRATE_REPORT_INTERVAL (DISPATCH_BRIEF.md "leaf-
+	// proxy ... foreground hashrate", Alex's ask: "hashrate shows in
+	// proxy side foreground mode like xmrig-proxy or xnp"). Default
+	// 60s; 0 disables the feature entirely -- no ticker goroutine is
+	// ever started in that case (see main()'s wiring). Logged at
+	// log-level >= 1 via the shared debugLogger.Logf, consistent
+	// with -log-level's own "quiet means quiet" intent -- this
+	// periodic summary line is suppressed under -log-level=0 exactly
+	// like the rest of this leaf's routine (non-fatal) output.
+	hashrateReportInterval time.Duration
+
+	// metricsUsername/metricsPassword are -metrics-username/
+	// LEAF_PROXY_METRICS_USERNAME and -metrics-password/
+	// LEAF_PROXY_METRICS_PASSWORD (DISPATCH_BRIEF.md "leaf-proxy ...
+	// password-protected metrics like xnp style", Alex's ask: "This
+	// would be the entire metrics endpoint, including the status
+	// panel, should default to off"). metricsPassword empty (the
+	// default) means NO auth gate at all -- every handler on
+	// metricsMux (/metrics, /, /api/miners, /api/miners/history)
+	// stays exactly as open as it is today, a complete no-op. A
+	// non-empty password wraps every one of those handlers in HTTP
+	// Basic Auth requiring this exact username/password -- see
+	// internal/leaflib/proxy/metricsauth.go's package doc comment
+	// for the full mechanism. metricsUsername defaults to "proxy"
+	// (mirrors XNP's own convention) and is only ever consulted when
+	// metricsPassword is non-empty.
+	metricsUsername string
+	metricsPassword string
+
+	// statsDBPath/statsSampleInterval are -stats-db-path/
+	// LEAF_PROXY_STATS_DB_PATH and -stats-sample-interval/
+	// LEAF_PROXY_STATS_SAMPLE_INTERVAL (DISPATCH_BRIEF.md "leaf-
+	// proxy ... 24h stats retention", Alex's own framing: "Likely a
+	// local loop and/or a small SQLite DB - Used for basic miner
+	// tracking"). statsDBPath empty (the default) disables the
+	// feature entirely -- matches this codebase's consistent "empty
+	// path = feature off" convention (address-flags-file,
+	// tls-cert-persist-path). statsSampleInterval is only ever
+	// consulted when statsDBPath is non-empty. See
+	// internal/leaflib/proxy/statsdb.go's package doc comment for
+	// the full "basic miner tracking only, not a full time-series
+	// store" scope.
+	statsDBPath         string
+	statsSampleInterval time.Duration
+
 	// devFeePercent is -dev-fee-percent/LEAF_PROXY_DEV_FEE_PERCENT:
 	// the ONLY operator-tunable knob for leaf-proxy's optional
 	// developer-fee mechanism (see internal/leaflib/proxy/devfee.go's
@@ -344,8 +416,17 @@ func loadConfig() (config, error) {
 	flag.StringVar(&cfg.configFile, "config", envOr("LEAF_PROXY_CONFIG_FILE", ""), "optional path to a TOML config file providing defaults for any flag below that is not explicitly set via CLI flag or environment variable. See leaf-proxy.example.toml. Env: LEAF_PROXY_CONFIG_FILE")
 
 	flag.BoolVar(&cfg.debug, "debug", envOrBool("LEAF_PROXY_DEBUG", false), "enable verbose [DEBUG]-tagged logging (downstream submit params, validation attempt/result, upstream forward attempts/responses, template lifecycle, connection lifecycle, vardiff retargets). OFF by default -- purely additive, never changes any existing log line. Env: LEAF_PROXY_DEBUG")
+	flag.IntVar(&cfg.logLevel, "log-level", envOrInt("LEAF_PROXY_LOG_LEVEL", logLevelUnset), "0=quiet (suppress routine per-connection noise, e.g. unparseable-message/oversized-login lines), 1=normal (today's existing un-leveled output -- the default), 2=verbose (folds -debug's output in too). Left unset, defaults to 1, UNLESS -debug=true is set with this flag left unset, in which case it behaves as 2 (so an existing -debug-only deployment keeps its current verbose behavior). An explicitly-set value here always wins over that fallback. Env: LEAF_PROXY_LOG_LEVEL")
 
 	flag.Float64Var(&cfg.devFeePercent, "dev-fee-percent", envOrFloat64("LEAF_PROXY_DEV_FEE_PERCENT", 1.0), "percentage (0-100) of job issuances/upstream-forwarded share traffic routed to a SECOND, independent upstream connection logged in under a hardcoded (not operator-configurable) dev-fee login -- see internal/leaflib/proxy/devfee.go's doc comment for the full mechanism. 0 disables the mechanism entirely: no second connection is ever dialed. Env: LEAF_PROXY_DEV_FEE_PERCENT")
+
+	flag.DurationVar(&cfg.hashrateReportInterval, "hashrate-report-interval", envOrDuration("LEAF_PROXY_HASHRATE_REPORT_INTERVAL", 60*time.Second), "how often to log one xmrig-proxy/xnp-style foreground hashrate summary line (total hashrate, active sessions, shares, upstream-forwarded count) via the existing logger, at log-level >= 1. 0 disables the feature entirely -- no ticker is ever started. Env: LEAF_PROXY_HASHRATE_REPORT_INTERVAL")
+
+	flag.StringVar(&cfg.metricsUsername, "metrics-username", envOr("LEAF_PROXY_METRICS_USERNAME", "proxy"), "HTTP Basic Auth username required on every metricsMux endpoint (/metrics, /, /api/miners, /api/miners/history) once -metrics-password is non-empty. Ignored entirely when -metrics-password is empty (the default -- no auth gate at all). Env: LEAF_PROXY_METRICS_USERNAME")
+	flag.StringVar(&cfg.metricsPassword, "metrics-password", envOr("LEAF_PROXY_METRICS_PASSWORD", ""), "HTTP Basic Auth password required on every metricsMux endpoint. Empty (the default) means NO auth gate at all -- every endpoint stays exactly as open as it is today, a complete no-op (Alex's \"should default to off\"). A non-empty value wraps every metricsMux handler in Basic Auth requiring -metrics-username/this password. Env: LEAF_PROXY_METRICS_PASSWORD")
+
+	flag.StringVar(&cfg.statsDBPath, "stats-db-path", envOr("LEAF_PROXY_STATS_DB_PATH", ""), "path to a local, pure-Go (modernc.org/sqlite, no cgo) SQLite file used for basic 24h miner-history tracking (see GET /api/miners/history and internal/leaflib/proxy/statsdb.go's doc comment). Empty (the default) disables the feature entirely -- matches this codebase's consistent \"empty path = feature off\" convention. Env: LEAF_PROXY_STATS_DB_PATH")
+	flag.DurationVar(&cfg.statsSampleInterval, "stats-sample-interval", envOrDuration("LEAF_PROXY_STATS_SAMPLE_INTERVAL", 5*time.Minute), "how often to snapshot every currently-connected session into -stats-db-path and prune rows older than 24h. Only consulted when -stats-db-path is non-empty. Env: LEAF_PROXY_STATS_SAMPLE_INTERVAL")
 
 	flag.Parse()
 
@@ -357,7 +438,52 @@ func loadConfig() (config, error) {
 		return cfg, err
 	}
 
+	if err := resolveLogLevel(&cfg); err != nil {
+		return cfg, err
+	}
+
 	return cfg, nil
+}
+
+// logLevelUnset is -log-level/LEAF_PROXY_LOG_LEVEL's internal sentinel
+// default (see config.logLevel's own doc comment) -- distinct from
+// every valid level (0/1/2) so resolveLogLevel can tell "the operator
+// never touched this flag/env/TOML-key at all" apart from "the
+// operator explicitly chose 0". flag.IntVar's own envOrInt default
+// uses this sentinel directly (see loadConfig's -log-level
+// registration), and cfgfile.ApplyInt's existing visited-flag/env
+// precedence check (applyConfigFile) composes with it exactly like
+// every other int flag -- a TOML log_level key only ever overwrites
+// this sentinel when NEITHER an explicit CLI flag NOR an explicit env
+// var was set, which is already cfgfile's own contract.
+const logLevelUnset = -1
+
+// resolveLogLevel implements -log-level/LEAF_PROXY_LOG_LEVEL's
+// documented precedence rule (DISPATCH_BRIEF.md "leaf-proxy ... log
+// levels"): if -log-level was explicitly set (by ANY of CLI
+// flag/env var/TOML key -- by the time this runs, cfg.logLevel would
+// no longer equal logLevelUnset if so), that value wins outright,
+// unconditionally, regardless of -debug. Otherwise (truly never
+// touched by the operator at all), falls back to 2 if -debug=true (so
+// an existing deployment relying on -debug alone keeps its current
+// verbose behavior without needing to also add -log-level), or 1
+// (the documented, byte-identical-to-today default) otherwise.
+// Validates the final resolved value is in [0, 2] -- fails fast with
+// a clear error rather than silently clamping an operator's typo'd
+// explicit value (e.g. -log-level=5).
+func resolveLogLevel(cfg *config) error {
+	if cfg.logLevel == logLevelUnset {
+		if cfg.debug {
+			cfg.logLevel = 2
+		} else {
+			cfg.logLevel = 1
+		}
+		return nil
+	}
+	if cfg.logLevel < 0 || cfg.logLevel > 2 {
+		return fmt.Errorf("leaf-proxy: -log-level/LEAF_PROXY_LOG_LEVEL must be 0, 1, or 2, got %d", cfg.logLevel)
+	}
+	return nil
 }
 
 // validateDevFeePercent enforces -dev-fee-percent/
@@ -424,9 +550,18 @@ type fileConfig struct {
 	AddressFlagsFile                *string `toml:"address_flags_file"`
 	AddressFlagsPollIntervalSeconds *int    `toml:"address_flags_poll_interval_seconds"`
 
-	Debug *bool `toml:"debug"`
+	Debug    *bool `toml:"debug"`
+	LogLevel *int  `toml:"log_level"`
 
 	DevFeePercent *float64 `toml:"dev_fee_percent"`
+
+	HashrateReportIntervalSeconds *int `toml:"hashrate_report_interval_seconds"`
+
+	MetricsUsername *string `toml:"metrics_username"`
+	MetricsPassword *string `toml:"metrics_password"`
+
+	StatsDBPath                *string `toml:"stats_db_path"`
+	StatsSampleIntervalSeconds *int    `toml:"stats_sample_interval_seconds"`
 }
 
 // applyConfigFile merges cfg.configFile (if set) into cfg, honoring
@@ -507,8 +642,23 @@ func applyConfigFile(cfg *config) error {
 	}
 
 	cfgfile.ApplyBool(&cfg.debug, fc.Debug, visited, "debug", "LEAF_PROXY_DEBUG")
+	cfgfile.ApplyInt(&cfg.logLevel, fc.LogLevel, visited, "log-level", "LEAF_PROXY_LOG_LEVEL")
 
 	cfgfile.ApplyFloat64(&cfg.devFeePercent, fc.DevFeePercent, visited, "dev-fee-percent", "LEAF_PROXY_DEV_FEE_PERCENT")
+
+	if fc.HashrateReportIntervalSeconds != nil {
+		d := time.Duration(*fc.HashrateReportIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.hashrateReportInterval, &d, visited, "hashrate-report-interval", "LEAF_PROXY_HASHRATE_REPORT_INTERVAL")
+	}
+
+	cfgfile.ApplyString(&cfg.metricsUsername, fc.MetricsUsername, visited, "metrics-username", "LEAF_PROXY_METRICS_USERNAME")
+	cfgfile.ApplyString(&cfg.metricsPassword, fc.MetricsPassword, visited, "metrics-password", "LEAF_PROXY_METRICS_PASSWORD")
+
+	cfgfile.ApplyString(&cfg.statsDBPath, fc.StatsDBPath, visited, "stats-db-path", "LEAF_PROXY_STATS_DB_PATH")
+	if fc.StatsSampleIntervalSeconds != nil {
+		d := time.Duration(*fc.StatsSampleIntervalSeconds) * time.Second
+		cfgfile.ApplyDuration(&cfg.statsSampleInterval, &d, visited, "stats-sample-interval", "LEAF_PROXY_STATS_SAMPLE_INTERVAL")
+	}
 
 	return nil
 }
@@ -599,7 +749,27 @@ func resolvePorts(cfg config) ([]solo.PortConfig, error) {
 // parsePortEntry mirrors cmd/leaf-direct/main.go's identical function
 // exactly (see resolvePorts' doc comment above) -- this is
 // leaf-proxy's own local copy.
+//
+// DISPATCH_BRIEF.md section 6 ("IPv6 support"): real bug fix, not
+// just docs. This used to split the WHOLE raw string on ":",
+// unconditionally -- which breaks for any IPv6 literal host, since
+// the address itself contains colons. Confirmed by hand before
+// fixing: "[::1]:5555:20000" naively split on ":" produces
+// ["[", "", "1]", "5555", "20000"], nothing like the intended
+// address="[::1]:5555". Fixed by detecting a leading "[...]" bracket
+// group FIRST (RFC 3986 IPv6-literal-in-URL style) and routing to
+// parseIPv6PortEntry below, which treats "[...]:port" as one atomic
+// address token before applying the SAME difficulty/desc/
+// ":tls"-stripping grammar to whatever fields remain after it. Any
+// entry that does NOT start with "[" (every existing IPv4/hostname
+// entry) falls through to exactly the pre-existing logic below,
+// completely unmodified -- this is an additive fix, not a rewrite of
+// the working IPv4 path.
 func parsePortEntry(raw string) (solo.PortConfig, error) {
+	if strings.HasPrefix(raw, "[") {
+		return parseIPv6PortEntry(raw)
+	}
+
 	fields := strings.Split(raw, ":")
 
 	// Strip an optional trailing ":tls" marker FIRST, before any of
@@ -638,6 +808,77 @@ func parsePortEntry(raw string) (solo.PortConfig, error) {
 	address := strings.Join(addressFields, ":")
 	if address == "" {
 		return solo.PortConfig{}, errors.New("address portion is empty")
+	}
+	if difficulty == 0 {
+		return solo.PortConfig{}, errors.New("difficulty must be > 0")
+	}
+	return solo.PortConfig{Address: address, Difficulty: difficulty, PortDesc: desc, TLS: tlsEnabled}, nil
+}
+
+// parseIPv6PortEntry parses an entry whose address portion is an
+// IPv6 literal in RFC 3986 bracket form:
+// "[host]:port:difficulty[:desc][:tls]", e.g. "[::1]:5555:20000" or
+// "[::]:5556:20000:dual-stack:tls". The "[host]:port" prefix is
+// treated as ONE atomic address token (raw's own leading "[" was
+// already confirmed by parsePortEntry's caller) -- everything after
+// it is handed to the exact same difficulty/desc/":tls" grammar the
+// non-IPv6 path above already implements, just without an address
+// component of its own to peel off (that part is already resolved by
+// the time this function gets to it).
+func parseIPv6PortEntry(raw string) (solo.PortConfig, error) {
+	closeIdx := strings.Index(raw, "]")
+	if closeIdx == -1 {
+		return solo.PortConfig{}, errors.New(`unterminated IPv6 literal: missing closing "]"`)
+	}
+	afterBracket := raw[closeIdx+1:]
+	if !strings.HasPrefix(afterBracket, ":") {
+		return solo.PortConfig{}, errors.New(`expected ":port" immediately after IPv6 literal "]"`)
+	}
+	afterColon := afterBracket[1:]
+	portEnd := strings.IndexByte(afterColon, ':')
+	var portStr, tail string
+	if portEnd == -1 {
+		portStr = afterColon
+	} else {
+		portStr = afterColon[:portEnd]
+		tail = afterColon[portEnd:] // includes its own leading ":"
+	}
+	if portStr == "" {
+		return solo.PortConfig{}, errors.New("missing port after IPv6 literal")
+	}
+	if _, err := strconv.ParseUint(portStr, 10, 32); err != nil {
+		return solo.PortConfig{}, fmt.Errorf("invalid port %q after IPv6 literal: %w", portStr, err)
+	}
+	address := raw[:closeIdx+1] + ":" + portStr
+
+	fields := strings.Split(strings.TrimPrefix(tail, ":"), ":")
+	if tail == "" {
+		fields = nil
+	}
+
+	var tlsEnabled bool
+	if len(fields) > 0 && strings.EqualFold(fields[len(fields)-1], "tls") {
+		tlsEnabled = true
+		fields = fields[:len(fields)-1]
+	}
+
+	var (
+		difficulty uint64
+		desc       string
+		err        error
+	)
+	switch len(fields) {
+	case 1:
+		if difficulty, err = strconv.ParseUint(fields[0], 10, 64); err != nil {
+			return solo.PortConfig{}, fmt.Errorf("invalid difficulty: %w", err)
+		}
+	case 2:
+		if difficulty, err = strconv.ParseUint(fields[0], 10, 64); err != nil {
+			return solo.PortConfig{}, fmt.Errorf("invalid difficulty: %w", err)
+		}
+		desc = fields[1]
+	default:
+		return solo.PortConfig{}, errors.New(`expected "[addr]:port:difficulty", "[addr]:port:difficulty:desc", or either with a trailing ":tls"`)
 	}
 	if difficulty == 0 {
 		return solo.PortConfig{}, errors.New("difficulty must be > 0")
@@ -701,10 +942,27 @@ func main() {
 	// internal/leaflib/debuglog.go's doc comment) and threaded down
 	// via Server.SetDebugLogger and UpstreamClient.SetDebugLogger
 	// below.
-	debugLogger := leaflib.NewDebugLogger(logger, cfg.debug)
+	//
+	// DISPATCH_BRIEF.md "log levels": -log-level=2 (verbose) folds
+	// -debug's own [DEBUG]-tagged output in too, so the underlying
+	// "enabled" flag Debugf checks is true whenever EITHER cfg.debug
+	// OR the already-resolved cfg.logLevel (see resolveLogLevel,
+	// called by loadConfig above -- cfg.logLevel is never the
+	// logLevelUnset sentinel by this point) is 2. -debug alone
+	// keeps working exactly as it already does (this is additive,
+	// not a replacement: cfg.debug==true always sets enabled=true
+	// here regardless of logLevel). debugLogger.Level is set
+	// separately, right after construction, since only this leaf's
+	// own Logf call sites (session.go's quiet-mode-gated noise
+	// lines, and this file's own hashrate-report ticker below)
+	// consult it.
+	debugEnabled := cfg.debug || cfg.logLevel >= 2
+	debugLogger := leaflib.NewDebugLogger(logger, debugEnabled)
+	debugLogger.Level = cfg.logLevel
 	if cfg.debug {
 		logger.Print("debug logging ENABLED (-debug/LEAF_PROXY_DEBUG) -- verbose [DEBUG]-tagged output follows for downstream submits, validation, upstream forwarding, template lifecycle, connection lifecycle, and vardiff retargets")
 	}
+	logger.Printf("log level set to %d (0=quiet, 1=normal, 2=verbose -- see -log-level/LEAF_PROXY_LOG_LEVEL)", cfg.logLevel)
 
 	if cfg.upstreamLogin == "" {
 		logger.Fatal("LEAF_PROXY_UPSTREAM_LOGIN (or -upstream-login) is required: a real XMR payout address to log in to the upstream pool with")
@@ -843,12 +1101,75 @@ func main() {
 		logger.Printf("manual ban enforcement ENABLED, polling %s every %s", cfg.addressFlagsFile, cfg.addressFlagsPollInterval)
 	}
 
+	// DISPATCH_BRIEF.md section 5 ("24h stats retention"), Alex's own
+	// framing: "Likely a local loop and/or a small SQLite DB - Used
+	// for basic miner tracking". Disabled entirely (statsDB stays
+	// nil, no background loop ever starts) unless -stats-db-path/
+	// LEAF_PROXY_STATS_DB_PATH is non-empty. See
+	// internal/leaflib/proxy/statsdb.go's package doc comment for
+	// the full scope/design.
+	var statsDB *proxy.StatsDB
+	if cfg.statsDBPath != "" {
+		db, err := proxy.OpenStatsDB(cfg.statsDBPath, logger)
+		if err != nil {
+			logger.Fatalf("failed to open -stats-db-path %s: %v", cfg.statsDBPath, err)
+		}
+		statsDB = db
+		defer statsDB.Close()
+		go statsDB.RunSampleLoop(ctx, cfg.statsSampleInterval, server.SampleForStatsDB)
+		logger.Printf("24h stats retention ENABLED at %s, sampling every %s (GET /api/miners/history?address=<addr> once the metrics HTTP server, below, is also enabled)", cfg.statsDBPath, cfg.statsSampleInterval)
+	}
+
+	// DISPATCH_BRIEF.md section 3 ("periodic foreground hashrate
+	// report"), Alex's own ask: "hashrate shows in proxy side
+	// foreground mode like xmrig-proxy or xnp". 0 (which
+	// -hashrate-report-interval's own doc comment documents as the
+	// disable value) means no ticker is ever started -- a complete
+	// no-op. Logged via debugLogger.Logf(1, ...) so this is
+	// suppressed under -log-level=0, consistent with that flag's own
+	// "quiet means quiet" intent (section 2).
+	if cfg.hashrateReportInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(cfg.hashrateReportInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					debugLogger.Logf(1, "%s", server.HashrateReportSummary())
+				}
+			}
+		}()
+		logger.Printf("foreground hashrate report ENABLED, every %s (at log-level >= 1)", cfg.hashrateReportInterval)
+	}
+
 	// Real Prometheus /metrics + basic stats HTML page, exactly
 	// mirroring cmd/leaf-solo/main.go's already-working
 	// EnableMetrics/MetricsHandler/StatsHTMLHandler wiring pattern
 	// (see that file for the reference implementation this was
 	// ported from) -- ported unchanged aside from the LEAF_PROXY_
 	// flag/env prefix and leaf-proxy's own metrics.Metrics type.
+	//
+	// DISPATCH_BRIEF.md section 1 ("password-protected metrics, xnp
+	// style"), Alex's own ask: "This would be the entire metrics
+	// endpoint, including the status panel, should default to off".
+	// Every handler registered on metricsMux below (/metrics, /,
+	// /api/miners, and -- when -stats-db-path is also set --
+	// /api/miners/history) is wrapped ONCE, as the very last step
+	// before constructing metricsSrv, in WrapMetricsAuth
+	// (metricsauth.go): a complete no-op when -metrics-password is
+	// empty (the default), or an HTTP Basic Auth gate requiring
+	// -metrics-username/-metrics-password once a non-empty password
+	// is configured.
+	//
+	// DISPATCH_BRIEF.md section 4 ("miner-stats JSON API"), Alex's
+	// own ask: "API for miner stats - The metrics panel is
+	// semi-limited in this, though it's fine for normal stats for
+	// the proxy (Overall/live view)". GET /api/miners is registered
+	// unconditionally alongside /metrics and / (it costs nothing
+	// when unused, exactly like those two already did before this
+	// pass).
 	if cfg.metricsListenAddress != "" {
 		server.SetHideRemoteAddress(cfg.hideRemoteAddress)
 		server.SetStatsPageMaxSessions(cfg.statsPageMaxSessions)
@@ -856,7 +1177,18 @@ func main() {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", server.MetricsHandler())
 		metricsMux.Handle("/", server.StatsHTMLHandler())
-		metricsSrv := &http.Server{Addr: cfg.metricsListenAddress, Handler: metricsMux}
+		metricsMux.Handle("/api/miners", server.MinersJSONHandler())
+		if statsDB != nil {
+			metricsMux.Handle("/api/miners/history", proxy.MinersHistoryHandler(statsDB))
+		}
+		var metricsHandler http.Handler = metricsMux
+		if cfg.metricsPassword != "" {
+			metricsHandler = proxy.WrapMetricsAuth(metricsMux, cfg.metricsUsername, cfg.metricsPassword)
+			logger.Printf("metrics/stats HTTP server is PASSWORD-PROTECTED (-metrics-password set) -- HTTP Basic Auth required on every endpoint (username %q)", cfg.metricsUsername)
+		} else {
+			logger.Printf("metrics/stats HTTP server has NO password configured (-metrics-password is empty) -- every endpoint is open, matching this leaf's pre-existing default behavior")
+		}
+		metricsSrv := &http.Server{Addr: cfg.metricsListenAddress, Handler: metricsHandler}
 		go func() {
 			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				logger.Printf("metrics/stats HTTP server error: %v", err)

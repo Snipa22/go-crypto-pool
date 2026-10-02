@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -219,6 +220,127 @@ func (s *Server) StatsHTMLHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := statsPageTemplate.Execute(w, data); err != nil {
 			http.Error(w, fmt.Sprintf("failed to render stats page: %v", err), http.StatusInternalServerError)
+		}
+	})
+}
+
+// HashrateReportSummary renders a single, xmrig-proxy/xnp-style
+// foreground summary line from a fresh Stats() snapshot (DISPATCH_
+// BRIEF.md "leaf-proxy ... foreground hashrate", Alex's ask:
+// "hashrate shows in proxy side foreground mode like xmrig-proxy or
+// xnp") -- e.g.
+// "hashrate: total=12.34 MH/s sessions=7 shares=142 upstream_forwarded=3".
+// Reuses formatHashrate (above) for the human-readable unit
+// formatting rather than re-implementing it, per the brief's own
+// explicit instruction. cmd/leaf-proxy/main.go's own periodic ticker
+// is the intended (and, today, only) caller -- see that file's
+// -hashrate-report-interval wiring, which logs this string via the
+// shared debugLogger.Logf(1, ...) so it is suppressed under
+// -log-level=0 exactly like this leaf's other routine output.
+func (s *Server) HashrateReportSummary() string {
+	st := s.Stats()
+	return fmt.Sprintf("hashrate: total=%s sessions=%d shares=%d upstream_forwarded=%d",
+		formatHashrate(st.TotalEstimatedHashrate), st.ActiveSessions, st.TotalShares, st.TotalBlocks)
+}
+
+// MinersAPIOverview is the "overview" object of the GET /api/miners
+// JSON response (DISPATCH_BRIEF.md "leaf-proxy ... miner-stats API"),
+// built from the exact same Stats() snapshot StatsHTMLHandler's stat
+// cards already use -- deliberately "the same data, JSON-shaped", not
+// a new stats-collection mechanism.
+type MinersAPIOverview struct {
+	UpstreamConnected  bool    `json:"upstream_connected"`
+	UpstreamReconnects uint64  `json:"upstream_reconnects"`
+	ActiveSessions     int     `json:"active_sessions"`
+	UniqueRemoteIPs    int     `json:"unique_remote_ips"`
+	TotalShares        uint64  `json:"total_shares"`
+	TotalBlocks        uint64  `json:"total_blocks"`
+	GlobalHashrateHz   float64 `json:"global_hashrate_hz"`
+}
+
+// MinerAPIEntry is one connected session's entry in the GET
+// /api/miners JSON response's "miners" array -- field-for-field the
+// same data SessionStat already carries (see that type's doc
+// comment, including its FIX_BRIEF.md finding #16
+// miner-spoofability caveat for EstimatedHashrateHz/ShareCount below
+// a below-upstream-target share), JSON-shaped instead of HTML-row-
+// shaped. RemoteAddr uses `omitempty` AND is only ever populated when
+// s.hideRemoteAddress is false (MinersJSONHandler below) -- when
+// hidden, the key is genuinely ABSENT from the marshaled JSON, not
+// merely empty-stringed, mirroring StatsHTMLHandler's own "omit the
+// column entirely" behavior for the HTML table.
+type MinerAPIEntry struct {
+	SessionID              string  `json:"session_id"`
+	Address                string  `json:"address"`
+	Worker                 string  `json:"worker"`
+	Port                   string  `json:"port"`
+	RemoteAddr             string  `json:"remote_addr,omitempty"`
+	ConnectedAt            string  `json:"connected_at"`
+	UptimeSeconds          int64   `json:"uptime_seconds"`
+	Difficulty             uint64  `json:"difficulty"`
+	EstimatedHashrateHz    float64 `json:"estimated_hashrate_hz"`
+	ShareCount             uint64  `json:"share_count"`
+	UpstreamForwardedCount uint64  `json:"upstream_forwarded_count"`
+}
+
+// MinersAPIResponse is the full GET /api/miners JSON response body.
+type MinersAPIResponse struct {
+	GeneratedAt string            `json:"generated_at"`
+	Overview    MinersAPIOverview `json:"overview"`
+	Miners      []MinerAPIEntry   `json:"miners"`
+}
+
+// MinersJSONHandler serves GET /api/miners: the same Stats() snapshot
+// StatsHTMLHandler already renders as HTML, JSON-shaped instead
+// (DISPATCH_BRIEF.md "leaf-proxy ... miner-stats API" -- Alex's ask:
+// "API for miner stats - The metrics panel is semi-limited in this,
+// though it's fine for normal stats for the proxy (Overall/live
+// view)"). Intended registration: the SAME metricsMux /metrics and /
+// are already registered on (cmd/leaf-proxy/main.go), so section 1's
+// optional HTTP Basic Auth gate (metricsauth.go), once a password is
+// configured, covers this route too.
+func (s *Server) MinersJSONHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st := s.Stats()
+		hideRemote := s.hideRemoteAddress.Load()
+
+		miners := make([]MinerAPIEntry, 0, len(st.Sessions))
+		for _, sess := range st.Sessions {
+			entry := MinerAPIEntry{
+				SessionID:              sess.SessionID,
+				Address:                sess.Address,
+				Worker:                 sess.Worker,
+				Port:                   sess.Port,
+				ConnectedAt:            sess.ConnectedAt.UTC().Format(time.RFC3339),
+				UptimeSeconds:          int64(time.Since(sess.ConnectedAt).Round(time.Second).Seconds()),
+				Difficulty:             sess.CurrentDifficulty,
+				EstimatedHashrateHz:    sess.EstimatedHashrate,
+				ShareCount:             sess.ShareCount,
+				UpstreamForwardedCount: sess.BlockCount,
+			}
+			if !hideRemote {
+				entry.RemoteAddr = sess.RemoteAddr
+			}
+			miners = append(miners, entry)
+		}
+
+		resp := MinersAPIResponse{
+			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+			Overview: MinersAPIOverview{
+				UpstreamConnected:  st.UpstreamConnected,
+				UpstreamReconnects: st.UpstreamReconnects,
+				ActiveSessions:     st.ActiveSessions,
+				UniqueRemoteIPs:    st.UniqueRemoteIPs,
+				TotalShares:        st.TotalShares,
+				TotalBlocks:        st.TotalBlocks,
+				GlobalHashrateHz:   st.TotalEstimatedHashrate,
+			},
+			Miners: miners,
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			http.Error(w, fmt.Sprintf("failed to encode miners JSON: %v", err), http.StatusInternalServerError)
 		}
 	})
 }
