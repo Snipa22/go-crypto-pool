@@ -328,11 +328,18 @@ func (s *Server) StatsHTMLHandler() http.Handler {
 // "hashrate: total=12.34 MH/s sessions=7 shares=142 upstream_forwarded=3".
 // Reuses formatHashrate (above) for the human-readable unit
 // formatting rather than re-implementing it, per the brief's own
-// explicit instruction. cmd/leaf-proxy/main.go's own periodic ticker
-// is the intended (and, today, only) caller -- see that file's
-// -hashrate-report-interval wiring, which logs this string via the
-// shared debugLogger.Logf(1, ...) so it is suppressed under
-// -log-level=0 exactly like this leaf's other routine output.
+// explicit instruction. cmd/leaf-proxy/main.go's own periodic
+// ticker is the intended (and, today, only) caller: a fixed,
+// unconditional, always-on 30-second ticker with no disable/
+// reconfigure flag at all (DISPATCH_BRIEF_HASHRATE_API_FOLLOWUP.md
+// section 1, Alex's own ask verbatim: "show it at all log levels,
+// make it a 30 second print no matter what"). That caller logs this
+// string via the raw *log.Logger's Printf directly -- deliberately
+// NOT the leveled debugLogger.Logf/Debugf gate -- so it is printed
+// unconditionally at EVERY -log-level, including -log-level=0
+// (quiet). This is an intentional, permanent exception to this
+// leaf's usual "quiet means quiet" noise-gating; do not "fix" it by
+// routing it back through a level check.
 func (s *Server) HashrateReportSummary() string {
 	st := s.Stats()
 	return fmt.Sprintf("hashrate: total=%s sessions=%d shares=%d upstream_forwarded=%d",
@@ -380,6 +387,10 @@ type MinerAPIEntry struct {
 }
 
 // MinersAPIResponse is the full GET /api/miners JSON response body.
+// Miners is deliberately the FULL, uncapped set of currently-
+// connected sessions -- see MinersJSONHandler's doc comment for the
+// permanent, by-design guarantee this field carries (DISPATCH_
+// BRIEF_HASHRATE_API_FOLLOWUP.md section 2).
 type MinersAPIResponse struct {
 	GeneratedAt string            `json:"generated_at"`
 	Overview    MinersAPIOverview `json:"overview"`
@@ -395,6 +406,25 @@ type MinersAPIResponse struct {
 // are already registered on (cmd/leaf-proxy/main.go), so section 1's
 // optional HTTP Basic Auth gate (metricsauth.go), once a password is
 // configured, covers this route too.
+//
+// Provably, PERMANENTLY uncapped by design (DISPATCH_BRIEF_HASHRATE_
+// API_FOLLOWUP.md section 2, Alex's own framing: "lets make sure
+// /api/miners shows /all/ miners, the main stats page tends to
+// suppress some data"): this handler builds its "miners" array from
+// the raw st.Sessions returned by Stats() -- it deliberately does
+// NOT apply capSessionsForDisplay's session cap (StatsHTMLHandler's
+// ShownSessions truncation for a calm default HTML view) and does
+// NOT expose CapAddressCounts's address-cardinality cap
+// (st.MinersByAddress's "other"-bucket aggregation) in any form at
+// all -- there is no address-cardinality concept in this response
+// whatsoever, every connected session is listed individually by its
+// own address. This is the "full/comprehensive" counterpart to the
+// HTML stats page's deliberately-summarized default view, not an
+// accident of how Stats() happens to be wired today. See
+// miners_api_test.go's regression test, which is the real guardrail
+// against a future "let's just reuse ShownSessions here for
+// consistency" edit accidentally reintroducing a cap -- this comment
+// is only here to make the intent impossible to miss.
 func (s *Server) MinersJSONHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		st := s.Stats()

@@ -263,18 +263,6 @@ type config struct {
 	// a replacement.
 	logLevel int
 
-	// hashrateReportInterval is -hashrate-report-interval/
-	// LEAF_PROXY_HASHRATE_REPORT_INTERVAL (DISPATCH_BRIEF.md "leaf-
-	// proxy ... foreground hashrate", Alex's ask: "hashrate shows in
-	// proxy side foreground mode like xmrig-proxy or xnp"). Default
-	// 60s; 0 disables the feature entirely -- no ticker goroutine is
-	// ever started in that case (see main()'s wiring). Logged at
-	// log-level >= 1 via the shared debugLogger.Logf, consistent
-	// with -log-level's own "quiet means quiet" intent -- this
-	// periodic summary line is suppressed under -log-level=0 exactly
-	// like the rest of this leaf's routine (non-fatal) output.
-	hashrateReportInterval time.Duration
-
 	// metricsUsername/metricsPassword are -metrics-username/
 	// LEAF_PROXY_METRICS_USERNAME and -metrics-password/
 	// LEAF_PROXY_METRICS_PASSWORD (DISPATCH_BRIEF.md "leaf-proxy ...
@@ -420,8 +408,6 @@ func loadConfig() (config, error) {
 
 	flag.Float64Var(&cfg.devFeePercent, "dev-fee-percent", envOrFloat64("LEAF_PROXY_DEV_FEE_PERCENT", 1.0), "percentage (0-100) of job issuances/upstream-forwarded share traffic routed to a SECOND, independent upstream connection logged in under a hardcoded (not operator-configurable) dev-fee login -- see internal/leaflib/proxy/devfee.go's doc comment for the full mechanism. 0 disables the mechanism entirely: no second connection is ever dialed. Env: LEAF_PROXY_DEV_FEE_PERCENT")
 
-	flag.DurationVar(&cfg.hashrateReportInterval, "hashrate-report-interval", envOrDuration("LEAF_PROXY_HASHRATE_REPORT_INTERVAL", 60*time.Second), "how often to log one xmrig-proxy/xnp-style foreground hashrate summary line (total hashrate, active sessions, shares, upstream-forwarded count) via the existing logger, at log-level >= 1. 0 disables the feature entirely -- no ticker is ever started. Env: LEAF_PROXY_HASHRATE_REPORT_INTERVAL")
-
 	flag.StringVar(&cfg.metricsUsername, "metrics-username", envOr("LEAF_PROXY_METRICS_USERNAME", "proxy"), "HTTP Basic Auth username required on every metricsMux endpoint (/metrics, /, /api/miners, /api/miners/history) once -metrics-password is non-empty. Ignored entirely when -metrics-password is empty (the default -- no auth gate at all). Env: LEAF_PROXY_METRICS_USERNAME")
 	flag.StringVar(&cfg.metricsPassword, "metrics-password", envOr("LEAF_PROXY_METRICS_PASSWORD", ""), "HTTP Basic Auth password required on every metricsMux endpoint. Empty (the default) means NO auth gate at all -- every endpoint stays exactly as open as it is today, a complete no-op (Alex's \"should default to off\"). A non-empty value wraps every metricsMux handler in Basic Auth requiring -metrics-username/this password. Env: LEAF_PROXY_METRICS_PASSWORD")
 
@@ -555,8 +541,6 @@ type fileConfig struct {
 
 	DevFeePercent *float64 `toml:"dev_fee_percent"`
 
-	HashrateReportIntervalSeconds *int `toml:"hashrate_report_interval_seconds"`
-
 	MetricsUsername *string `toml:"metrics_username"`
 	MetricsPassword *string `toml:"metrics_password"`
 
@@ -645,11 +629,6 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyInt(&cfg.logLevel, fc.LogLevel, visited, "log-level", "LEAF_PROXY_LOG_LEVEL")
 
 	cfgfile.ApplyFloat64(&cfg.devFeePercent, fc.DevFeePercent, visited, "dev-fee-percent", "LEAF_PROXY_DEV_FEE_PERCENT")
-
-	if fc.HashrateReportIntervalSeconds != nil {
-		d := time.Duration(*fc.HashrateReportIntervalSeconds) * time.Second
-		cfgfile.ApplyDuration(&cfg.hashrateReportInterval, &d, visited, "hashrate-report-interval", "LEAF_PROXY_HASHRATE_REPORT_INTERVAL")
-	}
 
 	cfgfile.ApplyString(&cfg.metricsUsername, fc.MetricsUsername, visited, "metrics-username", "LEAF_PROXY_METRICS_USERNAME")
 	cfgfile.ApplyString(&cfg.metricsPassword, fc.MetricsPassword, visited, "metrics-password", "LEAF_PROXY_METRICS_PASSWORD")
@@ -1120,29 +1099,34 @@ func main() {
 		logger.Printf("24h stats retention ENABLED at %s, sampling every %s (GET /api/miners/history?address=<addr> once the metrics HTTP server, below, is also enabled)", cfg.statsDBPath, cfg.statsSampleInterval)
 	}
 
-	// DISPATCH_BRIEF.md section 3 ("periodic foreground hashrate
-	// report"), Alex's own ask: "hashrate shows in proxy side
-	// foreground mode like xmrig-proxy or xnp". 0 (which
-	// -hashrate-report-interval's own doc comment documents as the
-	// disable value) means no ticker is ever started -- a complete
-	// no-op. Logged via debugLogger.Logf(1, ...) so this is
-	// suppressed under -log-level=0, consistent with that flag's own
-	// "quiet means quiet" intent (section 2).
-	if cfg.hashrateReportInterval > 0 {
-		go func() {
-			ticker := time.NewTicker(cfg.hashrateReportInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					debugLogger.Logf(1, "%s", server.HashrateReportSummary())
-				}
+	// DISPATCH_BRIEF_HASHRATE_API_FOLLOWUP.md section 1, Alex's own
+	// ask verbatim: "for the foreground hashrate ticker, show it at
+	// all log levels, make it a 30 second print no matter what."
+	// This ticker is now ALWAYS active -- there is no flag/env/TOML
+	// key to disable it or change its period (the former
+	// -hashrate-report-interval/LEAF_PROXY_HASHRATE_REPORT_INTERVAL/
+	// hashrate_report_interval_seconds has been removed entirely,
+	// not deprecated-to-no-op). The interval is hardcoded to exactly
+	// 30 seconds below. The summary line is printed via logger.
+	// Printf directly -- deliberately NOT debugLogger.Logf/Debugf or
+	// any -log-level check -- so it is unconditional and prints at
+	// EVERY log level, including -log-level=0 (quiet). This is a
+	// deliberate, intentional exception to the "quiet means quiet"
+	// rule the rest of this leaf's noise-gating follows; do not
+	// "fix" this by adding a level check back in.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				logger.Printf("%s", server.HashrateReportSummary())
 			}
-		}()
-		logger.Printf("foreground hashrate report ENABLED, every %s (at log-level >= 1)", cfg.hashrateReportInterval)
-	}
+		}
+	}()
+	logger.Printf("foreground hashrate report ENABLED, fixed 30s interval, printed at every log level (not gated by -log-level)")
 
 	// Real Prometheus /metrics + basic stats HTML page, exactly
 	// mirroring cmd/leaf-solo/main.go's already-working
