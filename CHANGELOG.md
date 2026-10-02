@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.0](https://github.com/Snipa22/go-crypto-pool/compare/go-crypto-pool-v1.2.0...go-crypto-pool-v1.3.0) (2026-10-02)
+
+
+### Features
+
+* **leaflib,proxy,direct:** close-and-drop on HTTP CONNECT probe ([c3da6ce](https://github.com/Snipa22/go-crypto-pool/commit/c3da6ce389d4b76877cafc1482b280c7ef3ed082))
+* **leaflib,proxy,direct:** generalize HTTP CONNECT probe guard to all HTTP methods ([01e8718](https://github.com/Snipa22/go-crypto-pool/commit/01e87189017a0900de08c74ce3c3306e0f9f8ba3))
+
+
+### Bug Fixes
+
+* **ci:** match docker-build tag trigger to release-please's actual go-crypto-pool-v* tags ([5515312](https://github.com/Snipa22/go-crypto-pool/commit/5515312846f833e256e1131392c1b434b11620df))
+
 ## [1.2.0](https://github.com/Snipa22/go-crypto-pool/compare/go-crypto-pool-v1.1.0...go-crypto-pool-v1.2.0) (2026-10-02)
 
 
