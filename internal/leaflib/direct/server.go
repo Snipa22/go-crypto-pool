@@ -1037,6 +1037,18 @@ func (s *Server) recordSubmitValidation(algo string, seconds float64) {
 // produced a real accepted share.
 const connErrorNoShareTimeout = "no-share-timeout"
 
+// connErrorHTTPConnectProbe is this feature's own connection-error
+// category (DISPATCH_BRIEF_HTTP_CONNECT_PROBE.md), recorded via
+// recordConnectionError exactly like connErrorNoShareTimeout above --
+// same bare-literal-string convention, since direct/metrics defines
+// no ConnError* named constants of its own. Distinguishes a
+// downstream connection closed because the FIRST thing it ever sent
+// was a literal HTTP CONNECT request line (see
+// leaflib.IsHTTPConnectProbe's doc comment) -- a port scanner/
+// open-proxy probe hitting this leaf's 80/443 listener, not a
+// genuine mining client -- from every other category above.
+const connErrorHTTPConnectProbe = "http-connect-probe"
+
 // startNoShareSweep launches the single, Server-scoped periodic
 // no-share-timeout sweep goroutine (runNoShareSweep) if
 // s.noShareTimeout is positive -- deliberately ONE ticker for the

@@ -312,6 +312,35 @@ func classifyCloseError(err error) string {
 }
 
 func (s *Session) handleLine(line string) {
+	// DISPATCH_BRIEF_HTTP_CONNECT_PROBE.md: a port scanner/open-proxy
+	// probe hitting this leaf's 80/443 listener sends a literal HTTP
+	// CONNECT request line, not a stratum message -- checked FIRST,
+	// before the JSON unmarshal attempt below, so it never reaches
+	// the "sent unparseable message" noise path (that path is for
+	// genuinely malformed JSON, a different, already-handled case).
+	// Close immediately via the same s.mc.Close mechanism used for
+	// every other defensive disconnect in this file (e.g. the
+	// consecutive-invalid-share threshold below) and return without
+	// writing any reply: whatever sent this almost certainly isn't a
+	// client capable of or interested in parsing a stratum-shaped
+	// response. "Drop them from tracking": closing s.mc here causes
+	// Session.Run's read loop to exit, and handleConn's EXISTING
+	// deferred cleanup (removal from s.server.sessions) runs exactly
+	// as it already does for every other disconnect reason -- no new
+	// tracking-removal code needed (the session was already
+	// registered into s.server.sessions by handleConn BEFORE
+	// session.Run/handleLine is ever reached, so this holds even for
+	// a probe that never logs in). leaf-direct has no leveled-logger
+	// mechanism (that's leaf-proxy-only, -log-level/resolveLogLevel
+	// -- see this feature's own report), so this logs unconditionally
+	// via the existing plain s.server.logger.Printf, matching this
+	// file's current un-leveled convention.
+	if leaflib.IsHTTPConnectProbe(line) {
+		s.server.recordConnectionError(connErrorHTTPConnectProbe)
+		s.server.logger.Printf("direct: session %s sent an HTTP CONNECT probe, dropping: %q", s.sessionID, line)
+		s.mc.Close("HTTP CONNECT probe detected, not a stratum client")
+		return
+	}
 	var req solo.Request
 	if err := json.Unmarshal([]byte(line), &req); err != nil {
 		s.server.logger.Printf("direct: session %s sent unparseable message, dropping: %v", s.sessionID, err)
