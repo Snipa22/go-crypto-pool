@@ -3,7 +3,7 @@ package leaflib
 
 import "testing"
 
-func TestIsHTTPConnectProbe(t *testing.T) {
+func TestIsHTTPRequestProbe(t *testing.T) {
 	cases := []struct {
 		name string
 		line string
@@ -30,6 +30,31 @@ func TestIsHTTPConnectProbe(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "real GET request line (DISPATCH_BRIEF_HTTP_PROBE_GENERALIZE.md production evidence)",
+			line: "GET / HTTP/1.1\r\n",
+			want: true,
+		},
+		{
+			name: "lowercase get request line",
+			line: "get / HTTP/1.1\r\n",
+			want: true,
+		},
+		{
+			name: "real HEAD request line",
+			line: "HEAD /status HTTP/1.1\r\n",
+			want: true,
+		},
+		{
+			name: "real POST request line",
+			line: "POST /submit HTTP/1.1\r\n",
+			want: true,
+		},
+		{
+			name: "leading whitespace before GET",
+			line: "   GET / HTTP/1.1",
+			want: true,
+		},
+		{
 			name: "substring connect elsewhere must NOT match",
 			line: `{"method":"connect","params":{}}`,
 			want: false,
@@ -37,6 +62,16 @@ func TestIsHTTPConnectProbe(t *testing.T) {
 		{
 			name: "word connect appearing later in the line must NOT match",
 			line: "please connect me to the pool",
+			want: false,
+		},
+		{
+			name: "substring get elsewhere must NOT match",
+			line: `{"method":"get","params":{}}`,
+			want: false,
+		},
+		{
+			name: "word get appearing later in the line must NOT match",
+			line: "please get me the results",
 			want: false,
 		},
 		{
@@ -68,8 +103,8 @@ func TestIsHTTPConnectProbe(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := IsHTTPConnectProbe(tc.line); got != tc.want {
-				t.Errorf("IsHTTPConnectProbe(%q) = %v, want %v", tc.line, got, tc.want)
+			if got := IsHTTPRequestProbe(tc.line); got != tc.want {
+				t.Errorf("IsHTTPRequestProbe(%q) = %v, want %v", tc.line, got, tc.want)
 			}
 		})
 	}
