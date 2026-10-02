@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/Snipa22/go-crypto-pool/compare/go-crypto-pool-v1.3.0...go-crypto-pool-v1.4.0) (2026-10-02)
+
+
+### Features
+
+* **leaflib,proxy:** opt-in min-1-share metrics filter + vardiff retarget logs at log-level 1 ([16951d0](https://github.com/Snipa22/go-crypto-pool/commit/16951d040b4a4b59e623a43dba09939537059530))
+
 ## [1.3.0](https://github.com/Snipa22/go-crypto-pool/compare/go-crypto-pool-v1.2.0...go-crypto-pool-v1.3.0) (2026-10-02)
 
 
