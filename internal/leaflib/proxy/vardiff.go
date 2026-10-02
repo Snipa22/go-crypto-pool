@@ -161,9 +161,20 @@ func (s *Session) maybeRetarget() {
 	// job-issuance call site, at no cost.
 	job, err := s.currentJob(newDiff)
 	if err != nil {
-		s.server.logger.Printf("proxy: vardiff retarget for session %s failed to build a new job: %v", s.sessionID, err)
+		// DISPATCH_BRIEF_MIN_SHARE_FILTER.md "vardiff retarget logs
+		// -> minimum log-level 1": routed through
+		// leaflib.DebugLogger.Logf(1, ...) instead of the raw,
+		// un-leveled logger.Printf -- mirrors session.go's own
+		// already-leveled lines (e.g. the unparseable-message/
+		// oversized-login lines) exactly. Visible at the default
+		// level 1 (byte-identical to today's un-leveled behavior for
+		// an operator who has never touched -log-level), suppressed
+		// at -log-level=0, and still included at level 2.
+		s.server.debugLogger.Logf(1, "proxy: vardiff retarget for session %s failed to build a new job: %v", s.sessionID, err)
 		return
 	}
-	s.server.logger.Printf("proxy: vardiff retarget for session %s: %d -> %d (hashes=%d, connSeconds=%d)", s.sessionID, curDiff, newDiff, hashes, connSeconds)
+	// Same -log-level=1 gating as the failed-to-build-a-new-job line
+	// immediately above -- see that line's own comment.
+	s.server.debugLogger.Logf(1, "proxy: vardiff retarget for session %s: %d -> %d (hashes=%d, connSeconds=%d)", s.sessionID, curDiff, newDiff, hashes, connSeconds)
 	s.pushJob(job)
 }
