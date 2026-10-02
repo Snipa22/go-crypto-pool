@@ -408,6 +408,31 @@ func newSession(mc *leaflib.ManagedConnection, server *Server, startingDifficult
 }
 
 // Run is the session's read loop.
+//
+// NO-GAP GUARANTEE for handleLine's HTTP-request-probe close (see
+// that method's doc comment, DISPATCH_BRIEF_HTTP_PROBE_GENERALIZE.md
+// section 2): bufio.Scanner's underlying Read on s.mc may return
+// multiple already-newline-terminated lines worth of bytes in a
+// single call (e.g. a multi-header HTTP GET request arriving as one
+// TCP segment) -- scanner.Scan() then returns true repeatedly WITHOUT
+// touching the connection again, purely by parsing its own internal
+// buffer. That is exactly why the `if ctx.Err() != nil { return }`
+// check below is placed where it is, on every loop iteration BEFORE
+// handleLine is called: s.mc.Close(...) (called synchronously from
+// within handleLine, e.g. on the first line's probe detection)
+// cancels mc.Context() -- the very ctx this loop was handed -- via
+// ManagedConnection.Close's first statement, mc.cancel(), which runs
+// synchronously before Close even returns (see connection.go). So by
+// the time handleLine returns control to this loop and the next
+// scanner.Scan() call completes (whether satisfied from
+// already-buffered bytes or a fresh Read that now errors on the
+// closed connection), ctx.Err() is already non-nil and this loop
+// returns BEFORE calling handleLine a second time for the same
+// connection. Confirmed by a real net.Pipe()-based repro test
+// (TestSession_HTTPRequestProbe_MultiLineRequestOnlyLogsOnce in
+// httpconnectprobe_test.go) that writes a full multi-header GET
+// request in one Write call and asserts exactly one probe-detected
+// connection-error increment, not five.
 func (s *Session) Run(ctx context.Context) {
 	scanner := bufio.NewScanner(s.mc)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
@@ -447,29 +472,43 @@ func classifyCloseError(err error) string {
 }
 
 func (s *Session) handleLine(line string) {
-	// DISPATCH_BRIEF_HTTP_CONNECT_PROBE.md: a port scanner/open-proxy
-	// probe hitting this leaf's 80/443 listener sends a literal HTTP
-	// CONNECT request line, not a stratum message -- checked FIRST,
-	// before the JSON unmarshal attempt below, so it never reaches
-	// the "sent unparseable message" noise path (that path is for
-	// genuinely malformed JSON, a different, already-handled case).
-	// Close immediately via the same s.mc.Close mechanism used for
-	// every other defensive disconnect in this file (e.g. the
-	// consecutive-invalid-share threshold below) and return without
-	// writing any reply: whatever sent this almost certainly isn't a
-	// client capable of or interested in parsing a stratum-shaped
-	// response. "Drop them from tracking": closing s.mc here causes
-	// Session.Run's read loop to exit, and handleConn's EXISTING
-	// deferred cleanup (removal from s.server.sessions) runs exactly
-	// as it already does for every other disconnect reason -- no new
+	// DISPATCH_BRIEF_HTTP_CONNECT_PROBE.md / DISPATCH_BRIEF_HTTP_PROBE_GENERALIZE.md:
+	// a port scanner/open-proxy probe (or a plain misdirected HTTP
+	// client) hitting this leaf's 80/443 listener sends a literal
+	// HTTP request line (CONNECT, GET, POST, etc.), not a stratum
+	// message -- checked FIRST, before the JSON unmarshal attempt
+	// below, so it never reaches the "sent unparseable message" noise
+	// path (that path is for genuinely malformed JSON, a different,
+	// already-handled case -- see leaflib.IsHTTPRequestProbe's doc
+	// comment for the real production log evidence of why this check
+	// was generalized beyond CONNECT-only). Close immediately via the
+	// same s.mc.Close mechanism used for every other defensive
+	// disconnect in this file (e.g. the consecutive-invalid-share
+	// threshold below) and return without writing any reply: whatever
+	// sent this almost certainly isn't a client capable of or
+	// interested in parsing a stratum-shaped response. "Drop them
+	// from tracking": closing s.mc here causes Session.Run's read
+	// loop to exit, and handleConn's EXISTING deferred cleanup
+	// (removal from s.server.sessions) runs exactly as it already
+	// does for every other disconnect reason -- no new
 	// tracking-removal code needed (the session was already
 	// registered into s.server.sessions by handleConn BEFORE
 	// session.Run/handleLine is ever reached, so this holds even for
-	// a probe that never logs in).
-	if leaflib.IsHTTPConnectProbe(line) {
-		s.server.recordConnectionError(metrics.ConnErrorHTTPConnectProbe)
-		s.server.debugLogger.Logf(1, "proxy: session %s sent an HTTP CONNECT probe, dropping: %q", s.sessionID, line)
-		s.mc.Close("HTTP CONNECT probe detected, not a stratum client")
+	// a probe that never logs in). This also ensures only ONE such
+	// line is ever processed per connection: the FIRST line to detect
+	// as a probe closes s.mc, which cancels mc.Context() -- the very
+	// ctx that Session.Run's read loop passes through its
+	// `if ctx.Err() != nil { return }` check on every subsequent
+	// iteration (including an iteration serving an already-buffered
+	// line read in the same underlying Read() call as this one, e.g.
+	// a multi-header HTTP GET request that arrived as a single TCP
+	// segment) BEFORE handleLine is ever called again on this
+	// connection -- see Session.Run's own doc comment for the full
+	// trace confirming there is no gap here.
+	if leaflib.IsHTTPRequestProbe(line) {
+		s.server.recordConnectionError(metrics.ConnErrorHTTPRequestProbe)
+		s.server.debugLogger.Logf(1, "proxy: session %s sent an HTTP request probe, dropping: %q", s.sessionID, line)
+		s.mc.Close("HTTP request probe detected, not a stratum client")
 		return
 	}
 	var req Request
