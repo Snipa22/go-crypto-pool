@@ -189,6 +189,14 @@ stats_page_max_sessions = 150
 # recommended for public-facing deployments. (default: false)
 hide_remote_address = false
 
+# Exclude any currently-connected session that has never submitted a single
+# share (e.g. a scanner/probe that merely logs in and sits idle) from EVERY
+# metrics/stats surface derived from session state -- Stats(), the stats
+# HTML page, /api/miners, and the Prometheus snapshot-derived metrics alike.
+# Opt-in; OFF by default (today's exact existing unfiltered behavior).
+# (default: false)
+metrics_min_shares_filter = false
+
 # Path to a local, operator-maintained JSON file of manually banned payment
 # addresses (see internal/leaflib/addressflags.FileSource's doc comment for
 # the file format). Empty (default) disables the feature entirely --

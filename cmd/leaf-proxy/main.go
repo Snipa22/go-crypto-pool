@@ -197,6 +197,23 @@ type config struct {
 	metricsListenAddress string
 	maxAddressLabels     int
 
+	// metricsMinSharesFilter is
+	// -metrics-min-shares-filter/LEAF_PROXY_METRICS_MIN_SHARES_FILTER
+	// (DISPATCH_BRIEF_MIN_SHARE_FILTER.md, Alex's ask: "Add a
+	// feature to filter metrics to only connections with at least 1
+	// share"): when true, every metrics/stats surface derived from
+	// session state (Stats() and its consumers -- the stats HTML
+	// page, /api/miners -- plus the Prometheus snapshot-derived
+	// metrics) excludes any currently-connected session that has
+	// never submitted a single share (e.g. a scanner/probe that
+	// merely logs in and sits idle) -- see
+	// proxy.Server.countableSessions's doc comment for the single
+	// shared choke point this goes through. Opt-in, default false
+	// (today's exact existing unfiltered behavior, byte-identical),
+	// matching every other flag added across this whole feature arc
+	// so far.
+	metricsMinSharesFilter bool
+
 	// statsPageMaxSessions is this feature's own
 	// -stats-page-max-sessions/LEAF_PROXY_STATS_PAGE_MAX_SESSIONS
 	// flag (see its flag.IntVar registration below and
@@ -397,6 +414,7 @@ func loadConfig() (config, error) {
 	flag.BoolVar(&cfg.hideRemoteAddress, "hide-remote-address", envOrBool("LEAF_PROXY_HIDE_REMOTE_ADDRESS", false), "omit the \"Remote address\" column from the stats HTML page entirely -- recommended for public-facing deployments. Disabled by default. Env: LEAF_PROXY_HIDE_REMOTE_ADDRESS")
 	flag.IntVar(&cfg.maxAddressLabels, "max-address-labels", envOrInt("LEAF_PROXY_MAX_ADDRESS_LABELS", 0), "cap on distinct payment-address labels tracked by leaf_proxy_miners_by_address and the stats page's per-address breakdown (0 = package default). Env: LEAF_PROXY_MAX_ADDRESS_LABELS")
 	flag.IntVar(&cfg.statsPageMaxSessions, "stats-page-max-sessions", envOrInt("LEAF_PROXY_STATS_PAGE_MAX_SESSIONS", proxy.DefaultStatsPageMaxSessions), "cap on how many session rows the stats HTML page's \"Connected sessions\" table renders (the separate \"Active connections\" summary count is always accurate/uncapped). 0 or negative disables the cap entirely (render every session). Env: LEAF_PROXY_STATS_PAGE_MAX_SESSIONS")
+	flag.BoolVar(&cfg.metricsMinSharesFilter, "metrics-min-shares-filter", envOrBool("LEAF_PROXY_METRICS_MIN_SHARES_FILTER", false), "exclude any currently-connected session that has never submitted a single share (e.g. a scanner/probe that merely logs in and sits idle) from EVERY metrics/stats surface -- Stats(), the stats HTML page, /api/miners, and the Prometheus snapshot-derived metrics alike. Opt-in, OFF by default (today's exact existing unfiltered behavior). Env: LEAF_PROXY_METRICS_MIN_SHARES_FILTER")
 
 	flag.StringVar(&cfg.addressFlagsFile, "address-flags-file", envOr("LEAF_PROXY_ADDRESS_FLAGS_FILE", ""), "path to a local, operator-maintained JSON file of manually banned payment addresses (see internal/leaflib/addressflags.FileSource's doc comment for the file format). Empty (default) disables the feature entirely -- leaf-proxy has no go-crypto-pool backend to poll instead. Env: LEAF_PROXY_ADDRESS_FLAGS_FILE")
 	flag.DurationVar(&cfg.addressFlagsPollInterval, "address-flags-poll-interval", envOrDuration("LEAF_PROXY_ADDRESS_FLAGS_POLL_INTERVAL", 30*time.Second), "how often -address-flags-file is re-read. Ignored if -address-flags-file is unset. Env: LEAF_PROXY_ADDRESS_FLAGS_POLL_INTERVAL")
@@ -528,10 +546,11 @@ type fileConfig struct {
 
 	PoolDiffCapEnabled *bool `toml:"pool_diff_cap_enabled"`
 
-	MetricsListenAddress *string `toml:"metrics_listen_address"`
-	MaxAddressLabels     *int    `toml:"max_address_labels"`
-	StatsPageMaxSessions *int    `toml:"stats_page_max_sessions"`
-	HideRemoteAddress    *bool   `toml:"hide_remote_address"`
+	MetricsListenAddress   *string `toml:"metrics_listen_address"`
+	MaxAddressLabels       *int    `toml:"max_address_labels"`
+	StatsPageMaxSessions   *int    `toml:"stats_page_max_sessions"`
+	HideRemoteAddress      *bool   `toml:"hide_remote_address"`
+	MetricsMinSharesFilter *bool   `toml:"metrics_min_shares_filter"`
 
 	AddressFlagsFile                *string `toml:"address_flags_file"`
 	AddressFlagsPollIntervalSeconds *int    `toml:"address_flags_poll_interval_seconds"`
@@ -618,6 +637,7 @@ func applyConfigFile(cfg *config) error {
 	cfgfile.ApplyInt(&cfg.maxAddressLabels, fc.MaxAddressLabels, visited, "max-address-labels", "LEAF_PROXY_MAX_ADDRESS_LABELS")
 	cfgfile.ApplyInt(&cfg.statsPageMaxSessions, fc.StatsPageMaxSessions, visited, "stats-page-max-sessions", "LEAF_PROXY_STATS_PAGE_MAX_SESSIONS")
 	cfgfile.ApplyBool(&cfg.hideRemoteAddress, fc.HideRemoteAddress, visited, "hide-remote-address", "LEAF_PROXY_HIDE_REMOTE_ADDRESS")
+	cfgfile.ApplyBool(&cfg.metricsMinSharesFilter, fc.MetricsMinSharesFilter, visited, "metrics-min-shares-filter", "LEAF_PROXY_METRICS_MIN_SHARES_FILTER")
 
 	cfgfile.ApplyString(&cfg.addressFlagsFile, fc.AddressFlagsFile, visited, "address-flags-file", "LEAF_PROXY_ADDRESS_FLAGS_FILE")
 	if fc.AddressFlagsPollIntervalSeconds != nil {
@@ -1065,6 +1085,20 @@ func main() {
 		logger.Printf("pool-target-diff login cap ENABLED (-pool-diff-cap-enabled) -- none of the three difficulty floors may start a session above the upstream pool's own current target_diff")
 	} else {
 		logger.Printf("pool-target-diff login cap DISABLED by operator config (-pool-diff-cap-enabled=false) -- falling back to the pre-46a6e2c uncapped max()-of-floors behavior")
+	}
+
+	// DISPATCH_BRIEF_MIN_SHARE_FILTER.md: opt-in min-1-share metrics
+	// filter. Set unconditionally (NOT gated behind
+	// cfg.metricsListenAddress != "" like SetHideRemoteAddress/
+	// SetStatsPageMaxSessions below) because Stats() -- the surface
+	// this toggles -- is also consumed by -stats-db-path's
+	// SampleForStatsDB sampling loop (wired below, independent of
+	// whether the metrics HTTP server is enabled at all), not just
+	// the HTML/metrics endpoints. Default false (today's exact
+	// existing unfiltered behavior).
+	server.SetMetricsMinSharesFilter(cfg.metricsMinSharesFilter)
+	if cfg.metricsMinSharesFilter {
+		logger.Printf("metrics min-1-share filter ENABLED (-metrics-min-shares-filter) -- a session that has never submitted a share is excluded from every metrics/stats surface (Stats(), the stats HTML page, /api/miners, and the Prometheus snapshot-derived metrics)")
 	}
 
 	// Real, manual ban enforcement (see internal/leaflib/addressflags's

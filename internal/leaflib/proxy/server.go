@@ -219,6 +219,22 @@ type Server struct {
 	// -- see that field's doc comment for the exact rationale, which
 	// applies identically here.
 	lastDevFeeReconnectCount atomic.Uint64
+
+	// metricsMinSharesFilter gates the opt-in "only count sessions
+	// with >= 1 share" filter (DISPATCH_BRIEF_MIN_SHARE_FILTER.md:
+	// Alex's ask, "filter metrics to only connections with at least
+	// 1 share"). Defaults to false (zero value) -- today's exact
+	// existing unfiltered behavior, byte-identical, unless
+	// explicitly enabled. See countableSessions below, the single
+	// choke point this flag is consulted through -- EVERY surface
+	// derived from session state (Stats() and its consumers, the
+	// HTML stats page, /api/miners, and the Prometheus
+	// snapshot-derived metrics via sessionSnapshots) goes through
+	// that one helper, so this flag can never apply to one surface
+	// while missing another. Set via SetMetricsMinSharesFilter;
+	// cmd/leaf-proxy wires it from
+	// -metrics-min-shares-filter/LEAF_PROXY_METRICS_MIN_SHARES_FILTER.
+	metricsMinSharesFilter atomic.Bool
 }
 
 // NewServer constructs a Server. cm must already be configured with
@@ -395,6 +411,55 @@ func (s *Server) EnableDevFeeUpstream(upstream UpstreamSubmitter) {
 	s.devFeeUpstream = upstream
 }
 
+// SetMetricsMinSharesFilter toggles the opt-in min-1-share metrics
+// filter (see metricsMinSharesFilter's own doc comment and
+// countableSessions below) -- cmd/leaf-proxy wires this from
+// -metrics-min-shares-filter/LEAF_PROXY_METRICS_MIN_SHARES_FILTER
+// before Serve begins. Safe to call at any time (atomic.Bool), though
+// production callers only ever call it once, at startup.
+func (s *Server) SetMetricsMinSharesFilter(enabled bool) {
+	s.metricsMinSharesFilter.Store(enabled)
+}
+
+// countableSessions is the single shared choke point for "the set of
+// currently-connected downstream sessions that count" -- both Stats()
+// and sessionSnapshots() iterate over its return value instead of
+// s.sessions directly (DISPATCH_BRIEF_MIN_SHARE_FILTER.md). Before
+// this helper existed, Stats() and sessionSnapshots() each iterated
+// s.sessions independently, with no single choke point between them;
+// centralizing the filter predicate here guarantees the two surfaces
+// (and everything built on top of either of them: the HTML stats
+// page, /api/miners, and every Prometheus snapshot-derived metric)
+// can never drift out of sync with each other on which sessions they
+// count -- that consistency is the actual point of centralizing this,
+// not just avoiding duplicated code.
+//
+// Acquires s.mu.RLock internally and returns a plain []*Session copy
+// (safe to use lock-free afterward, exactly mirroring
+// repushAllSessions' identical RLock-copy-then-unlock pattern above)
+// -- callers must NOT already hold s.mu when calling this.
+//
+// When the filter is disabled (metricsMinSharesFilter's zero value,
+// i.e. SetMetricsMinSharesFilter was never called with true), this
+// returns every currently-connected session unconditionally -- today's
+// exact existing behavior, zero-diff. When enabled, a session with
+// shareCount.Load() == 0 (never submitted a single share -- e.g. a
+// scanner/probe that merely logs in and sits idle) is excluded
+// entirely.
+func (s *Server) countableSessions() []*Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	filter := s.metricsMinSharesFilter.Load()
+	out := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		if filter && sess.shareCount.Load() == 0 {
+			continue
+		}
+		out = append(out, sess)
+	}
+	return out
+}
+
 // upstreamForRoute is the single resolution choke point every
 // route-dependent decision in session.go's handleSubmit goes through:
 // given the UpstreamRoute a specific Job (job.go) was minted under, it
@@ -512,18 +577,20 @@ func (s *Server) refreshUpstreamHealth() {
 }
 
 // sessionSnapshots implements metrics.SnapshotFunc against this
-// Server's real, live session map, AND (since this is called
-// synchronously on every /metrics scrape — see metrics.SnapshotFunc's
-// doc comment, and MetricsHandler's doc comment for why this is now
-// ALSO called once earlier, before Gather) refreshes the single
-// upstream connection's real health via refreshUpstreamHealth.
+// Server's real, live session set (via countableSessions -- see that
+// helper's doc comment for why this and Stats() both go through it
+// rather than iterating s.sessions directly), AND (since this is
+// called synchronously on every /metrics scrape — see
+// metrics.SnapshotFunc's doc comment, and MetricsHandler's doc
+// comment for why this is now ALSO called once earlier, before
+// Gather) refreshes the single upstream connection's real health via
+// refreshUpstreamHealth.
 func (s *Server) sessionSnapshots() []metrics.SessionSnapshot {
 	s.refreshUpstreamHealth()
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]metrics.SessionSnapshot, 0, len(s.sessions))
-	for _, sess := range s.sessions {
+	sessions := s.countableSessions()
+	out := make([]metrics.SessionSnapshot, 0, len(sessions))
+	for _, sess := range sessions {
 		addr := sess.Identity().Address
 		out = append(out, metrics.SessionSnapshot{
 			Address:    addr,
@@ -930,17 +997,20 @@ type Stats struct {
 // implements UpstreamHealth) the real single-upstream-connection
 // health — mirrors internal/leaflib/solo/server.go's Stats() exactly,
 // plus the upstream-health fields solo mode has no analogue for.
+//
+// Iterates countableSessions() (DISPATCH_BRIEF_MIN_SHARE_FILTER.md),
+// NOT s.sessions directly — see that helper's doc comment for why
+// Stats() and sessionSnapshots() share this one choke point.
 func (s *Server) Stats() Stats {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sessions := s.countableSessions()
 
-	st := Stats{ActiveSessions: len(s.sessions)}
-	ipSet := make(map[string]struct{}, len(s.sessions))
+	st := Stats{ActiveSessions: len(sessions)}
+	ipSet := make(map[string]struct{}, len(sessions))
 	addrCounts := make(map[string]int)
-	diffs := make([]uint64, 0, len(s.sessions))
-	st.Sessions = make([]SessionStat, 0, len(s.sessions))
+	diffs := make([]uint64, 0, len(sessions))
+	st.Sessions = make([]SessionStat, 0, len(sessions))
 
-	for _, sess := range s.sessions {
+	for _, sess := range sessions {
 		st.TotalShares += sess.shareCount.Load()
 		st.TotalBlocks += sess.blockCount.Load()
 
