@@ -53,6 +53,77 @@ func TestStatsHTMLHandler_HidesRemoteAddressWhenConfigured(t *testing.T) {
 	}
 }
 
+// TestStatsHTMLHandler_DarkModeAndRefreshControls is the required
+// (per DISPATCH_BRIEF_ADDENDUM_DARKMODE.md's "Testing" section) Go
+// test asserting the rendered HTML still contains the expected
+// structural pieces for the dark-mode toggle + adjustable
+// auto-refresh feature: the old hardcoded <meta http-equiv="refresh">
+// tag is gone, the new <select> refresh control and theme-toggle
+// button are present, and the page still renders without error for
+// both an empty and a populated Stats(). The interactive JS behavior
+// itself (localStorage persistence, setTimeout scheduling) is not
+// unit-testable from Go and was instead verified by manual/visual
+// reading of the rendered template output per the addendum's
+// "Required verification" section.
+func TestStatsHTMLHandler_DarkModeAndRefreshControls(t *testing.T) {
+	fetch := func(h *harness) string {
+		srv := httptest.NewServer(h.server.StatsHTMLHandler())
+		defer srv.Close()
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("GET stats page: %v", err)
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, 65536)
+		n, _ := resp.Body.Read(buf)
+		return string(buf[:n])
+	}
+
+	t.Run("empty Stats()", func(t *testing.T) {
+		h := newHarness(t, leaflib.VardiffConfig{}, 6*time.Minute)
+		body := fetch(h)
+
+		if strings.Contains(body, `http-equiv="refresh"`) {
+			t.Errorf("expected the old hardcoded <meta http-equiv=\"refresh\"> tag to be gone, got:\n%s", body)
+		}
+		if !strings.Contains(body, `id="refresh-select"`) {
+			t.Errorf("expected the new auto-refresh <select> control, got:\n%s", body)
+		}
+		if !strings.Contains(body, `id="theme-toggle"`) {
+			t.Errorf("expected the new dark-mode toggle button, got:\n%s", body)
+		}
+		if !strings.Contains(body, "leaf-proxy-stats-theme") {
+			t.Errorf("expected the theme localStorage key to be referenced, got:\n%s", body)
+		}
+		if !strings.Contains(body, "leaf-proxy-stats-refresh-ms") {
+			t.Errorf("expected the refresh-interval localStorage key to be referenced, got:\n%s", body)
+		}
+		if !strings.Contains(body, "<html") {
+			t.Errorf("expected a real HTML document even with no sessions, got:\n%s", body)
+		}
+	})
+
+	t.Run("populated Stats()", func(t *testing.T) {
+		h := newHarness(t, leaflib.VardiffConfig{}, 6*time.Minute)
+		c, _ := h.connect()
+		c.login(t, "darkmode-refresh-test")
+		body := fetch(h)
+
+		if strings.Contains(body, `http-equiv="refresh"`) {
+			t.Errorf("expected the old hardcoded <meta http-equiv=\"refresh\"> tag to be gone, got:\n%s", body)
+		}
+		if !strings.Contains(body, `id="refresh-select"`) {
+			t.Errorf("expected the new auto-refresh <select> control, got:\n%s", body)
+		}
+		if !strings.Contains(body, `id="theme-toggle"`) {
+			t.Errorf("expected the new dark-mode toggle button, got:\n%s", body)
+		}
+		if !strings.Contains(body, "darkmode-refresh-test") {
+			t.Errorf("expected the connected session's address to still render normally, got:\n%s", body)
+		}
+	})
+}
+
 // TestCapSessionsForDisplay is the pure, table-driven unit test for
 // the small helper StatsHTMLHandler uses to truncate the "Connected
 // sessions" table -- see capSessionsForDisplay's own doc comment for
