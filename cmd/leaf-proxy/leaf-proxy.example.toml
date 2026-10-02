@@ -223,15 +223,6 @@ debug = false
 # (default: 1, or 2 if debug=true and this key is left unset)
 log_level = 1
 
-# How often to log one xmrig-proxy/xnp-style foreground hashrate summary
-# line (total hashrate, active sessions, shares, upstream-forwarded
-# count) via the existing logger, at log_level >= 1, in seconds
-# (DISPATCH_BRIEF.md "leaf-proxy ... foreground hashrate", Alex's ask:
-# "hashrate shows in proxy side foreground mode like xmrig-proxy or
-# xnp"). 0 disables the feature entirely -- no ticker is ever started.
-# (default: 60)
-hashrate_report_interval_seconds = 60
-
 # HTTP Basic Auth username/password gating EVERY endpoint on the metrics
 # HTTP server (/metrics, /, /api/miners, /api/miners/history) --
 # DISPATCH_BRIEF.md "leaf-proxy ... password-protected metrics like xnp
