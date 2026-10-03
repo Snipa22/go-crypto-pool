@@ -1015,21 +1015,40 @@ func main() {
 		IdleTimeout:    cfg.idleTimeout,
 	})
 
-	// Real, in-process, pure-Go RandomX validator -- NO external
-	// randomx-service HTTP daemon dependency. leaf-proxy's local
+	// Real, in-process RandomX validator -- NO external randomx-service
+	// HTTP daemon dependency either way. leaf-proxy's local
 	// re-validation gate (internal/leaflib/proxy/session.go's
 	// handleSubmit) only calls ValidateBlobSeedResult on a genuine
 	// block-level find (a submit that already meets the real upstream
-	// pool's block target), not on every ordinary sub-block share -- at
-	// that call frequency, pure-Go RandomX's real ~258ms/hash cost
-	// (benchmarked separately, git.gammaspectra.live/P2Pool/go-randomx
-	// @v1.0.0) is genuinely acceptable, and removing the external
-	// daemon dependency simplifies leaf-proxy's deployment. See
-	// internal/leaflib/validator/randomx_puregolang.go's doc comment
-	// for the full honest writeup, including why leaf-solo's RXT
-	// support (a real per-share hot path) still uses the external-
-	// daemon-backed RandomXValidator instead.
-	rxValidator := validator.NewPureGoRandomXValidator()
+	// pool's block target), not on every ordinary sub-block share, so
+	// removing the external daemon dependency simplifies leaf-proxy's
+	// deployment regardless of which concrete validator below ends up
+	// in the binary.
+	//
+	// WHICH ONE: validator.NewProxyRandomXValidator() is a build-tag-
+	// selected factory (internal/leaflib/validator/factory.go /
+	// factory_cgo.go), NOT a runtime flag -- this call site doesn't
+	// know or care which concrete validator it gets back, only that it
+	// satisfies proxy.ShareValidator. A plain `go build` (no tags,
+	// CGO_ENABLED=0) returns PureGoRandomXValidator: real, correct,
+	// but slow (~376ms/hash steady-state, AMD EPYC 9R14
+	// -benchtime=20x) -- see randomx_puregolang.go's doc comment for
+	// why that cost is genuinely acceptable at this call's real
+	// (block-find-only) frequency, and why leaf-solo's RXT support (a
+	// true per-share hot path) still uses the external-daemon-backed
+	// RandomXValidator instead. A `-tags randomx_cgo` build
+	// (CGO_ENABLED=1, C++ toolchain required) returns
+	// CgoRandomXValidator instead: the real C++ RandomX reference
+	// implementation via cgo, ~16x faster on the same benchmark
+	// (~23.6ms/hash steady-state) -- see randomx_cgo.go's doc comment
+	// for its one real concurrency-model tradeoff vs. the pure-Go
+	// path. The real, publicly-distributed leaf-proxy Docker image and
+	// linux/darwin release archives build with randomx_cgo; only the
+	// windows/amd64 release archive (no prebuilt go-randomx static
+	// lib, no viable cgo cross-compile path) falls back to this
+	// pure-Go path -- see .github/workflows/docker-build.yml's
+	// release-archives job.
+	rxValidator := validator.NewProxyRandomXValidator()
 
 	vardiffCfg := leaflib.VardiffConfig{
 		MinDifficulty:    cfg.minDifficulty,

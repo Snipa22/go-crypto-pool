@@ -113,32 +113,86 @@ jobs:
 
   # Cross-compiled leaf-proxy release archives. Only built on version
   # tags (never on plain main pushes) — mirrors the docker job's
-  # push-gate above. leaf-proxy has no CGO dependency (see
-  # docker/leaf-proxy/Dockerfile, which already builds with
-  # CGO_ENABLED=0), so cross-compilation needs no target toolchain.
+  # push-gate above.
+  #
+  # CGO IS NOW ASYMMETRIC ACROSS THESE 4 LEGS -- read before "fixing"
+  # the windows leg: linux/amd64, linux/arm64, and darwin/arm64 build
+  # with CGO_ENABLED=1 and -tags randomx_cgo, pulling in
+  # CgoRandomXValidator (internal/leaflib/validator/factory_cgo.go) —
+  # real cgo bindings over tevador/RandomX's reference C++
+  # implementation via github.com/mining-pool/go-randomx, which ships
+  # prebuilt static libs ONLY for linux/amd64, linux/arm64,
+  # darwin/arm64 (confirmed directly against that module's own
+  # lib/*.a and its #cgo LDFLAGS selectors in randomx.go — its README
+  # also claims darwin/amd64, but no darwin/amd64 .a actually exists
+  # in the module as vendored; darwin/amd64 is not a release-archives
+  # leg here regardless, so this doesn't affect us, but don't trust
+  # that README claim at face value if a 5th leg is ever added).
+  # windows/amd64 has NO prebuilt go-randomx lib and no viable
+  # cgo/C++-cross-to-Windows-from-Linux path worth taking on here, so
+  # it STAYS CGO_ENABLED=0 with no build tag -- it builds
+  # PureGoRandomXValidator instead, via
+  # validator.NewProxyRandomXValidator()'s build-tag fallback
+  # (internal/leaflib/validator/factory.go). That is a real, working,
+  # already-tested pure-Go RandomX implementation, just slower
+  # (~376ms/hash steady-state vs. the cgo path's ~23.6ms/hash,
+  # AMD EPYC 9R14 -benchtime=20x) -- not a stub, not missing
+  # functionality, just the one leg where the real tradeoff is cgo's
+  # own platform-support ceiling. Do NOT try to force CGO_ENABLED=1
+  # onto this leg without first solving go-randomx's missing
+  # windows/amd64 static lib.
   release-archives:
     name: Release archive (${{ matrix.os }}/${{ matrix.arch }})
     needs: test
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Native build on the existing ubuntu-latest (amd64) runner
+          # -- no cross-toolchain needed.
           - os: linux
             arch: amd64
             ext: ""
+            runs-on: ubuntu-latest
+            cgo: "1"
+            tags: "randomx_cgo"
+          # Cross-compile from the amd64 runner to arm64 -- needs the
+          # aarch64 gcc/g++ cross-toolchain installed below and
+          # CC/CXX pointed at it, otherwise cgo would try (and fail)
+          # to invoke the host's native amd64 gcc against arm64
+          # object code.
           - os: linux
             arch: arm64
             ext: ""
+            runs-on: ubuntu-latest
+            cgo: "1"
+            tags: "randomx_cgo"
+          # No prebuilt go-randomx static lib for windows/amd64, and
+          # cross-compiling cgo+C++ to Windows from Linux is its own
+          # large lift -- stays pure-Go (CGO_ENABLED=0, no tag). See
+          # this job's header comment above.
           - os: windows
             arch: amd64
             ext: ".exe"
+            runs-on: ubuntu-latest
+            cgo: "0"
+            tags: ""
+          # Native build on a real Apple Silicon runner -- no
+          # cross-toolchain needed (osxcross cross-compiling cgo+C++
+          # from Linux would be a large, fragile lift not justified
+          # here when GitHub ships native arm64 macOS runners).
+          # macos-15, NOT macos-14 -- macos-14 runners are being
+          # retired by GitHub.
           - os: darwin
             arch: arm64
             ext: ""
+            runs-on: macos-15
+            cgo: "1"
+            tags: "randomx_cgo"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -149,16 +203,42 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install aarch64 cross-toolchain (linux/arm64 only)
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
       - name: Build leaf-proxy binary
         env:
-          CGO_ENABLED: "0"
+          CGO_ENABLED: ${{ matrix.cgo }}
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         run: |
+          set -euo pipefail
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" \
+          # linux/arm64 is a cross-compile from this amd64 runner --
+          # point cgo at the aarch64 toolchain installed above rather
+          # than letting it fall back to the host's native amd64 gcc.
+          if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
+            export CC=aarch64-linux-gnu-gcc
+            export CXX=aarch64-linux-gnu-g++
+          fi
+          tag_args=()
+          if [ -n "${{ matrix.tags }}" ]; then
+            tag_args=(-tags "${{ matrix.tags }}")
+          fi
+          go build -trimpath -ldflags="-s -w" "${tag_args[@]}" \
             -o "dist/leaf-proxy${{ matrix.ext }}" \
             ./cmd/leaf-proxy
+
+      - name: Verify cross-compiled binary architecture (linux/arm64 only)
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
+        run: |
+          set -euo pipefail
+          file "dist/leaf-proxy${{ matrix.ext }}"
+          file "dist/leaf-proxy${{ matrix.ext }}" | grep -q 'ELF 64-bit.*ARM aarch64' \
+            || { echo "expected an ELF aarch64 binary, got something else"; exit 1; }
 
       - name: Stage and package archive
         id: archive
