@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.5.0](https://github.com/Snipa22/go-crypto-pool/compare/go-crypto-pool-v1.4.1...go-crypto-pool-v1.5.0) (2026-10-03)
+
+
+### Features
+
+* **leaflib/validator,leaf-proxy:** wire CgoRandomXValidator into real builds ([3b6e0f5](https://github.com/Snipa22/go-crypto-pool/commit/3b6e0f52b0e3d6cdfe68fe1e4e3ff31fc7e4e052))
+* **leaflib/validator:** add cgo RandomX light-mode validator for leaf-proxy ([644a693](https://github.com/Snipa22/go-crypto-pool/commit/644a6934fc7192acd218b198bcab48f025de0da8))
+
+
+### Bug Fixes
+
+* **leaflib/proxy:** fix data race in vardiff retarget log-level tests ([8871851](https://github.com/Snipa22/go-crypto-pool/commit/8871851db3725e3b7801c265f8fde7e0fe006b32))
+
 ## [1.4.1](https://github.com/Snipa22/go-crypto-pool/compare/go-crypto-pool-v1.4.0...go-crypto-pool-v1.4.1) (2026-10-03)
 
 
