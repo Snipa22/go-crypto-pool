@@ -12,6 +12,7 @@ require (
 	github.com/gtank/ristretto255 v0.2.0
 	github.com/holiman/uint256 v1.3.2
 	github.com/jackc/pgx/v5 v5.7.5
+	github.com/mining-pool/go-randomx v1.2.1
 	github.com/nats-io/nats-server/v2 v2.14.5
 	github.com/nats-io/nats.go v1.53.1
 	github.com/nsqio/go-diskqueue v1.1.0
