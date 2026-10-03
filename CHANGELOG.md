@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/Snipa22/go-crypto-pool/compare/go-crypto-pool-v1.4.0...go-crypto-pool-v1.4.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **ci:** give release-please a PAT so its tags/PRs can trigger downstream workflows ([a9183d3](https://github.com/Snipa22/go-crypto-pool/commit/a9183d3b1a355dde23db0d287837a7f6dcbd08a7))
+
 ## [1.4.0](https://github.com/Snipa22/go-crypto-pool/compare/go-crypto-pool-v1.3.0...go-crypto-pool-v1.4.0) (2026-10-02)
 
 
