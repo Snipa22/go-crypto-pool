@@ -4,14 +4,26 @@
 #
 # Builds cmd/leaf-proxy, the XNP-style proxy-aggregator leaf mode.
 #
-# Runtime base: gcr.io/distroless/static-debian12. leaf-proxy never
-# shells out (no os/exec usage in this package tree) — it emulates a
-# mining client to its upstream over plain stratum-style TCP, but it
-# also talks to a Monero-family node over RPC and to the backend over
-# HTTP+Protobuf, both of which may be TLS, so it needs CA
-# certificates for outbound TLS verification. distroless/static ships
-# ca-certificates and a built-in nonroot (65532:65532) user, covering
-# both needs without a shell or package manager.
+# Builder: CGO_ENABLED=1 with the randomx_cgo build tag, so the real
+# block-find re-validation path (internal/leaflib/validator's
+# CgoRandomXValidator, selected automatically by
+# validator.NewProxyRandomXValidator()'s build-tag factory — see
+# factory_cgo.go) is compiled in, backed by real cgo bindings to
+# tevador/RandomX's reference C++ implementation via
+# github.com/mining-pool/go-randomx. golang:1.25-bookworm already
+# ships gcc/g++ (verified directly: `docker run --rm
+# golang:1.25-bookworm g++ --version` succeeds), so no extra
+# toolchain package install is needed here.
+#
+# Runtime base: gcr.io/distroless/cc-debian12 (NOT ...static-debian12
+# — that variant ships no libc at all and will fail to even start a
+# dynamically-linked cgo binary like this one). The `cc` variant adds
+# glibc + libstdc++ + libgcc on top of distroless/static's baseline,
+# which is exactly what a cgo/C++ binary needs to run, while still
+# shipping ca-certificates and the same built-in nonroot (65532:65532)
+# user leaf-proxy relies on for outbound TLS verification (it talks to
+# a Monero-family node over RPC and to the backend over HTTP+Protobuf,
+# both potentially TLS) without a shell or package manager.
 
 FROM golang:1.25-bookworm AS builder
 
@@ -22,13 +34,14 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -tags randomx_cgo \
     -trimpath \
     -ldflags="-s -w" \
     -o /out/leaf-proxy \
     ./cmd/leaf-proxy
 
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /out/leaf-proxy /usr/local/bin/leaf-proxy
 
