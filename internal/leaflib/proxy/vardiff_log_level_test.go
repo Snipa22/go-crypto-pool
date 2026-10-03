@@ -5,11 +5,65 @@ import (
 	"bytes"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Snipa22/go-crypto-pool/internal/leaflib"
 )
+
+// syncBuffer is a mutex-guarded bytes.Buffer -- a plain bytes.Buffer
+// is NOT safe here. retargetLogLevelHarness's connect() call spins up
+// a REAL background handleConn goroutine (session_test.go's
+// connectAtDifficultyWithPort) that keeps logging through this same
+// buffer (session.go's -debug output, plus server.go's own
+// "connection accepted"/"connection closed" Debugf calls) right up
+// until that goroutine actually returns -- including AFTER each test
+// below calls c.client.Close(), since the server-side goroutine's own
+// deferred "connection closed" Debugf write races with whatever
+// happens next on the test's main goroutine. drainJobPushes' done
+// channel only observes the CLIENT side of the net.Pipe going away;
+// it says nothing about whether the SERVER-side handleConn goroutine
+// has finished executing its own deferred cleanup (which is exactly
+// where that write comes from -- see server.go's handleConn, the
+// "connection closed" Debugf inside its second defer). So the test's
+// subsequent buf.String()/buf.Len() read has no synchronization with
+// that write: a real, reproducible data race under `go test -race`
+// (confirmed: `go test -race -run
+// TestMaybeRetarget_RetargetLog_LoggedAtLogLevelTwo -count=20`
+// without this fix fails nearly every run). Guarding every access
+// with a mutex makes the concurrent Write/String/Len/Reset calls
+// legitimately safe -- it does not change what gets logged, only
+// makes reading it memory-safe while a background goroutine may
+// still be writing to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *syncBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
 
 // TestMaybeRetarget_RetargetLog_SuppressedAtLogLevelZero/
 // TestMaybeRetarget_RetargetLog_LoggedAtLogLevelOne/
@@ -32,12 +86,12 @@ import (
 // blocks (mirrors forced_min_difficulty_test.go's identical drain
 // goroutine exactly).
 
-func retargetLogLevelHarness(t *testing.T, level int, debugEnabled bool) (*harness, *testClient, *Session, *bytes.Buffer) {
+func retargetLogLevelHarness(t *testing.T, level int, debugEnabled bool) (*harness, *testClient, *Session, *syncBuffer) {
 	t.Helper()
 	h := newHarness(t, leaflib.VardiffConfig{RetargetInterval: time.Second, TargetTime: 15}, 0)
 
-	var buf bytes.Buffer
-	h.server.logger = log.New(&buf, "", 0)
+	buf := &syncBuffer{}
+	h.server.logger = log.New(buf, "", 0)
 	h.server.debugLogger = leaflib.NewDebugLogger(h.server.logger, debugEnabled)
 	h.server.debugLogger.Level = level
 
@@ -59,7 +113,7 @@ func retargetLogLevelHarness(t *testing.T, level int, debugEnabled bool) (*harne
 
 	buf.Reset() // discard any login-time logging noise unrelated to this assertion
 
-	return h, c, sess, &buf
+	return h, c, sess, buf
 }
 
 // drainJobPushes reads and discards every line c receives until c is
